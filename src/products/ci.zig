@@ -258,6 +258,13 @@ fn run(arena: std.mem.Allocator, io: std.Io, argv: []const [:0]const u8) !u8 {
     }, .{ .emit_null_optional_fields = false })}));
     std.debug.print("determinismo-ci: testing: {d} shards of {d} timelines, run {s}/#{d}\n", .{ shard_count, config.timelines, serve_url, started.id });
     _ = try client.run_wait(started.id, 1000);
+    // What serve said of the run: why it stopped it (no coverage in its first timelines: the
+    // job's shards then lack timelines, an "error" with no reason given), or that it ended
+    // without coverage.
+    const Said = struct { stopped_why: []const u8 = "", uncovered: []const u8 = "" };
+    const said = client.json(Said, "GET", try std.fmt.allocPrint(arena, "/runs/{d}", .{started.id}), null) catch Said{};
+    if (said.stopped_why.len > 0) std.debug.print("determinismo-ci: serve stopped run {d}: {s}\n", .{ started.id, said.stopped_why });
+    if (said.uncovered.len > 0) std.debug.print("determinismo-ci: run {d}: {s}\n", .{ started.id, said.uncovered });
     // Each shard's verdict: its property's failing timelines among its own.
     const ShardRow = struct { shard: u32 = 0, failing: u32 = 0, timelines: u32 = 0 };
     const shard_sql = "SELECT CAST(json_extract(event, '$.assert.details.shard') AS INTEGER) AS shard, " ++

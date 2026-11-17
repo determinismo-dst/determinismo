@@ -775,6 +775,9 @@ function statsHtml() {
   // Its explorer has not said what it does for that long: stalled (a deadlock, or a hang).
   if (run.state === "running" && run.stalled_s) notes.push(`<b class="fail-text">no progress for ${Math.round(run.stalled_s / 60)} min: its explorer may be stalled</b>`);
   if (run.eventsError) notes.push(`<span class="fail-text" title="${escape(run.eventsError)}">its events could not be read (hover for why)</span>`);
+  // What serve said of it: why it stopped the run (the coverage gate), or that it ended uncovered.
+  if (run.stopped_why) notes.push(`<b class="fail-text">stopped by serve: ${escape(run.stopped_why)}</b>`);
+  if (run.uncovered) notes.push(`<b class="fail-text">${escape(run.uncovered)}</b>`);
   return `<div class="stats" id="stats-live">
     ${stat("Timelines", done.toLocaleString(), notes.join(" · "))}
     ${stat("Failing", failing.toLocaleString(), "timelines with a failing property", failing ? "var(--fail)" : "var(--pass)")}

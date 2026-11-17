@@ -87,6 +87,12 @@ release profile with `debug = true` and `strip = false`: Cargo strips it by defa
 whatever `RUSTFLAGS` ask). Zig programs report their edges' lines from their own debug
 information wherever they run (not stripped: Zig keeps it but in ReleaseSmall).
 
+A run without coverage is explored blind, so serve does not let one go unnoticed: a run whose
+first 4 ended timelines report none is stopped, and one that ended by itself before that keeps
+its verdict; either way its page and `GET /runs/<id>` say so (`stopped_why`, `uncovered`), and
+determinismo-ci prints it. `"coverage": "off"` in the run's request says it is meant (a
+self-test of the platform itself).
+
 Branch directions: each side of a branch is a block of its own (Go: `determinismo-toolexec`
 gives an `if` without an `else` one, on its body's closing line, so the direction not taken is a
 behavior too; the JVM: each side of a forward conditional branch probes as a block, a thread

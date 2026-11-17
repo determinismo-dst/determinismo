@@ -603,7 +603,10 @@ fn run_update(server: *Server, id: u32) !void {
         shared.setup_ingested[id] = true;
         generation_next(server, id);
     };
-    if (size == shared.ingested[id] and replays_size == shared.replays_ingested[id]) return;
+    // A run that ended before the coverage gate looked (fewer timelines than it waits for, or
+    // all of them between two looks): judged once, here, though nothing new arrived.
+    const judge_ended = !shared.coverage_known[id] and !run_going(server, id);
+    if (size == shared.ingested[id] and replays_size == shared.replays_ingested[id] and !judge_ended) return;
     // Counted as any connection: its database stays attached while it ingests.
     var connection = try run_connect(server, id);
     defer run_release(server, id, &connection);
@@ -617,6 +620,7 @@ fn run_update(server: *Server, id: u32) !void {
         if (arrived > 0) generation_next(server, id);
         if (arrived > 0 and !shared.coverage_known[id]) coverage_gate(server, id, &connection);
     }
+    if (judge_ended and !shared.coverage_known[id]) coverage_gate(server, id, &connection);
     if (replays_size != shared.replays_ingested[id]) {
         store.replays_ingest(&connection, server.arena, server.io, replays) catch |err| {
             server.detail = try server.arena.dupe(u8, connection.failure.text());
@@ -630,7 +634,10 @@ fn run_update(server: *Server, id: u32) !void {
 /// Coverage always (since 2026-11-16, after a hunt explored a system 12 hours without it and
 /// 21 of 33 workloads' latest runs had none): a running run whose first
 /// coverage_gate_timelines ended timelines carry no coverage event is stopped, its `stopped` file
-/// saying why, unless its request says `"coverage": "off"` (a self-test's own workload). A system
+/// saying why, unless its request says `"coverage": "off"` (a self-test's own workload). One
+/// that ended by itself before the gate looked keeps its verdict and gets an `uncovered` file
+/// saying the same (a CI job of a few fast timelines ended unjudged, its tests uninstrumented).
+/// Both are in the run's JSON (run_show: stopped_why, uncovered), for its page and its client. A system
 /// without its language's instrumentation is explored blind: no guidance from its code, no
 /// thread-pause points in it. Its workload needs a build with it (Go's determinismo-toolexec,
 /// rustc's or clang's trace-pc-guard with the binary in /symbols, a JVM of 24 or later for the
@@ -639,7 +646,15 @@ const coverage_gate_timelines = 4;
 
 fn coverage_gate(server: *Server, id: u32, connection: *duckdb.Connection) void {
     const shared = server.shared;
-    if (!run_going(server, id)) return; // Judged as it went, or ended before: nothing to stop.
+    const going = run_going(server, id);
+    if (!going) {
+        // Stopped by someone (or by this gate, at an earlier look): not this gate's to judge.
+        const run = run_get(server, id) orelse return;
+        if (run.stopped) {
+            shared.coverage_known[id] = true;
+            return;
+        }
+    }
     const Asked = struct { coverage: ?[]const u8 = null };
     const request = run_file(server, id, "request.json") catch return;
     const asked = std.json.parseFromSliceLeaky(Asked, server.arena, request, .{ .ignore_unknown_fields = true }) catch Asked{};
@@ -655,19 +670,28 @@ fn coverage_gate(server: *Server, id: u32, connection: *duckdb.Connection) void 
         return;
     }
     const ended = (connection.row(Count, server.arena, "SELECT count(*) AS count FROM timelines", .{}) catch return) orelse return;
+    const remedy = "its system runs without its language's instrumentation (coverage always); build its workload with it, " ++
+        "or ask \"coverage\": \"off\" for a self-test\n";
+    if (!going) {
+        shared.coverage_known[id] = true;
+        if (ended.count == 0) return; // No timeline ended (its setup failed): no code ran to cover.
+        const why = std.fmt.allocPrint(server.arena, "no coverage in its {d} timelines: " ++ remedy, .{ended.count}) catch return;
+        const directory = run_directory(server, id) catch return;
+        const uncovered = std.fs.path.join(server.arena, &.{ directory, "uncovered" }) catch return;
+        std.Io.Dir.cwd().writeFile(server.io, .{ .sub_path = uncovered, .data = why }) catch {};
+        std.debug.print("[serve] run {d} ended uncovered: {s}", .{ id, why });
+        return;
+    }
     if (ended.count < coverage_gate_timelines) return;
     shared.coverage_known[id] = true;
     var buffer: [256]u8 = undefined;
     var reply: std.Io.Writer = .fixed(&buffer);
-    _ = run_stop(server, id, false, &reply) catch |err| {
+    // Its reason with the stop itself: a client that sees the run stopped reads why.
+    const why = std.fmt.allocPrint(server.arena, "no coverage in its first {d} timelines: " ++ remedy, .{ended.count}) catch return;
+    _ = run_stop(server, id, false, why, &reply) catch |err| {
         std.debug.print("[serve] run {d}: no coverage in its first {d} timelines, and its stop failed: {s}\n", .{ id, ended.count, @errorName(err) });
         return;
     };
-    const why = std.fmt.allocPrint(server.arena, "no coverage in its first {d} timelines: its system runs without its " ++
-        "language's instrumentation (coverage always); build its workload with it, or ask \"coverage\": \"off\" for a self-test\n", .{ended.count}) catch return;
-    const directory = run_directory(server, id) catch return;
-    const stopped = std.fs.path.join(server.arena, &.{ directory, "stopped" }) catch return;
-    std.Io.Dir.cwd().writeFile(server.io, .{ .sub_path = stopped, .data = why }) catch {};
     std.debug.print("[serve] run {d} stopped: {s}", .{ id, why });
 }
 
@@ -1369,7 +1393,7 @@ fn run_route(
         return session_start(server, run, request.body, out);
     }
     if (eql(u8, action, "stop") and eql(u8, request.method, "POST")) {
-        return run_stop(server, run.id, query_value(server.query_string, "drain") != null, out);
+        return run_stop(server, run.id, query_value(server.query_string, "drain") != null, "", out);
     }
     if (eql(u8, action, "resume") and eql(u8, request.method, "POST")) {
         return run_resume(server, run.id, out);
@@ -2081,6 +2105,14 @@ fn run_show(server: *Server, run: *const Run, out: *std.Io.Writer) !u16 {
     try out.print("{{\"id\":{d},\"state\":\"{s}\"", .{ run.id, state(run) });
     if (run.draining) try out.writeAll(",\"draining\":true");
     if (run.status) |status| try out.print(",\"status\":{d}", .{status});
+    // Why serve stopped it (the coverage gate's reason in its `stopped` file; someone's stop
+    // leaves the file empty), and that it ended without coverage (its `uncovered` file).
+    inline for (.{ .{ "stopped", "stopped_why" }, .{ "uncovered", "uncovered" } }) |pair| {
+        if (run_file(server, run.id, pair[0])) |text| {
+            const said = std.mem.trim(u8, text, " \n");
+            if (said.len > 0) try out.print(",\"{s}\":{f}", .{ pair[1], std.json.fmt(said, .{}) });
+        } else |_| {}
+    }
     // When (seconds since the epoch, from its files): asked (its request, written once), last
     // started (its pid file, written by each explorer: a resume too), ended (its record's
     // last write, once it is not running).
@@ -5122,7 +5154,8 @@ fn runs_copy(server: *Server) []const Run {
 /// POST /runs/<id>/stop: its explorer ends now (SIGTERM), the timelines running with it,
 /// discarded; with `?drain=1`, it starts none more and ends once those running end, each
 /// recorded (SIGUSR2, main.zig's drain_requested). Either way the run is stopped: resumable.
-fn run_stop(server: *Server, id: u32, drain: bool, out: *std.Io.Writer) !u16 {
+/// `why`: serve's own reason, kept in the run's `stopped` file (empty for someone's stop).
+fn run_stop(server: *Server, id: u32, drain: bool, why: []const u8, out: *std.Io.Writer) !u16 {
     const shared = server.shared;
     shared.lock();
     defer shared.unlock();
@@ -5131,10 +5164,13 @@ fn run_stop(server: *Server, id: u32, drain: bool, out: *std.Io.Writer) !u16 {
     } else return error.NotFound;
     if (run.status != null) return error.NotRunning;
     if (linux.errno(linux.kill(run.pid, if (drain) .USR2 else .TERM)) != .SUCCESS) return error.NotRunning;
-    if (drain) run.draining = true else run.stopped = true;
     const directory = try run_directory(server, run.id);
     const path = try std.fs.path.join(server.arena, &.{ directory, if (drain) "draining" else "stopped" });
-    try std.Io.Dir.cwd().writeFile(server.io, .{ .sub_path = path, .data = "" });
+    // The file, then the state: a reader that finds the run stopped finds its reason there.
+    // Signalled already, it is stopped whatever the write says.
+    const written = std.Io.Dir.cwd().writeFile(server.io, .{ .sub_path = path, .data = why });
+    if (drain) run.draining = true else run.stopped = true;
+    try written;
     try out.print("{{\"id\":{d},\"state\":\"{s}\"}}\n", .{ run.id, if (drain) "draining" else "stopped" });
     return 200;
 }
@@ -5297,6 +5333,9 @@ fn runs_discover(server: *Server) !void {
         // earlier build up to date in place (store.schema_ensure: minutes for a long run's):
         // the running run's ingests and the reaping behind them all.
         if (run.status != null) run.complete = true;
+        // Nor for the coverage gate: it judges the runs this serve sees end, not the host's
+        // history (each ended run's events read once more at its first request).
+        if (run.status != null or run.stopped) shared.coverage_known[id] = true;
         runs_insert(shared, run);
     }
 }

@@ -2896,7 +2896,10 @@ fn events_count(context: *Context, arguments: []const []const u8) !u64 {
 
 /// Coverage always (serve's coverage_gate): a run of a program with no coverage at all (the
 /// self-test bank, its nodes uninstrumented) is stopped once 4 of its timelines ended, its
-/// `stopped` file saying why; the same run asked with `"coverage": "off"` goes on.
+/// `stopped` file saying why, and its JSON too (what its page and determinismo-ci show: the
+/// reason was in serve's log alone); the same run asked with `"coverage": "off"` goes on; and
+/// one of two timelines, ended by itself before the gate's four, keeps its verdict and says it
+/// ran uncovered (it ended unjudged).
 fn check_coverage_gate(context: *Context) !void {
     const arena = context.arena;
     const address = "127.0.0.1:7931";
@@ -2939,11 +2942,33 @@ fn check_coverage_gate(context: *Context) !void {
         if (ended >= 8 or std.mem.indexOf(u8, going, "\"state\":\"running\"") == null) break;
         sleep_ms(500);
     }
+    // Two timelines, fewer than the gate waits for: the run ends by itself.
+    const short = try std.fmt.allocPrint(arena, "{{\"program\":{f},\"scenario\":\"bank\"," ++
+        "\"seed\":5,\"branches\":2,\"jobs\":1,\"time_budget\":\"10m\"}}", .{std.json.fmt(program, .{})});
+    _ = try curl(context, &.{ "-X", "POST", "-d", short, url ++ "/runs" });
+    var ended_run: []const u8 = "";
+    for (0..1200) |_| {
+        ended_run = curl(context, &.{url ++ "/runs/3"}) catch "";
+        if (ended_run.len > 0 and std.mem.indexOf(u8, ended_run, "\"state\":\"running\"") == null) break;
+        sleep_ms(500);
+    }
+    // Its verdict, then serve's look at what it left (the watcher's next passes).
+    for (0..60) |_| {
+        if (std.mem.indexOf(u8, ended_run, "\"uncovered\"") != null) break;
+        sleep_ms(500);
+        ended_run = curl(context, &.{url ++ "/runs/3"}) catch "";
+    }
     expect_all(context, &.{
         .{ "the uncovered run is stopped", std.mem.indexOf(u8, run, "\"state\":\"stopped\"") != null },
         .{ "its stopped file says why", std.mem.indexOf(u8, why, "no coverage in its first") != null },
+        .{ "and its JSON, for its page and its client", std.mem.indexOf(u8, run, "\"stopped_why\":\"no coverage in its first") != null },
+        .{ "a run that ended by itself before the gate keeps its verdict", std.mem.indexOf(u8, ended_run, "\"state\":\"stopped\"") == null and
+            std.mem.indexOf(u8, ended_run, "\"state\":\"running\"") == null and ended_run.len > 0 },
+        .{ "and says it ran uncovered", std.mem.indexOf(u8, ended_run, "\"uncovered\":\"no coverage in its 2 timelines") != null },
         .{ "asked without coverage, it goes on past 4 timelines", ended >= 8 and std.mem.indexOf(u8, going, "\"state\":\"running\"") != null },
-    }, "coverage gate: run 1 {s}, why \"{s}\"; run 2 at {d} timelines", .{ run[0..@min(run.len, 160)], why, ended });
+    }, "coverage gate: run 1 {s}, why \"{s}\"; run 2 at {d} timelines; run 3 {s}", .{
+        run[0..@min(run.len, 160)], why, ended, ended_run[0..@min(ended_run.len, 260)],
+    });
 }
 
 /// The HTTP API and its web UI: `serve` answers with the page, starts a run, records every
