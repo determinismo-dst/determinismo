@@ -5,7 +5,7 @@
 # them (their pid files). `stop` takes the runs too (they live in its cgroup): before KVM is
 # reloaded. Idempotent. Run as root.
 # Usage: serve.sh <user> start|stop [--reserved-cores N] [--siblings on|off]
-#   [--margin-branches N|auto]
+#   [--margin-branches N|auto] [--machines-per-cpu N]
 #   Every exploration on the host is one of its runs (~/.determinismo, src/runs.zig): serve
 #   shows them however they were started.
 #   --reserved-cores N: N physical cores (with their hyperthreads) for the user's own sessions
@@ -28,6 +28,10 @@
 #   hunts' 40 VMs included; margin 48 instead of 128 took Mu3's single-steps from 5.78 M to
 #   about 2 M a 20 s timeline, the same timeline (2026-11-10). Other CPUs skid more (a W-2295
 #   65, Granite Rapids under 96 VMs 104): measured on each host, not assumed.
+#   --machines-per-cpu N: how many machines (sandboxes, a CI job's setup: fast VMs) share a CPU
+#   among themselves, never with a timeline's deterministic VM (serve's --machines-per-cpu,
+#   cpus.zig). Kept in /etc/determinismo/machines-per-cpu. Default serve's own, 4: lower it
+#   where the sandboxes are busy at the same moment.
 set -euo pipefail
 user=${1:?usage: $0 <user> start|stop [--reserved-cores N]}
 action=${2:?usage: $0 <user> start|stop [--reserved-cores N]}
@@ -35,11 +39,13 @@ shift 2
 reserved_given=
 siblings_given=
 margin_given=
+machines_given=
 while [ $# -gt 0 ]; do
   case $1 in
     --reserved-cores) reserved_given=${2:?--reserved-cores needs a number}; shift 2 ;;
     --siblings) siblings_given=${2:?--siblings needs on or off}; shift 2 ;;
     --margin-branches) margin_given=${2:?--margin-branches needs a number or auto}; shift 2 ;;
+    --machines-per-cpu) machines_given=${2:?--machines-per-cpu needs a number}; shift 2 ;;
     *) echo "error: unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -77,6 +83,13 @@ case $margin_given in
   "") ;;
   *) echo "error: --margin-branches takes a number or auto" >&2; exit 2 ;;
 esac
+machines_config=/etc/determinismo/machines-per-cpu
+case $machines_given in
+  [1-9]*) mkdir -p "$(dirname "$machines_config")"; echo "$machines_given" > "$machines_config" ;;
+  "") ;;
+  *) echo "error: --machines-per-cpu takes a number" >&2; exit 2 ;;
+esac
+machines=$(cat "$machines_config" 2>/dev/null || true)
 margin=$(cat "$margin_config" 2>/dev/null || echo auto)
 if [ "$margin" = auto ]; then
   margin=
@@ -184,7 +197,7 @@ ExecStartPre=+$home/determinismo/infra/host/isolate.sh ${own_cpus:--} ${run_cpus
 # The UI page read from the repository's file at each request: a UI change ships as a copy.
 ExecStart=$home/determinismo/zig-out/bin/determinismo serve --listen $listen \\
   --ui $home/determinismo/src/ui/index.html --bb $home/opt/bb/bb --kernel $home/guest/vmlinuz \\
-  --initrd $home/guest/base.cpio --append quiet --cache $home/cache --memory-mib 4096${margin:+ --margin-branches $margin}
+  --initrd $home/guest/base.cpio --append quiet --cache $home/cache --memory-mib 4096${margin:+ --margin-branches $margin}${machines:+ --machines-per-cpu $machines}
 # Restarts stop serve alone: its runs go on, adopted by the next.
 KillMode=process
 # A process the kernel's OOM killer takes (a holder, a worker) is not a reason to stop the unit

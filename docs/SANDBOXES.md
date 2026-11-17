@@ -67,39 +67,13 @@ The permission is part of the sandbox's state, as its files are. A checkpoint re
 
 ## CPUs
 
-A sandbox's machine holds one CPU for its life, whatever its vCPUs: the CPUs serve's machines
-run on (the reserved cores when serve has them, `serve.sh --reserved-cores`; serve's own
-otherwise) bound how many sandboxes are alive at once. One more is refused at once
-(`every CPU machines run on is held by a machine`): delete a sandbox first. A deleted sandbox
-keeps its record and checkpoints and leaves `list`.
-
-## Secrets
-
-`write ... --secret` writes a file (an agent's key) without keeping a copy beside the record,
-which says only that a secret went there. But a checkpoint is the whole machine: one taken
-after the secret was written holds it, in its memory file on serve's disk, and so do the forks
-and runs made from it. Write secrets after the checkpoints you keep, or delete those
-checkpoints with the machine's directory when done.
-
-## MCP tools
-
-`determinismo-sandbox mcp` gives an agent the same as tools: `sandbox_create`, `sandbox_exec`,
-`sandbox_write_file`, `sandbox_read_file`, `sandbox_checkpoint`, `sandbox_fork`,
-`sandbox_rewind`, `sandbox_explore`, `sandbox_replay`, `sandbox_delete`, `sandbox_list`. For the
-work itself an agent is better off with its own tools inside the sandbox (the harness
-inside); the tools are for what those cannot express: checkpoints, forks, rewinds.
-
-## Example
-
-```sh
-determinismo-sandbox create --compose /srv/app/compose.yaml        # {"sandbox":1}
-determinismo-sandbox exec 1 app 'make test'
-determinismo-sandbox checkpoint 1                                  # {"checkpoint":"1/here-1"}
-determinismo-sandbox fork 1 1/here-1 4                             # {"sandboxes":[2,3,4,5]}
-determinismo-sandbox replay 1 1/here-1                             # {"run":7}
-```
-
-serve's machine API underneath (`POST /machines`, `/machines/<id>/exec`, `/files`,
-`/checkpoint`, `DELETE`; runs from a checkpoint: `POST /runs {checkpoint, checkpoint_exec |
-checkpoint_steps}`) is determinismo's; the sandbox's record and its fork, rewind and replay are
-this product's.
+Sandboxes share CPUs among themselves: a sandbox is idle most of the time, so several sit on
+one CPU (4 by default, serve's `--machines-per-cpu`), and a new one joins the CPU that already
+has some before taking a fresh one. They never share one with a timeline: a deterministic VM
+has its CPU to itself, and a CPU with a sandbox on it is closed to timelines until its last
+sandbox goes. So the sandboxes alive at once are the CPUs serve's machines run on (the reserved
+cores when serve has them, `serve.sh --reserved-cores`; serve's own otherwise) times that
+number. One more is refused at once (`every place for a machine is taken`): delete a sandbox
+first. Busy at the same moment, the sandboxes of one CPU slow each other: lower the number for
+agents that compile or test all the time. A deleted sandbox keeps its record and checkpoints and
+leaves `list`.

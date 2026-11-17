@@ -62,6 +62,9 @@ const usage =
     \\                            on 4 CPUs beside the runs)
     \\                            [--machine-start-seconds <s>]   (how long a machine asked for
     \\                            may wait for a CPU before it is given up, 600 by default)
+    \\                            [--machines-per-cpu <n>]   (how many machines share a CPU,
+    \\                            4 by default: sandboxes are idle most of the time; never
+    \\                            with a timeline's deterministic VM)
     \\                            <machine options>
     \\       determinismo mcp     <machine options>   (an MCP server on stdio, for agents)
     \\       determinismo verify  <explore options> --record <run.jsonl> --tape-dir <dir>
@@ -858,6 +861,20 @@ const OwnCpu = struct {
         own.held = own.pool.take();
     }
 
+    /// A fast machine's place: on a CPU with other machines, never a deterministic VM's
+    /// (cpus.Pool.take_shared).
+    fn take_shared(own: *OwnCpu) void {
+        if (own.held != null) return;
+        if (!own.opened) {
+            own.pool.open() catch |err| {
+                std.debug.print("[determinismo] the CPU pool: {s}\n", .{@errorName(err)});
+                linux.exit_group(1);
+            };
+            own.opened = true;
+        }
+        own.held = own.pool.take_shared();
+    }
+
     fn give(own: *OwnCpu) void {
         const held = own.held orelse return;
         own.pool.give(held);
@@ -1328,6 +1345,7 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
     var failure_analysis = false;
     var session_idle_minutes: u64 = 30;
     var machine_start_seconds: u64 = 600;
+    var machines_per_cpu: u32 = cpus.machines_per_cpu_default;
     var bb: []const u8 = "bb";
     var machine: std.ArrayList([]const u8) = .empty;
     var index: usize = 0;
@@ -1363,6 +1381,10 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
             machine_start_seconds = try std.fmt.parseInt(u64, value, 10);
             if (machine_start_seconds == 0) return error.MachineStartSeconds;
             index += 1;
+        } else if (std.mem.eql(u8, flag, "--machines-per-cpu")) {
+            machines_per_cpu = try std.fmt.parseInt(u32, value, 10);
+            if (machines_per_cpu == 0) return error.MachinesPerCpu;
+            index += 1;
         } else if (std.mem.eql(u8, flag, "--explorer")) {
             explorer = value; // Self-tests: a stand-in for `determinismo explore`.
             index += 1;
@@ -1389,6 +1411,7 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
         .failure_analysis = failure_analysis,
         .session_idle_ns = session_idle_minutes * std.time.ns_per_min,
         .machine_start_ns = machine_start_seconds * std.time.ns_per_s,
+        .machines_per_cpu = machines_per_cpu,
     });
 }
 
@@ -1636,7 +1659,9 @@ fn cmdline_build(
 
 fn command_run(context: Context, vm: *VM, options: *const VM.Options, from_snapshot: ?[]const u8) !void {
     assert(!options.stop_at_setup_complete);
-    own_cpu.take();
+    // A fast VM (several vCPUs, never deterministic: a sandbox, a CI job's setup) shares its CPU
+    // with other machines; a deterministic one has a CPU of its own.
+    if (options.vcpus > 1) own_cpu.take_shared() else own_cpu.take();
     if (from_snapshot) |path| {
         // A fast VM going on from a saved snapshot (`run --vcpus N --from-snapshot`).
         assert(options.vcpus > 1);
@@ -7754,6 +7779,10 @@ fn parse_option(
         arguments.dev_directory = value;
     } else if (eql(u8, flag, "--vcpus")) {
         arguments.vcpus = try std.fmt.parseInt(u32, value, 10);
+    } else if (eql(u8, flag, "--machines-per-cpu")) {
+        // How many fast machines share a CPU (cpus.zig): serve's, given to each it starts.
+        cpus.machines_per_cpu = try std.fmt.parseInt(u32, value, 10);
+        if (cpus.machines_per_cpu == 0) return error.MachinesPerCpu;
     } else if (eql(u8, flag, "--guest-cpu")) {
         arguments.guest_cpu = std.meta.stringToEnum(VM.GuestCpu, value) orelse return error.UnknownGuestCpu;
     } else if (eql(u8, flag, "--tsc-jitter-seed")) {

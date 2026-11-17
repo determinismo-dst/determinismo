@@ -1963,11 +1963,14 @@ fn check_sandbox(context: *Context) !void {
 /// taken after that reads it too, and so does the sandbox rewound to it (the proxy came with the
 /// checkpoint, the host's relay is added: an agent's model calls in its forks), and its steps
 /// replayed in a deterministic machine (the run's egress, the proxy asking its channel at each
-/// connection). With both CPUs held by machines, one more is refused at once, saying so (it
+/// connection). Machines share a CPU among themselves (two each here, `--machines-per-cpu 2`):
+/// the sandbox and its first fork sit on one CPU, the next two forks on the other, four
+/// machines on two CPUs. With every place taken, one more is refused at once, saying so (it
 /// waited ten minutes for a CPU that could not come, then failed without a reason); and one
 /// asked of a second serve on the same CPUs, which has no machine of its own to count, is given
 /// up after that serve's `--machine-start-seconds` and its process stopped (it was left, and
 /// took a CPU when one came free: a machine of no one's). A deleted sandbox leaves the list.
+/// The replay's deterministic VM then runs on the CPU the forks left, never the sandbox's.
 fn check_sandbox_egress(context: *Context) !void {
     const arena = context.arena;
     const linux = std.os.linux;
@@ -2000,7 +2003,9 @@ fn check_sandbox_egress(context: *Context) !void {
     }
     const data = try std.fs.path.join(arena, &.{ context.scratch, "serve-sandbox-egress" });
     var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(arena, &.{ "taskset", "-c", two.items, context.determinismo, "serve", "--listen", address, "--data", data });
+    try argv.appendSlice(arena, &.{
+        "taskset", "-c", two.items, context.determinismo, "serve", "--listen", address, "--data", data, "--machines-per-cpu", "2",
+    });
     try argv.appendSlice(arena, context.machine);
     var server = try std.process.spawn(context.io, .{ .argv = argv.items, .stdout = .ignore, .stderr = .ignore });
     defer server.kill(context.io);
@@ -2042,7 +2047,19 @@ fn check_sandbox_egress(context: *Context) !void {
     const forks = (std.json.parseFromSliceLeaky(Forked, arena, tool(context, &.{ "fork", id_text, checkpoint, "1" }), .{ .ignore_unknown_fields = true }) catch Forked{}).sandboxes;
     const fork_text = if (forks.len == 1) try std.fmt.allocPrint(arena, "{d}", .{forks[0]}) else "0";
     const forked = if (forks.len == 1) tool(context, &.{ "exec", fork_text, "redis", fetch }) else "";
-    // Both CPUs held by machines now: a third is refused at once.
+    // Where each machine is pinned (serve numbers them as they are made: the sandbox's 1, its
+    // forks' 2 to 4), read from its process.
+    const machine_cpu = struct {
+        fn of(c: *Context, serve_data: []const u8, machine: u32) []const u8 {
+            const command = std.fmt.allocPrint(c.arena, "grep Cpus_allowed_list /proc/$(cat '{s}/machines/{d}/pid')/status | cut -f2", .{ serve_data, machine }) catch return "";
+            const result = run_kept(c, &.{ "sh", "-c", command }) catch return "";
+            return std.mem.trim(u8, result.stdout, " \t\n");
+        }
+    }.of;
+    // Two more forks: the first CPU has its two machines, they take the other.
+    const more = (std.json.parseFromSliceLeaky(Forked, arena, tool(context, &.{ "fork", id_text, checkpoint, "2" }), .{ .ignore_unknown_fields = true }) catch Forked{}).sandboxes;
+    const cpu_of = [_][]const u8{ machine_cpu(context, data, 1), machine_cpu(context, data, 2), machine_cpu(context, data, 3), machine_cpu(context, data, 4) };
+    // Every place taken now (two CPUs, two machines each): a fifth is refused at once.
     const refused_start = monotonic_ns();
     const refused = tool(context, &.{ "fork", id_text, checkpoint, "1" });
     const refused_s = (monotonic_ns() - refused_start) / std.time.ns_per_s;
@@ -2051,7 +2068,8 @@ fn check_sandbox_egress(context: *Context) !void {
     const other_data = try std.fs.path.join(arena, &.{ context.scratch, "serve-sandbox-egress-other" });
     var other_argv: std.ArrayList([]const u8) = .empty;
     try other_argv.appendSlice(arena, &.{
-        "taskset", "-c", two.items, context.determinismo, "serve", "--listen", "127.0.0.1:7913", "--data", other_data, "--machine-start-seconds", "5",
+        "taskset",            "-c", two.items, context.determinismo, "serve", "--listen", "127.0.0.1:7913", "--data", other_data, "--machine-start-seconds", "5",
+        "--machines-per-cpu", "2",
     });
     try other_argv.appendSlice(arena, context.machine);
     var other = try std.process.spawn(context.io, .{ .argv = other_argv.items, .stdout = .ignore, .stderr = .ignore });
@@ -2070,6 +2088,7 @@ fn check_sandbox_egress(context: *Context) !void {
     sleep_ms(500);
     const given_up_runs = given_up_pid > 0 and linux.errno(linux.kill(given_up_pid, @fromBackingInt(@intCast(0)))) == .SUCCESS;
     _ = tool(context, &.{ "delete", fork_text });
+    for (more) |fork| _ = tool(context, &.{ "delete", try std.fmt.allocPrint(arena, "{d}", .{fork}) });
     const listed = tool(context, &.{"list"});
     _ = tool(context, &.{ "rewind", id_text, checkpoint });
     const rewound = tool(context, &.{ "exec", id_text, "redis", fetch });
@@ -2086,15 +2105,18 @@ fn check_sandbox_egress(context: *Context) !void {
         .{ "a sandbox's node is given a way out", id > 0 and std.mem.indexOf(u8, allowed, "\"proxy\"") != null },
         .{ "it reads the allowed site's page", std.mem.indexOf(u8, first, page) != null },
         .{ "a fork of a checkpoint taken after reads it too", forks.len == 1 and std.mem.indexOf(u8, forked, page) != null },
-        .{ "with every CPU held by a machine, one more is refused at once, saying so", refused_s < 30 and std.mem.indexOf(u8, refused, "is held by a machine") != null },
+        .{ "the sandbox and its first fork share a CPU", cpu_of[0].len > 0 and std.mem.indexOfAny(u8, cpu_of[0], ",-") == null and std.mem.eql(u8, cpu_of[0], cpu_of[1]) },
+        .{ "the next two forks share the other", more.len == 2 and cpu_of[2].len > 0 and !std.mem.eql(u8, cpu_of[2], cpu_of[0]) and std.mem.eql(u8, cpu_of[2], cpu_of[3]) },
+        .{ "with every place taken, one more is refused at once, saying so", refused_s < 30 and std.mem.indexOf(u8, refused, "every place for a machine is taken (4 of 4") != null },
         .{ "a machine that got no CPU in its serve's time is given up, saying so", std.mem.indexOf(u8, given_up, "was not up after 5 s") != null },
         .{ "and its process is stopped", given_up_pid > 0 and !given_up_runs },
         .{ "a deleted sandbox leaves the list", forks.len == 1 and std.mem.indexOf(u8, listed, try std.fmt.allocPrint(arena, "\"sandbox\":{s},", .{fork_text})) == null and
             std.mem.indexOf(u8, listed, try std.fmt.allocPrint(arena, "\"sandbox\":{d},", .{id})) != null },
         .{ "the sandbox rewound to the checkpoint reads it", std.mem.indexOf(u8, rewound, page) != null },
         .{ "its steps replayed in a deterministic machine read it", replay_id > 0 and std.mem.indexOf(u8, replayed, page) != null },
-    }, "sandbox-egress: {d}, first \"{s}\", fork {s} \"{s}\", a third machine refused in {d} s (\"{s}\"), another serve's given up \"{s}\" (pid {d}, {s}), rewound \"{s}\", replay run {d}", .{
+    }, "sandbox-egress: {d}, first \"{s}\", fork {s} \"{s}\", machines on CPUs {s} {s} {s} {s}, a fifth refused in {d} s (\"{s}\"), another serve's given up \"{s}\" (pid {d}, {s}), rewound \"{s}\", replay run {d}", .{
         id,                                             std.mem.trim(u8, first[0..@min(first.len, 60)], " \n"),      fork_text,                                                     std.mem.trim(u8, forked[0..@min(forked.len, 60)], " \n"),
+        cpu_of[0],                                      cpu_of[1],                                                   cpu_of[2],                                                     cpu_of[3],
         refused_s,                                      std.mem.trim(u8, refused[0..@min(refused.len, 140)], " \n"), std.mem.trim(u8, given_up[0..@min(given_up.len, 160)], " \n"), given_up_pid,
         if (given_up_runs) "still running" else "gone", std.mem.trim(u8, rewound[0..@min(rewound.len, 60)], " \n"),  replay_id,
     });

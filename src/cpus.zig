@@ -59,6 +59,15 @@ pub var run_key: ?linux.pid_t = null;
 /// takes: set once at its start, forks inherit it. 0: none claimed.
 pub var claim_bytes: u64 = 0;
 
+/// How many fast machines one CPU holds, unless told (serve's `--machines-per-cpu`, given to each
+/// machine it starts): a fast VM (`run` with several vCPUs: a sandbox, a CI job's setup) is
+/// never deterministic, so several share a CPU among themselves (Pool.take_shared), most of
+/// them idle most of the time; with each holding a CPU of its own for its life, a host's
+/// machines alive at once were its CPUs (three sandboxes on three). Never with a deterministic
+/// VM: its CPU is its own (Pool.take), as before.
+pub const machines_per_cpu_default = 4;
+pub var machines_per_cpu: u32 = machines_per_cpu_default;
+
 /// The CPUs this process was given: its affinity before a pin narrowed it to the one CPU it
 /// held. Its pool, its count of usable CPUs and a CPU given back go by it, never by the pinned
 /// affinity: an explorer pinned while it booted and set up once counted one usable CPU (every
@@ -330,9 +339,125 @@ pub const Pool = struct {
         }
     }
 
+    /// Takes a place for a fast machine, pinned to its CPU: on a CPU that has machines and
+    /// fewer than machines_per_cpu (the one with the fewest), else on a free one, which becomes
+    /// the machines'. A CPU's lock held shared is the machines'; a deterministic VM's take asks
+    /// for it exclusively and never gets one a machine is on, nor a machine one a deterministic
+    /// VM holds. One machine places itself at a time (the pool's `machines.lock`): the counts
+    /// it reads are those it joins. Its memory claim waits as any VM's; kept in a file of its
+    /// own (`machine-<pid>-<n>`, held while it has its place), a CPU's file having room for its
+    /// one exclusive holder's.
+    pub fn take_shared(pool: *Pool) Held {
+        assert(pool.count > 0);
+        assert(machines_per_cpu > 0);
+        const asked_ns = monotonic_ns();
+        const directory = pool.directory_buffer[0..pool.directory_size];
+        var path_buffer: [128]u8 = undefined;
+        const placing_path = std.fmt.bufPrintSentinel(&path_buffer, "{s}/machines.lock", .{directory}, 0) catch unreachable;
+        const flags: linux.O = .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true };
+        const placing_opened = linux.open(placing_path, flags, 0o600);
+        assert(linux.errno(placing_opened) == .SUCCESS);
+        const placing: linux.fd_t = @intCast(placing_opened);
+        defer _ = linux.close(placing);
+        var random: std.Random.DefaultPrng = .init(@as(u64, @intCast(linux.getpid())) ^ monotonic_ns());
+        var memory_wait_ns: u64 = 0;
+        var memory_since: ?u64 = null;
+        var said_ns: u64 = asked_ns;
+        while (true) {
+            // The host's memory, as a deterministic VM's take: no machine starts while the VMs
+            // running and this one could come to need more than the host has.
+            const available = memory_available(); // 0: unknown, never a reason to wait.
+            const below = available != 0 and available < memory_reserve() / 2 + sessions_reserve_bytes();
+            const fitting = !below and pool.claim_fits(claim_bytes);
+            if (!fitting and memory_since == null) {
+                memory_since = monotonic_ns();
+                // Any VM waiting: holders that keep it out go (holders.zig).
+                if (memory_wanted_open()) |fd| _ = linux.flock(fd, std.posix.LOCK.SH);
+            }
+            if (fitting) {
+                if (memory_since) |since| {
+                    memory_wait_ns += monotonic_ns() - since;
+                    if (memory_wanted_open()) |fd| _ = linux.flock(fd, std.posix.LOCK.UN);
+                    memory_since = null;
+                }
+                while (linux.errno(linux.flock(placing, std.posix.LOCK.EX)) == .INTR) {}
+                const placed = pool.machine_place();
+                _ = linux.flock(placing, std.posix.LOCK.UN);
+                if (placed) |held| {
+                    var taken = held;
+                    taken.memory_wait_ns = memory_wait_ns;
+                    taken.cpu_wait_ns = (monotonic_ns() - asked_ns) -| memory_wait_ns;
+                    pin(pool.cpus[taken.slot]);
+                    return taken;
+                }
+            }
+            // Said, for whoever started it and waits (serve gives a machine up after a while
+            // and answers with its last line).
+            const now = monotonic_ns();
+            if (now - said_ns >= memory_say_after_ns) {
+                said_ns = now;
+                if (fitting) {
+                    std.debug.print("[determinismo] waiting {d} s for a CPU: each one this machine may take holds a " ++
+                        "deterministic VM or {d} machines\n", .{ (now - asked_ns) / std.time.ns_per_s, machines_per_cpu });
+                } else {
+                    std.debug.print("[determinismo] waiting {d} s for memory: {d} MiB available, a machine of {d} MiB " ++
+                        "beside the VMs running\n", .{ (now - asked_ns) / std.time.ns_per_s, available >> 20, claim_bytes >> 20 });
+                }
+            }
+            const wait_ns = random.random().intRangeAtMost(u64, wait_ns_min, wait_ns_max);
+            const pause: linux.timespec = .{ .sec = 0, .nsec = @intCast(wait_ns) };
+            _ = linux.nanosleep(&pause, null);
+        }
+    }
+
+    /// A place for a machine now, if one is (take_shared, holding the pool's `machines.lock`).
+    fn machine_place(pool: *Pool) ?Held {
+        const directory = pool.directory_buffer[0..pool.directory_size];
+        var counts: [cpus_max]u16 = @splat(0);
+        _ = machines_scan(directory, &counts);
+        // Among the CPUs that have machines and room: the one with the fewest.
+        var joined: ?u32 = null;
+        for (0..pool.count) |index| {
+            const count = counts[pool.cpus[index]];
+            if (count == 0 or count >= machines_per_cpu) continue;
+            if (joined == null or count < counts[pool.cpus[joined.?]]) joined = @intCast(index);
+        }
+        const slot: u32 = joined orelse fresh: {
+            // None: a free CPU becomes the machines' (one a check waits for is left to it).
+            for (0..pool.count) |index| {
+                const candidate: u32 = @intCast(index);
+                if (counts[pool.cpus[candidate]] != 0) continue; // Full of machines.
+                if (!pool.priority and pool.priority_waiting(candidate)) continue;
+                // Shared, the first of its machines: granted unless a deterministic VM holds
+                // it exclusively (the scan found no machine on it).
+                if (linux.errno(linux.flock(pool.fds[candidate], std.posix.LOCK.SH | std.posix.LOCK.NB)) != .SUCCESS) continue;
+                break :fresh candidate;
+            }
+            return null;
+        };
+        // Shared with the machines there (a fresh one's is held already: taken again, the same).
+        if (linux.errno(linux.flock(pool.fds[slot], std.posix.LOCK.SH | std.posix.LOCK.NB)) != .SUCCESS) return null;
+        var held: Held = .{ .slot = slot };
+        const serial = machine_serial;
+        machine_serial += 1;
+        const path = std.fmt.bufPrintSentinel(&held.machine_path, "{s}/machine-{d}-{d}", .{ directory, linux.getpid(), serial }, 0) catch unreachable;
+        held.machine_path_size = @intCast(path.len);
+        const opened = linux.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o600);
+        if (linux.errno(opened) != .SUCCESS) {
+            _ = linux.flock(pool.fds[slot], std.posix.LOCK.UN);
+            return null;
+        }
+        held.machine_fd = @intCast(opened);
+        const place: MachinePlace = .{ .claim_bytes = claim_bytes, .cpu = pool.cpus[slot] };
+        _ = linux.pwrite(held.machine_fd, std.mem.asBytes(&place), @sizeOf(MachinePlace), 0);
+        _ = linux.flock(held.machine_fd, std.posix.LOCK.EX);
+        return held;
+    }
+
     /// Whether `bytes` more fit beside what the held CPUs' processes claimed, on any CPU of the
     /// host: within the host's memory less the reserve. A CPU's claim counts while its lock is
-    /// held.
+    /// held exclusively (a deterministic VM's); the machines sharing CPUs keep theirs in their
+    /// own files (machines_scan).
     fn claim_fits(pool: *Pool, bytes: u64) bool {
         if (bytes == 0) return true;
         // The claims are every run's, host-wide: against the host's memory and reserve. A
@@ -352,6 +477,7 @@ pub const Pool = struct {
             if (linux.pread(fd, &claim, claim.len, 0) == claim.len) claimed += std.mem.bytesToValue(u64, &claim);
         }
         claimed += nodes_claimed(pool.directory_buffer[0..pool.directory_size]);
+        claimed += machines_scan(pool.directory_buffer[0..pool.directory_size], null);
         if (!fits(claimed, bytes, total, 0, host_reserve(total) + sessions_reserve_bytes())) return false;
         const available = if (pool.available_counts) memory_available() else 0;
         return fits(0, bytes, std.math.maxInt(u64) / 2, available, reserve_bytes());
@@ -369,6 +495,11 @@ pub const Pool = struct {
 
     pub fn give(pool: *Pool, held: Held) void {
         assert(held.slot < pool.count);
+        // A machine's place: its file gone (its claim and its count with it), then the CPU.
+        if (held.machine_fd >= 0) {
+            _ = linux.unlink(@ptrCast(held.machine_path[0..held.machine_path_size :0]));
+            _ = linux.close(held.machine_fd);
+        }
         _ = linux.flock(pool.fds[held.slot], std.posix.LOCK.UN);
         unpin(); // Not pinned to a CPU it no longer holds (nor are what it forks or runs next).
     }
@@ -383,7 +514,65 @@ pub const Held = struct {
     /// And for a CPU, the rest of the take: every CPU held (by other runs' VMs, a priority
     /// process, or this run's own replays and workers), each attempt a pause of 10 to 30 ms.
     cpu_wait_ns: u64 = 0,
+    /// A fast machine's place (take_shared): its file in the pool's directory, held while it
+    /// has the place.
+    machine_fd: linux.fd_t = -1,
+    machine_path: [127:0]u8 = @splat(0),
+    machine_path_size: u8 = 0,
 };
+
+/// A machine's place file's content: its memory claim and the CPU it is on.
+const MachinePlace = extern struct { claim_bytes: u64 = 0, cpu: u64 = 0 };
+
+/// This process's machines' places so far (a file each: machine-<pid>-<n>).
+var machine_serial: u32 = 0;
+
+/// The fast machines holding places (their `machine-<pid>-<n>` files, each locked by its
+/// machine while it has the place): their memory claims in all and, in `counts`, how many sit
+/// on each CPU (by its number). A file nobody holds is a machine gone (removed when its process
+/// is), or one just made and not locked yet.
+fn machines_scan(directory: []const u8, counts: ?*[cpus_max]u16) u64 {
+    if (directory.len == 0) return 0;
+    var path_buffer: [128]u8 = undefined;
+    const directory_z = std.fmt.bufPrintSentinel(&path_buffer, "{s}", .{directory}, 0) catch return 0;
+    const opened = linux.open(directory_z, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+    if (linux.errno(opened) != .SUCCESS) return 0;
+    const dir: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(dir);
+    var total: u64 = 0;
+    var entries: [8192]u8 align(8) = undefined;
+    while (true) {
+        const size = linux.getdents64(dir, &entries, entries.len);
+        if (linux.errno(size) != .SUCCESS or size == 0) break;
+        var at: usize = 0;
+        while (at < size) {
+            const entry: *align(1) const linux.dirent64 = @ptrCast(&entries[at]);
+            at += entry.reclen;
+            const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&entry.name)), 0);
+            if (!std.mem.startsWith(u8, name, "machine-")) continue;
+            const name_z: [*:0]const u8 = @ptrCast(&entry.name);
+            const file = linux.openat(dir, name_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+            if (linux.errno(file) != .SUCCESS) continue;
+            const fd: linux.fd_t = @intCast(file);
+            defer _ = linux.close(fd);
+            if (linux.errno(linux.flock(fd, std.posix.LOCK.SH | std.posix.LOCK.NB)) == .SUCCESS) {
+                const pid_text = name["machine-".len..];
+                const pid_end = std.mem.indexOfScalar(u8, pid_text, '-') orelse pid_text.len;
+                var proc_buffer: [32]u8 = undefined;
+                const proc = std.fmt.bufPrintSentinel(&proc_buffer, "/proc/{s}", .{pid_text[0..pid_end]}, 0) catch continue;
+                if (linux.errno(linux.access(proc, std.posix.F_OK)) != .SUCCESS) _ = linux.unlinkat(dir, name_z, 0);
+                continue;
+            }
+            var place: MachinePlace = .{};
+            if (linux.pread(fd, std.mem.asBytes(&place), @sizeOf(MachinePlace), 0) != @sizeOf(MachinePlace)) continue;
+            total += place.claim_bytes;
+            if (counts) |by_cpu| if (place.cpu < cpus_max) {
+                by_cpu[place.cpu] += 1;
+            };
+        }
+    }
+    return total;
+}
 
 /// A run's turn file's content: how long the turn's holders waited for memory, for the run's
 /// processes queued behind them (each books the part of its queueing that a memory wait ahead of
@@ -1085,6 +1274,104 @@ test "a CPU is held by one process at a time, and given back" {
     try std.testing.expect(linux.errno(again) == .SUCCESS);
     _ = linux.flock(second.fds[held.slot], std.posix.LOCK.UN);
     unpin();
+}
+
+/// The pool's slot of a CPU, by its number (each pool orders the same CPUs alike).
+fn test_slot_of(pool: *const Pool, cpu: u16) u32 {
+    for (pool.cpus[0..pool.count], 0..) |candidate, index| {
+        if (candidate == cpu) return @intCast(index);
+    }
+    unreachable;
+}
+
+test "fast machines share a CPU up to their number, and a deterministic VM never one of theirs" {
+    var machines: [3]Pool = undefined;
+    for (&machines) |*pool| try pool.open();
+    defer for (&machines) |*pool| pool.close();
+    var timeline: Pool = undefined;
+    try timeline.open();
+    defer timeline.close();
+    if (timeline.count < 3) return error.SkipZigTest;
+    for (&machines) |*pool| pool.available_counts = false;
+    timeline.available_counts = false;
+    const saved_number = machines_per_cpu;
+    defer machines_per_cpu = saved_number;
+    machines_per_cpu = 2;
+    const saved_claim = claim_bytes;
+    defer claim_bytes = saved_claim;
+    claim_bytes = 1 << 20;
+    defer unpin();
+    // Two machines: one CPU.
+    const first = machines[0].take_shared();
+    const second = machines[1].take_shared();
+    const theirs = machines[0].cpus[first.slot];
+    try std.testing.expectEqual(theirs, machines[1].cpus[second.slot]);
+    // A deterministic VM: a CPU of its own, not the machines'.
+    const own = timeline.take();
+    try std.testing.expect(timeline.cpus[own.slot] != theirs);
+    // The machines' CPU has its two: a third machine opens another, not the deterministic VM's.
+    const third = machines[2].take_shared();
+    const another = machines[2].cpus[third.slot];
+    try std.testing.expect(another != theirs);
+    try std.testing.expect(another != timeline.cpus[own.slot]);
+    // Asked exclusively, the machines' CPU is refused while one of them is there.
+    const asked = timeline.fds[test_slot_of(&timeline, theirs)];
+    try std.testing.expect(linux.errno(linux.flock(asked, std.posix.LOCK.EX | std.posix.LOCK.NB)) == .AGAIN);
+    machines[0].give(first);
+    try std.testing.expect(linux.errno(linux.flock(asked, std.posix.LOCK.EX | std.posix.LOCK.NB)) == .AGAIN);
+    // A machine that comes now joins the one left there (the fewest of the CPUs with room).
+    const again = machines[0].take_shared();
+    try std.testing.expectEqual(theirs, machines[0].cpus[again.slot]);
+    machines[0].give(again);
+    machines[1].give(second);
+    // The last gone, it is anyone's.
+    try std.testing.expect(linux.errno(linux.flock(asked, std.posix.LOCK.EX | std.posix.LOCK.NB)) == .SUCCESS);
+    _ = linux.flock(asked, std.posix.LOCK.UN);
+    // Nor does a machine take the CPU a deterministic VM holds: with every other CPU's places
+    // taken it would wait, so asked of that CPU alone, it finds no place.
+    var counts: [cpus_max]u16 = @splat(0);
+    _ = machines_scan(machines[2].directory_buffer[0..machines[2].directory_size], &counts);
+    try std.testing.expectEqual(@as(u16, 1), counts[another]);
+    try std.testing.expectEqual(@as(u16, 0), counts[timeline.cpus[own.slot]]);
+    const held_exclusively = machines[0].fds[test_slot_of(&machines[0], timeline.cpus[own.slot])];
+    try std.testing.expect(linux.errno(linux.flock(held_exclusively, std.posix.LOCK.SH | std.posix.LOCK.NB)) == .AGAIN);
+    machines[2].give(third);
+    timeline.give(own);
+}
+
+test "a machine's memory claim counts while it has its place, and a gone machine's file goes" {
+    var holder: Pool = undefined;
+    try holder.open();
+    defer holder.close();
+    var other: Pool = undefined;
+    try other.open();
+    defer other.close();
+    holder.available_counts = false; // The claims' accounting alone (fits has the rest).
+    other.available_counts = false;
+    const total = meminfo("MemTotal:");
+    if (total == 0) return error.SkipZigTest;
+    const saved = claim_bytes;
+    defer claim_bytes = saved;
+    claim_bytes = total / 2;
+    defer unpin();
+    const held = holder.take_shared(); // Claims half the host.
+    try std.testing.expect(!other.claim_fits(total / 2)); // Half more, and the reserve: no.
+    try std.testing.expect(other.claim_fits(1 << 20));
+    holder.give(held);
+    try std.testing.expect(other.claim_fits(total / 2)); // Its place given back: no claim.
+    // A place file whose machine is gone (a pid above any the kernel gives), held by no one.
+    const directory = holder.directory_buffer[0..holder.directory_size];
+    var path_buffer: [128]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/machine-2147483646-0", .{directory}, 0);
+    const made = linux.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o600);
+    try std.testing.expect(linux.errno(made) == .SUCCESS);
+    const place: MachinePlace = .{ .claim_bytes = total, .cpu = holder.cpus[0] };
+    _ = linux.pwrite(@intCast(made), std.mem.asBytes(&place), @sizeOf(MachinePlace), 0);
+    _ = linux.close(@intCast(made));
+    var counts: [cpus_max]u16 = @splat(0);
+    try std.testing.expectEqual(@as(u64, 0), machines_scan(directory, &counts));
+    try std.testing.expectEqual(@as(u16, 0), counts[holder.cpus[0]]);
+    try std.testing.expect(linux.errno(linux.access(path, std.posix.F_OK)) != .SUCCESS);
 }
 
 var test_give_up_at_ns: u64 = 0;

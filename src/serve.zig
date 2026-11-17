@@ -144,6 +144,9 @@ pub const Options = struct {
     /// A machine asked for is given up when it is not up after this long
     /// (`--machine-start-seconds`): it waits for a CPU of its pool, which others' VMs may hold.
     machine_start_ns: u64 = 600 * std.time.ns_per_s,
+    /// How many machines share a CPU (`--machines-per-cpu`, each machine's `run` told so): fast
+    /// VMs among themselves, never with a deterministic VM (cpus.zig's take_shared).
+    machines_per_cpu: u32 = cpus.machines_per_cpu_default,
 };
 
 const runs_max = host_runs.runs_max;
@@ -3052,20 +3055,24 @@ fn machine_create(server: *Server, asked: MachineRequest) !u32 {
     if ((asked.program == null) == (asked.compose == null)) return error.BadRequest;
     if (asked.vcpus < 2 or asked.vcpus > 32) return error.BadRequest;
     const shared = server.shared;
-    // A machine holds a CPU of its pool for its life (`run` takes it as it starts, and a machine
-    // does not end by itself): with every one held by a machine, another waited ten minutes for
-    // a CPU that could not come and failed without a word (MachineFailed: the agent demo's
-    // fourth sandbox, on three reserved cores). Refused at once, saying so.
+    // A machine holds a place on a CPU of its pool for its life (`run` takes it as it starts,
+    // and a machine does not end by itself), machines_per_cpu of them a CPU: with every place
+    // held, another waited ten minutes for one that could not come and failed without a word
+    // (MachineFailed: the agent demo's fourth sandbox, on three reserved cores, when a machine
+    // had a CPU to itself). Refused at once, saying so.
     const pool_cpus = try machine_cpus(server);
+    const places = pool_cpus * server.options.machines_per_cpu;
     shared.lock();
     var alive: u32 = 0;
     for (&shared.machines) |*other| {
         // One being made (its slot taken, its process not started yet) will hold a CPU too.
         if (other.id != 0 and (other.pid <= 0 or other.alive())) alive += 1;
     }
-    if (alive >= pool_cpus) {
+    if (alive >= places) {
         shared.unlock();
-        server.detail = try print(server, "every CPU machines run on is held by a machine ({d} of {d}): delete one first", .{ alive, pool_cpus });
+        server.detail = try print(server, "every place for a machine is taken ({d} of {d}: {d} CPUs, {d} machines a CPU): delete one first", .{
+            alive, places, pool_cpus, server.options.machines_per_cpu,
+        });
         return error.NoFreeCpu;
     }
     const machine = for (&shared.machines) |*slot| {
@@ -3095,9 +3102,10 @@ fn machine_create(server: *Server, asked: MachineRequest) !u32 {
     if (asked.profile) |profile| try argv.appendSlice(arena, &.{ "--profile", profile });
     if (asked.scenario) |scenario| try argv.appendSlice(arena, &.{ "--scenario", scenario });
     try argv.appendSlice(arena, &.{
-        "--vcpus",      try print(server, "{d}", .{asked.vcpus}),
-        "--memory-mib", try print(server, "{d}", .{asked.memory_mib}),
-        "--dev",        directory,
+        "--vcpus",            try print(server, "{d}", .{asked.vcpus}),
+        "--memory-mib",       try print(server, "{d}", .{asked.memory_mib}),
+        "--dev",              directory,
+        "--machines-per-cpu", try print(server, "{d}", .{server.options.machines_per_cpu}),
     });
     if (asked.from) |reference| try argv.appendSlice(arena, &.{ "--from-snapshot", try checkpoint_path(server, reference) });
     const output = try std.fs.path.join(arena, &.{ directory, "output.log" });
