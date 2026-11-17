@@ -1,0 +1,690 @@
+// SPDX-License-Identifier: MIT
+/*
+ * determinismo SDK for the JVM (Java, Clojure, Kotlin, Scala): assertions, events and platform
+ * randomness. One file, no dependencies: compile it with your code.
+ *
+ * Inside determinismo everything goes through /dev/determinismo (events are recorded with their
+ * moment; random values are platform decisions, steerable and replayable). Outside it,
+ * randomness comes from SecureRandom and events go to stderr. `details` are JSON objects as
+ * strings (null for none).
+ *
+ *   Determinismo.always(total == 1000, "total balance is conserved", "{\"total\":" + total + "}");
+ *   long account = Determinismo.randomBelow(10);
+ */
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.SecureRandom;
+
+public final class Determinismo {
+  private static final String DEVICE_PATH = "/dev/determinismo";
+  private static final int MESSAGE_SIZE_MAX = 4096 - 16; // One event or one pull per call.
+  private static final RandomAccessFile device = open();
+  private static final SecureRandom fallback = device == null ? new SecureRandom() : null;
+
+  private Determinismo() {}
+
+  /** Whether this runs inside determinismo (for the coverage agent's thread pausing). */
+  static boolean inside() {
+    return device != null;
+  }
+
+  private static RandomAccessFile open() {
+    // Only the device: "rw" would create a plain file where /dev is writable (containers).
+    Path path = Path.of(DEVICE_PATH);
+    if (!Files.exists(path) || Files.isRegularFile(path)) return null;
+    try {
+      return new RandomAccessFile(DEVICE_PATH, "rw");
+    } catch (IOException notInsideDeterminismo) {
+      return null;
+    }
+  }
+
+  /** {@code count} random bytes: a platform decision inside determinismo. */
+  public static synchronized byte[] randomBytes(int count) {
+    byte[] bytes = new byte[count];
+    if (device == null) {
+      fallback.nextBytes(bytes);
+      return bytes;
+    }
+    try {
+      int done = 0;
+      while (done < count) {
+        int got = device.read(bytes, done, Math.min(256, count - done));
+        if (got <= 0) throw new IOException("short read from " + DEVICE_PATH);
+        done += got;
+      }
+    } catch (IOException e) {
+      throw new IllegalStateException("determinismo: randomness unavailable", e);
+    }
+    return bytes;
+  }
+
+  /** A double in [0, 1) from 53 random bits: a platform decision. */
+  public static double random() {
+    return (randomLong() >>> 11) * 0x1.0p-53;
+  }
+
+  /** Antithesis's name for {@link #randomLong}. */
+  public static long getRandom() {
+    return randomLong();
+  }
+
+  public static long randomLong() {
+    byte[] bytes = randomBytes(8);
+    long value = 0;
+    for (int index = 7; index >= 0; index--) value = (value << 8) | (bytes[index] & 0xff);
+    return value;
+  }
+
+  /** A uniformly random integer in [0, count). */
+  public static long randomBelow(long count) {
+    if (count <= 0) throw new IllegalArgumentException("count must be positive");
+    return Long.remainderUnsigned(randomLong(), count);
+  }
+
+  /**
+   * A {@link java.util.Random} whose every draw is a platform decision, for code that takes an
+   * RNG: what it draws is steerable by strategies and replays from tapes. Each draw is one
+   * request to the platform; for hot loops, {@link #prng()}.
+   */
+  public static java.util.Random rng() {
+    return new java.util.Random() {
+      private static final long serialVersionUID = 1L;
+
+      @Override
+      protected int next(int bits) {
+        return (int) (randomLong() >>> (64 - bits));
+      }
+
+      @Override
+      public synchronized void setSeed(long seed) {} // The platform decides.
+    };
+  }
+
+  /**
+   * A fast generator seeded from one platform decision: deterministic and different in every
+   * branch, steered only through its seed.
+   */
+  public static java.util.SplittableRandom prng() {
+    return new java.util.SplittableRandom(randomLong());
+  }
+
+  public static void always(boolean condition, String message, String details) {
+    assertion("always", condition, message, details);
+  }
+
+  public static void alwaysOrUnreachable(boolean condition, String message, String details) {
+    assertion("always_or_unreachable", condition, message, details);
+  }
+
+  public static void sometimes(boolean condition, String message, String details) {
+    assertion("sometimes", condition, message, details);
+  }
+
+  public static void reachable(String message, String details) {
+    assertion("reachable", true, message, details);
+  }
+
+  public static void unreachable(String message, String details) {
+    assertion("unreachable", true, message, details);
+  }
+
+  /**
+   * Announces an assertion before it runs (the catalog): one never reached is then judged too.
+   * DeterminismoCatalog (a Java agent) and the Clojure SDK's macros call it as code loads; each
+   * assertion is announced once.
+   */
+  public static void declare(String kind, String message) {
+    if (!declared.add(kind + '\u0000' + message)) return;
+    // Outside determinismo, listed (catalogAssertions) but not announced.
+    if (device == null) return;
+    emit("{\"assert\":{\"type\":" + quote(kind) + ",\"message\":" + quote(message)
+        + ",\"hit\":false}}");
+  }
+
+  private static final java.util.Set<String> declared =
+      java.util.Collections.synchronizedSet(new java.util.LinkedHashSet<>());
+
+  /**
+   * The assertions declared so far (the catalog agent's, the Clojure SDK's macros', declare's):
+   * each a {kind, message} pair.
+   */
+  public static java.util.List<String[]> catalogAssertions() {
+    java.util.List<String[]> listed = new java.util.ArrayList<>();
+    synchronized (declared) {
+      for (String entry : declared) listed.add(entry.split("\u0000", 2));
+    }
+    return listed;
+  }
+
+  /** Writes the catalog, one JSON object a line ({"kind","message"}): for review or CI. */
+  public static void catalogWrite(java.io.PrintStream out) {
+    for (String[] entry : catalogAssertions()) {
+      out.println("{\"kind\":" + quote(entry[0]) + ",\"message\":" + quote(entry[1]) + "}");
+    }
+  }
+
+  // Guidance assertions: the compared values in the details, and a guidance event telling
+  // strategies how far the timeline is from the interesting outcome (an always violated, a
+  // sometimes true): distance, lower is closer, 0 or less is there.
+
+  public static void alwaysGreaterThan(double left, double right, String message, String details) {
+    compare(true, left > right, left - right, left, right, message, details);
+  }
+
+  public static void alwaysGreaterThanOrEqual(double left, double right, String message,
+      String details) {
+    compare(true, left >= right, left - right, left, right, message, details);
+  }
+
+  public static void alwaysLessThan(double left, double right, String message, String details) {
+    compare(true, left < right, right - left, left, right, message, details);
+  }
+
+  public static void alwaysLessThanOrEqual(double left, double right, String message,
+      String details) {
+    compare(true, left <= right, right - left, left, right, message, details);
+  }
+
+  public static void sometimesGreaterThan(double left, double right, String message,
+      String details) {
+    compare(false, left > right, left - right, left, right, message, details);
+  }
+
+  public static void sometimesGreaterThanOrEqual(double left, double right, String message,
+      String details) {
+    compare(false, left >= right, left - right, left, right, message, details);
+  }
+
+  public static void sometimesLessThan(double left, double right, String message,
+      String details) {
+    compare(false, left < right, right - left, left, right, message, details);
+  }
+
+  public static void sometimesLessThanOrEqual(double left, double right, String message,
+      String details) {
+    compare(false, left <= right, right - left, left, right, message, details);
+  }
+
+  // Antithesis's names.
+
+  public static void alwaysGreaterThanOrEqualTo(double left, double right, String message,
+      String details) {
+    alwaysGreaterThanOrEqual(left, right, message, details);
+  }
+
+  public static void alwaysLessThanOrEqualTo(double left, double right, String message,
+      String details) {
+    alwaysLessThanOrEqual(left, right, message, details);
+  }
+
+  public static void sometimesGreaterThanOrEqualTo(double left, double right, String message,
+      String details) {
+    sometimesGreaterThanOrEqual(left, right, message, details);
+  }
+
+  public static void sometimesLessThanOrEqualTo(double left, double right, String message,
+      String details) {
+    sometimesLessThanOrEqual(left, right, message, details);
+  }
+
+  /** At least one of the named conditions holds, every time (all evaluated by the caller). */
+  public static void alwaysSome(java.util.Map<String, Boolean> conditions, String message,
+      String details) {
+    int held = held(conditions);
+    assertion("always", held > 0, message, conditionsDetails(conditions, details));
+    guidance(message, held);
+  }
+
+  /** All the named conditions hold together, at least once. */
+  public static void sometimesAll(java.util.Map<String, Boolean> conditions, String message,
+      String details) {
+    int held = held(conditions);
+    assertion("sometimes", held == conditions.size(), message,
+        conditionsDetails(conditions, details));
+    guidance(message, conditions.size() - held);
+  }
+
+  private static void compare(boolean always, boolean holds, double margin, double left,
+      double right, String message, String details) {
+    String merged = "{\"left\":" + operand(left) + ",\"right\":" + operand(right)
+        + ",\"details\":" + orEmpty(details) + "}";
+    assertion(always ? "always" : "sometimes", holds, message, merged);
+    guidance(message, always ? margin : -margin);
+  }
+
+  private static int held(java.util.Map<String, Boolean> conditions) {
+    int held = 0;
+    for (Boolean value : conditions.values()) if (Boolean.TRUE.equals(value)) held++;
+    return held;
+  }
+
+  private static String conditionsDetails(java.util.Map<String, Boolean> conditions,
+      String details) {
+    StringBuilder out = new StringBuilder("{\"conditions\":{");
+    boolean first = true;
+    for (java.util.Map.Entry<String, Boolean> entry : conditions.entrySet()) {
+      if (!first) out.append(',');
+      first = false;
+      out.append(quote(entry.getKey())).append(':').append(Boolean.TRUE.equals(entry.getValue()));
+    }
+    return out.append("},\"details\":").append(orEmpty(details)).append('}').toString();
+  }
+
+  /**
+   * A comparison's operand as JSON. JSON has no infinity or NaN (a double's text, "Infinity"
+   * and "NaN", is no JSON a parser reads: the whole assertion was lost), so those are the
+   * strings "Infinity", "-Infinity" and "NaN", as every SDK of ours sends them.
+   */
+  private static String operand(double value) {
+    if (Double.isNaN(value)) return "\"NaN\"";
+    if (Double.isInfinite(value)) return value > 0 ? "\"Infinity\"" : "\"-Infinity\"";
+    return Double.toString(value);
+  }
+
+  private static void guidance(String message, double distance) {
+    // NaN is nowhere; an infinite distance (an infinite operand) is the largest JSON number.
+    if (Double.isNaN(distance)) return;
+    distance = Math.max(-Double.MAX_VALUE, Math.min(Double.MAX_VALUE, distance));
+    // Only improvements: all a strategy needs.
+    Double known = best.get(message);
+    if (known != null && distance >= known) return;
+    best.put(message, distance);
+    emit("{\"guidance\":{\"message\":" + quote(message) + ",\"distance\":" + distance + "}}");
+  }
+
+  /**
+   * One of the items, a platform decision (Antithesis's Random.randomChoice): null for none. To
+   * name the decision for strategies, {@link #decide}.
+   */
+  public static <T> T randomChoice(java.util.List<T> items) {
+    if (items.isEmpty()) return null;
+    return items.get((int) randomBelow(items.size()));
+  }
+
+  /**
+   * A named decision among options (which fault, which account, which node): the index chosen,
+   * a platform decision announced with the options' names, for strategies.
+   */
+  public static int decide(String name, java.util.List<String> options) {
+    if (options.isEmpty()) throw new IllegalArgumentException("no options");
+    if (device != null) {
+      StringBuilder list = new StringBuilder("[");
+      for (int index = 0; index < options.size(); index++) {
+        if (index > 0) list.append(',');
+        list.append(quote(options.get(index)));
+      }
+      emit("{\"decision\":{\"name\":" + quote(name) + ",\"options\":" + list + "]}}");
+    }
+    return (int) randomBelow(options.size());
+  }
+
+  private static final java.util.List<String> NEAR_EDGES =
+      java.util.List.of("zero", "one", "limit-1", "limit", "limit+1", "twice");
+
+  /**
+   * A value up to {@code max} drawn around a limit the workload declares (a batch size, a buffer,
+   * a threshold): half the time uniform, else one of the limit's edges, where bugs gather and
+   * uniform draws seldom land: 0, 1, limit - 1, limit, limit + 1 or twice it (each kept within
+   * {@code max}). Named decisions ({@code <name>.near}, then {@code name}), as the Zig SDK's
+   * random_near.
+   */
+  public static long randomNear(String name, long limit, long max) {
+    if (max <= 0 || limit < 0) throw new IllegalArgumentException("max must be positive, limit not negative");
+    if (randomBelowNamed(name + ".near", 2) == 0) {
+      return randomBelowNamed(name, max == Long.MAX_VALUE ? max : max + 1);
+    }
+    long value;
+    switch (decide(name, NEAR_EDGES)) {
+      case 0: value = 0; break;
+      case 1: value = 1; break;
+      case 2: value = Math.max(limit - 1, 0); break;
+      case 3: value = limit; break;
+      case 4: value = limit == Long.MAX_VALUE ? limit : limit + 1; break;
+      default: value = limit > Long.MAX_VALUE / 2 ? Long.MAX_VALUE : limit * 2; break;
+    }
+    return Math.min(value, max);
+  }
+
+  /** randomBelow, named for strategies ("retry.jitterMs"). */
+  public static long randomBelowNamed(String name, long count) {
+    if (device != null) {
+      emit("{\"decision\":{\"name\":" + quote(name) + ",\"range\":" + count + "}}");
+    }
+    return randomBelow(count);
+  }
+
+  // Swarm testing over a workload's operations: the Zig SDK's swarm_index (sdk/zig/
+  // determinismo.zig), the same table from the same seed (FNV-1a and SplitMix64), so drivers in
+  // any language agree on a timeline's mix.
+
+  private static final String SWARM_SEED_PATH = "/opt/determinismo/swarm-seed";
+  private static Long swarmSeedCached;
+  /** Each name's last answer in this process (its stretch, the answer), for its runs. */
+  private static final java.util.Map<String, long[]> swarmRuns = new java.util.HashMap<>();
+
+  private static long swarmMix(long value) {
+    long z = value + 0x9e3779b97f4a7c15L;
+    z = (z ^ (z >>> 30)) * 0xbf58476d1ce4e5b9L;
+    z = (z ^ (z >>> 27)) * 0x94d049bb133111ebL;
+    return z ^ (z >>> 31);
+  }
+
+  /** The table's draws: FNV-1a of the name, mixed with the seed, stretch and what by SplitMix64. */
+  public static long swarmHash(long seed, String name, long stretch, long what) {
+    long nameHash = 0xcbf29ce484222325L;
+    for (byte b : name.getBytes(StandardCharsets.UTF_8)) nameHash = (nameHash ^ (b & 0xff)) * 0x100000001b3L;
+    return swarmMix(swarmMix(swarmMix(seed ^ nameHash) ^ stretch) ^ what);
+  }
+
+  private static Long swarmSeed() {
+    if (swarmSeedCached != null) return swarmSeedCached;
+    try {
+      swarmSeedCached = Long.parseUnsignedLong(Files.readString(Path.of(SWARM_SEED_PATH)).trim());
+    } catch (IOException | NumberFormatException e) {
+      return null;
+    }
+    return swarmSeedCached;
+  }
+
+  /**
+   * An index below {@code count} (64 at most) by swarm testing: among the options this timeline
+   * keeps for the name, weighted and repeated in runs, the table changing with stretches of
+   * virtual time. Plain uniform outside determinismo, before the drivers, or with --no-swarm.
+   */
+  public static synchronized long swarmIndex(String name, long count) {
+    if (count <= 0 || count > 64) throw new IllegalArgumentException("swarmIndex: 1 to 64 options");
+    String label = "swarm." + name;
+    Long seedValue = swarmSeed();
+    if (seedValue == null) return randomBelowNamed(label, count);
+    long seed = seedValue;
+    long nowMs = System.nanoTime() / 1_000_000; // CLOCK_MONOTONIC on Linux, as the other SDKs.
+    long stretch = nowMs / (10_000 + Long.remainderUnsigned(swarmHash(seed, name, 0, 1), 110_001));
+    long eighths = 1 + Long.remainderUnsigned(swarmHash(seed, name, stretch, 2), 7);
+    long mean = new long[] {1, 4, 16, 64}[(int) Long.remainderUnsigned(swarmHash(seed, name, stretch, 3), 4)];
+    long[] weights = new long[(int) count];
+    long kept = 0;
+    for (int i = 0; i < count; i++) {
+      long drawn = swarmHash(seed, name, stretch, 16 + i);
+      if (Long.remainderUnsigned(drawn, 8) >= eighths) continue;
+      weights[i] = 1L << ((drawn >>> 32) % 8);
+      kept |= 1L << i;
+    }
+    if (kept == 0) {
+      int i = (int) Long.remainderUnsigned(swarmHash(seed, name, stretch, 4), count);
+      weights[i] = 1;
+      kept = 1L << i;
+    }
+    long total = 0;
+    for (long weight : weights) total += weight;
+    long[] run = swarmRuns.get(name);
+    if (run != null && run[0] == stretch && mean > 1 && randomBelowNamed(label + " run", mean) != 0) return run[1];
+    long pick = randomBelowNamed(label, total);
+    long answer = 0;
+    for (int i = 0; i < count; i++) {
+      if (pick < weights[i]) {
+        answer = i;
+        break;
+      }
+      pick -= weights[i];
+    }
+    if (run == null || run[0] != stretch) {
+      event("swarm", "{\"name\":" + quote(name) + ",\"stretch\":" + stretch + ",\"kept\":" + kept + ",\"mean\":" + mean + "}");
+    }
+    swarmRuns.put(name, new long[] {stretch, answer});
+    return answer;
+  }
+
+  /** One of the items by swarm testing ({@link #swarmIndex}), where randomChoice drew uniformly. */
+  public static <T> T swarmChoice(String name, java.util.List<T> items) {
+    return items.get((int) swarmIndex(name, items.size()));
+  }
+
+  /** A buggify point's state for a stretch of time: active with its own generator, or not. */
+  private static final class BuggifyPoint {
+    final java.util.SplittableRandom random;
+    final long untilNanos;
+
+    BuggifyPoint(java.util.SplittableRandom random, long untilNanos) {
+      this.random = random;
+      this.untilNanos = untilNanos;
+    }
+  }
+
+  private static final java.util.concurrent.ConcurrentHashMap<String, BuggifyPoint> buggified =
+      new java.util.concurrent.ConcurrentHashMap<>();
+  private static final long BUGGIFY_PERIOD_NANOS = 2_000_000_000L;
+
+  /**
+   * A buggify point (FoundationDB's BUGGIFY): inside determinismo, a point is active one stretch
+   * of two seconds (virtual time) in four, a named decision ("buggify &lt;name&gt;") at the
+   * stretch's first evaluation, which the explorer varies and a strategy steers; while active,
+   * it is true one evaluation in four, drawn from its own generator, seeded by the platform for
+   * the stretch (a hot point costs a decision a stretch, not one a call). Outside determinismo,
+   * always false. Where it is true, take a rare path the real system can take too (a pause before
+   * a lock, a forced retry), never one it cannot.
+   */
+  public static boolean buggify(String name) {
+    java.util.SplittableRandom random = buggifyGenerator(name);
+    if (random == null) return false;
+    synchronized (random) {
+      return random.nextInt(4) == 0;
+    }
+  }
+
+  /**
+   * At a buggify point, a pause of up to 9 ms one evaluation in 32 while the point is active
+   * (rarer than buggify: pause points sit on hot paths, and a few pauses a stretch are enough for
+   * the other threads to run in the window).
+   */
+  public static void buggifyPause(String name) {
+    java.util.SplittableRandom random = buggifyGenerator(name);
+    if (random == null) return;
+    long ms;
+    synchronized (random) {
+      if (random.nextInt(32) != 0) return;
+      ms = random.nextInt(10);
+    }
+    try {
+      Thread.sleep(ms);
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+    }
+  }
+
+  private static java.util.SplittableRandom buggifyGenerator(String name) {
+    if (device == null) return null;
+    long now = System.nanoTime(); // Virtual time inside determinismo.
+    BuggifyPoint point = buggified.compute(name, (key, current) -> {
+      if (current != null && now < current.untilNanos) return current;
+      boolean active = randomBelowNamed("buggify " + key, 4) == 0;
+      return new BuggifyPoint(active ? new java.util.SplittableRandom(randomLong()) : null,
+          now + BUGGIFY_PERIOD_NANOS);
+    });
+    return point.random;
+  }
+
+  /** The system is ready: the platform snapshots here. */
+  public static void setupComplete(String details) {
+    emit("{\"lifecycle\":\"setup_complete\",\"details\":" + orEmpty(details) + "}");
+  }
+
+  public static void event(String name, String details) {
+    emit("{\"event\":" + quote(name) + ",\"details\":" + orEmpty(details) + "}");
+  }
+
+  /** An objective's direction ({@link #optimize}). */
+  public enum Goal { MAXIMIZE, MINIMIZE }
+
+  /**
+   * An objective for exploration (Antithesis's "Optimizing our way through Metroid"): {@code
+   * bucket}'s strings and booleans (a JSON object, or null) split states into buckets (a leader, a
+   * phase), explored evenly, each keeping the state with the best {@code value} by {@code goal};
+   * the tree returns there and goes further from it.
+   */
+  public static void optimize(String message, String bucket, double value, Goal goal) {
+    if (!Double.isFinite(value)) return;
+    emit("{\"optimize\":{\"message\":" + quote(message) + ",\"bucket\":" + orEmpty(bucket)
+        + ",\"value\":" + value + ",\"goal\":\"" + goal.name().toLowerCase(java.util.Locale.ROOT) + "\"}}");
+  }
+
+  /** Antithesis's name for {@link #event}. */
+  public static void sendEvent(String name, String details) {
+    event(name, details);
+  }
+
+  /**
+   * A fault now, from the scenario: {@code fault("{\"kind\":\"pause\",\"node\":\"db\"}")}
+   * (as det-faults inject takes it). Applied, logged and undone like a drawn one; only while the
+   * fault injector runs. Through det-faults: the JVM cannot open a FIFO without blocking.
+   */
+  public static void fault(String json) {
+    faultsCommand("inject", json);
+  }
+
+  /**
+   * Aims the fault injector at {@code node} from now on, until another call ("" for none): half
+   * its faults involve it, each a decision strategies see and replays repeat (a primary, a
+   * leader).
+   */
+  public static void faultAim(String node) {
+    faultsCommand("aim", node);
+  }
+
+  /** A quiet period (Antithesis's ANTITHESIS_STOP_FAULTS) of {@code seconds}; 0 ends it. */
+  public static void stopFaults(double seconds) {
+    String command = System.getenv("DETERMINISMO_STOP_FAULTS");
+    run(new String[] {command == null ? "/opt/determinismo/bin/det-stop-faults" : command,
+        Double.toString(seconds)});
+  }
+
+  private static void faultsCommand(String verb, String argument) {
+    run(new String[] {"/opt/determinismo/bin/det-faults", verb, argument});
+  }
+
+  private static void run(String[] command) {
+    try {
+      new ProcessBuilder(command).inheritIO().start().waitFor();
+    } catch (java.io.IOException | InterruptedException unavailable) {
+      // Outside determinismo: nothing to ask.
+    }
+  }
+
+  /**
+   * Which evaluations become events: every one (false, the default: queries see each), or, as
+   * Antithesis's SDKs do, each assertion's first pass and first failure in this process (true:
+   * for hot paths, the same verdict with far fewer events). Set it once, at the start.
+   */
+  public static volatile boolean firstPassFirstFailure = false;
+
+  private static final java.util.Set<String> seen =
+      java.util.concurrent.ConcurrentHashMap.newKeySet();
+  private static final java.util.Map<String, Double> best =
+      new java.util.concurrent.ConcurrentHashMap<>();
+
+  private static void assertion(String kind, boolean condition, String message, String details) {
+    if (firstPassFirstFailure && !seen.add(condition + "\u0000" + message)) return;
+    String head = "{\"assert\":{\"type\":\"" + kind + "\",\"message\":" + quote(message)
+        + ",\"condition\":" + condition + location(message) + ",\"details\":";
+    String line = head + orEmpty(details) + "}}";
+    // Details too large for one event: their JSON text cut to what fits, as a string (the Zig
+    // and Python SDKs' "<details cut>"; replaced by an empty object, Pedestal's exceptions, whose
+    // text carries their whole interceptor context, said nothing).
+    if (line.getBytes(StandardCharsets.UTF_8).length > MESSAGE_SIZE_MAX) {
+      String text = "<details cut> " + orEmpty(details);
+      int room = MESSAGE_SIZE_MAX - (head + "}}").getBytes(StandardCharsets.UTF_8).length;
+      int keep = Math.min(text.length(), room);
+      String cut = quote(text.substring(0, keep));
+      while (keep > 0 && cut.getBytes(StandardCharsets.UTF_8).length > room) {
+        keep = keep * 9 / 10;
+        cut = quote(text.substring(0, keep));
+      }
+      line = head + cut + "}}";
+    }
+    emit(line);
+  }
+
+  private static final java.util.Set<String> located =
+      java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+  /** The caller's place (the first frame outside this SDK), the first time an assertion runs. */
+  private static String location(String message) {
+    if (!located.add(message)) return "";
+    return StackWalker.getInstance().walk(frames -> frames
+        // The SDK's own frames, in the default package or copied into a project's.
+        .filter(frame -> !frame.getClassName().equals("Determinismo")
+            && !frame.getClassName().endsWith(".Determinismo"))
+        .findFirst()
+        .map(frame -> ",\"location\":{\"file\":" + quote(String.valueOf(frame.getFileName()))
+            + ",\"line\":" + frame.getLineNumber() + ",\"class\":" + quote(frame.getClassName())
+            + ",\"function\":" + quote(frame.getMethodName()) + "}")
+        .orElse(""));
+  }
+
+  private static synchronized void emit(String line) {
+    byte[] bytes = line.getBytes(StandardCharsets.UTF_8);
+    if (device == null) {
+      java.io.PrintStream local = localOutput();
+      if (local != null) local.println(line);
+      return;
+    }
+    try {
+      device.write(bytes); // One write, one event.
+    } catch (IOException e) {
+      System.err.println(line);
+    }
+  }
+
+  private static java.io.PrintStream localOutput;
+  private static boolean localOutputLooked;
+
+  /**
+   * Outside determinismo: the file DETERMINISMO_SDK_LOCAL_OUTPUT (or Antithesis's
+   * ANTITHESIS_SDK_LOCAL_OUTPUT) names, one JSON object a line, else nowhere (null: Antithesis's
+   * default, assertions evaluated, nothing written).
+   */
+  private static java.io.PrintStream localOutput() {
+    if (localOutputLooked) return localOutput;
+    localOutputLooked = true;
+    String path = System.getenv("DETERMINISMO_SDK_LOCAL_OUTPUT");
+    if (path == null || path.isEmpty()) path = System.getenv("ANTITHESIS_SDK_LOCAL_OUTPUT");
+    if (path != null && !path.isEmpty()) {
+      try {
+        localOutput = new java.io.PrintStream(new java.io.FileOutputStream(path, true), true,
+            StandardCharsets.UTF_8);
+      } catch (IOException unwritable) {
+        localOutput = null;
+      }
+    }
+    return localOutput;
+  }
+
+  /** Any JSON object as an event of its own (the protocol's raw form: docs/SDKS.md). */
+  public static void output(String json) {
+    emit(json);
+  }
+
+  private static String orEmpty(String details) {
+    return details == null ? "{}" : details;
+  }
+
+  private static String quote(String text) {
+    StringBuilder out = new StringBuilder("\"");
+    for (char c : text.toCharArray()) {
+      switch (c) {
+        case '"': out.append("\\\""); break;
+        case '\\': out.append("\\\\"); break;
+        case '\n': out.append("\\n"); break;
+        case '\r': out.append("\\r"); break;
+        case '\t': out.append("\\t"); break;
+        default:
+          if (c < 0x20) out.append(String.format("\\u%04x", (int) c));
+          else out.append(c);
+      }
+    }
+    return out.append('"').toString();
+  }
+}

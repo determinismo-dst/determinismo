@@ -1,0 +1,643 @@
+// SPDX-License-Identifier: MIT
+//! `determinismo query`: searching the events of a multiverse, as Antithesis's Logs Explorer
+//! search and event sets do (docs/ANTITHESIS.md).
+//!
+//!   determinismo query <events-dir> '<condition>'
+//!       [--preceded-by '<condition>' [--within <s>]] [--not-preceded-by ...]
+//!       [--followed-by '<condition>' [--within <s>]] [--not-followed-by ...]
+//!       [--branch <n>] [--up-to-vtime <s>] [--limit <n>] [--count | --branches] [--json]
+//!
+//! A query runs on the run's events database (store.zig): a condition is SQL over each
+//! timeline's events (`timeline_events`), and temporal conditions are window functions over the
+//! timeline. The same conditions are matched live where events are not stored yet: a replay's
+//! moment `--until` (vm.zig).
+//!
+//! A condition is terms joined by `and` and `or` (`or` binds loosest). A term is `path op value`
+//! over the event's JSON (`event=fault`, `details.kind=partition`, `output.text~refused`,
+//! `assert.condition=false`), or over `vtime` (seconds), `branch` and `seq`. Operators: `=`,
+//! `!=`, `~` (contains), `!~`, `=~` (matches a regular expression, see regex.zig), `!=~`, `<`,
+//! `<=`, `>`, `>=`, `?` (present), `!?` (absent). Values are words or "quoted strings" (where a
+//! backslash escapes the next character: `\\d` for a regex's `\d`); numbers and booleans compare
+//! as such. Events without the field never match, negative operators included (as in
+//! Antithesis).
+//!
+//! Temporal conditions look in the same timeline: before the event (preceded by), or after it
+//! (followed by), within a window of virtual seconds if given. Every match comes with its moment
+//! (`--from-branch <n> --from-vtime-ms <ms>`), to branch from or look at.
+const std = @import("std");
+const assert = std.debug.assert;
+const duckdb = @import("duckdb.zig");
+const store = @import("store.zig");
+
+const temporal_max = 8;
+const condition_core = @import("core").condition;
+pub const Operator = condition_core.Operator;
+pub const Term = condition_core.Term;
+pub const Event = condition_core.Event;
+pub const Condition = condition_core.Condition;
+pub const parse = condition_core.parse;
+const Pseudo = condition_core.Pseudo;
+const pseudo_of = condition_core.pseudo_of;
+const event_test = condition_core.event_test;
+const term_needs = condition_core.term_needs;
+const condition_events = condition_core.condition_events;
+const json_numbers = "('BIGINT', 'UBIGINT', 'HUGEINT', 'DOUBLE')";
+const condition_checks = condition_core.condition_checks;
+
+/// A condition as SQL: a boolean (never NULL) over a row with the columns `event` (JSON),
+/// `vtime_ns`, `timeline` and `seq`; with `indexed`, also store.indexed_paths' columns (a
+/// row of `timeline_events`), read instead of the JSON.
+pub fn condition_sql(condition: *const Condition, out: *std.Io.Writer, indexed: bool) !void {
+    try out.writeAll("(");
+    for (condition.alternatives, 0..) |terms, alternative| {
+        if (alternative > 0) try out.writeAll(" OR ");
+        try out.writeAll("(");
+        for (terms, 0..) |*term, at| {
+            if (at > 0) try out.writeAll(" AND ");
+            try term_sql(term, out, indexed);
+        }
+        try out.writeAll(")");
+    }
+    try out.writeAll(")");
+}
+
+const Fields = struct { text: []const u8, type: []const u8 };
+
+/// The columns of an indexed path (store.indexed_paths), when the row has them.
+fn indexed_fields(path: []const []const u8, indexed: bool) ?Fields {
+    if (!indexed) return null;
+    entries: for (store.indexed_paths) |entry| {
+        var keys = std.mem.splitScalar(u8, entry.path, '.');
+        for (path) |key| {
+            const expected = keys.next() orelse continue :entries;
+            if (!std.mem.eql(u8, key, expected)) continue :entries;
+        }
+        if (keys.next() != null) continue;
+        return .{ .text = entry.column, .type = entry.type_column };
+    }
+    return null;
+}
+
+fn term_sql(term: *const Term, out: *std.Io.Writer, indexed: bool) !void {
+    if (pseudo_of(term.path)) |pseudo| return pseudo_sql(term, pseudo, out);
+    var text_buffer: [1200]u8 = undefined;
+    var type_buffer: [1200]u8 = undefined;
+    const fields: Fields = indexed_fields(term.path, indexed) orelse fields: {
+        var path_buffer: [1024]u8 = undefined;
+        var path_writer: std.Io.Writer = .fixed(&path_buffer);
+        try path_writer.writeAll("$");
+        for (term.path) |key| {
+            // A key with a quote or backslash cannot be written in a JSON path.
+            for (key) |byte| if (byte == '"' or byte == '\\') return error.BadPath;
+            try path_writer.print(".\"{s}\"", .{key});
+        }
+        var literal_buffer: [1100]u8 = undefined;
+        var literal_writer: std.Io.Writer = .fixed(&literal_buffer);
+        try string_literal(&literal_writer, path_writer.buffered());
+        const path = literal_writer.buffered();
+        break :fields .{
+            .text = try std.fmt.bufPrint(&text_buffer, "(event ->> {s})", .{path}),
+            .type = try std.fmt.bufPrint(&type_buffer, "json_type(event, {s})", .{path}),
+        };
+    };
+    const text = fields.text;
+    const kind = fields.type;
+    // Columns are cheap to read; the JSON is not: most events are told apart by their text.
+    const needed = if (indexed_fields(term.path, indexed) == null) term_needs(term) else null;
+    if (needed) |value| {
+        try out.writeAll("(contains(event::VARCHAR, ");
+        try string_literal(out, value);
+        try out.writeAll(") AND ");
+    } else try out.writeAll("(");
+    switch (term.operator) {
+        .present => try out.print("{s} IS NOT NULL", .{kind}),
+        .absent => try out.print("{s} IS NULL", .{kind}),
+        .equal => try equal_sql(term.value, fields, out),
+        .not_equal => {
+            try out.print("{s} IS NOT NULL AND NOT ", .{kind});
+            try equal_sql(term.value, fields, out);
+        },
+        .contains, .excludes => {
+            try out.print("coalesce({s} = 'VARCHAR' AND {s}contains({s}, ", .{
+                kind, if (term.operator == .excludes) "NOT " else "", text,
+            });
+            try string_literal(out, term.value);
+            try out.writeAll("), false)");
+        },
+        .matches, .not_matches => {
+            try out.print("coalesce({s} = 'VARCHAR' AND {s}regexp_matches({s}, ", .{
+                kind, if (term.operator == .not_matches) "NOT " else "", text,
+            });
+            try string_literal(out, term.value);
+            try out.writeAll("), false)");
+        },
+        .less, .less_equal, .greater, .greater_equal => {
+            const wanted = std.fmt.parseFloat(f64, term.value) catch {
+                try out.writeAll("false)");
+                return;
+            };
+            try out.print("coalesce((CASE WHEN {s} IN {s} THEN TRY_CAST({s} AS DOUBLE) " ++
+                "WHEN {s} = 'BOOLEAN' THEN CASE {s} WHEN 'true' THEN 1.0 ELSE 0.0 END END) " ++
+                "{s} {e}, false)", .{
+                kind, json_numbers, text, kind, text, comparison(term.operator), wanted,
+            });
+        },
+    }
+    try out.writeAll(")");
+}
+
+/// `=` as the live matcher has it: a string by its text; a boolean by `true`, `false`, or as 1
+/// and 0; null by `null`; a number by its value (17.0 is 17).
+fn equal_sql(value: []const u8, fields: Fields, out: *std.Io.Writer) !void {
+    const number = std.fmt.parseFloat(f64, value) catch null;
+    const text = fields.text;
+    try out.print("coalesce(CASE {s} WHEN 'VARCHAR' THEN {s} = ", .{ fields.type, text });
+    try string_literal(out, value);
+    try out.writeAll(" WHEN 'BOOLEAN' THEN ");
+    if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "false")) {
+        try out.print("{s} = '{s}'", .{ text, value });
+    } else if (number) |wanted| {
+        try out.print("(CASE {s} WHEN 'true' THEN 1.0 ELSE 0.0 END) = {e}", .{ text, wanted });
+    } else try out.writeAll("false");
+    const null_equal = std.mem.eql(u8, value, "null");
+    try out.print(" WHEN 'NULL' THEN {s}", .{if (null_equal) "true" else "false"});
+    if (number) |wanted| {
+        for ([_][]const u8{ "BIGINT", "UBIGINT", "HUGEINT", "DOUBLE" }) |json_number| {
+            try out.print(" WHEN '{s}' THEN TRY_CAST({s} AS DOUBLE) = {e}", .{
+                json_number, text, wanted,
+            });
+        }
+    }
+    try out.writeAll(" ELSE false END, false)");
+}
+
+fn pseudo_sql(term: *const Term, pseudo: Pseudo, out: *std.Io.Writer) !void {
+    const column = switch (pseudo) {
+        .vtime => "(vtime_ns / 1e9)",
+        .branch => "timeline",
+        .seq => "seq",
+    };
+    const wanted = std.fmt.parseFloat(f64, term.value) catch null;
+    switch (term.operator) {
+        .present => try out.writeAll("true"),
+        // A number has no text: no match, as live.
+        .absent, .contains, .excludes, .matches, .not_matches => try out.writeAll("false"),
+        .equal => if (wanted) |number| {
+            try out.print("({s}::DOUBLE = {e})", .{ column, number });
+        } else try out.writeAll("false"),
+        .not_equal => if (wanted) |number| {
+            try out.print("({s}::DOUBLE <> {e})", .{ column, number });
+        } else try out.writeAll("true"),
+        .less, .less_equal, .greater, .greater_equal => if (wanted) |number| {
+            try out.print("({s}::DOUBLE {s} {e})", .{ column, comparison(term.operator), number });
+        } else try out.writeAll("false"),
+    }
+}
+
+fn comparison(operator: Operator) []const u8 {
+    return switch (operator) {
+        .less => "<",
+        .less_equal => "<=",
+        .greater => ">",
+        .greater_equal => ">=",
+        else => unreachable,
+    };
+}
+
+/// A string as a SQL literal.
+pub fn string_literal(out: *std.Io.Writer, text: []const u8) !void {
+    try out.writeByte('\'');
+    for (text) |byte| {
+        if (byte == '\'') try out.writeByte('\'');
+        try out.writeByte(byte);
+    }
+    try out.writeByte('\'');
+}
+
+/// A temporal condition: some event matching `condition` before (or after) the event, within
+/// `window_ns` if set; or, negated, none.
+pub const Temporal = struct {
+    condition: Condition,
+    direction: enum { before, after },
+    negated: bool,
+    window_ns: ?u64 = null,
+};
+
+/// `marks`: what a map draws, small: each match's timeline, time and a summary (a fault's kind
+/// and nodes, an assertion's type and message), at most one per `bucket_ns` of a timeline.
+pub const Output = enum { events, count, branches, marks };
+
+pub const Query = struct {
+    condition: Condition,
+    temporals: []const Temporal = &.{},
+    only_branch: ?u32 = null,
+    up_to_ns: ?u64 = null,
+    limit: u64 = std.math.maxInt(u64),
+    output: Output = .events,
+    /// `marks`: one per this much virtual time of a timeline (the first), null for all.
+    bucket_ns: ?u64 = null,
+    /// Only these timelines (a map draws the ones it shows); empty for all.
+    timelines: []const u32 = &.{},
+};
+
+/// A query as JSON, for the HTTP API and agents (MCP): the command's options as fields.
+pub const Request = struct {
+    condition: []const u8,
+    preceded_by: ?[]const u8 = null,
+    not_preceded_by: ?[]const u8 = null,
+    followed_by: ?[]const u8 = null,
+    not_followed_by: ?[]const u8 = null,
+    /// Seconds of virtual time, for every temporal condition.
+    within: ?f64 = null,
+    branch: ?u32 = null,
+    up_to_vtime: ?f64 = null,
+    limit: u64 = 100,
+    output: Output = .events,
+    bucket_ns: ?u64 = null,
+    timelines: []const u32 = &.{},
+};
+
+pub fn query_of(arena: std.mem.Allocator, request: Request) !Query {
+    var temporals: std.ArrayList(Temporal) = .empty;
+    const window: ?u64 = if (request.within) |seconds| try seconds_to_ns_float(seconds) else null;
+    const fields = [_]struct { ?[]const u8, @FieldType(Temporal, "direction"), bool }{
+        .{ request.preceded_by, .before, false }, .{ request.not_preceded_by, .before, true },
+        .{ request.followed_by, .after, false },  .{ request.not_followed_by, .after, true },
+    };
+    for (fields) |field| {
+        const text = field[0] orelse continue;
+        try temporals.append(arena, .{
+            .condition = try parse(arena, text),
+            .direction = field[1],
+            .negated = field[2],
+            .window_ns = window,
+        });
+    }
+    return .{
+        .condition = try parse(arena, request.condition),
+        .temporals = temporals.items,
+        .only_branch = request.branch,
+        .up_to_ns = if (request.up_to_vtime) |seconds| try seconds_to_ns_float(seconds) else null,
+        .limit = request.limit,
+        .output = request.output,
+        .bucket_ns = request.bucket_ns,
+        .timelines = request.timelines,
+    };
+}
+
+/// The query's matches as SQL (`timeline`, `seq`, `vtime_ns`, `event`): the condition over each
+/// timeline's events; each temporal condition as the nearest earlier (or later) matching event
+/// of the timeline, a window function.
+pub fn matches_sql(arena: std.mem.Allocator, query: *const Query) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    try w.writeAll("WITH flagged AS (SELECT timeline, seq, vtime_ns, event, ");
+    try condition_sql(&query.condition, w, true);
+    try w.writeAll(" AS hit");
+    for (query.temporals, 0..) |*temporal, index| {
+        try w.writeAll(switch (temporal.direction) {
+            .before => ", max(CASE WHEN ",
+            .after => ", min(CASE WHEN ",
+        });
+        try condition_sql(&temporal.condition, w, true);
+        try w.print(" THEN vtime_ns END) OVER (PARTITION BY timeline ORDER BY vtime_ns, seq {s})" ++
+            " AS near_{d}", .{
+            switch (temporal.direction) {
+                .before => "ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING",
+                .after => "ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING",
+            },
+            index,
+        });
+    }
+    try w.writeAll(" FROM timeline_events");
+    if (query.only_branch) |branch| {
+        try w.print(" WHERE timeline = {d}", .{branch});
+    } else if (query.timelines.len > 0) {
+        try w.writeAll(" WHERE timeline IN (");
+        for (query.timelines, 0..) |timeline, index| try w.print("{s}{d}", .{ if (index == 0) "" else ",", timeline });
+        try w.writeAll(")");
+    }
+    try w.writeAll(") SELECT timeline, seq, vtime_ns, event FROM flagged WHERE hit");
+    if (query.up_to_ns) |end| try w.print(" AND vtime_ns <= {d}", .{end});
+    for (query.temporals, 0..) |*temporal, index| {
+        const negation = if (temporal.negated) "NOT " else "";
+        try w.print(" AND {s}(near_{d} IS NOT NULL", .{ negation, index });
+        if (temporal.window_ns) |window| try w.print(" AND {s} <= {d}", .{
+            switch (temporal.direction) {
+                .before => try std.fmt.allocPrint(arena, "vtime_ns - near_{d}", .{index}),
+                .after => try std.fmt.allocPrint(arena, "near_{d} - vtime_ns", .{index}),
+            },
+            window,
+        });
+        try w.writeAll(")");
+    }
+    return out.written();
+}
+
+/// Runs `query` on a run's events database; writes its answer as JSON lines (the HTTP API and
+/// agents) or as text, and returns how many it found.
+pub fn answer(
+    connection: *duckdb.Connection,
+    arena: std.mem.Allocator,
+    query: *const Query,
+    out: *std.Io.Writer,
+    json: bool,
+) !u64 {
+    const matched = try matches_sql(arena, query);
+    switch (query.output) {
+        .events => {
+            const sql = try std.fmt.allocPrintSentinel(arena,
+                \\{s} ORDER BY timeline, vtime_ns, seq LIMIT {d}
+            , .{ matched, @min(query.limit, std.math.maxInt(i64)) }, 0);
+            const Row = struct { branch: u32, seq: u64, vtime_ns: u64, event: []const u8 };
+            const rows = try connection.rows(Row, arena, sql, .{});
+            for (rows) |row| {
+                if (json) {
+                    const format = "{{\"branch\":{d},\"seq\":{d},\"vtime_ns\":{d}," ++
+                        "\"event\":{s}}}\n";
+                    try out.print(format, .{
+                        row.branch, row.seq, row.vtime_ns, row.event,
+                    });
+                } else {
+                    const format = "branch {d} vtime {d}.{d:0>6}s  {s}  " ++
+                        "(--from-branch {d} --from-vtime-ms {d})\n";
+                    try out.print(format, .{
+                        row.branch,                              row.vtime_ns / std.time.ns_per_s,
+                        row.vtime_ns % std.time.ns_per_s / 1000, row.event,
+                        row.branch,                              row.vtime_ns / std.time.ns_per_ms,
+                    });
+                }
+            }
+            return rows.len;
+        },
+        .branches => {
+            const sql = try std.fmt.allocPrintSentinel(arena,
+                \\SELECT timeline, count(*), min(vtime_ns) FROM ({s})
+                \\GROUP BY timeline ORDER BY timeline
+            , .{matched}, 0);
+            const Row = struct { branch: u32, matches: u64, first_vtime_ns: u64 };
+            const rows = try connection.rows(Row, arena, sql, .{});
+            for (rows) |row| {
+                if (json) {
+                    try out.print("{{\"branch\":{d},\"matches\":{d},\"first_vtime_ns\":{d}}}\n", .{
+                        row.branch, row.matches, row.first_vtime_ns,
+                    });
+                } else {
+                    const ms = row.first_vtime_ns / std.time.ns_per_ms;
+                    try out.print("branch {d}: {d} matches, first at vtime {d}ms " ++
+                        "(--from-branch {d} " ++
+                        "--from-vtime-ms {d})\n", .{ row.branch, row.matches, ms, row.branch, ms });
+                }
+            }
+            return rows.len;
+        },
+        .marks => {
+            const bucket = query.bucket_ns orelse 1;
+            const sql = try std.fmt.allocPrintSentinel(arena,
+                \\SELECT timeline, seq, vtime_ns, CASE WHEN json_extract_string(event, '$.event') = 'fault'
+                \\  THEN json_object('kind', json_extract_string(event, '$.details.kind'),
+                \\    'flavor', json_extract_string(event, '$.details.flavor'),
+                \\    'node', json_extract_string(event, '$.details.node'),
+                \\    'peer', json_extract_string(event, '$.details.peer'),
+                \\    'duration_ns', json_extract(event, '$.details.duration_ns'),
+                \\    'why', json_extract_string(event, '$.details.why'),
+                \\    'injected', json_extract(event, '$.details.injected'))::VARCHAR
+                \\  ELSE json_object('type', coalesce(json_extract_string(event, '$.assert.type'),
+                \\      json_extract_string(event, '$.antithesis_assert.display_type')),
+                \\    'message', coalesce(json_extract_string(event, '$.assert.message'),
+                \\      json_extract_string(event, '$.antithesis_assert.message')))::VARCHAR END
+                \\FROM ({s})
+                \\QUALIFY row_number() OVER (PARTITION BY timeline, vtime_ns // {d} ORDER BY vtime_ns, seq) = 1
+                \\ORDER BY timeline, vtime_ns, seq LIMIT {d}
+            , .{ matched, bucket, @min(query.limit, std.math.maxInt(i64)) }, 0);
+            const Row = struct { branch: u32, seq: u64, vtime_ns: u64, mark: []const u8 };
+            const rows = try connection.rows(Row, arena, sql, .{});
+            for (rows) |row| {
+                try out.print("{{\"branch\":{d},\"seq\":{d},\"vtime_ns\":{d},\"mark\":{s}}}\n", .{
+                    row.branch, row.seq, row.vtime_ns, row.mark,
+                });
+            }
+            return rows.len;
+        },
+        .count => {
+            const scope = if (query.only_branch) |branch|
+                try std.fmt.allocPrint(arena, " WHERE branch = {d}", .{branch})
+            else
+                "";
+            const sql = try std.fmt.allocPrintSentinel(arena,
+                \\SELECT (SELECT count(*) FROM ({s})), (SELECT count(DISTINCT timeline) FROM ({s})),
+                \\    (SELECT count(*) FROM timelines{s})
+            , .{ matched, matched, scope }, 0);
+            const Row = struct { events: u64, branches: u64, timelines: u64 };
+            const row = (try connection.row(Row, arena, sql, .{})).?;
+            if (json) {
+                try out.print("{{\"events\":{d},\"branches\":{d},\"timelines\":{d}}}\n", .{
+                    row.events, row.branches, row.timelines,
+                });
+            } else {
+                try out.print("{d} events in {d} of {d} timelines\n", .{
+                    row.events, row.branches, row.timelines,
+                });
+            }
+            return row.events;
+        },
+    }
+}
+
+fn seconds_to_ns_float(seconds: f64) !u64 {
+    if (seconds < 0) return error.NegativeTime;
+    return @trunc(seconds * std.time.ns_per_s);
+}
+
+/// The command: arguments after `query`. Exit status 0 when something matched, 1 when nothing
+/// did (as grep), 2 on usage errors.
+pub fn run(arena: std.mem.Allocator, io: std.Io, arguments: []const [:0]const u8) !u8 {
+    if (arguments.len < 2) return error.Usage;
+    const directory = arguments[0];
+    // `query <dir> '{"condition": ...}'`: the HTTP API's request, and its answer.
+    const api = arguments.len == 2 and std.mem.startsWith(u8, arguments[1], "{");
+    var json = api;
+    const query = if (api) blk: {
+        const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+        const asked = try std.json.parseFromSliceLeaky(Request, arena, arguments[1], options);
+        break :blk try query_of(arena, asked);
+    } else try arguments_parse(arena, arguments[1..], &json);
+    const opened = try store.open_for_command(arena, io, directory);
+    defer opened.close();
+    var buffer: [64 * 1024]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(io, &buffer);
+    const found = answer(&opened.connection, arena, &query, &stdout.interface, json) catch |err| {
+        std.debug.print("error: {s}\n", .{opened.connection.failure.text()});
+        return err;
+    };
+    try stdout.interface.flush();
+    return if (found > 0) 0 else 1;
+}
+
+fn arguments_parse(arena: std.mem.Allocator, arguments: []const [:0]const u8, json: *bool) !Query {
+    var query = Query{ .condition = try parse(arena, arguments[0]) };
+    var temporals: std.ArrayList(Temporal) = .empty;
+    var index: usize = 1;
+    while (index < arguments.len) : (index += 1) {
+        const flag = arguments[index];
+        const eql = std.mem.eql;
+        if (eql(u8, flag, "--count")) {
+            query.output = .count;
+        } else if (eql(u8, flag, "--branches")) {
+            query.output = .branches;
+        } else if (eql(u8, flag, "--json")) {
+            json.* = true;
+        } else {
+            index += 1;
+            if (index == arguments.len) return error.Usage;
+            try option_parse(arena, &query, &temporals, flag, arguments[index]);
+        }
+    }
+    query.temporals = temporals.items;
+    return query;
+}
+
+const temporal_flags = [_]struct { []const u8, @FieldType(Temporal, "direction"), bool }{
+    .{ "--preceded-by", .before, false }, .{ "--not-preceded-by", .before, true },
+    .{ "--followed-by", .after, false },  .{ "--not-followed-by", .after, true },
+};
+
+fn option_parse(
+    arena: std.mem.Allocator,
+    query: *Query,
+    temporals: *std.ArrayList(Temporal),
+    flag: []const u8,
+    value: []const u8,
+) !void {
+    const eql = std.mem.eql;
+    for (temporal_flags) |kind| {
+        if (!eql(u8, flag, kind[0])) continue;
+        if (temporals.items.len == temporal_max) return error.TooManyTemporalConditions;
+        try temporals.append(arena, .{
+            .condition = try parse(arena, value),
+            .direction = kind[1],
+            .negated = kind[2],
+        });
+        return;
+    }
+    if (eql(u8, flag, "--within")) {
+        if (temporals.items.len == 0) return error.WithinWithoutTemporal;
+        temporals.items[temporals.items.len - 1].window_ns = try seconds_to_ns(value);
+    } else if (eql(u8, flag, "--branch")) {
+        query.only_branch = try std.fmt.parseInt(u32, value, 10);
+    } else if (eql(u8, flag, "--up-to-vtime")) {
+        query.up_to_ns = try seconds_to_ns(value);
+    } else if (eql(u8, flag, "--limit")) {
+        query.limit = try std.fmt.parseInt(u64, value, 10);
+    } else return error.Usage;
+}
+
+fn seconds_to_ns(text: []const u8) !u64 {
+    const seconds = try std.fmt.parseFloat(f64, text);
+    if (seconds < 0) return error.NegativeTime;
+    return @trunc(seconds * std.time.ns_per_s);
+}
+
+const testing = std.testing;
+
+/// `timeline_events` for a test: the rows of `raw`, with the indexed paths' columns.
+fn indexed_table(arena: std.mem.Allocator) ![:0]const u8 {
+    const create = "CREATE TABLE timeline_events AS SELECT *{s} FROM raw";
+    return std.fmt.allocPrintSentinel(arena, create, .{try store.indexed_select(arena)}, 0);
+}
+
+test "conditions as SQL agree with the live matcher" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var failure: duckdb.Failure = .{};
+    var database = try duckdb.Database.open(":memory:", .{ .threads = 1 }, &failure);
+    defer database.close();
+    var connection = try database.connect(&failure);
+    defer connection.close();
+    try connection.exec(
+        \\CREATE TABLE raw (timeline UINTEGER, seq UBIGINT, vtime_ns UBIGINT, event JSON)
+    );
+    for (condition_events) |event| {
+        const insert = "INSERT INTO raw VALUES (0, 1, {d}, '{s}')";
+        const sql = try std.fmt.allocPrintSentinel(arena, insert, .{ event[0], event[1] }, 0);
+        try connection.exec(sql);
+    }
+    // With the indexed paths' columns, as the events database has them.
+    try connection.exec(try indexed_table(arena));
+    for ([_]bool{ false, true }) |indexed| for (condition_checks) |check| {
+        const condition = try parse(arena, check[0]);
+        var sql: std.Io.Writer.Allocating = .init(arena);
+        try sql.writer.writeAll("SELECT ");
+        try condition_sql(&condition, &sql.writer, indexed);
+        try sql.writer.writeAll(" FROM timeline_events ORDER BY vtime_ns");
+        const Row = struct { hit: bool };
+        const text = try arena.dupeSentinel(u8, sql.written(), 0);
+        const rows = connection.rows(Row, arena, text, .{}) catch |err| {
+            std.debug.print("{s}\n{s}\n", .{ sql.written(), connection.failure.text() });
+            return err;
+        };
+        testing.expectEqual(check[1], rows[0].hit) catch |err| {
+            std.debug.print("SQL, fault: {s}\n", .{check[0]});
+            return err;
+        };
+        testing.expectEqual(check[2], rows[1].hit) catch |err| {
+            std.debug.print("SQL, output: {s}\n", .{check[0]});
+            return err;
+        };
+    };
+}
+
+test "temporal: preceded and followed by, within windows" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var failure: duckdb.Failure = .{};
+    var database = try duckdb.Database.open(":memory:", .{ .threads = 1 }, &failure);
+    defer database.close();
+    var connection = try database.connect(&failure);
+    defer connection.close();
+    try connection.exec(
+        \\CREATE TABLE raw AS SELECT * FROM (VALUES
+        \\    (1, 1, 1000000000, '{"event":"fault"}'::JSON),
+        \\    (1, 2, 1500000000, '{"event":"ping"}'::JSON),
+        \\    (1, 3, 4000000000, '{"event":"error"}'::JSON),
+        \\    (2, 1, 1000000000, '{"event":"ping"}'::JSON)
+        \\) t(timeline, seq, vtime_ns, event);
+        \\CREATE TABLE timelines AS SELECT * FROM (VALUES (1), (2)) t(branch);
+    );
+    try connection.exec(try indexed_table(arena));
+    const checks = [_]struct { Request, []const u8 }{
+        // 0.5 s after the fault: within a second; the error, 3 s after, is not.
+        .{ .{ .condition = "event!=fault", .preceded_by = "event=fault", .within = 1 }, "1:2 " },
+        .{ .{ .condition = "event!=fault", .preceded_by = "event=fault" }, "1:2 1:3 " },
+        // Never followed by an error: the error itself, and timeline 2's ping (another timeline).
+        .{ .{ .condition = "event?", .not_followed_by = "event=error" }, "1:3 2:1 " },
+        .{ .{ .condition = "event=ping", .followed_by = "event=error", .within = 2 }, "" },
+        .{ .{ .condition = "event=ping", .followed_by = "event=error", .within = 3 }, "1:2 " },
+        .{ .{ .condition = "event=ping", .branch = 2 }, "2:1 " },
+        .{ .{ .condition = "event?", .up_to_vtime = 1.2 }, "1:1 2:1 " },
+    };
+    for (checks) |check| {
+        const query = try query_of(arena, check[0]);
+        var found: std.Io.Writer.Allocating = .init(arena);
+        var out: std.Io.Writer.Allocating = .init(arena);
+        _ = try answer(&connection, arena, &query, &out.writer, true);
+        var lines = std.mem.tokenizeScalar(u8, out.written(), '\n');
+        while (lines.next()) |line| {
+            const Line = struct { branch: u32, seq: u64 };
+            const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+            const parsed = try std.json.parseFromSliceLeaky(Line, arena, line, options);
+            try found.writer.print("{d}:{d} ", .{ parsed.branch, parsed.seq });
+        }
+        testing.expectEqualStrings(check[1], found.written()) catch |err| {
+            std.debug.print("{s}\n", .{check[0].condition});
+            return err;
+        };
+    }
+    const query = try query_of(arena, .{ .condition = "event=ping", .output = .count });
+    var out: std.Io.Writer.Allocating = .init(arena);
+    _ = try answer(&connection, arena, &query, &out.writer, true);
+    const counted = "{\"events\":2,\"branches\":2,\"timelines\":2}\n";
+    try testing.expectEqualStrings(counted, out.written());
+}

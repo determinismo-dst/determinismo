@@ -1,0 +1,40 @@
+# Zig
+zig-out/
+zig-out-ship/
+zig-out-check/
+zig-out-trial/
+zig-out-unit/
+zig-out-pin/
+zig-out-commit/
+.zig-cache/
+zig-pkg/
+# Kernel module build outputs
+guest/module/*.ko
+guest/module/*.o
+guest/module/*.mod
+guest/module/*.mod.c
+guest/module/.*.cmd
+guest/module/Module.symvers
+guest/module/modules.order
+guest/module/.module-common.o
+# Claude Code local settings
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+__pycache__/
+.cpcache/
+
+# .NET builds
+sdk/dotnet/*/bin/
+sdk/dotnet/*/obj/
+examples/race/dotnet/bin/
+examples/race/dotnet/obj/
+sdk/dotnet/test/DeterminismoCatalog.g.cs
+.triage/
+# The guest REPL proxy's port, for editors (infra/host/nrepl-proxy.py).
+.nrepl-port
+examples/kine/kclient/kclient
+
+# Local credentials (API keys), never committed.
+.secrets/
+plugins/clojure/proposed/
+examples/jank-interop/jank-coverage/*.tar

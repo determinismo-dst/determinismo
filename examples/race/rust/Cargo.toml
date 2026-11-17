@@ -1,0 +1,10 @@
+[package]
+name = "race"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# The SDK for its coverage callbacks alone (feature `coverage`): where thread pausing pauses.
+[dependencies]
+determinismo = { path = "../../../sdk/rust", features = ["coverage"] }

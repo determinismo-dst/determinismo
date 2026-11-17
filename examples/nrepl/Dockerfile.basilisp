@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Basilisp 0.5.1 (EPL-1.0, Clojure on Python) serving nREPL with its own server: proof's matrix
+# has it (its `basilisp` profile). No interrupt op: scenario `basic`. No coverage.
+FROM docker.io/library/python:3.13-alpine
+RUN pip install --no-cache-dir basilisp==0.5.1
+ENTRYPOINT ["basilisp", "nrepl-server", "--host", "0.0.0.0", "--port", "7888"]

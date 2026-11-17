@@ -1,0 +1,36 @@
+determinismo: a fatal signal names the first process of its task's PID namespace
+
+Each node runs in a PID namespace of its own; its runtime knows the namespace's first process
+(the node's main process), so a crash the kernel reports (print-fatal-signals=1) is judged as
+that node's, with what the node said, even when it dumped no core (a crash during an exit).
+
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -1255,15 +1255,23 @@
+ {
+ 	struct pt_regs *regs = task_pt_regs(current);
+ 	struct file *exe_file;
++	/*
++	 * determinismo: the first process of the task's PID namespace, as the root namespace numbers
++	 * it. Each node runs in a namespace of its own, its first process the one its runtime started:
++	 * a crash is then the node's, judged with what the node said (a crash with no core dump, as
++	 * one during an exit, otherwise had only its program's name).
++	 */
++	struct task_struct *reaper = READ_ONCE(task_active_pid_ns(current)->child_reaper);
++	pid_t init = reaper ? task_tgid_nr(reaper) : 0;
+ 
+ 	exe_file = get_task_exe_file(current);
+ 	if (exe_file) {
+-		pr_info("%pD: %s: potentially unexpected fatal signal %d.\n",
+-			exe_file, current->comm, signr);
++		pr_info("%pD: %s: potentially unexpected fatal signal %d. Namespace init %d.\n",
++			exe_file, current->comm, signr, init);
+ 		fput(exe_file);
+ 	} else {
+-		pr_info("%s: potentially unexpected fatal signal %d.\n",
+-			current->comm, signr);
++		pr_info("%s: potentially unexpected fatal signal %d. Namespace init %d.\n",
++			current->comm, signr, init);
+ 	}
+ 
+ #if defined(__i386__) && !defined(__arch_um__)

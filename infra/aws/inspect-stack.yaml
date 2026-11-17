@@ -1,0 +1,153 @@
+AWSTemplateFormatVersion: "2010-09-09"
+# SPDX-License-Identifier: MIT
+Description: >-
+  determinismo: one failure opened at its moment, with serve's web UI (docs/INSPECT.md). A
+  bare-metal machine from determinismo's base AMI pulls the bundle at boot and serves it on
+  127.0.0.1:7878, reached through the SSH tunnel in the outputs (SSH from your address alone).
+  An m5zn.metal costs about $1 an hour on spot, $3.96 on demand: delete the stack when done.
+
+Parameters:
+  BundleName:
+    Type: String
+    Description: The bundle to open (its name under the bucket's bundles/).
+    AllowedPattern: "[A-Za-z0-9._-]+"
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Your EC2 key pair, for the SSH tunnel to the UI.
+  AllowedCidr:
+    Type: String
+    Description: Your address alone (https://checkip.amazonaws.com, then /32), the only one let in on SSH.
+    AllowedPattern: "\\d+\\.\\d+\\.\\d+\\.\\d+/32"
+    ConstraintDescription: one address, as a.b.c.d/32 (never a range open to others)
+  ImageId:
+    Type: AWS::EC2::Image::Id
+    Description: determinismo's base AMI (infra/aws/inspect-ami.sh's determinismo-base-*, bare metal).
+  InstanceType:
+    Type: String
+    Description: Bare metal only (determinismo runs its own KVM on the hardware); m5zn.metal fits every bundle.
+    Default: m5zn.metal
+    AllowedValues: [m5zn.metal, c7i.metal-24xl, c8i.metal-48xl]
+  Purchase:
+    Type: String
+    Description: >-
+      spot (about a quarter of the price; AWS may take the machine back, and your account's spot
+      vCPU quota must allow 48) or on-demand.
+    Default: spot
+    AllowedValues: [spot, on-demand]
+  Bucket:
+    Type: String
+    Description: The bucket the bundle is in (infra/host/bundle-s3.sh push).
+  Prefix:
+    Type: String
+    Default: determinismo
+  PublicUrl:
+    Type: String
+    Default: ""
+    Description: >-
+      Empty: the bundle comes from the bucket (an account it was shared with). A public bundle's
+      address instead (CloudFront's, https://...): anyone's account opens it, no sharing needed.
+
+Conditions:
+  Spot: !Equals [!Ref Purchase, spot]
+
+Resources:
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: read-bundles
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub arn:${AWS::Partition}:s3:::${Bucket}
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/*
+  Profile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref Role]
+  Group:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: determinismo, SSH from one address
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedCidr
+  Template:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref ImageId
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        IamInstanceProfile: { Arn: !GetAtt Profile.Arn }
+        SecurityGroupIds: [!GetAtt Group.GroupId]
+        InstanceMarketOptions: !If
+          - Spot
+          - MarketType: spot
+            SpotOptions: { SpotInstanceType: one-time, InstanceInterruptionBehavior: terminate }
+          - !Ref AWS::NoValue
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: { VolumeSize: 60, VolumeType: gp3, DeleteOnTermination: true }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub "determinismo-${BundleName}" }
+              - { Key: project, Value: determinismo }
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            # The bundle pulled, then serve's UI for it on 127.0.0.1:7878 (a unit of admin's).
+            set -euxo pipefail
+            export AWS_REGION=${AWS::Region}
+            # From the bucket (shared), or a public bundle's address (PublicUrl, over HTTPS).
+            source="${PublicUrl}"
+            [ -n "$source" ] || source="s3://${Bucket}/${Prefix}"
+            fetch() { case $source in https://*) curl -fsS --retry 5 -o "$2" "$source/$1" ;; *) aws s3 cp --quiet "$source/$1" "$2" ;; esac; }
+            # The tools of this release, over the image's (it may be older).
+            fetch tools/serve-bundle.sh /usr/local/bin/serve-bundle.sh
+            fetch tools/bundle-s3.sh /usr/local/bin/bundle-s3.sh.new && mv /usr/local/bin/bundle-s3.sh.new /usr/local/bin/bundle-s3.sh
+            chmod +x /usr/local/bin/serve-bundle.sh /usr/local/bin/bundle-s3.sh
+            su - admin -c "AWS_REGION=${AWS::Region} bundle-s3.sh pull $source ${BundleName} ~/store ~/${BundleName}"
+            cat > /etc/systemd/system/determinismo-serve.service <<'UNIT'
+            [Unit]
+            Description=determinismo serve for the bundle
+            After=network-online.target determinismo-kvm.service
+            [Service]
+            User=admin
+            Environment=XDG_RUNTIME_DIR=/run/user/1000
+            ExecStart=/usr/local/bin/serve-bundle.sh /home/admin/${BundleName}
+            Restart=on-failure
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+            systemctl daemon-reload
+            systemctl enable --now determinismo-serve.service
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref Template
+        Version: !GetAtt Template.LatestVersionNumber
+
+Outputs:
+  Tunnel:
+    Description: >-
+      Run this, then open the UI (7878); 7950 is where the UI's "Open a port here" listens by
+      default (a REPL inside a node, reached from your editor)
+    Value: !Sub "ssh -N -L 7878:127.0.0.1:7878 -L 7950:127.0.0.1:7950 admin@${Instance.PublicIp}"
+  UI:
+    Description: The failure, at its moment
+    Value: http://localhost:7878/#1

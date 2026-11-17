@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: MIT
+# determinismo CI (docs/PRODUCTS.md, docs/CI.md): the repository's tests run on the team's
+# determinismo host. The checkout is copied there over SSH and `determinismo-ci` runs in it:
+# the setup from its cached snapshot when nothing it depends on changed, the tests sharded
+# over deterministic machines, each failing timeline a replayable link on the host's serve.
+# Exit status: 0 every shard passed, 1 one failed, 2 one was flaky (0 with flaky-passes).
+name: determinismo CI
+description: Run the repository's tests on a determinismo host, every failure replayable.
+inputs:
+  host:
+    description: The determinismo host (address or name).
+    required: true
+  user:
+    description: Its user (serve's).
+    default: det
+  ssh-key:
+    description: A private key the host's user accepts (a repository secret).
+    required: true
+  known-hosts:
+    description: The host's line for ~/.ssh/known_hosts (ssh-keyscan's), so the host is checked.
+    required: true
+  config:
+    description: The CI config, relative to the repository.
+    default: .determinismo/ci.json
+  serve:
+    description: serve's URL as seen on the host.
+    default: http://127.0.0.1:7878
+  flaky-passes:
+    description: Count flaky shards as passing ("true").
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - name: SSH to the host
+      shell: bash
+      run: |
+        mkdir -p ~/.ssh && chmod 700 ~/.ssh
+        printf '%s\n' "${{ inputs.ssh-key }}" > ~/.ssh/determinismo && chmod 600 ~/.ssh/determinismo
+        printf '%s\n' "${{ inputs.known-hosts }}" >> ~/.ssh/known_hosts
+    - name: The checkout, on the host
+      shell: bash
+      run: |
+        target="ci/${GITHUB_REPOSITORY//\//-}/${GITHUB_SHA}"
+        echo "DETERMINISMO_CI_DIR=$target" >> "$GITHUB_ENV"
+        ssh -i ~/.ssh/determinismo "${{ inputs.user }}@${{ inputs.host }}" "mkdir -p $target"
+        rsync -az --delete --exclude .git -e "ssh -i $HOME/.ssh/determinismo" ./ \
+          "${{ inputs.user }}@${{ inputs.host }}:$target/"
+    - name: determinismo-ci
+      shell: bash
+      run: |
+        flaky=""
+        [ "${{ inputs.flaky-passes }}" = "true" ] && flaky="--flaky-passes"
+        # Where the tests come from, for serve's CI page: GitHub's, the checkout copied without
+        # its .git.
+        job=$(printf ' --repository %q --branch %q --commit %q --subject %q' "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA" "$(git log -1 --format=%s)")
+        ssh -i ~/.ssh/determinismo "${{ inputs.user }}@${{ inputs.host }}" \
+          "cd $DETERMINISMO_CI_DIR && determinismo-ci --config ${{ inputs.config }} --serve ${{ inputs.serve }} $flaky$job"

@@ -1,0 +1,250 @@
+[
+  {
+    "name": "sandbox_create",
+    "description": "Make an agent sandbox: a system (a test program's profile or a Compose file) booted in a fast VM, on several cores at full speed, its nodes running. Answers {sandbox}.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "program": {
+          "type": "string",
+          "description": "Path to a test program"
+        },
+        "compose": {
+          "type": "string",
+          "description": "Path to a Compose file"
+        },
+        "profile": {
+          "type": "string"
+        },
+        "scenario": {
+          "type": "string"
+        },
+        "vcpus": {
+          "type": "integer",
+          "description": "vCPUs (2 to 32, default 4)"
+        },
+        "memory_mib": {
+          "type": "integer",
+          "description": "Memory (default 2048)"
+        }
+      }
+    }
+  },
+  {
+    "name": "sandbox_list",
+    "description": "The sandboxes: id, whether its machine runs, its checkpoints.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "name": "sandbox_exec",
+    "description": "Run a shell command (/bin/sh -c) in a node of the sandbox: its exit status and output (stdout and stderr together).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sandbox": {
+          "type": "integer",
+          "description": "The sandbox's id (sandbox_create's answer)"
+        },
+        "node": {
+          "type": "string"
+        },
+        "command": {
+          "type": "string"
+        },
+        "timeout_s": {
+          "type": "integer",
+          "description": "Default 600"
+        }
+      },
+      "required": [
+        "sandbox",
+        "node",
+        "command"
+      ]
+    }
+  },
+  {
+    "name": "sandbox_write_file",
+    "description": "Write a file (its text) in a node of the sandbox, its directory made if needed.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sandbox": {
+          "type": "integer",
+          "description": "The sandbox's id (sandbox_create's answer)"
+        },
+        "node": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "content": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sandbox",
+        "node",
+        "path",
+        "content"
+      ]
+    }
+  },
+  {
+    "name": "sandbox_read_file",
+    "description": "Read a file in a node of the sandbox.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sandbox": {
+          "type": "integer",
+          "description": "The sandbox's id (sandbox_create's answer)"
+        },
+        "node": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sandbox",
+        "node",
+        "path"
+      ]
+    }
+  },
+  {
+    "name": "sandbox_checkpoint",
+    "description": "Save the sandbox's whole machine as it stands (milliseconds; it goes on). Answers {checkpoint}: fork, rewind or explore from it later.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sandbox": {
+          "type": "integer",
+          "description": "The sandbox's id (sandbox_create's answer)"
+        }
+      },
+      "required": [
+        "sandbox"
+      ]
+    }
+  },
+  {
+    "name": "sandbox_fork",
+    "description": "Make `count` new sandboxes, each a copy of a checkpoint's machine (side-by-side attempts from one state). Answers {sandboxes}.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sandbox": {
+          "type": "integer",
+          "description": "The sandbox's id (sandbox_create's answer)"
+        },
+        "checkpoint": {
+          "type": "string"
+        },
+        "count": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sandbox",
+        "checkpoint"
+      ]
+    }
+  },
+  {
+    "name": "sandbox_rewind",
+    "description": "Put the sandbox back to a checkpoint: its machine replaced by one restored from it.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sandbox": {
+          "type": "integer",
+          "description": "The sandbox's id (sandbox_create's answer)"
+        },
+        "checkpoint": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sandbox",
+        "checkpoint"
+      ]
+    }
+  },
+  {
+    "name": "sandbox_explore",
+    "description": "Run deterministic timelines from a checkpoint (the system's scenario, with faults: a node crashed, the network cut, a disk full), each replayable exactly. Answers the run's id: its verdicts on serve.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sandbox": {
+          "type": "integer",
+          "description": "The sandbox's id (sandbox_create's answer)"
+        },
+        "checkpoint": {
+          "type": "string"
+        },
+        "branches": {
+          "type": "integer"
+        },
+        "time_budget": {
+          "type": "string",
+          "description": "e.g. 10m"
+        },
+        "seed": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sandbox",
+        "checkpoint"
+      ]
+    }
+  },
+  {
+    "name": "sandbox_delete",
+    "description": "Stop the sandbox's machine (its checkpoints stay).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sandbox": {
+          "type": "integer",
+          "description": "The sandbox's id (sandbox_create's answer)"
+        }
+      },
+      "required": [
+        "sandbox"
+      ]
+    }
+  },
+  {
+    "name": "sandbox_replay",
+    "description": "Replay the sandbox's steps after a checkpoint in a deterministic machine started from it: the same commands and writes, in order, every replay the same. Answers the run's id (its output on serve).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sandbox": {
+          "type": "integer",
+          "description": "The sandbox's id"
+        },
+        "checkpoint": {
+          "type": "string"
+        },
+        "until": {
+          "type": "integer",
+          "description": "Only the steps before this one (0-based)"
+        }
+      },
+      "required": [
+        "sandbox",
+        "checkpoint"
+      ]
+    }
+  }
+]

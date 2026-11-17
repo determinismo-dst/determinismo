@@ -1,0 +1,13 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# The repl check's program in its node (/opt/workload/run). `prepare`, the node's command during
+# setup, compiles its namespaces into /opt/workload/classes, first on the classpath: in the
+# setup's snapshot, so every command of every timeline starts compiled (1.1 s on a guest's vCPU,
+# 3.2 s from source; the JVM's AOT cache on top measured no faster).
+classpath="/opt/workload/classes:/opt/workload/src:$(cat /opt/workload/classpath)"
+java="java --enable-native-access=ALL-UNNAMED -XX:+UseSerialGC -XX:TieredStopAtLevel=1 -Xmx256m"
+if [ "$1" = prepare ]; then
+  mkdir -p /opt/workload/classes
+  exec $java -cp "$classpath" clojure.main -m repl-test compile repl-test
+fi
+exec $java -cp "$classpath" clojure.main -m repl-test "$@"

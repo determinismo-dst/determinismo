@@ -1,0 +1,22 @@
+# What syncing the repository to a host leaves out (update.sh, check.sh, trial.sh: rsync
+# --exclude-from): git's own, build outputs and caches, the developer's private notes, the guest
+# module's build products (the host builds its own).
+.git
+.zig-cache
+zig-out
+zig-out-ship
+zig-out-check
+zig-out-trial
+zig-out-unit
+zig-out-pin
+zig-out-commit
+.determinismo-cache
+todo.md
+QUESTIONS.md
+node_modules
+guest/module/*.ko
+guest/module/*.o
+guest/module/.*
+guest/module/*.mod*
+guest/module/Module.symvers
+guest/module/modules.order

@@ -1,0 +1,555 @@
+[
+  {
+    "name": "describe",
+    "description": "Show a test program's profiles (nodes, sources, faults) and scenarios (test commands).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "program": {
+          "type": "string",
+          "description": "Path to the test program"
+        }
+      },
+      "required": [
+        "program"
+      ]
+    }
+  },
+  {
+    "name": "validate",
+    "description": "Check a system before a run, without booting it (as Antithesis's snouty validate): it is resolved (images pulled or built, test templates found), its nodes and each scenario's commands listed, and what would keep a run from testing it named: files named as test commands that cannot run (not executable, no shebang), a scenario with no driver command, several setup commands, an image not built for linux/amd64. Its last line counts the problems.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "program": {
+          "type": "string",
+          "description": "A test program, or"
+        },
+        "compose": {
+          "type": "string",
+          "description": "a Compose file, or"
+        },
+        "kubernetes": {
+          "type": "string",
+          "description": "a directory of Kubernetes manifests"
+        },
+        "profile": {
+          "type": "string",
+          "description": "The profile (default: the first)"
+        }
+      }
+    }
+  },
+  {
+    "name": "explore",
+    "description": "Explore a scenario: snapshot after setup, run many branches (each a different interleaving, faults and inputs), and report which properties failed and in which branches. The result ends with events_dir: every branch's events, for the query tool.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "program": {
+          "type": "string"
+        },
+        "scenario": {
+          "type": "string"
+        },
+        "profile": {
+          "type": "string"
+        },
+        "seed": {
+          "type": "integer"
+        },
+        "cpu_modulation": {
+          "type": "boolean",
+          "description": "Branches run at varying CPU speeds (decisions), so preemption lands elsewhere: on by default (as Antithesis with faults); false turns it off; replays need the run's setting too"
+        },
+        "branches": {
+          "type": "integer",
+          "description": "How many timelines (default 16; with time_budget, at most this many)"
+        },
+        "time_budget": {
+          "type": "string",
+          "description": "Explore as many timelines as fit in this wall time, boot included: 90s, 10m, 2h"
+        },
+        "compose": {
+          "type": "string",
+          "description": "A Compose file instead of a test program"
+        },
+        "kubernetes": {
+          "type": "string",
+          "description": "Or a directory of Kubernetes manifests (raw, images fully qualified): a single-node K3s cluster runs them, as Antithesis does; test templates in their images are the scenarios"
+        },
+        "timeline": {
+          "type": "string",
+          "description": "How long each timeline's drivers run, in virtual time (e.g. 15m); replays and forks of its timelines need the same"
+        },
+        "generation": {
+          "type": "integer",
+          "description": "A tree's timelines per generation: 16 (the default), or a multiple of it for a machine with more CPUs (they run at once), with more moments returned to"
+        },
+        "changed": {
+          "type": "string",
+          "description": "A targeted run: a diff file or git range (on the machine running determinismo) whose changed lines the tree explores first; the result says which hunks ran in how many timelines, and which never ran"
+        },
+        "changed_repository": {
+          "type": "string",
+          "description": "Where changed's range is: a repository's directory on the machine running determinismo, or its URL (fetched into the cache). With it, changed is a commit (that commit's change), a range a..b, or releases v1.6.0..v1.7.0"
+        },
+        "retroactive": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Retroactive logging: output lines containing any of these texts are left out of the exploration's events (they still count for behaviors and the logging limit); replay a timeline to see them"
+        },
+        "strategy": {
+          "type": "string",
+          "description": "A strategy deciding the faults, inputs and moments returned to: any command on the machine running determinismo speaking the JSON lines protocol (docs/PLUGINS.md), e.g. \"python3 plugins/python/llm.py\" or one the agent wrote; tcp://host:port reaches one running anywhere; image:<reference> runs one packaged as a container image (podman). Its decisions are in the tapes: replays need no strategy"
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "replay",
+    "description": "Replay one branch exactly; optionally stop at a virtual time and run a shell command in the guest there (e.g. det-nodes exec <node> <command>). With continue, the branch runs on after the command, so a change made there (data, configuration, code through a REPL) plays out. Instead of at_vtime_ms, until stops at the first event matching a condition (the query tool's syntax), as Antithesis's wait_until. Every thread's stack in a node there: exec \"/opt/determinismo/bin/det-profile <node> --stacks\".",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "program": {
+          "type": "string"
+        },
+        "scenario": {
+          "type": "string"
+        },
+        "profile": {
+          "type": "string"
+        },
+        "seed": {
+          "type": "integer"
+        },
+        "cpu_modulation": {
+          "type": "boolean",
+          "description": "Branches run at varying CPU speeds (decisions), so preemption lands elsewhere: on by default (as Antithesis with faults); false turns it off; replays need the run's setting too"
+        },
+        "branch": {
+          "type": "integer",
+          "description": "The timeline to replay (one of a tree exploration's first 16; others by their tape)"
+        },
+        "tape": {
+          "type": "string",
+          "description": "Replay the timeline of this tape instead (explore returns tape_dir; its timelines are tape_dir/branch-<n>.jsonl): any timeline of a tree exploration"
+        },
+        "at_vtime_ms": {
+          "type": "integer"
+        },
+        "exec": {
+          "type": "string"
+        },
+        "steps": {
+          "type": "array",
+          "description": "Or a branch grown from the moment step by step (Antithesis's advanced multiverse debugging): each step one of {exec, node?, background?} (a command run to its end, or in the background beside the next steps), {wait_ms} (run on), {until, timeout_ms?} (run on until an event matches); each step's end is a moment",
+          "items": {
+            "type": "object",
+            "properties": {
+              "exec": {
+                "type": "string"
+              },
+              "node": {
+                "type": "string"
+              },
+              "background": {
+                "type": "boolean"
+              },
+              "wait_ms": {
+                "type": "integer"
+              },
+              "until": {
+                "type": "string"
+              },
+              "timeout_ms": {
+                "type": "integer"
+              }
+            }
+          }
+        },
+        "continue": {
+          "type": "boolean",
+          "description": "After exec, let the branch run to its end (see the effects of the change)"
+        },
+        "fresh_seed": {
+          "type": "integer",
+          "description": "With exec or steps: from the moment on, randomness from this seed (the guest kernel's generator reseeded): the branch's own future, as Antithesis's branches diverge from their timeline. Without it the branch keeps its timeline's randomness"
+        },
+        "compose": {
+          "type": "string",
+          "description": "A Compose file instead of a test program"
+        },
+        "kubernetes": {
+          "type": "string",
+          "description": "Or a directory of Kubernetes manifests (raw, images fully qualified): a single-node K3s cluster runs them, as Antithesis does; test templates in their images are the scenarios"
+        },
+        "until": {
+          "type": "string",
+          "description": "A condition: the moment is the first event matching it (with at_vtime_ms too, that time at the latest: a timeout)"
+        },
+        "rewind_ms": {
+          "type": "integer",
+          "description": "With until: the moment this many milliseconds of virtual time before the condition holds (Antithesis's rewind)"
+        },
+        "timeline": {
+          "type": "string",
+          "description": "How long each timeline's drivers run, in virtual time (e.g. 15m); replays and forks of its timelines need the same"
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "fork",
+    "description": "Replay a branch to a virtual time, snapshot it there, and explore new branches from that moment.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "program": {
+          "type": "string"
+        },
+        "scenario": {
+          "type": "string"
+        },
+        "profile": {
+          "type": "string"
+        },
+        "seed": {
+          "type": "integer"
+        },
+        "cpu_modulation": {
+          "type": "boolean",
+          "description": "Branches run at varying CPU speeds (decisions), so preemption lands elsewhere: on by default (as Antithesis with faults); false turns it off; replays need the run's setting too"
+        },
+        "from_branch": {
+          "type": "integer"
+        },
+        "from_vtime_ms": {
+          "type": "integer"
+        },
+        "branches": {
+          "type": "integer"
+        },
+        "exec": {
+          "type": "string",
+          "description": "A command to run at the fork point first: the branches explore the changed system"
+        },
+        "compose": {
+          "type": "string",
+          "description": "A Compose file instead of a test program"
+        },
+        "kubernetes": {
+          "type": "string",
+          "description": "Or a directory of Kubernetes manifests (raw, images fully qualified): a single-node K3s cluster runs them, as Antithesis does; test templates in their images are the scenarios"
+        },
+        "timeline": {
+          "type": "string",
+          "description": "How long each timeline's drivers run, in virtual time (e.g. 15m); replays and forks of its timelines need the same"
+        },
+        "strategy": {
+          "type": "string",
+          "description": "A strategy deciding the futures' faults and inputs: any command speaking the JSON lines protocol (docs/PLUGINS.md), as explore's"
+        }
+      },
+      "required": [
+        "from_branch",
+        "from_vtime_ms"
+      ]
+    }
+  },
+  {
+    "name": "query",
+    "description": "Search the events of an exploration (its events_dir), as Antithesis's Logs Explorer: a condition of terms 'path op value' joined by and/or over the event JSON (event=fault, details.kind=partition, output.text~refused, assert.condition=false, output.source=redis) or vtime/branch/seq; operators = != ~ !~ =~ !=~ < <= > >= ? !?. Temporal conditions look in the same timeline before (preceded_by) or after (followed_by) the event, within some virtual seconds. Each match comes with its moment (branch, vtime_ns) to replay or fork from.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "events_dir": {
+          "type": "string",
+          "description": "From explore or fork"
+        },
+        "condition": {
+          "type": "string"
+        },
+        "preceded_by": {
+          "type": "string"
+        },
+        "not_preceded_by": {
+          "type": "string"
+        },
+        "followed_by": {
+          "type": "string"
+        },
+        "not_followed_by": {
+          "type": "string"
+        },
+        "within": {
+          "type": "number",
+          "description": "Seconds of virtual time for the temporal conditions"
+        },
+        "branch": {
+          "type": "integer"
+        },
+        "up_to_vtime": {
+          "type": "number",
+          "description": "Seconds: only events up to this moment"
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Events to return (default 100)"
+        },
+        "output": {
+          "type": "string",
+          "enum": [
+            "events",
+            "count",
+            "branches"
+          ]
+        }
+      },
+      "required": [
+        "events_dir",
+        "condition"
+      ]
+    }
+  },
+  {
+    "name": "events",
+    "description": "Event sets over an exploration's events (its events_dir), as Antithesis's: a pipeline (JSON array) of operations, each an object with one key. filter/exclude take a condition (the query tool's syntax). with_last {name: condition} adds last_<name>, the nearest earlier event of the timeline matching. with_next {name: condition} (+ timeout seconds) gives, for each event, the nearest later matching event with last_event and with_next_type (or a 'timeout' event). union/intersect take a list of pipelines, difference one pipeline. narrow takes field paths. through takes a shell command that reads the set as JSON lines {branch,index,vtime_ns,event} and writes the new set the same way: map, flatmap and fold in any language. Example: [{\"filter\":\"event=request details.ok=false\"},{\"with_last\":{\"fault\":\"event=fault\"}},{\"filter\":\"last_fault.event.details.kind=partition\"}].",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "events_dir": {
+          "type": "string",
+          "description": "From explore or fork"
+        },
+        "pipeline": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "branch": {
+          "type": "integer"
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Events to return (default 100)"
+        },
+        "output": {
+          "type": "string",
+          "enum": [
+            "events",
+            "count",
+            "branches"
+          ]
+        }
+      },
+      "required": [
+        "events_dir",
+        "pipeline"
+      ]
+    }
+  },
+  {
+    "name": "sql",
+    "description": "Read-only SQL (DuckDB) on an exploration's events database (its events_dir), for what query and events do not say: one SELECT, answered as a JSON array (at most 10000 rows). Tables: events (every event once: branch = the timeline whose file it is in, NULL for the setup's shared by all; seq, vtime_ns, branches; kind = assert | event | output | decision | lifecycle | guidance | antithesis_assert | antithesis_sdk | raw; name = an assertion's or guidance's message, an event's/lifecycle's/decision's name, an output's stream; type = an assertion's type (always, always_or_unreachable, sometimes, reachable, unreachable); condition = its outcome (NULL: declared only); node = an event's details.node or an output's source; text = an output's text; behavior = a hash of what counts as one behavior; event = the event's JSON, e.g. event->>'$.details.kind'), timelines (branch, seed, outcome, vtime_ns, wall_ns, events, events_hash, generation, why, parent, start_ns, path), steps (a tree timeline's ancestors' parts), and the view timeline_events (each timeline's events from the setup through its ancestors to its own: timeline, origin, then the event columns). Example: SELECT name, count(DISTINCT timeline) FROM timeline_events WHERE kind = 'assert' AND NOT condition GROUP BY name.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "events_dir": {
+          "type": "string",
+          "description": "From explore or fork"
+        },
+        "sql": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "events_dir",
+        "sql"
+      ]
+    }
+  },
+  {
+    "name": "causality",
+    "description": "Causality analysis (as Antithesis's): how likely a property's failure was at moments of a branch where it failed. Finds the first failure in the branch, then at several moments from the snapshot to it forks many futures and counts how many fail. Jumps in probability mark where the timeline made the bug likely: query the branch's events just before each jump. At a jump, replay to its end with exec \"/opt/determinismo/bin/det-profile <node> --stacks\" for the code each thread was in, and query the coverage events inside it for the code first run there.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "program": {
+          "type": "string"
+        },
+        "compose": {
+          "type": "string"
+        },
+        "kubernetes": {
+          "type": "string",
+          "description": "Or a directory of Kubernetes manifests (raw, images fully qualified): a single-node K3s cluster runs them, as Antithesis does; test templates in their images are the scenarios"
+        },
+        "scenario": {
+          "type": "string"
+        },
+        "profile": {
+          "type": "string"
+        },
+        "seed": {
+          "type": "integer"
+        },
+        "cpu_modulation": {
+          "type": "boolean",
+          "description": "Branches run at varying CPU speeds (decisions), so preemption lands elsewhere: on by default (as Antithesis with faults); false turns it off; replays need the run's setting too"
+        },
+        "branch": {
+          "type": "integer"
+        },
+        "property": {
+          "type": "string",
+          "description": "The property's message"
+        },
+        "points": {
+          "type": "integer",
+          "description": "Moments to measure (default 8)"
+        },
+        "futures": {
+          "type": "integer",
+          "description": "Futures per moment (default 16)"
+        },
+        "timeline": {
+          "type": "string",
+          "description": "How long each timeline's drivers run, in virtual time (e.g. 15m); replays and forks of its timelines need the same"
+        }
+      },
+      "required": [
+        "branch",
+        "property"
+      ]
+    }
+  },
+  {
+    "name": "shrink",
+    "description": "Shrinking: the fewest of a failing branch's faults the property's failure still needs. Makes the branch's script (determinismo script), then delta debugging (ddmin) over its fault entries, each candidate explored over the same timelines: kept when it fails in at least half as many of them as the whole script. Returns the faults kept, the failure counts with them, with all of them and with none, and the shrunk script (explore --script).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "program": {
+          "type": "string"
+        },
+        "compose": {
+          "type": "string"
+        },
+        "kubernetes": {
+          "type": "string",
+          "description": "Or a directory of Kubernetes manifests (raw, images fully qualified): a single-node K3s cluster runs them, as Antithesis does; test templates in their images are the scenarios"
+        },
+        "scenario": {
+          "type": "string"
+        },
+        "profile": {
+          "type": "string"
+        },
+        "seed": {
+          "type": "integer"
+        },
+        "cpu_modulation": {
+          "type": "boolean",
+          "description": "Branches run at varying CPU speeds (decisions), so preemption lands elsewhere: on by default (as Antithesis with faults); false turns it off; replays need the run's setting too"
+        },
+        "branch": {
+          "type": "integer"
+        },
+        "property": {
+          "type": "string",
+          "description": "The property's message"
+        },
+        "timelines": {
+          "type": "integer",
+          "description": "Timelines each candidate is judged over (default 16): a fault removed shifts the guest's random stream, so one timeline failing again is chance"
+        }
+      },
+      "required": [
+        "branch",
+        "property"
+      ]
+    }
+  },
+  {
+    "name": "mutate",
+    "description": "A mutation testing campaign: explore the system as it is, then once per mutant (a patch to one node's build context) with the same seed and options. Each mutant is judged caught (a property fails that passes without it), never_ran (its lines never ran in any timeline) or unnoticed (it ran and no property noticed: a gap in the properties). The result ends with out: results.jsonl and each exploration's events, for the query tool.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "program": {
+          "type": "string"
+        },
+        "compose": {
+          "type": "string",
+          "description": "A Compose file instead of a test program"
+        },
+        "kubernetes": {
+          "type": "string",
+          "description": "Or a directory of Kubernetes manifests (raw, images fully qualified): a single-node K3s cluster runs them, as Antithesis does; test templates in their images are the scenarios"
+        },
+        "scenario": {
+          "type": "string"
+        },
+        "profile": {
+          "type": "string"
+        },
+        "seed": {
+          "type": "integer"
+        },
+        "branches": {
+          "type": "integer",
+          "description": "Timelines per exploration (default 16)"
+        },
+        "time_budget": {
+          "type": "string",
+          "description": "Wall time per exploration: 90s, 10m"
+        },
+        "mutants": {
+          "type": "string",
+          "description": "A JSON lines file: {\"name\", \"node\", \"patch\"} per mutant, patch a unified diff relative to the node's build context"
+        },
+        "timeline": {
+          "type": "string",
+          "description": "How long each timeline's drivers run, in virtual time (e.g. 15m); replays and forks of its timelines need the same"
+        }
+      },
+      "required": [
+        "mutants"
+      ]
+    }
+  },
+  {
+    "name": "verify",
+    "description": "Determinism check of a run: replays a sample of its timelines (or the ones named) from their tapes, each beside whatever else runs on the host, and compares each history with the run's record (its events hash). A timeline that does not replay is a determinism bug of determinismo's: its output says where the replay parted from its tape (the checkpoint, and the replay's last events before it, to compare with the run's events there).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "run": {
+          "type": "string",
+          "description": "The run's directory (its record.jsonl, tapes/ and machine.json: a run serve made, ~/.determinismo/runs/<id>)"
+        },
+        "timelines": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          },
+          "description": "The timelines to replay (all of them must have a tape); none: a sample"
+        },
+        "sample": {
+          "type": "integer",
+          "description": "How many timelines to sample when none are named (the same ones each time for one record)"
+        }
+      },
+      "required": [
+        "run"
+      ]
+    }
+  }
+]

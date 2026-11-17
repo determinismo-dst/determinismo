@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: MIT
+# The race in Python (examples/race/python), with the Python SDK's coverage on racerun alone: its
+# lines and branches are where thread pausing pauses threads.
+FROM docker.io/library/python:3.12-alpine
+# Python's standard library compiled here: the image ships it without bytecode, so a first start
+# writes it, unsynced, and a power loss persisting part of that tears a .pyc (its header kept, its
+# body cut): Python then fails to start (EOFError from _compile_bytecode, CPython #72194; local-fs
+# hunt run 1019, 161 timelines). Nothing written at run time either.
+RUN python3 -m compileall -q -j 0 "$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])')"
+ENV PYTHONDONTWRITEBYTECODE=1
+WORKDIR /app
+COPY sdk/python/determinismo.py examples/race/python/race.py examples/race/python/racerun.py /app/
+ENTRYPOINT ["python3", "-u", "/app/race.py"]

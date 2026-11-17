@@ -1,0 +1,42 @@
+--- a/fs/sync.c
++++ b/fs/sync.c
+@@ -165,6 +165,15 @@
+ 	return ret ? ret : ret2;
+ }
+ 
++/*
++ * determinismo: a module may hold a sync or stop its node there (det_guest.ko's sync_stall and
++ * durable_crash faults). Called in the syncing task's context, where it may sleep: before the
++ * file system syncs (`after` false; a non-zero return is the call's result, nothing synced),
++ * and once it has (`after` true). Unset, and nothing changes.
++ */
++int (*det_durability_point)(struct file *file, bool after) __read_mostly;
++EXPORT_SYMBOL_GPL(det_durability_point);
++
+ /**
+  * vfs_fsync_range - helper to sync a range of data & metadata to disk
+  * @file:		file to sync
+@@ -179,12 +188,22 @@
+ int vfs_fsync_range(struct file *file, loff_t start, loff_t end, int datasync)
+ {
+ 	struct inode *inode = file->f_mapping->host;
++	int (*point)(struct file *file, bool after) = READ_ONCE(det_durability_point);
++	int ret;
+ 
+ 	if (!file->f_op->fsync)
+ 		return -EINVAL;
++	if (point) {
++		ret = point(file, false);
++		if (ret)
++			return ret;
++	}
+ 	if (!datasync && (inode->i_state & I_DIRTY_TIME))
+ 		mark_inode_dirty_sync(inode);
+-	return file->f_op->fsync(file, start, end, datasync);
++	ret = file->f_op->fsync(file, start, end, datasync);
++	if (point)
++		point(file, true);
++	return ret;
+ }
+ EXPORT_SYMBOL(vfs_fsync_range);
+ 

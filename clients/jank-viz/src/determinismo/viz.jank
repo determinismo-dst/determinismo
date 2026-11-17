@@ -1,0 +1,1179 @@
+;; SPDX-License-Identifier: MIT
+;; determinismo's data drawn with Dear ImGui, following a jank REPL: a printer for what the
+;; REPL does. On top, the run's multiverse (its timelines, where they branch, their faults and
+;; failures, the moment a session is at). Below, a card for each evaluation, shown by what it
+;; was: a session opened (its timeline, its moment, how it was found, the faults around it),
+;; registers and memory with what they were before beside what they are now, the instructions
+;; at an address before and after a poke, a command's output, a query's events and maps as EDN,
+;; SQL's rows as a table, numbers as bars with what changed since the last ones, anything else
+;; as it prints; none for nil. Nothing to call for it: the REPL's
+;; evaluations (jank's nREPL server, in this process) and the client's calls
+;; (determinismo.tap) are told here. The drawing is plain jank over a few native primitives
+;; (include/detviz.hpp), changed from the REPL like anything else.
+(ns determinismo.viz
+  (:include "detviz.hpp")
+  (:require [clojure.string :as str]
+            [determinismo.api :as api]
+            [determinismo.http :as http]
+            [determinismo.json :as json]
+            [determinismo.tap :as tap]))
+
+;; serve's palette.
+(def paper 0xfdf6d8)
+(def card 0xfffbe6)
+(def ink 0x1c1b18)
+(def muted 0x7a7466)
+(def rule 0xcfc49a)
+(def red 0xb3261e)
+(def green 0x2e7d32)
+(def blue 0x1a4f8b)
+(def orange 0xb86b00)
+
+;; A game's crates on a screen (a session's frames), each its id's last digit's colour.
+(def ^:private digit-of (zipmap (map str (range 10)) (range 10)))
+(def ^:private crate-colors [0xb3261e 0x1a4f8b 0x2e7d32 0xb86b00 0x6a1b9a 0x00838f 0xad1457 0x4e342e 0x283593 0x558b2f])
+
+;; Text sizes (detviz.hpp): mono small, normal, large; serif normal, large.
+(def small 0)
+(def mono 1)
+(def big 2)
+(def serif 3)
+(def title 4)
+
+(def state
+  (atom {:run nil :info nil :timelines [] :marks [] :visits [] :looked #{} :cursor nil
+         :session nil :cards [] :live false}))
+
+;; What the client did during the evaluation under way (the REPL's thread), for its card.
+(def ^:private told (atom []))
+
+;; Native primitives, by name.
+(defn- text! [x y color size what] (cpp/detviz.text x y color size what))
+(defn- text-width [size what] (cpp/detviz.text_width size what))
+(defn- line! [x1 y1 x2 y2 color thickness] (cpp/detviz.line x1 y1 x2 y2 color thickness))
+(defn- curve! [x1 y1 x2 y2 color thickness] (cpp/detviz.curve x1 y1 x2 y2 color thickness))
+(defn- rect! [x1 y1 x2 y2 color alpha rounding] (cpp/detviz.rect x1 y1 x2 y2 color alpha rounding))
+(defn- frame! [x1 y1 x2 y2 color thickness] (cpp/detviz.frame x1 y1 x2 y2 color thickness))
+(defn- circle! [x y radius color alpha] (cpp/detviz.circle x y radius color alpha))
+(defn- ring! [x y radius color thickness] (cpp/detviz.ring x y radius color thickness))
+
+;; Times are doubles wherever they are added or multiplied: jank 0.1's integer + and * wrap at
+;; 32 bits when both operands fit in them ((* 3000 1000000) is -1294967296), and a moment in
+;; nanoseconds passes 2^31 at 2.1 s.
+(defn- seconds
+  "Nanoseconds as seconds, three decimals."
+  [ns]
+  (let [ms (long (/ ns 1000000.0))]
+    (str (quot ms 1000) "." (subs (str (+ 1000 (mod ms 1000))) 1) " s")))
+
+(def ^:private hex-digits "0123456789abcdef")
+
+(defn- hex2 [byte]
+  (str (nth hex-digits (quot byte 16)) (nth hex-digits (mod byte 16))))
+
+(defn- clip
+  "`what` cut to `width` points at size `size`."
+  [size width what]
+  (let [what (str what)]
+    (if (<= (text-width size what) width)
+      what
+      (loop [n (count what)]
+        (let [cut (str (subs what 0 n) "…")]
+          (if (or (<= n 1) (<= (text-width size cut) width))
+            cut
+            (recur (- n (max 1 (quot n 8))))))))))
+
+(defn- instructions
+  "The x86-64 instructions `bytes` are (llvm-mc), a line each; none without the tool."
+  [bytes]
+  (let [said (str (cpp/detviz.run (cpp/cast cpp/std.string
+                                            (str "printf '" (str/join " " (map (fn [b] (str "0x" (hex2 b))) bytes))
+                                                 "' | /opt/homebrew/opt/llvm/bin/llvm-mc --disassemble -triple=x86_64 2>/dev/null"))))]
+    (->> (str/split-lines said)
+         (map str/trim)
+         (remove (fn [line] (or (str/blank? line) (str/starts-with? line "."))))
+         (mapv (fn [line] (str/replace line "\t" " "))))))
+
+;; What serve knows, asked without telling the listeners (this is one).
+
+(defn- fetch [path]
+  (json/read-json (api/request :get path)))
+
+(defn- fetch-lines [path body]
+  (mapv json/read-json (remove str/blank? (str/split-lines (or (api/request :post path body) "")))))
+
+(defn- fault-said [details]
+  (str (:kind details) " " (:node details)
+       (when (and (:duration_ns details) (pos? (:duration_ns details)))
+         (str " " (quot (:duration_ns details) 1000000) " ms"))))
+
+(defn- marks-of
+  "The run's faults and crashes and each timeline's first failed assertion; of `timeline` alone
+  when one is given (a run's are many: a query answers the first thousands)."
+  [run timeline]
+  (let [found (fn [condition limit]
+                (fetch-lines (str "/runs/" run "/query")
+                             (cond-> {:condition condition :limit limit}
+                               (some? timeline) (assoc :branch timeline))))
+        first-failed (vals (reduce (fn [seen event]
+                                     (if (contains? seen (:branch event)) seen (assoc seen (:branch event) event)))
+                                   {} (found "assert.type=always assert.condition=false" 2000)))]
+    (concat (map (fn [event] {:timeline (:branch event) :at-ns (:vtime_ns event) :kind :fault
+                              :what (fault-said (get-in event [:event :details]))})
+                 (found "event=fault" 4000))
+            (map (fn [event] {:timeline (:branch event) :at-ns (:vtime_ns event) :kind :crash
+                              :what (str (get-in event [:event :details :process]) " " (get-in event [:event :details :signal]))})
+                 (found "event=core_dump" 1000))
+            (map (fn [event] {:timeline (:branch event) :at-ns (:vtime_ns event) :kind :failure
+                              :what (get-in event [:event :assert :message])})
+                 first-failed)
+            (map (fn [event] {:timeline (:branch event) :at-ns (:vtime_ns event) :kind :checkpoint
+                              :what (get-in event [:event :details :name])})
+                 (found "event=session_checkpoint" 200)))))
+
+(defn refresh!
+  "The shown run's timelines and marks, as serve has them now: the run's, those of each timeline
+  the REPL looked at, and what its last query found."
+  []
+  (when-let [run (:run @state)]
+    (let [info (fetch (str "/runs/" run))
+          timelines (fetch (str "/runs/" run "/timelines"))
+          marks (distinct (concat (marks-of run nil)
+                                  (mapcat (fn [index] (marks-of run index)) (:looked @state))))]
+      (swap! state (fn [s]
+                     (assoc s
+                            :info info
+                            :timelines (if (map? timelines) [timelines] (vec timelines))
+                            ;; What the last query found, and checkpoints said before the
+                            ;; store has their session's events.
+                            :marks (vec (distinct (concat marks (filter (fn [mark] (contains? #{:found :checkpoint} (:kind mark))) (:marks s)))))
+                            :live (= "running" (:state info)))))))
+  nil)
+
+(defn- switch-run! [run]
+  (when (not= run (:run @state))
+    (swap! state assoc :run run :timelines [] :marks [] :visits [] :looked #{} :cursor nil :session nil :ghosts [] :planned nil)))
+
+(defn show-run!
+  "Shows run `run`: its multiverse, from serve."
+  [run]
+  (switch-run! run)
+  (refresh!))
+
+(defn- look!
+  "Shows `run` with `timeline` among those looked at: a row of its own, its marks."
+  [run timeline]
+  (switch-run! run)
+  (when (some? timeline)
+    (swap! state (fn [s] (assoc s :looked (conj (:looked s) timeline)))))
+  (refresh!))
+
+(defn- follow!
+  "A run still exploring: its timelines looked at again every two seconds until it ends."
+  [run]
+  (future
+    (loop []
+      (when (= run (:run @state))
+        (refresh!)
+        (when (:live @state)
+          (http/sleep-ms 2000)
+          (recur))))))
+
+(defn- moment-ns
+  "Where a session opened: its time, or its event's (the first matching, rewound)."
+  [{:keys [run branch at-vtime-ms until rewind-ms preceded-by not-preceded-by followed-by not-followed-by within]}]
+  (if at-vtime-ms
+    (* 1000000.0 at-vtime-ms)
+    (when until
+      (let [found (first (fetch-lines (str "/runs/" run "/query")
+                                      (cond-> {:condition until :branch branch :limit 1}
+                                        preceded-by (assoc :preceded_by preceded-by)
+                                        not-preceded-by (assoc :not_preceded_by not-preceded-by)
+                                        followed-by (assoc :followed_by followed-by)
+                                        not-followed-by (assoc :not_followed_by not-followed-by)
+                                        within (assoc :within within))))]
+        (when found
+          (max 0.0 (- (* 1.0 (:vtime_ns found)) (* 1000000.0 (or rewind-ms 0)))))))))
+
+;; A session's screen: the last `frame` event its timeline said (a game's board, as
+;; examples/jank-game and examples/flecs-game draw it), from the last one before its moment, then
+;; as it comes while the session is open (serve's /sessions/<id>/latest), drawn under the map.
+
+(defn- screen-frame-of
+  "A `frame` event as the screen shows it: its board, counts and moment; nil without a board."
+  [event]
+  (let [details (get-in event [:event :details])]
+    (when (string? (:board details))
+      {:board (:board details) :crates (:crates details) :score (:score details) :at-ns (:vtime_ns event)})))
+
+(defn- screen-follow!
+  "The screen of session `id`: the frame before its moment on `branch`, then its own as they
+  come, until it is no longer the session shown."
+  [run branch at-ns id]
+  (future
+    (let [before (when at-ns
+                   (last (fetch-lines (str "/runs/" run "/query")
+                                      {:condition "event=frame" :branch branch
+                                       :up_to_vtime (/ at-ns 1000000000.0) :limit 5000})))]
+      (when-let [frame (screen-frame-of before)]
+        (swap! state (fn [s] (if (= id (:id (:session s))) (assoc s :screen frame) s))))
+      (loop []
+        (when (= id (:id (:session @state)))
+          (let [said (try (api/request :get (str "/sessions/" id "/latest?event=frame")) (catch :default _ nil))]
+            (when (and (string? said) (not (str/blank? said)))
+              (when-let [frame (screen-frame-of (json/read-json said))]
+                (swap! state (fn [s] (if (= id (:id (:session s))) (assoc s :screen frame) s))))))
+          (http/sleep-ms 100)
+          (recur))))))
+
+(defn- heard
+  "What the client did: the map's state after it, and its part of the evaluation's card."
+  [kind data]
+  (cond
+    (= kind :session/open)
+    (do (swap! state (fn [s] (assoc s :ghosts (vec (remove (fn [g] (= (:index g) (:timeline data))) (:ghosts s))))))
+        (look! (:run data) (:branch data))
+        (let [at (moment-ns data)
+              session {:id (:session data) :timeline (:timeline data) :from (:branch data) :at-ns at
+                       :until (:until data) :rewind-ms (:rewind-ms data)}]
+          (swap! state (fn [s] (assoc s :cursor {:timeline (:branch data) :at-ns at} :session session
+                                      :looked (conj (:looked s) (:branch data))
+                                      :visits (conj (:visits s) {:timeline (:branch data) :at-ns at}))))
+          ;; Its screen (after the state names it: the follower stops once it no longer does).
+          (screen-follow! (:run data) (:branch data) at (:session data))
+          (swap! told conj [kind session])))
+
+    ;; A plan: the timeline it would be, a ghost row where it would leave, until it is opened.
+    (= kind :session/plan)
+    (do (look! (:run data) (:extends data))
+        (swap! state (fn [s] (assoc s :ghosts (conj (vec (remove (fn [g] (= (:index g) (:timeline data))) (:ghosts s)))
+                                                   {:index (:timeline data) :extends (:extends data) :ghost true
+                                                    :start_ns (* 1000000.0 (:at_vtime_ms data))
+                                                    :vtime_ns (* 1000000.0 (:at_vtime_ms data))
+                                                    :from_ns (* 1000000.0 (:from_vtime_ms data))}))))
+        (swap! told conj [kind data]))
+
+    (= kind :session/close)
+    (do (swap! state assoc :cursor nil :session nil :screen nil)
+        (refresh!)
+        (swap! told conj [kind data]))
+
+    ;; A run planned: the map shows its imagined first timelines, setups only, until it starts.
+    (= kind :run/plan)
+    (do (swap! state assoc :run nil :info nil :marks [] :visits [] :looked #{} :cursor nil :session nil
+               :ghosts [] :planned data
+               :timelines (mapv (fn [setup] {:index (:index setup) :ghost true :setup true :start_ns 0 :vtime_ns 0})
+                                (:setups data)))
+        (swap! told conj [kind data]))
+
+    (= kind :run/start)
+    (do (show-run! (:run data))
+        (follow! (:run data))
+        (swap! told conj [kind data]))
+
+    (= kind :run/done)
+    (do (show-run! (:run data))
+        (swap! told conj [kind data]))
+
+    (= kind :replay)
+    (do (look! (:run data) (:branch (:request data)))
+        (let [request (:request data)
+              at (moment-ns {:run (:run data) :branch (:branch request) :at-vtime-ms (:at_vtime_ms request)
+                             :until (:until request) :rewind-ms (:rewind_ms request)})]
+          (swap! state (fn [s] (assoc s :looked (conj (:looked s) (:branch request))
+                                      :visits (conj (:visits s) {:timeline (:branch request) :at-ns at}))))
+          (swap! told conj [kind (assoc data :at-ns at)])))
+
+    (= kind :query)
+    (do (look! (:run data) (:branch (:request data)))
+        ;; A few events found: their timelines are looked at too (a crash's, a failure's).
+        (when (<= (count (:events data)) 3)
+          (doseq [event (:events data)]
+            (look! (:run data) (:branch event))))
+        (swap! state (fn [s]
+                       (assoc s
+                              :looked (if (some? (:branch (:request data))) (conj (:looked s) (:branch (:request data))) (:looked s))
+                              :marks (vec (concat (remove (fn [mark] (= :found (:kind mark))) (:marks s))
+                                                    (map (fn [event] {:timeline (:branch event) :at-ns (:vtime_ns event) :kind :found})
+                                                         (:events data)))))))
+        (swap! told conj [kind data]))
+
+    ;; Its flag at once: the session's events reach serve's store when it ends.
+    (= kind :checkpoint)
+    (do (swap! state (fn [s] (assoc s :marks (vec (distinct (conj (:marks s)
+                                                                   {:timeline (:timeline data) :kind :checkpoint
+                                                                    :at-ns (:vtime_ns (:checkpoint data))
+                                                                    :what (:name (:checkpoint data))}))))))
+        (swap! told conj [kind data]))
+
+    (or (= kind :sql) (= kind :properties))
+    (do (show-run! (:run data))
+        (swap! told conj [kind data]))
+
+    :else
+    (swap! told conj [kind data]))
+  nil)
+
+;; A card: an evaluation's code, how it is shown (:view), and what that view shows.
+
+(defn- last-told [kind happened]
+  (second (last (filter (fn [[k _]] (= k kind)) happened))))
+
+(defn- previous-of
+  "The last card of `view` before this one (what a value was: its before)."
+  [cards view]
+  (last (filter (fn [c] (= view (:view c))) cards)))
+
+(defn- nearby-faults
+  "The faults of the session's timeline in the second before its moment."
+  [s session]
+  (when (:at-ns session)
+    (->> (:marks s)
+         (filter (fn [mark] (and (= :fault (:kind mark)) (= (:timeline mark) (:from session))
+                                 (<= (:at-ns mark) (:at-ns session))
+                                 (> (:at-ns mark) (- (:at-ns session) 1000000000.0)))))
+         (take-last 3)
+         (mapv (fn [mark] (str (seconds (:at-ns mark)) "  " (:what mark)))))))
+
+(defn- said-of [value]
+  (if (string? value) value (pr-str value)))
+
+(defn- brief
+  "A value as a card holds it: its text, cut where no card is wide enough to show more (an
+  analysis's details are megabytes, measured again every frame otherwise)."
+  [value]
+  (let [said (said-of value)]
+    (if (> (count said) 240) (str (subs said 0 240) "…") said)))
+
+(defn- brief-row [row]
+  (into {} (map (fn [[k v]] [k (brief v)]) row)))
+
+(def ^:private columns 100)
+
+(defn- pretty
+  "A value as EDN lines: on one line when it fits `columns` from `indent`, else a map a key a
+  line and a collection an element a line, what they hold likewise; a text too long is cut."
+  [value indent]
+  (let [flat (pr-str value)
+        pad (apply str (repeat indent " "))
+        room (max 12 (- columns indent))
+        broken (fn [open close parts]
+                 ;; Each part: the lines of one key and its value, or of one element.
+                 (let [lines (vec (apply concat
+                                         (map-indexed (fn [i part]
+                                                        (cons (str pad (if (zero? i) open " ") (first part)) (rest part)))
+                                                      parts)))]
+                   (conj (vec (butlast lines)) (str (last lines) close))))]
+    (cond
+      (<= (count flat) room) [(str pad flat)]
+      (and (map? value) (seq value))
+      (broken "{" "}" (map (fn [[k v]]
+                             (let [said (pr-str k)
+                                   inner (pretty v (+ indent 2 (count said)))]
+                               (cons (str said " " (str/triml (first inner))) (rest inner))))
+                           value))
+      (and (or (sequential? value) (set? value)) (seq value))
+      (broken (if (vector? value) "[" (if (set? value) "#{" "(")) (if (vector? value) "]" (if (set? value) "}" ")"))
+              (map (fn [item]
+                     (let [inner (pretty item (+ indent 1))]
+                       (cons (str/triml (first inner)) (rest inner))))
+                   value))
+      :else [(str pad (subs flat 0 (dec room)) "…")])))
+
+(defn- pretty-lines
+  "`value` as EDN, `most` lines of it at most."
+  [value most]
+  (let [lines (pretty value 0)]
+    (if (> (count lines) most)
+      (conj (vec (take (dec most) lines)) "…")
+      lines)))
+
+(defn- plain?
+  "A value of one piece: nothing, a number, a word."
+  [value]
+  (or (nil? value) (number? value) (boolean? value) (keyword? value) (symbol? value)
+      (and (string? value) (not (str/includes? value "\n")))))
+
+(defn- frame-of
+  "A crash's frame as it is shown: its place's last two parts when it is a path from the root
+  (a library's), whole when it is the program's own (relative), which is what `:own` says."
+  [frame]
+  (let [at (str (:at frame))
+        own (and (not (str/starts-with? at "/")) (not (str/includes? at "+0x")) (str/includes? at ":"))
+        parts (str/split at #"/")]
+    {:at (if (str/starts-with? at "/") (str/join "/" (take-last 2 parts)) at) :own own}))
+
+(defn- shaped
+  "A value's view: numbers as bars, rows as a table, a flat map as its keys and values, a
+  nested one as EDN, text as lines, a number or a word as it prints; none for nil."
+  [value]
+  (cond
+    (nil? value) nil
+    ;; A crash's stack (the crash_stack event's details): where it crashed.
+    (and (map? value) (vector? (:frames value)) (contains? value :rip))
+    {:view :stack :process (:process value) :signal (:signal value) :fault (:fault_address value)
+     :frames (mapv frame-of (take 10 (:frames value)))}
+    (and (map? value) (contains? value :rip)) {:view :registers :registers value}
+    (and (vector? value) (seq value) (every? number? value)) {:view :numbers :numbers value}
+    (and (sequential? value) (seq value) (every? map? value)
+         (every? (fn [row] (every? plain? (vals row))) value)) {:view :table :rows (mapv brief-row (take 8 value))
+                                                                :count (count value)}
+    (and (map? value) (seq value) (every? plain? (vals value)))
+    {:view :table :rows (mapv (fn [[k v]] {:key (if (keyword? k) (name k) (str k)) :value (brief v)}) value)}
+    (and (sequential? value) (seq value) (every? string? value)) {:view :lines :lines (mapv brief (take-last 8 value))}
+    (and (string? value) (str/includes? value "\n")) {:view :lines :lines (mapv brief (take-last 8 (str/split-lines value)))}
+    (plain? value) {:view :value :said (brief value)}
+    :else {:view :edn :lines (pretty-lines value 16)}))
+
+;; A run's draws (determinismo.api's draw-split and draw-sets): a row a label, its values side
+;; by side, each a bar; in a split, the failing timelines' share (red) over the others' (blue),
+;; the labels where they differ most first.
+
+(defn- value-said [v] (str (:drew v)))
+
+(defn- choice-label?
+  "A label a card shows: options, or a range of a few values (a duration's nanoseconds, each
+  draw its own value, says nothing drawn as bars)."
+  [label]
+  (or (= "options" (:kind label)) (and (some? (:count label)) (<= (:count label) 16))))
+
+(defn- draw-split-view [split]
+  (let [failing (max 1 (or (:failing split) 0))
+        passing (max 1 (or (:passing split) 0))
+        rated (mapv (fn [label]
+                      (let [values (mapv (fn [v] (assoc v :failing-share (/ (* 1.0 (:failing v)) failing)
+                                                        :passing-share (/ (* 1.0 (:passing v)) passing)))
+                                         (:values label))
+                            apart (apply max 0.0 (map (fn [v] (abs (- (:failing-share v) (:passing-share v)))) values))]
+                        (assoc label :values values :apart apart)))
+                    (filter choice-label? (:labels split)))]
+    {:view :draw-split :property (:property split) :failing (:failing split) :passing (:passing split)
+     :labels (vec (take 6 (reverse (sort-by :apart rated))))}))
+
+(defn- draw-sets-view [sets]
+  (let [total (fn [label] (apply + (map :timelines (:values label))))]
+    {:view :draw-sets
+     :labels (mapv (fn [label]
+                     (let [n (max 1 (total label))]
+                       (assoc label :values (mapv (fn [v] (assoc v :passing-share (/ (* 1.0 (:timelines v)) n)))
+                                                  (:values label)))))
+                   (take 6 (filter choice-label? (:labels sets))))}))
+
+;; A run's plan: what it is, the run like it, and its imagined first timelines' setups (each
+;; label's values across them, as bars); the map shows them as setups, no length, no outcome.
+
+(defn- run-plan-view [planned]
+  (let [setups (:setups planned)
+        by-name (group-by :name (mapcat :draws setups))
+        labels (vec (for [[name draws] (take 5 (sort-by first by-name))
+                          :let [counts (frequencies (map (fn [d] (str (:drew d))) draws))
+                                n (max 1 (count draws))]]
+                      {:name name
+                       :values (mapv (fn [[drew k]] {:drew drew :passing-share (/ (* 1.0 k) n)})
+                                     (sort-by first counts))}))]
+    {:view :run-plan
+     :lines [(str "a run of " (last (str/split (str (:program planned)) #"/"))
+                  (when (:scenario planned) (str " " (:scenario planned)))
+                  (when (:time_budget planned) (str " for " (:time_budget planned)))
+                  (when (:decide planned) (str ", fixed " (:decide planned))) ", seed " (:seed planned))
+             (if-let [like (:like planned)]
+               (str "about " (:timelines_expected planned) " timelines (run " (:run like) ": " (:timelines like)
+                    " in " (or (:budget like) (str (:branches like) " branches")) ")")
+               "no run like it yet")
+             (str (count setups) " first timelines' setups imagined, " (count by-name) " choices each:")]
+     :labels labels}))
+
+;; A session's plan: its moment as the run recorded it (the faults on then, each node's last
+;; start or end, what failed in the seconds before, the choices made by then, its frame), then
+;; what opening it costs.
+
+(defn- plan-view [planned]
+  (let [at (fn [ns] (seconds (* 1.0 ns)))
+        faults (mapv (fn [f] [:fault (str (at (:vtime_ns f)) "  " (:kind f) " " (or (:node f) "")
+                                          (when (:peer f) (str " " (:peer f)))
+                                          (when (:duration_ns f) (str " " (quot (:duration_ns f) 1000000) " ms")))])
+                     (take 3 (:faults planned)))
+        nodes [:node (str/join "   " (map (fn [n] (str (:node n) " " (str/replace (str (:state n)) "node_" ""))) (:nodes planned)))]
+        failures (mapv (fn [f] [:failure (str (at (:vtime_ns f)) "  " (:kind f) " " (or (:what f) ""))]) (take 2 (:failures planned)))
+        draws [:draw (str/join "  " (map (fn [d] (str (:name d) "=" (:drew d))) (take 5 (:draws planned))))]]
+    {:view :plan
+     :title (str "timeline #" (:timeline planned) ", from #" (:extends planned) " at " (seconds (* 1000000.0 (:at_vtime_ms planned))))
+     :rows (vec (concat faults
+                        (when (seq (:nodes planned)) [nodes])
+                        failures
+                        (when (seq (:draws planned)) [draws])))
+     :board (get-in planned [:frame :board])
+     :cost (str "opening it replays " (seconds (* 1000000.0 (:replay_ms planned))) " from "
+                (if (= "boot" (:from planned)) "boot" (str "its snapshot at " (seconds (* 1000000.0 (:from_vtime_ms planned)))))
+                (when (some? (:wall_ms planned)) (str ", about " (seconds (* 1000000.0 (:wall_ms planned))))))}))
+
+(defn- memory-before
+  "The bytes the last card of `address` showed."
+  [cards address]
+  (:bytes (last (filter (fn [c] (and (= :memory (:view c)) (= (:address c) address))) cards))))
+
+(defn- card-of
+  "The card of an evaluation: `code`, its `value` (or `error`), what the client did meanwhile.
+  None when it answered nil and did nothing to show."
+  [s code value error happened]
+  (let [session (last-told :session/open happened)
+        closed (last-told :session/close happened)
+        poke (last-told :poke happened)
+        mem (last-told :mem happened)
+        regs (last-told :regs happened)
+        sh (last-told :sh happened)
+        step (last-told :step happened)
+        query (last-told :query happened)
+        replay (last-told :replay happened)
+        translate (last-told :translate happened)
+        started (last-told :run/start happened)
+        planned (last-told :session/plan happened)
+        run-planned (last-told :run/plan happened)
+        imagined (last-told :run/imagined happened)
+        checked (last-told :run/check happened)
+        split (last-told :draw/split happened)
+        sets (last-told :draw/sets happened)
+        drawn (last-told :draws happened)
+        value (if (var? value) (deref value) value)
+        now (:session s)
+        context (cond session (str "timeline #" (:from session) (when (:at-ns session) (str " at " (seconds (:at-ns session)))))
+                      replay (str "timeline #" (:branch (:request replay)) (when (:at-ns replay) (str " at " (seconds (:at-ns replay)))))
+                      now (str "session " (:id now) (when (:timeline now) (str " · timeline #" (:timeline now))))
+                      :else nil)
+        cards (:cards s)
+        view
+        (cond
+       error {:view :error :said error}
+       poke (let [was (memory-before cards (:address poke))]
+              {:view :memory :address (:address poke) :bytes (:bytes poke) :was was :poked true
+               :instructions (instructions (:bytes poke))
+               :instructions-before (when was (vec (take 1 (instructions was))))})
+       mem (let [was (memory-before cards (:address mem))]
+             {:view :memory :address (:address mem) :bytes (:bytes mem) :was (when (not= was (:bytes mem)) was)
+              :instructions (instructions (:bytes mem))})
+       regs {:view :registers :registers (:regs regs) :was (:registers (previous-of cards :registers))}
+       (and session (not sh) (not step)) {:view :session :session session :faults (nearby-faults s session)}
+       (and started (plain? value)) {:view :note :said (str "run " (:run started) " started")}
+       (and closed (or (nil? value) (and (map? value) (contains? value :done))))
+       {:view :note :said (str "session " (:session closed) " ended"
+                               (when (:timeline closed) (str ": timeline #" (:timeline closed) " of the run")))}
+       (and query (seq (:events query)) (= value (:events query)))
+       {:view :events
+        :events (mapv (fn [event] {:timeline (:branch event) :at-ns (:vtime_ns event)
+                                   :lines (pretty-lines (:event event) 10)})
+                      (take 3 (:events query)))
+        :count (count (:events query))}
+       (and translate (plain? value))
+       {:view :translate :virtual (:virtual translate) :physical (:physical translate)}
+       run-planned (run-plan-view run-planned)
+       imagined {:view :table :count (count (:draws (:setup imagined)))
+                 :rows (mapv (fn [d] {:choice (:name d) :drew (str (:drew d)) :fixed (if (:fixed d) "yes" "")})
+                             (take 8 (:draws (:setup imagined))))}
+       checked {:view :lines
+                :lines (vec (concat [(str (:matched checked) " of " (:choices checked) " choices as imagined, in "
+                                          (- (count (:timelines checked)) (:pending checked)) " timelines"
+                                          (when (pos? (:pending checked)) (str ", " (:pending checked) " still running")))]
+                                    (for [t (:timelines checked) p (take 1 (:parted t))]
+                                      (str "#" (:index t) " " (:name p) ": imagined " (:imagined p) ", drew " (:drew p)))))}
+       planned (plan-view planned)
+       split (draw-split-view split)
+       sets (draw-sets-view sets)
+       drawn {:view :table :count (count (:draws drawn))
+              :rows (mapv (fn [d] {:name (:name d) :drew (str (:drew d))
+                                   :part (:part d) :after (seconds (* 1.0 (:after_ns d)))
+                                   :steered (if (:overridden d) "yes" "")})
+                          (take 8 (:draws drawn)))}
+       (and sh (string? value)) {:view :lines :lines (mapv brief (take-last 8 (str/split-lines value)))}
+       (and step (string? value)) {:view :lines
+                                   :lines (->> (str/split-lines value)
+                                               (remove (fn [line] (or (str/blank? line) (str/starts-with? line "[guest @"))))
+                                               (take-last 8)
+                                               (mapv brief))}
+       :else (let [view (shaped value)]
+               (if (= :numbers (:view view))
+                 (assoc view :was (:numbers (previous-of cards :numbers)))
+                 view)))]
+    (when view
+      (merge {:code code :context context} view))))
+
+(defn evaluated!
+  "An evaluation ended: its card, last in the feed."
+  [code value error]
+  (let [happened @told
+        value (if (var? value) (deref value) value)]
+    (reset! told [])
+    (when-not (or (str/blank? code) (and (fn? value) (empty? happened)))
+      (swap! state (fn [s]
+                     (if-let [made (card-of s code value error happened)]
+                       (assoc s :cards (vec (take-last 400 (conj (:cards s) made))))
+                       s))))
+    nil))
+
+(defn show
+  "A value on a card of its own (the REPL's results go there by themselves)."
+  ([value] (show "value" value))
+  ([said value]
+   (swap! state (fn [s] (assoc s :cards (conj (:cards s) (merge {:code said} (or (shaped value) {:view :note :said (pr-str value)}))))))
+   value))
+
+(defn clear!
+  "No cards."
+  []
+  (swap! state assoc :cards [])
+  nil)
+
+(defn listen!
+  "The client's calls shown from now on."
+  []
+  (tap/listen! (fn [kind data] (heard kind data))))
+
+;; Drawing. Points from the window's top left.
+
+(defn- box!
+  "A panel: its title over a rule; where its content starts (y)."
+  [x y width height what]
+  (rect! x y (+ x width) (+ y height) card 1.0 6.0)
+  (frame! x y (+ x width) (+ y height) rule 1.0)
+  (text! (+ x 14) (+ y 10) ink serif what)
+  (line! (+ x 14) (+ y 34) (- (+ x width) 14) (+ y 34) rule 1.0)
+  (+ y 44))
+
+(defn- draw-header [s width]
+  (let [info (:info s)
+        request (:request info)
+        run (:run s)
+        planned (:planned s)
+        said (cond run (str "Run " run (when (:scenario request) (str " · " (:scenario request))))
+                   planned (str "A run planned" (when (:scenario planned) (str " · " (:scenario planned))))
+                   :else "determinismo")]
+    (text! 32 22 ink title said)
+    (when info
+      (let [now (str (:state info))]
+        (text! (+ 44 (text-width title said)) 34 (if (= now "failed") red (if (= now "running") blue green)) small (str/upper-case now)))
+      (text! 32 60 muted small
+             (clip small (- width 64)
+                   (str (last (str/split (str (or (:program_asked request) (:compose request) "")) #"/"))
+                        (when (:profile request) (str " · profile " (:profile request)))
+                        (when (some? (:seed request)) (str " · seed " (:seed request)))))))
+    (line! 32 84 (- width 32) 84 ink 1.5)))
+
+(defn- rows-of
+  "The timelines with a row: the explored ones, and of the sessions' those the REPL is at or
+  looked at (and what they extend). The others are ticks where they left."
+  [s]
+  (let [timelines (:timelines s)
+        by-index (into {} (map (fn [t] [(:index t) t]) timelines))
+        wanted (concat (:looked s) (when (some? (:timeline (:session s))) [(:timeline (:session s))]))
+        kept (loop [found #{} left wanted]
+               (if (empty? left)
+                 found
+                 (let [index (first left)
+                       t (get by-index index)]
+                   (if (or (nil? t) (contains? found index))
+                     (recur found (rest left))
+                     (recur (conj found index) (concat (rest left) (when (some? (:extends t)) [(:extends t)])))))))]
+    (vec (sort-by :index (filter (fn [t] (or (nil? (:extends t)) (contains? kept (:index t)))) timelines)))))
+
+(defn- view-of
+  "The stretch of virtual time the map shows: every timeline; with moments looked at or found
+  by a query, those and what is near them."
+  [s shown]
+  (let [ends (map :vtime_ns (:timelines s))
+        latest (* 1.0 (if (seq ends) (apply max ends) 1000000000))
+        short (filter :extends shown)
+        cursor (:cursor s)
+        points (map (fn [point] (* 1.0 point))
+                    (remove nil? (concat (map :start_ns short) (map :vtime_ns short) (map :at-ns (:visits s))
+                                         (map :at-ns (filter (fn [mark] (= :found (:kind mark))) (:marks s)))
+                                         (when (:at-ns cursor) [(:at-ns cursor)]))))]
+    (if (seq points)
+      (let [from (apply min points)
+            to (apply max points)
+            pad (max 200000000.0 (/ (- to from) 3.0) (/ latest 20.0))]
+        [(max 0.0 (- from pad)) (min (+ latest pad) (+ to pad))])
+      [0.0 latest])))
+
+(defn- draw-marks
+  "A timeline's marks on its row at `ty`: faults, crashes, its first failure, what a query
+  found, the moments looked at."
+  [s index ty at-x from to large]
+  (doseq [mark (:marks s)]
+    (when (and (= index (:timeline mark)) (>= (:at-ns mark) from) (<= (:at-ns mark) to))
+      (let [mx (at-x (:at-ns mark))
+            kind (:kind mark)]
+        (cond
+          (= kind :fault) (when large (rect! (- mx 1.5) (- ty 5) (+ mx 1.5) (+ ty 5) orange 0.85 0.0))
+          (= kind :failure) (circle! mx ty (if large 5.0 2.0) red 1.0)
+          (= kind :crash) (when large
+                            (line! (- mx 6) (- ty 6) (+ mx 6) (+ ty 6) red 2.5)
+                            (line! (- mx 6) (+ ty 6) (+ mx 6) (- ty 6) red 2.5))
+          (= kind :found) (when large (ring! mx ty 7.0 blue 2.0))
+          ;; A session's checkpoint: a flag where a session can come back to.
+          (= kind :checkpoint) (when large
+                                 (line! mx (- ty 8) mx (+ ty 6) green 2.0)
+                                 (rect! mx (- ty 8) (+ mx 7) (- ty 3) green 1.0 0.0))))))
+  (when large
+    (doseq [visit (:visits s)]
+      (when (and (= index (:timeline visit)) (:at-ns visit))
+        (line! (at-x (:at-ns visit)) (- ty 7) (at-x (:at-ns visit)) (+ ty 7) ink 1.0)))))
+
+(defn- draw-map
+  "The multiverse: a row a timeline, where each left the one before it, faults, crashes and
+  failures on them, the moments looked at, the session's. Many timelines are thin rows, and
+  those the REPL looked at are drawn again below them, large. Returns where it ends (y)."
+  [s0 x y width]
+  (let [ghosts (:ghosts s0)
+        s (assoc s0 :timelines (vec (concat (:timelines s0) ghosts)) :looked (into (set (:looked s0)) (map :index ghosts)))
+        timelines (rows-of s)
+        n (count timelines)
+        row (cond (<= n 6) 30.0 (<= n 12) 20.0 (<= n 30) 11.0 :else (/ 300.0 n))
+        large (>= row 11.0)
+        by-index (into {} (map (fn [t] [(:index t) t]) timelines))
+        focus (if large [] (vec (take 3 (filter (fn [index] (contains? by-index index)) (sort (:looked s))))))
+        dense (max 40.0 (* row (max 1 n)))
+        height (+ dense (* 34 (count focus)))
+        [from to] (view-of s timelines)
+        span (max 1.0 (- to from))
+        left (+ x 14)
+        right (- (+ x width) 104)
+        at-x (fn [ns] (+ left (* (- right left) (/ (max 0.0 (min span (- (* 1.0 ns) from))) span))))
+        rows (into {} (map-indexed (fn [i t] [(:index t) (+ y 46 (* row i) (/ row 2.0))]) timelines))
+        focus-rows (into {} (map-indexed (fn [i index] [index (+ y 46 dense 17 (* 34 i))]) focus))
+        all (count (:timelines s0))
+        sessions (count (filter :extends (:timelines s0)))]
+    (box! x y width (+ height 78)
+          (str "Multiverse · " all (if (= all 1) " timeline" " timelines")
+               (when (pos? sessions) (str ", " sessions " from sessions"))
+               (when (:live s) " · exploring")))
+    (doseq [t timelines]
+      (let [ty (get rows (:index t))
+            start (or (:start_ns t) 0)
+            color (cond (seq (:failing t)) red (some? (:extends t)) blue :else green)
+            parent (if (some? (:extends t)) (:extends t) (:parent t))
+            branched (and (some? parent) (contains? rows parent) (>= start from) (<= start to))]
+        (when (:ghost t)
+          ;; A planned timeline: dashed from where it would leave, and what it would replay of
+          ;; the one it extends bracketed above that one's row.
+          (let [gx (at-x start)
+                py (get rows parent)]
+            (doseq [i (range 8)]
+              (line! (+ gx 14 (* 10 i)) ty (+ gx 19 (* 10 i)) ty muted 2.0))
+            (when py
+              (curve! gx py (+ gx 14) ty muted 1.5)
+              (line! (at-x (max from (:from_ns t))) (- py 9) gx (- py 9) muted 1.0)
+              (line! (at-x (max from (:from_ns t))) (- py 12) (at-x (max from (:from_ns t))) (- py 6) muted 1.0))
+            (text! (+ right 8) (- ty 7) muted small (str "#" (:index t) (if (:setup t) " setup" " planned")))))
+        (when (and (not (:ghost t)) (<= start to) (>= (:vtime_ns t) from))
+          (when branched
+            (if large
+              (do (curve! (at-x start) (get rows parent) (+ (at-x start) 14) ty color 1.5)
+                  (ring! (at-x start) (get rows parent) 4.0 ink 1.5))
+              (line! (at-x start) (get rows parent) (at-x start) ty color 1.0)))
+          (line! (if (and branched large) (+ (at-x start) 14) (at-x start)) ty
+                 (max (+ (at-x start) (if large 16 1)) (at-x (:vtime_ns t))) ty color (if large 2.0 1.0))
+          (when large
+            (text! (+ right 8) (- ty 7) (if (some? (:extends t)) blue muted) small
+                   (str "#" (:index t) (when (some? (:extends t)) " session")))))))
+    (doseq [t (:timelines s)]
+      (when (and (some? (:extends t)) (not (contains? rows (:index t))) (contains? rows (:extends t))
+                 (>= (or (:start_ns t) 0) from) (<= (or (:start_ns t) 0) to))
+        (let [tx (at-x (or (:start_ns t) 0))
+              ty (get (if (contains? focus-rows (:extends t)) focus-rows rows) (:extends t))]
+          (line! tx ty tx (+ ty 9) blue 1.5))))
+    (doseq [t timelines]
+      (draw-marks s (:index t) (get rows (:index t)) at-x from to large))
+    (doseq [index focus]
+      (let [t (get by-index index)
+            ty (get focus-rows index)
+            color (if (seq (:failing t)) red green)]
+        (line! (at-x (max from (or (:start_ns t) 0))) ty (at-x (:vtime_ns t)) ty color 2.0)
+        (text! (+ right 8) (- ty 7) ink small (str "#" index))
+        (draw-marks s index ty at-x from to true)))
+    (when-let [cursor (:cursor s)]
+      (when-let [ty (or (get focus-rows (:timeline cursor)) (get rows (:timeline cursor)))]
+        (when (:at-ns cursor)
+          (let [cx (at-x (:at-ns cursor))
+                pulse (+ 7.0 (* 2.5 (cpp/sin (* 4.0 (cpp/detviz.seconds)))))]
+            (line! cx (+ y 42) cx (+ y 50 height) ink 1.0)
+            (circle! cx ty 4.5 ink 1.0)
+            (ring! cx ty pulse ink 1.5)
+            (text! (+ cx 8) (+ y 36) ink small (seconds (:at-ns cursor)))))))
+    (text! left (+ y 56 height) muted small (seconds from))
+    (text! (- right (text-width small (seconds to))) (+ y 56 height) muted small (seconds to))
+    (+ y height 78 14)))
+
+;; Each card's body: its height, and its drawing at (x, y).
+
+(defn- lines-shown [c] (vec (take-last 8 (:lines c))))
+
+(def ^:private register-order
+  [:rip :rsp :rbp :rflags :cr3 :rax :rbx :rcx :rdx :rsi :rdi :r8 :r9 :r10 :r11 :r12 :r13 :r14 :r15])
+
+(defn- registers-shown
+  "The registers in the order they are read in, then any other."
+  [c]
+  (let [registers (:registers c)
+        known (filter (fn [k] (string? (get registers k))) register-order)
+        others (remove (fn [k] (some (fn [o] (= o k)) register-order))
+                       (map first (filter (fn [[_ v]] (string? v)) registers)))]
+    (mapv (fn [k] [k (get registers k)]) (concat known others))))
+
+(defn- body-height [c]
+  (let [view (:view c)]
+    (cond
+      (= view :session) (* 22 (+ 2 (if (:until (:session c)) 1 0) (count (:faults c))))
+      (= view :registers) (* 22 (quot (+ 1 (count (registers-shown c))) 2))
+      (= view :memory) (+ 44 (if (:was c) 22 0)
+                          (if (seq (:instructions-before c)) 16 0)
+                          (* 20 (max (count (:instructions c)) (count (:instructions-before c)))))
+      (= view :lines) (* 20 (max 1 (count (lines-shown c))))
+      (= view :table) (+ 20 (* 20 (min 8 (count (:rows c)))) (if (> (or (:count c) 0) 8) 20 0))
+      (= view :edn) (* 20 (count (:lines c)))
+      (= view :stack) (+ 28 (* 20 (count (:frames c))))
+      (= view :events) (+ (apply + (map (fn [event] (+ 26 (* 20 (count (:lines event))))) (:events c)))
+                          (if (> (:count c) (count (:events c))) 20 0))
+      (= view :numbers) 100
+      (= view :plan) (+ 22 (* 20 (count (:rows c))) (if (:board c) 168 0) 26)
+      (= view :run-plan) (+ (* 20 (count (:lines c))) 6 (* 44 (count (:labels c))))
+      (= view :draw-split) (+ 24 (* 44 (count (:labels c))))
+      (= view :draw-sets) (* 44 (count (:labels c)))
+      (= view :error) 22
+      :else 28)))
+
+(defn- draw-session [c x y width]
+  (let [session (:session c)
+        rows (concat
+              [["timeline" (str "#" (:from session) (when (:timeline session) (str "   its own from here: #" (:timeline session))))]
+               ["moment" (if (:at-ns session) (seconds (:at-ns session)) "")]]
+              (when (:until session)
+                [["found by" (str (:until session) (when (:rewind-ms session) (str "   − " (:rewind-ms session) " ms")))]])
+              (map (fn [fault] ["fault" fault]) (:faults c)))]
+    (doseq [[i [k v]] (map-indexed vector rows)]
+      (text! x (+ y (* 22 i)) (if (= k "fault") orange muted) mono k)
+      (text! (+ x 96) (+ y (* 22 i)) ink mono (clip mono (- width 96) v)))))
+
+(defn- draw-registers [c x y width]
+  (let [was (:was c)
+        shown (registers-shown c)
+        half (max 1 (quot (+ 1 (count shown)) 2))
+        column (quot width 2)]
+    (doseq [[i [k v]] (map-indexed vector shown)]
+      (let [cx (+ x (* column (quot i half)))
+            cy (+ y (* 22 (mod i half)))
+            before (get was k)
+            changed (and before (not= before v))]
+        (text! cx cy (if changed red muted) mono (name k))
+        (text! (+ cx 56) cy (if changed red ink) mono v)
+        (when changed
+          (text! (+ cx 66 (text-width mono v)) (+ cy 2) muted small (str "was " before)))))))
+
+(defn- draw-bytes [x y bytes was]
+  (doseq [[i byte] (map-indexed vector (take 16 bytes))]
+    (let [bx (+ x (* 54 i))
+          changed (and was (< i (count was)) (not= byte (nth was i)))]
+      (rect! bx y (+ bx 44) (+ y 28) (if changed red paper) (if changed 0.16 1.0) 4.0)
+      (frame! bx y (+ bx 44) (+ y 28) (if changed red rule) 1.0)
+      (text! (+ bx 11) (+ y 4) (if changed red ink) big (hex2 byte))
+      (when changed
+        (text! (+ bx 2) (+ y 32) muted small (str "was " (hex2 (nth was i))))))))
+
+(defn- draw-memory [c x y width]
+  (draw-bytes x y (:bytes c) (:was c))
+  (text! (- (+ x width) (text-width small (str (:address c)))) (+ y 8) muted small (str (:address c)))
+  (let [top (+ y 44 (if (:was c) 22 0))
+        before (vec (:instructions-before c))
+        both (seq before)
+        column (quot width 2)]
+    (when both
+      (text! x top muted small "before")
+      (text! (+ x column) top muted small "now"))
+    (doseq [[i line] (map-indexed vector (:instructions c))]
+      (let [differs (and both (not= line (get before i)))]
+        (text! (+ x (if both column 0)) (+ top (if both 16 0) (* 20 i)) (if differs red ink) mono
+               (clip mono (- column 10) line))))
+    (doseq [[i line] (map-indexed vector before)]
+      (text! x (+ top 16 (* 20 i)) muted mono (clip mono (- column 10) line)))))
+
+(defn- draw-lines [c x y width]
+  (doseq [[i line] (map-indexed vector (lines-shown c))]
+    (text! x (+ y (* 20 i))
+           (if (or (str/includes? line "Oops") (str/includes? line "panic") (str/includes? line "core_dump")
+                   (str/includes? line "Assertion failed"))
+             red
+             ink)
+           mono (clip mono width line))))
+
+(defn- draw-edn [lines x y width]
+  (doseq [[i line] (map-indexed vector lines)]
+    (text! x (+ y (* 20 i)) ink mono (clip mono width line))))
+
+(defn- draw-events
+  "A query's events, each under its timeline and moment, as EDN."
+  [c x y width]
+  (loop [at y left (:events c)]
+    (if (empty? left)
+      (when (> (:count c) (count (:events c)))
+        (text! x at muted small (str "… " (- (:count c) (count (:events c))) " more")))
+      (let [event (first left)]
+        (text! x at blue small (str "timeline #" (:timeline event) " at " (seconds (:at-ns event))))
+        (draw-edn (:lines event) x (+ at 20) width)
+        (recur (+ at 26 (* 20 (count (:lines event)))) (rest left))))))
+
+(defn- draw-stack
+  "Where a process crashed: its signal, the address at fault, its frames from the instruction
+  it stopped at outward; the program's own lines stand out, the first of them in red."
+  [c x y width]
+  (text! x y muted mono
+         (str (:process c) "   signal " (:signal c) (when (:fault c) (str "   fault at " (:fault c)))))
+  (let [first-own (first (keep-indexed (fn [i frame] (when (:own frame) i)) (:frames c)))]
+    (doseq [[i frame] (map-indexed vector (:frames c))]
+      (text! x (+ y 28 (* 20 i)) muted small (str "#" i))
+      (text! (+ x 34) (+ y 26 (* 20 i))
+             (cond (= i first-own) red (:own frame) ink :else muted)
+             mono (clip mono (- width 34) (:at frame))))))
+
+(defn- draw-table
+  "Rows under their columns' names: each column as wide as what it holds, the widest given
+  what the others leave."
+  [c x y width]
+  (let [rows (vec (take 8 (:rows c)))
+        columns (vec (take 5 (keys (first rows))))
+        said (fn [column] (if (keyword? column) (name column) (str column)))
+        natural (mapv (fn [column]
+                        (+ 18 (apply max (text-width small (said column))
+                                     (map (fn [row] (min 2000.0 (text-width mono (said-of (get row column))))) rows))))
+                      columns)
+        widest (if (seq natural) (apply max natural) 0)
+        others (- (apply + natural) widest)
+        widths (mapv (fn [w] (if (and (= w widest) (> (apply + natural) width)) (max 120.0 (- width others)) w)) natural)
+        offsets (vec (reductions + 0 widths))]
+    (doseq [[i column] (map-indexed vector columns)]
+      (text! (+ x (nth offsets i)) y muted small (said column)))
+    (doseq [[r row] (map-indexed vector rows)
+            [i column] (map-indexed vector columns)]
+      (text! (+ x (nth offsets i)) (+ y 20 (* 20 r)) ink mono
+             (clip mono (- (min (nth widths i) (- width (nth offsets i))) 10) (said-of (get row column)))))
+    (when (> (or (:count c) 0) 8)
+      (text! x (+ y 20 (* 20 (count rows))) muted small (str "… " (- (:count c) 8) " more")))))
+
+(defn- draw-numbers
+  "Numbers as bars, their sum beside them: what changed since the last ones marked (orange,
+  with what it was), a changed sum in red."
+  [c x y width]
+  (let [numbers (:numbers c)
+        n (count numbers)
+        was (when (= (count (:was c)) n) (:was c))
+        highest (max 1 (apply max (concat numbers was)))
+        slot (min 84.0 (/ (- width 150.0) (max 1 n)))
+        total (apply + numbers)
+        total-was (when was (apply + was))
+        differs (and was (not= total total-was))
+        floor (+ y 58)
+        sx (- (+ x width) 130)]
+    (doseq [[i value] (map-indexed vector numbers)]
+      (let [bx (+ x (* slot i))
+            before (when was (nth was i))
+            changed (and before (not= before value))
+            tall (* 52.0 (/ (* 1.0 value) highest))]
+        (rect! bx (- floor tall) (+ bx (- slot 10)) floor (if changed orange blue) (if changed 0.85 0.55) 2.0)
+        (when changed
+          (let [old (* 52.0 (/ (* 1.0 before) highest))]
+            (line! bx (- floor old) (+ bx (- slot 10)) (- floor old) ink 1.5)))
+        (text! bx (+ floor 4) (if changed orange ink) small (str value))
+        (when changed
+          (text! bx (+ floor 18) muted small (str "was " before)))))
+    (text! sx (+ y 6) muted small "sum")
+    (text! sx (+ y 22) (if differs red ink) big (str total))
+    (when differs
+      (text! sx (+ y 48) muted small (str "was " total-was)))))
+
+(defn- draw-draws
+  "A row a label: its name, then each value's bar (a split's two: failing in red over the others
+  in blue, a value the failures favor in red)."
+  [c x y width split]
+  (let [top (if split (+ y 22) y)
+        name-width 190.0]
+    (when split
+      (text! x y muted small (str (:failing c) " failing " (:property c) ", " (:passing c) " not")))
+    (doseq [[r label] (map-indexed vector (:labels c))]
+      (let [ry (+ top (* 44 r))
+            values (vec (take 8 (:values label)))
+            slot (min 90.0 (/ (- width name-width) (max 1 (count values))))]
+        (text! x (+ ry 10) ink mono (clip mono (- name-width 10) (str (:name label))))
+        (doseq [[i v] (map-indexed vector values)]
+          (let [bx (+ x name-width (* slot i))
+                floor (+ ry 26)
+                favored (and split (> (:failing-share v) (* 1.5 (:passing-share v))) (> (:failing-share v) 0.2))
+                passing-tall (* 24.0 (:passing-share v))]
+            (if split
+              (let [failing-tall (* 24.0 (:failing-share v))
+                    half (/ (- slot 12) 2.0)]
+                (rect! bx (- floor failing-tall) (+ bx half) floor red 0.8 2.0)
+                (rect! (+ bx half 2) (- floor passing-tall) (+ bx half half 2) floor blue 0.5 2.0))
+              (rect! bx (- floor passing-tall) (+ bx (- slot 12)) floor blue 0.55 2.0))
+            (text! bx (+ floor 2) (if favored red ink) small (clip small (- slot 6) (value-said v)))))))))
+
+(defn- draw-plan
+  "A session's plan: its moment's title, what was going on then (faults in orange, failures in
+  red), its frame's board small, and what opening it costs."
+  [c x y width]
+  (text! x y ink mono (clip mono width (:title c)))
+  (doseq [[i [kind line]] (map-indexed vector (:rows c))]
+    (text! x (+ y 22 (* 20 i)) (cond (= kind :fault) orange (= kind :failure) red :else muted) mono (clip mono width line)))
+  (let [below (+ y 22 (* 20 (count (:rows c))))]
+    (when-let [board (:board c)]
+      (let [rows (vec (take-while (fn [line] (re-matches #"[.0-9]+" line)) (str/split-lines board)))]
+        (doseq [[r row] (map-indexed vector rows)
+                [k ch] (map-indexed vector row)]
+          (let [cx (+ x (* 8 k))
+                cy (+ below 4 (* 8 r))]
+            (if (= (str ch) ".")
+              (rect! (+ cx 3) (+ cy 3) (+ cx 4) (+ cy 4) rule 1.0 0.0)
+              (rect! cx cy (+ cx 7) (+ cy 7) (nth crate-colors (get digit-of (str ch) 0)) 0.9 1.0))))))
+    (text! x (+ below (if (:board c) 168 0) 4) muted small (:cost c))))
+
+(defn- draw-card
+  "One card at (x, y): its code, where it was, its body. Returns its height."
+  [c x y width dim]
+  (let [height (+ 52 (body-height c))
+        inner (- width 28)
+        view (:view c)
+        context (:context c)
+        bx (+ x 14)
+        by (+ y 42)]
+    (rect! x y (+ x width) (+ y height) card (if dim 0.5 1.0) 6.0)
+    (frame! x y (+ x width) (+ y height) (if dim rule ink) 1.0)
+    (text! (+ x 14) (+ y 9) (if dim muted ink) mono
+           (clip mono (- inner (if context (+ 16 (text-width small context)) 0)) (str/replace (str (:code c)) #"\s+" " ")))
+    (when context
+      (text! (- (+ x width) 14 (text-width small context)) (+ y 11) blue small context))
+    (line! (+ x 14) (+ y 32) (- (+ x width) 14) (+ y 32) rule 1.0)
+    (cond
+      (= view :session) (draw-session c bx by inner)
+      (= view :registers) (draw-registers c bx by inner)
+      (= view :memory) (draw-memory c bx by inner)
+      (= view :lines) (draw-lines c bx by inner)
+      (= view :table) (draw-table c bx by inner)
+      (= view :edn) (draw-edn (:lines c) bx by inner)
+      (= view :stack) (draw-stack c bx by inner)
+      (= view :events) (draw-events c bx by inner)
+      (= view :plan) (draw-plan c bx by inner)
+      (= view :run-plan) (do (doseq [[i line] (map-indexed vector (:lines c))]
+                               (text! bx (+ by (* 20 i)) ink mono (clip mono inner line)))
+                             (draw-draws c bx (+ by 6 (* 20 (count (:lines c)))) inner false))
+      (= view :draw-split) (draw-draws c bx by inner true)
+      (= view :draw-sets) (draw-draws c bx by inner false)
+      (= view :numbers) (draw-numbers c bx by inner)
+      (= view :translate) (do (text! bx by ink big (str (:virtual c)))
+                              (text! (+ bx 20 (text-width big (str (:virtual c)))) by muted big "→")
+                              (text! (+ bx 52 (text-width big (str (:virtual c)))) by ink big (str (:physical c))))
+      (= view :error) (text! bx by red mono (clip mono inner (:said c)))
+      (= view :note) (text! bx by ink mono (clip mono inner (:said c)))
+      :else (text! bx by ink big (clip big inner (:said c))))
+    height))
+
+;; The feed's roll: how far its cards are shifted up (what does not fit goes under the map),
+;; eased toward where the newest card is whole. The render thread's alone.
+(def ^:private roll (atom {:shift 0.0 :at 0.0 :total 0}))
+
+(defn- draw-feed
+  "The cards in their order from `y`, the newest last and whole: once they pass the bottom all
+  of them are shifted up under the map, the shift eased, so that they roll and do not jump."
+  [s x y width bottom]
+  (let [cards (:cards s)
+        heights (mapv (fn [c] (+ 52 (body-height c) 12)) cards)
+        total (apply + 0 heights)
+        target (max 0.0 (- total (- bottom y)))
+        now (cpp/detviz.seconds)
+        was @roll
+        dt (max 0.0 (min 0.1 (- now (:at was))))
+        left (- target (:shift was))
+        ;; Fewer cards (cleared): where they are at once. More: a part of what is left each frame.
+        shift (if (or (< total (:total was)) (< (if (neg? left) (- left) left) 0.5))
+                target
+                (+ (:shift was) (* left (min 1.0 (* 7.0 dt)))))
+        newest (dec (count cards))
+        top (- y 6)]
+    (reset! roll {:shift shift :at now :total total})
+    (cpp/detviz.clip_begin x top (+ x width 2) bottom)
+    (loop [i 0 at (- y shift)]
+      (when (< i (count cards))
+        (let [height (nth heights i)]
+          (when (and (> (+ at height) top) (< at bottom))
+            (draw-card (nth cards i) x at width (not= i newest)))
+          (recur (inc i) (+ at height)))))
+    ;; What rolls under the map fades into the paper there.
+    (when (> shift 0.5)
+      (rect! x top (+ x width 2) (+ top 6) paper 0.85 0.0)
+      (rect! x (+ top 6) (+ x width 2) (+ top 12) paper 0.55 0.0)
+      (rect! x (+ top 12) (+ x width 2) (+ top 18) paper 0.25 0.0))
+    (cpp/detviz.clip_end)))
+
+(defn- draw-screen
+  "The session's screen: its frame's board as a grid, a cell a metre, each crate a block in its
+  colour with its id's last digit; under it the counts and when. Returns where it ends (y)."
+  [s x y width]
+  (let [screen (:screen s)
+        lines (str/split-lines (:board screen))
+        rows (vec (take-while (fn [line] (re-matches #"[.0-9]+" line)) lines))
+        cell 15.0
+        n (count rows)
+        side (* cell (max 1 (count (first rows))))
+        height (+ 44 (* cell n) 34)
+        top (box! x y width height (str "Screen · timeline #" (:timeline (:session s))
+                                       (when (:at-ns screen) (str " at " (seconds (:at-ns screen))))))
+        left (+ x (/ (- width side) 2.0))]
+    (rect! left top (+ left side) (+ top (* cell n)) paper 1.0 2.0)
+    (doseq [[r row] (map-indexed vector rows)
+            [c ch] (map-indexed vector row)]
+      (let [cx (+ left (* cell c))
+            cy (+ top (* cell r))]
+        (if (= (str ch) ".")
+          (rect! (+ cx 6.5) (+ cy 6.5) (+ cx 8.5) (+ cy 8.5) rule 1.0 0.0)
+          (let [digit (get digit-of (str ch) 0)]
+            (rect! (+ cx 1) (+ cy 1) (+ cx cell -1) (+ cy cell -1) (nth crate-colors digit) 0.9 2.0)
+            (text! (+ cx 4) (+ cy 0) paper small (str ch))))))
+    (text! left (+ top (* cell n) 8) muted small (str "crates " (:crates screen) "   score " (:score screen)))
+    (+ y height 14)))
+
+(defn draw
+  "One frame of `s`."
+  [s]
+  (let [width (cpp/detviz.width)
+        height (cpp/detviz.height)]
+    (draw-header s width)
+    (let [map-end (if (:run s) (draw-map s 32 100 (- width 64)) 100)
+          top (if (:screen s) (draw-screen s 32 map-end (- width 64)) map-end)]
+      (if (empty? (:cards s))
+        (text! 32 (+ top 8) muted serif "Evaluate something in the REPL: it is shown here.")
+        (draw-feed s 32 top (- width 64) (- height 20))))))
+
+(defn frames
+  "Frames drawn so far."
+  []
+  (cpp/detviz.frames))
+
+(defn snapshot!
+  "The next frame written to `path` (a PPM image): a recording's only."
+  [path]
+  (cpp/detviz.snapshot path))
+
+(defn open!
+  "The window. `hidden` and `record` (a video's path) for a recording."
+  [{:keys [width height hidden record]}]
+  (cpp/detviz.open (or width 960) (or height 1080) (boolean hidden) (or record "")))
+
+(defonce ^{:doc "The last error a frame's drawing threw (its message is drawn in red too)."} draw-error (atom nil))
+
+(defn loop!
+  "Frames until the window closes: on the main thread."
+  []
+  (while (cpp/detviz.alive)
+    (cpp/detviz.frame_begin paper)
+    (try
+      (draw @state)
+      (catch :default e
+        (reset! draw-error (str e))
+        (text! 32 110 red mono (str "draw: " e))))
+    (cpp/detviz.frame_end))
+  (cpp/detviz.close))

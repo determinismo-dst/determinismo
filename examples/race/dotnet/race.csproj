@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- The race of examples/race in C#, instrumented after its build by
+       determinismo-dotnet-instrument (Dockerfile.dotnet). DeterminismoSdk: where the SDK's one
+       file is (the image passes its own). -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>race</AssemblyName>
+    <RollForward>Major</RollForward>
+    <DeterminismoSdk Condition="'$(DeterminismoSdk)' == ''">$(MSBuildThisFileDirectory)../../../sdk/dotnet/Determinismo.cs</DeterminismoSdk>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="$(DeterminismoSdk)" />
+  </ItemGroup>
+</Project>

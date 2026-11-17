@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: MIT
+# A test template with files named as commands that cannot run (Antithesis's "Invalid commands
+# found"): one not executable, one executable with no shebang. They are never run, and the
+# composer fails "test templates hold only valid commands" with each. Run with:
+#   determinismo explore ... --compose tests/antithesis-compat/templates/compose.yaml --scenario checks
+services:
+  client:
+    build: ./client
+    command: [/usr/local/bin/ready]

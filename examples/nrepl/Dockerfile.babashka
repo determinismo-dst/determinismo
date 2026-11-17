@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Babashka 1.13.229 (EPL-1.0, a native-image Clojure interpreter) serving nREPL with its own
+# server (babashka.nrepl): what editors connect to for scripts. proof's matrix has it (its
+# `babashka` profile). A native binary: no coverage agent.
+FROM docker.io/babashka/babashka:1.13.229
+ENTRYPOINT ["bb", "nrepl-server", "0.0.0.0:7888"]

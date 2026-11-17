@@ -1,0 +1,18 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# warm-run run <scenario> <command>: a program's command run in the client node's long-lived JVM
+# (determinismo.workload's serve-commands, 127.0.0.1:7889), this script its thin client: the
+# command's output relayed, its status this one's exit. The composer ending this process (a
+# kill) closes the connection, and the JVM ends the command at its next call into the SDK.
+set -u
+exec 3<>/dev/tcp/127.0.0.1/7889 || { echo "warm-run: the client node's JVM takes no commands" >&2; exit 111; }
+printf '%s\n' "$*" >&3
+mark=$'\x1f'det-exit
+while IFS= read -r line <&3; do
+  case "$line" in
+    "$mark "*) exit "${line#"$mark "}" ;;
+    *) printf '%s\n' "$line" ;;
+  esac
+done
+echo "warm-run: the command's connection ended without its status" >&2
+exit 112

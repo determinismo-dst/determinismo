@@ -1,0 +1,94 @@
+; SPDX-License-Identifier: MIT
+; Test programs in jank, as Clojure's determinismo.workload and Zig's System: the system's
+; profiles and nodes and its scenarios' commands as data, libdeterminismo (determinismo.core)
+; checking and converting the definition as it does for Zig programs. A program is a map, and
+; its -main calls `main`:
+;
+;   (def program
+;     {:profiles [{:name "default"
+;                  :nodes [[:app {:build {:context "." :dockerfile "app/Dockerfile"}
+;                                 :ready {:tcp 7888}}]]}]
+;      ;; Commands run in this node, as `<program> run <scenario> <command>`.
+;      :node :app
+;      :program "/opt/workload/run"
+;      :scenarios [{:name "smoke"
+;                   :commands [(w/parallel-driver "drive" drive)]}]})
+;
+;   (defn -main [& arguments] (w/main program arguments))
+;
+; Node specs and scenario options are Zig's (system.zig's NodeSpec, schema.zig's Scenario) with
+; dashes for underscores. A command's function takes {:scenario :command}. `zig build <name>`
+; makes the program one file (build.zig's jank_programs, tools/program_pack.zig): --describe
+; runs it on the host with jank (~/opt/jank), its commands run in its node.
+(ns determinismo.workload
+  (:require [clojure.string :as string]
+            [determinismo.core :as det]))
+
+;; Commands, Antithesis's test command kinds as Zig's Scenario has them.
+
+(defn- command [kind command-name f]
+  {:kind kind :name command-name :run f})
+
+(defn setup [command-name f] (command "setup" command-name f))
+(defn first-command [command-name f] (command "first" command-name f))
+(defn parallel-driver [command-name f] (command "parallel_driver" command-name f))
+(defn serial-driver [command-name f] (command "serial_driver" command-name f))
+(defn singleton-driver [command-name f] (command "singleton_driver" command-name f))
+(defn anytime [command-name f] (command "anytime" command-name f))
+(defn eventually [command-name f] (command "eventually" command-name f))
+(defn finally-command [command-name f] (command "finally" command-name f))
+
+;; The definition, as det_describe takes it.
+
+(defn- named [x] (if (keyword? x) (name x) x))
+
+(defn- underscored
+  "Keys as Zig's fields: :timeout-s is timeout_s."
+  [value]
+  (cond
+    (map? value) (into {} (map (fn [[k v]] [(keyword (string/replace (named k) "-" "_")) (underscored v)]) value))
+    (sequential? value) (mapv underscored value)
+    :else value))
+
+(defn definition
+  "What det_describe takes: the program's definition as data, without its functions."
+  [{:keys [profiles node program scenarios]}]
+  {:profiles (for [profile profiles]
+               {:name (:name profile)
+                :nodes (for [[node-name spec] (:nodes profile)]
+                         {:name (named node-name)
+                          :spec (underscored (cond-> spec (:after spec) (update :after #(mapv named %))))})})
+   :scenarios (for [scenario scenarios]
+                (merge (underscored (dissoc scenario :commands))
+                       {:node (named node)
+                        :program program
+                        :commands (for [c (:commands scenario)] {:kind (:kind c) :name (:name c)})}))
+   :checks []})
+
+(defn- run [program scenario-name command-name]
+  (let [scenario (first (filter #(= scenario-name (:name %)) (:scenarios program)))
+        command (first (filter #(= command-name (:name %)) (:commands scenario)))]
+    (when-not command
+      (throw (ex-info (str "no command " command-name " in scenario " scenario-name) {})))
+    ((:run command) {:scenario scenario-name :command command-name})
+    0))
+
+(defn main
+  "--describe on the host; run <scenario> <command> where the program runs. Exits with its
+  status."
+  [program arguments]
+  (let [[verb a b] arguments
+        status (try
+                 (cond
+                   (= ["--describe"] (vec arguments))
+                   (if (neg? (det/describe (det/->json (definition program)))) 1 0)
+
+                   (and (= verb "run") a b (= 3 (count arguments)))
+                   (run program a b)
+
+                   :else
+                   (do (println "usage: --describe | run <scenario> <command>") 2))
+                 (catch cpp/jank.runtime.object_ref e
+                   (println "error:" e)
+                   1))]
+    (cpp/exit status)))

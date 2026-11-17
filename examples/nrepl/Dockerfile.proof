@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: MIT
+# proof (github.com/nrepl/proof, Apache-2.0, Bozhidar Batsov's): nREPL's compatibility suite, its
+# 80-odd checks (the protocol, sessions, interrupts, stdin, what CIDER, Calva, Conjure,
+# vim-fireplace, REPLy and neorepl send, and every message's wire format) run from this node
+# against the server under test (`proof run -address`), its profiles built in. Pinned to a commit;
+# fetched at build time (the guest has no network). The node idles: drivers run proof in it.
+FROM docker.io/library/golang:1.26-alpine AS build
+RUN apk add --no-cache git && \
+    go install github.com/nrepl/proof/cmd/proof@e9e325a756df344563891aac19dc829f710d3024
+FROM docker.io/library/alpine:3.22
+COPY --from=build /go/bin/proof /usr/local/bin/proof
+RUN mkdir -p /var/lib/proof
+CMD ["sh", "-c", "while :; do sleep 3600; done"]

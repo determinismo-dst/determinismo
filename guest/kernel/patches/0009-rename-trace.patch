@@ -1,0 +1,127 @@
+--- /dev/null
++++ b/include/trace/events/det_fs.h
+@@ -0,0 +1,75 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM det_fs
++
++#if !defined(_TRACE_DET_FS_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _TRACE_DET_FS_H
++
++#include <linux/cgroup.h>
++#include <linux/fs.h>
++#include <linux/tracepoint.h>
++
++/* Once, whatever the trace headers' multiple reads (TRACE_HEADER_MULTI_READ). */
++#ifndef _TRACE_DET_FS_HELPERS
++#define _TRACE_DET_FS_HELPERS
++/*
++ * determinismo's tracepoints (det_fs): the current task's cgroup path, into `buffer` (empty
++ * when it cannot be named).
++ */
++static inline const char *det_cgroup_path(char *buffer, size_t size)
++{
++	int length;
++
++	rcu_read_lock();
++	length = cgroup_path(task_dfl_cgroup(current), buffer, size);
++	rcu_read_unlock();
++	if (length < 0)
++		buffer[0] = 0;
++	return buffer;
++}
++#endif
++
++/*
++ * determinismo's persistence audit: a regular file renamed, with its data's state at that
++ * moment, once the rename took place: pages dirty in the page cache (never written back) or
++ * under writeback (ext4's auto_da_alloc starts it for a file renamed over another, but with
++ * dioread_nolock, ext4's default, the data's extents stay unwritten until the write completes
++ * and its conversion commits, which the rename's commit does not wait for: a power loss between
++ * leaves the file its size in zeros), whether it replaced a file, its name before, its path
++ * from its file system's root, and the renaming task's cgroup.
++ */
++TRACE_EVENT(det_rename,
++	TP_PROTO(struct inode *inode, const char *from, const char *path, const char *cgroup,
++		 bool replaced),
++	TP_ARGS(inode, from, path, cgroup, replaced),
++	TP_STRUCT__entry(
++		__field(dev_t, dev)
++		__field(unsigned long, ino)
++		__field(loff_t, size)
++		__field(bool, dirty)
++		__field(bool, writeback)
++		__field(bool, replaced)
++		__string(from, from)
++		__string(cgroup, cgroup)
++		__string(path, path)
++	),
++	TP_fast_assign(
++		__entry->dev = inode->i_sb->s_dev;
++		__entry->ino = inode->i_ino;
++		__entry->size = i_size_read(inode);
++		__entry->dirty = mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY);
++		__entry->writeback = mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK);
++		__entry->replaced = replaced;
++		__assign_str(from);
++		__assign_str(cgroup);
++		__assign_str(path);
++	),
++	TP_printk("dev=%u:%u ino=%lu size=%lld dirty=%d writeback=%d replaced=%d cgroup=%s from=%s path=%s",
++		  MAJOR(__entry->dev), MINOR(__entry->dev), __entry->ino, __entry->size,
++		  __entry->dirty, __entry->writeback, __entry->replaced, __get_str(cgroup),
++		  __get_str(from), __get_str(path))
++);
++
++#endif /* _TRACE_DET_FS_H */
++
++#include <trace/define_trace.h>
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -44,6 +44,9 @@
+ #include "internal.h"
+ #include "mount.h"
+ 
++#define CREATE_TRACE_POINTS
++#include <trace/events/det_fs.h>
++
+ /* [Feb-1997 T. Schoebel-Theuer]
+  * Fundamental changes in the pathname lookup mechanisms (namei)
+  * were necessary because of omirr.  The reason is that omirr needs
+@@ -4846,6 +4849,26 @@
+ }
+ EXPORT_SYMBOL(vfs_link);
+ 
++/* The renamed file's det_rename event: its dentry, moved, names the destination. */
++static noinline void det_trace_rename(struct dentry *dentry, struct inode *inode,
++				      const char *from, bool replaced)
++{
++	char *buffer = __getname();
++	char *cgroup = __getname();
++	char *path;
++
++	if (buffer && cgroup) {
++		path = dentry_path_raw(dentry, buffer, PATH_MAX);
++		if (!IS_ERR(path))
++			trace_det_rename(inode, from, path, det_cgroup_path(cgroup, PATH_MAX),
++					 replaced);
++	}
++	if (cgroup)
++		__putname(cgroup);
++	if (buffer)
++		__putname(buffer);
++}
++
+ /*
+  * Hardlinks are often used in delicate situations.  We avoid
+  * security-related surprises by not following symlinks on the
+@@ -5137,6 +5160,9 @@
+ 			fsnotify_move(new_dir, old_dir, &old_dentry->d_name,
+ 				      new_is_dir, NULL, new_dentry);
+ 		}
++		if (trace_det_rename_enabled() && !(flags & RENAME_EXCHANGE) && S_ISREG(source->i_mode))
++			det_trace_rename(old_dentry, source,
++					 (const char *)old_name.name.name, target != NULL);
+ 	}
+ 	release_dentry_name_snapshot(&old_name);
+ 

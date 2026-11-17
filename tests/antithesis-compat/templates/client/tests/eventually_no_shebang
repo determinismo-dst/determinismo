@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: MIT
+# Executable but no shebang: exec fails (ENOEXEC), so it is invalid and never run.
+echo "the command with no shebang ran"
+exit 1

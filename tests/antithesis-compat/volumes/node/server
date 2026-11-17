@@ -1,0 +1,12 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Started once init ended: its marker is there, and the project's file is in the image. Its file
+# two seconds in: its healthcheck's, which the client waits for.
+set -e
+[ "$(hostname)" = the_server_1 ] || { echo "hostname $(hostname), not the_server_1" >&2; exit 1; }
+[ "$(cat /srv/shared/marker)" = init ] || { echo "no marker from init" >&2; exit 1; }
+[ "$(cat /etc/server.txt)" = "from the project" ] || { echo "no project file" >&2; exit 1; }
+sleep 2
+echo server > /srv/shared/server
+printf '%s\n' '{"antithesis_setup":{"status":"complete","details":null}}' >> "$ANTITHESIS_OUTPUT_DIR/setup.jsonl"
+exec sleep infinity

@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: MIT
+# The maze on the JVM, for code coverage through the Java agent (sdk/java/DeterminismoCoverage):
+#   determinismo explore ... --compose tests/antithesis-compat/java/compose.yaml --scenario maze \
+#     --strategy "det-strategy-mutate --sync-dir <fresh dir>"
+# The client's build context is the repository root so that its image can include sdk/java.
+services:
+  client:
+    build:
+      context: ../../..
+      dockerfile: tests/antithesis-compat/java/client/Dockerfile
+    # Its setup said done (Ready: the SDK's setup_complete), then idle: tests run in it.
+    command: [sh, -c, "java -cp /app/sdk-classes:/app/classes Ready && exec sleep infinity"]

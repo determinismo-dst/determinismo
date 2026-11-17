@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: MIT
+# The race in C# (examples/race/dotnet): built, then instrumented by determinismo-dotnet-instrument
+# (sdk/dotnet/instrument) on RaceRun.cs alone: its statements are where thread pausing pauses
+# threads.
+FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
+COPY sdk/dotnet/Determinismo.cs /sdk/Determinismo.cs
+COPY sdk/dotnet/instrument/instrument.csproj sdk/dotnet/instrument/Program.cs /instrument/
+COPY examples/race/dotnet/race.csproj examples/race/dotnet/Race.cs examples/race/dotnet/RaceRun.cs /src/
+RUN dotnet publish /instrument/instrument.csproj -c Release -o /tool \
+ && dotnet publish /src/race.csproj -c Release -p:DeterminismoSdk=/sdk/Determinismo.cs -o /out \
+ && dotnet /tool/determinismo-dotnet-instrument.dll --include /src/RaceRun.cs /out/race.dll
+
+FROM mcr.microsoft.com/dotnet/runtime:8.0
+COPY --from=build /out/ /app/
+ENTRYPOINT ["dotnet", "/app/race.dll"]

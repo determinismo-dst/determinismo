@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: MIT
+# nREPL 1.8.0 with cider-nrepl 0.64.1's middleware (server/deps.edn, alias :cider): what CIDER
+# and Calva run (completion, info, test running, tracked namespace state, ...). The JVM SDK's
+# coverage agent on nREPL's and cider-nrepl's code. Dependencies fetched at build time.
+FROM docker.io/library/clojure:temurin-25-tools-deps-alpine
+# C1 only: short timelines and restarted JVMs never repay C2's compiling (examples/ignite/README.md).
+ENV JAVA_TOOL_OPTIONS="-XX:TieredStopAtLevel=1"
+WORKDIR /app
+COPY sdk/java/Determinismo.java sdk/java/DeterminismoCoverage.java /sdk/
+RUN mkdir -p /sdk/classes && javac -d /sdk/classes /sdk/*.java && \
+    printf 'Premain-Class: DeterminismoCoverage\n' > /sdk/manifest && \
+    jar cfm /sdk/determinismo-coverage.jar /sdk/manifest -C /sdk/classes .
+COPY examples/nrepl/server/deps.edn /app/
+RUN clojure -P -M:cider
+ENTRYPOINT ["clojure", "-J-javaagent:/sdk/determinismo-coverage.jar=nrepl,cider", "-M:cider"]

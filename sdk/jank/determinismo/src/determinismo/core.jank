@@ -1,0 +1,106 @@
+; SPDX-License-Identifier: MIT
+; determinismo from jank: libdeterminismo's functions (docs/SDKS.md), its header included and the
+; library linked by determinismo-sys; jank converts its strings, numbers and booleans to the C
+; types itself. As Clojure's determinismo.workload has them: decisions, events, assertions,
+; faults.
+(ns determinismo.core
+  (:require [clojure.string :as string])
+  (:include "libdeterminismo.h"))
+
+(def ^:private hex-digits "0123456789abcdef")
+
+(defn- json-char
+  "A character as it is inside a JSON string: quotes, backslashes and control characters (a
+  board's newlines) escaped, as the Clojure SDK's json-string does."
+  [c]
+  (let [n (int c)]
+    (cond
+      (= c \") "\\\""
+      (= c \\) "\\\\"
+      (= c \newline) "\\n"
+      (= c \return) "\\r"
+      (= c \tab) "\\t"
+      (and (>= n 0) (< n 32)) (str "\\u00" (nth hex-digits (quot n 16)) (nth hex-digits (mod n 16)))
+      :else (str c))))
+
+(defn- json-string [s]
+  (str "\"" (apply str (map json-char (str s))) "\""))
+
+(defn ->json
+  "A value as JSON: maps (keyword or string keys), vectors and lists, strings, keywords, numbers,
+  booleans, nil."
+  [value]
+  (cond
+    (map? value) (str "{" (string/join "," (map (fn [[k v]] (str (json-string (if (keyword? k) (name k) k)) ":" (->json v))) value)) "}")
+    (sequential? value) (str "[" (string/join "," (map ->json value)) "]")
+    (string? value) (json-string value)
+    (keyword? value) (json-string (name value))
+    (nil? value) "null"
+    :else (str value)))
+
+(defn random-below
+  "A uniformly random integer in [0, n): a platform decision (strategies steer it, replays repeat
+  it)."
+  [n]
+  (cpp/det_random_below n))
+
+(defn random-below-named
+  "random-below, named for strategies (\"retry.jitter-ms\")."
+  [decision n]
+  (let [decision (str decision)]
+    (cpp/det_random_below_named decision (count decision) n)))
+
+(defn swarm-index
+  "An index below n (64 at most) by swarm testing, where random-below drew uniformly: the
+  options this timeline keeps for the name, weighted, repeated in runs (the Zig SDK's
+  swarm_index)."
+  [decision n]
+  (let [decision (str decision)]
+    (cpp/det_swarm_index decision (count decision) n)))
+
+(defn random-near
+  "A value up to max drawn around a limit the workload declares: half the time uniform, else one
+  of the limit's edges (0, 1, limit - 1, limit, limit + 1, twice it), named decisions."
+  [decision limit max]
+  (let [decision (str decision)]
+    (cpp/det_random_near decision (count decision) limit max)))
+
+(defn event
+  "A structured event, in the run's events (the Logs Explorer)."
+  ([name] (event name {}))
+  ([name details]
+   (let [name (str name)
+         json (->json details)]
+     (cpp/det_event name (count name) json (count json)))))
+
+(defn- assertion [kind condition message details]
+  (let [json (->json details)]
+    (cpp/det_assert kind (count kind) (boolean condition) message (count message) json (count json))))
+
+(defn always
+  "Holds every time it is evaluated: a property of the run."
+  ([condition message] (always condition message {}))
+  ([condition message details] (assertion "always" condition message details)))
+
+(defn sometimes
+  "Holds at least once over the run."
+  ([condition message] (sometimes condition message {}))
+  ([condition message details] (assertion "sometimes" condition message details)))
+
+(defn fault
+  "A fault now, as a scenario asks for one: {:kind \"pause\" :node \"db\" :duration_ns 1000000000}
+  (libdeterminismo's det_fault)."
+  [request]
+  (let [json (->json request)]
+    (cpp/det_fault json (count json))))
+
+(defn describe
+  "A test program's --describe: its definition (JSON, as Zig's System) checked and converted by
+  libdeterminismo, printed on standard output; negative when refused."
+  [definition-json]
+  (cpp/det_describe definition-json (count definition-json)))
+
+(defn stop-faults
+  "A quiet period: no fault for duration-ns of virtual time."
+  [duration-ns]
+  (cpp/det_stop_faults duration-ns))

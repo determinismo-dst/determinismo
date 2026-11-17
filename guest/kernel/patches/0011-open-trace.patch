@@ -1,0 +1,87 @@
+--- a/include/trace/events/det_fs.h
++++ b/include/trace/events/det_fs.h
+@@ -70,6 +70,43 @@
+ 		  __get_str(from), __get_str(path))
+ );
+ 
++/*
++ * determinismo's persistence audit: a regular file whose data is not on its disk yet (pages
++ * dirty, or under writeback) opened, with when its inode was first dirtied since it was last
++ * written back and when the opening process started (both monotonic, ms since boot), and the
++ * opener's cgroup: a process that started after the data was written relies on data a power loss
++ * would have taken (a file written at a first start, never synced, read at the next).
++ */
++TRACE_EVENT(det_open,
++	TP_PROTO(struct inode *inode, const char *path, const char *cgroup, unsigned int flags,
++		 u64 started_ns),
++	TP_ARGS(inode, path, cgroup, flags, started_ns),
++	TP_STRUCT__entry(
++		__field(dev_t, dev)
++		__field(unsigned long, ino)
++		__field(loff_t, size)
++		__field(unsigned int, flags)
++		__field(u64, dirtied_ms)
++		__field(u64, started_ms)
++		__string(cgroup, cgroup)
++		__string(path, path)
++	),
++	TP_fast_assign(
++		__entry->dev = inode->i_sb->s_dev;
++		__entry->ino = inode->i_ino;
++		__entry->size = i_size_read(inode);
++		__entry->flags = flags;
++		__entry->dirtied_ms = jiffies_to_msecs(inode->dirtied_when - INITIAL_JIFFIES);
++		__entry->started_ms = div_u64(started_ns, NSEC_PER_MSEC);
++		__assign_str(cgroup);
++		__assign_str(path);
++	),
++	TP_printk("dev=%u:%u ino=%lu size=%lld flags=%#x dirtied_ms=%llu started_ms=%llu cgroup=%s path=%s",
++		  MAJOR(__entry->dev), MINOR(__entry->dev), __entry->ino, __entry->size,
++		  __entry->flags, __entry->dirtied_ms, __entry->started_ms, __get_str(cgroup),
++		  __get_str(path))
++);
++
+ #endif /* _TRACE_DET_FS_H */
+ 
+ #include <trace/define_trace.h>
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -36,6 +36,27 @@
+ 
+ #include "internal.h"
+ 
++#include <trace/events/det_fs.h>
++
++/* The opened file's det_open event (its data not on its disk yet). */
++static noinline void det_trace_open(struct file *file)
++{
++	char *buffer = __getname();
++	char *cgroup = __getname();
++	char *path;
++
++	if (buffer && cgroup) {
++		path = dentry_path_raw(file->f_path.dentry, buffer, PATH_MAX);
++		if (!IS_ERR(path))
++			trace_det_open(file_inode(file), path, det_cgroup_path(cgroup, PATH_MAX),
++				       file->f_flags, current->group_leader->start_time);
++	}
++	if (cgroup)
++		__putname(cgroup);
++	if (buffer)
++		__putname(buffer);
++}
++
+ int do_truncate(struct mnt_idmap *idmap, struct dentry *dentry,
+ 		loff_t length, unsigned int time_attrs, struct file *filp)
+ {
+@@ -1099,6 +1120,10 @@
+ 		 * symmetry.
+ 		 */
+ 		fsnotify_open(file);
++		if (trace_det_open_enabled() && S_ISREG(file_inode(file)->i_mode) &&
++		    (mapping_tagged(file->f_mapping, PAGECACHE_TAG_DIRTY) ||
++		     mapping_tagged(file->f_mapping, PAGECACHE_TAG_WRITEBACK)))
++			det_trace_open(file);
+ 	}
+ 	return ret;
+ }

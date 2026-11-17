@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: MIT
+# The race in Rust (examples/race/rust), with rustc's trace-pc-guard on the program's code
+# (--target: RUSTFLAGS reach it, not the build scripts) and the SDK's coverage callbacks, where
+# thread pausing pauses threads.
+FROM docker.io/library/rust:1.82-slim-bookworm AS build
+COPY sdk/rust /src/sdk/rust
+COPY examples/race/rust /src/examples/race/rust
+WORKDIR /src/examples/race/rust
+RUN rm -rf /src/sdk/rust/target && \
+    RUSTFLAGS="-C passes=sancov-module -C llvm-args=-sanitizer-coverage-level=3 -C llvm-args=-sanitizer-coverage-trace-pc-guard" \
+    cargo build --release --target x86_64-unknown-linux-gnu --quiet && \
+    cp target/x86_64-unknown-linux-gnu/release/race /race
+
+FROM docker.io/library/debian:bookworm-slim
+COPY --from=build /race /usr/local/bin/race
+ENTRYPOINT ["/usr/local/bin/race"]

@@ -1,0 +1,586 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- A timeline's window, played back without the platform: `determinismo runs export <id>
+     <timeline> <seconds> --html` writes this page with the window's export embedded (the
+     script #determinismo-export); without one it reads `?src=<export.json>` or a file dropped on
+     it. What was recorded, replayed as it happened: every timeline being deterministic, its
+     events are its replay (a re-execution needs KVM: `determinismo bundle`). No dependencies. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>determinismo window</title>
+<style>
+:root {
+  --bg: #15161a; --panel: #1d1f25; --panel-2: #24262e; --line: #30333d; --text: #e6e7eb;
+  --muted: #9a9eab; --accent: #8f7cf7; --pass: #3fbf7f; --fail: #f0506e; --warn: #f0a650;
+  --info: #5aa9f0; --future: .28; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #f6f6f9; --panel: #ffffff; --panel-2: #eeeef4; --line: #dcdce6; --text: #1c1d22;
+    --muted: #61646f; --accent: #6a55e0; --pass: #1f8f57; --fail: #cf2f4f; --warn: #b8720f;
+    --info: #2a78c2; color-scheme: light;
+  }
+}
+:root[data-theme="light"] {
+  --bg: #f6f6f9; --panel: #ffffff; --panel-2: #eeeef4; --line: #dcdce6; --text: #1c1d22;
+  --muted: #61646f; --accent: #6a55e0; --pass: #1f8f57; --fail: #cf2f4f; --warn: #b8720f;
+  --info: #2a78c2; color-scheme: light;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, sans-serif;
+  padding-block: 16px 40px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+button, input, select {
+  font: inherit; color: var(--text); background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 6px; padding: 4px 10px;
+}
+button { cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+h1 { font-size: 18px; margin: 0; letter-spacing: .3px; text-wrap: balance; }
+h1 .brand { color: var(--accent); }
+.meta { color: var(--muted); font-size: 13px; margin-top: 4px; display: flex; flex-wrap: wrap; gap: 4px 16px; }
+.meta b { color: var(--text); font-weight: 500; font-family: var(--mono); font-size: 12.5px; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; margin-top: 12px; }
+.label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .6px; margin-bottom: 6px; }
+.failures { display: flex; flex-direction: column; gap: 4px; }
+.failure { display: flex; gap: 10px; align-items: baseline; cursor: pointer; font-size: 13px; }
+.failure:hover .message { text-decoration: underline; }
+.failure .at { font-family: var(--mono); font-size: 12px; color: var(--muted); min-width: 7ch; }
+.failure .message { color: var(--fail); }
+.failure.run .message { color: var(--warn); }
+.failure.elsewhere { cursor: default; }
+.failure .said { margin-top: 4px; font-family: var(--mono, ui-monospace, monospace); font-size: 12px; color: var(--muted, #9aa0aa);
+  white-space: pre-wrap; overflow-wrap: anywhere; }
+.controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.controls input[type=range] { flex: 1 1 240px; min-width: 0; padding: 0; accent-color: var(--accent); }
+.clock { font-family: var(--mono); font-size: 13px; min-width: 15ch; text-align: right; }
+.strip-box { overflow-x: auto; margin-top: 8px; }
+svg.strip { display: block; width: 100%; min-width: 300px; cursor: crosshair; user-select: none; }
+svg.strip text { fill: var(--muted); font: 11px var(--mono); }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 6px; }
+.legend i { display: inline-block; width: 12px; height: 8px; border-radius: 2px; margin-right: 5px; opacity: .75; }
+.legend i.dash { width: 0; height: 10px; border-left: 1px dashed var(--fail); opacity: 1; }
+.legend .diamond { color: var(--fail); margin-right: 4px; font-weight: normal; }
+.filters { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.chip { font-size: 12px; padding: 2px 9px; border-radius: 11px; border: 1px solid var(--line); background: transparent; color: var(--muted); }
+.chip.on { color: var(--text); background: var(--panel-2); border-color: var(--muted); }
+.filters input[type=search] { flex: 1 1 160px; min-width: 0; font-size: 13px; }
+.filters label { font-size: 12.5px; color: var(--muted); display: inline-flex; gap: 4px; align-items: center; }
+.log { margin-top: 8px; max-height: 62vh; overflow: auto; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+.row { display: grid; grid-template-columns: 9ch 12ch minmax(0, 1fr); gap: 8px; padding: 1px 8px; font: 12.5px/1.5 var(--mono); border-bottom: 1px solid transparent; cursor: pointer; }
+.row:hover { background: var(--panel-2); }
+.row .t { color: var(--muted); text-align: right; }
+.row .src { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .text { white-space: pre-wrap; word-break: break-word; min-width: 0; }
+.row.future { opacity: var(--future); }
+.row.hidden-future { display: none; }
+.row.now { background: var(--panel-2); border-bottom-color: var(--accent); }
+.row.selected { outline: 1px solid var(--accent); outline-offset: -1px; }
+/* Both views: the interleaved one's text, side by side's cells. */
+.row.kind-assert-false :is(.text, .cell) { color: var(--fail); }
+.row.kind-assert-true :is(.text, .cell) { color: var(--muted); }
+.row.kind-fault :is(.text, .cell) { color: var(--warn); }
+.row.kind-event :is(.text, .cell) { color: var(--info); }
+.row.kind-kernel :is(.text, .cell) { color: var(--muted); }
+.columns .row { grid-template-columns: 9ch repeat(var(--lanes), minmax(14ch, 1fr)); }
+.columns .row .cell { white-space: pre-wrap; word-break: break-word; min-width: 0; border-left: 1px solid var(--line); padding-left: 6px; }
+.columns .head { position: sticky; top: 0; background: var(--panel-2); z-index: 1; cursor: default; color: var(--muted); }
+.detail { margin-top: 8px; }
+.detail pre { margin: 0; font: 12px/1.45 var(--mono); white-space: pre-wrap; word-break: break-word; max-height: 40vh; overflow: auto; }
+details.panel summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+details.panel pre { font: 12px/1.45 var(--mono); white-space: pre-wrap; word-break: break-word; max-height: 40vh; overflow: auto; }
+.drop { margin-top: 40px; border: 2px dashed var(--line); border-radius: 10px; padding: 40px 16px; text-align: center; color: var(--muted); }
+.drop.over { border-color: var(--accent); color: var(--text); }
+.note { color: var(--muted); font-size: 12.5px; }
+</style>
+</head>
+<body>
+<script id="determinismo-export" type="application/json">/*EXPORT*/</script>
+
+<div id="empty" class="drop" hidden>
+  <p>A <b>determinismo</b> window export: drop its JSON here, or choose it.</p>
+  <p class="note">Made with <code>determinismo runs export &lt;run&gt; &lt;timeline&gt; &lt;seconds&gt;</code>.</p>
+  <input type="file" id="file" accept=".json,application/json">
+  <p id="load-error" class="note"></p>
+</div>
+
+<div id="app" hidden>
+  <h1><span class="brand">determinismo</span> · <span id="title"></span></h1>
+  <div class="meta" id="meta"></div>
+
+  <div class="panel" id="failures-panel" hidden>
+    <div class="label">Failures</div>
+    <div class="failures" id="failures"></div>
+  </div>
+
+  <div class="panel">
+    <div class="controls">
+      <button id="play" class="primary" aria-label="Play">▶ play</button>
+      <select id="speed" aria-label="Speed">
+        <option value="0.25">¼×</option><option value="1" selected>1×</option>
+        <option value="4">4×</option><option value="16">16×</option>
+      </select>
+      <input type="range" id="scrub" min="0" max="100000" step="1" aria-label="Virtual time">
+      <span class="clock" id="clock"></span>
+    </div>
+    <div class="controls" style="margin-top:8px">
+      <button id="to-start">⏮ start</button>
+      <button id="to-moment">the moment</button>
+      <button id="prev-fail">◀ failure</button>
+      <button id="next-fail">failure ▶</button>
+      <button id="prev-event">◀ event</button>
+      <button id="next-event">event ▶</button>
+    </div>
+    <div class="strip-box"><svg class="strip" id="strip" role="img" aria-label="Faults, failures and nodes over virtual time"></svg></div>
+    <div class="legend note">
+      <span><i style="background:var(--fail)"></i>process, power</span>
+      <span><i style="background:var(--info)"></i>network</span>
+      <span><i style="background:var(--warn)"></i>disk, files, syscalls</span>
+      <span><i style="background:var(--accent)"></i>clock</span>
+      <span><b class="diamond">◆</b>an assertion failed</span>
+      <span><i class="dash"></i>the moment</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="filters" id="sources"></div>
+    <div class="filters" style="margin-top:8px">
+      <input type="search" id="grep" placeholder="filter text (regular expression)">
+      <label><input type="checkbox" id="columns"> side by side</label>
+      <label><input type="checkbox" id="hide-future" checked> hide what has not happened yet</label>
+      <label><input type="checkbox" id="details-on"> details</label>
+    </div>
+    <div class="log" id="log"></div>
+    <div class="panel detail" id="detail" hidden><div class="label">Event</div><pre id="detail-text"></pre></div>
+  </div>
+
+  <details class="panel" id="automations-panel" hidden><summary>Automations at the moment</summary><div id="automations"></div></details>
+  <details class="panel"><summary>The run</summary><pre id="run-text"></pre></details>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const NS = 1e9;
+const state = {
+  doc: null, events: [], rows: [], lanes: [], nodes: [], sources: new Map(),
+  from: 0, to: 0, moment: 0, cursor: 0, nowIndex: -1, playing: false, last: 0, selected: -1,
+};
+
+function fmt(seconds) { return seconds.toFixed(3) + " s"; }
+function esc(text) {
+  return String(text).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+// Scalar details as k=v; long arrays and nested objects left to the detail pane.
+function compact(details) {
+  if (!details || typeof details !== "object") return details === undefined || details === null ? "" : String(details);
+  const parts = [];
+  for (const [key, value] of Object.entries(details)) {
+    if (value === null || value === "" || value === false || value === 0) continue;
+    if (Array.isArray(value)) { if (value.length <= 8) parts.push(key + "=" + JSON.stringify(value)); continue; }
+    if (typeof value === "object") continue;
+    const text = String(value);
+    parts.push(key + "=" + (text.length > 160 ? text.slice(0, 160) + "…" : text));
+  }
+  return parts.join(" ");
+}
+
+// One event: its moment, the lane it belongs to, its text, its kind (colors and filters).
+function classify(line) {
+  const e = line.event || {};
+  const t = line.vtime_ns / NS;
+  if (e.output) {
+    const source = e.output.source || "?";
+    return { t, source, kind: source === "kernel" ? "kernel" : "output", text: e.output.text || "" };
+  }
+  if (e.assert) {
+    const a = e.assert;
+    const mark = a.condition === false ? "✗" : "✓";
+    const details = compact(a.details);
+    return {
+      t, source: "assert", kind: a.condition === false ? "assert-false" : "assert-true",
+      text: `${a.type} ${mark} ${a.message}${details ? "  " + details : ""}`, failed: a.condition === false,
+      message: a.message, node: a.details && a.details.node,
+    };
+  }
+  if (e.event === "fault") {
+    const d = e.details || {};
+    const ms = d.duration_ns ? Math.round(d.duration_ns / 1e6) : 0;
+    const peer = d.peer ? " ↔ " + d.peer : "";
+    const extra = [d.disruption, d.direction, d.flavor, d.permanent ? "permanent" : ""].filter(Boolean).join(" ");
+    return {
+      t, source: "fault", kind: "fault", text: `fault ${d.kind} ${d.node || ""}${peer} ${ms} ms ${extra}`.trim(),
+      // Each node a fault touches: an outage names several ("crdb-1,crdb-3"), a link its peer.
+      fault: {
+        kind: d.kind, end: t + (d.duration_ns || 0) / NS,
+        nodes: [...String(d.node || "").split(","), d.peer || ""].map((n) => n.trim()).filter(Boolean),
+      },
+    };
+  }
+  if (e.event) return { t, source: "event", kind: "event", text: `${e.event} ${compact(e.details)}`.trim() };
+  const key = Object.keys(e)[0] || "?";
+  return { t, source: key, kind: "event", text: `${key} ${JSON.stringify(e[key])}` };
+}
+
+function faultColor(kind) {
+  if (/clog|partition|loss|delay|netem|dns|bandwidth|reorder|duplicate/.test(kind)) return "var(--info)";
+  if (/disk|file|syscall|fsync|io/.test(kind)) return "var(--warn)";
+  if (/clock|skew|time/.test(kind)) return "var(--accent)";
+  return "var(--fail)";
+}
+
+function load(doc) {
+  state.doc = doc;
+  // Shown first: the strip is drawn at the width it is shown at (hidden, it measured none and
+  // was drawn at a fallback width, then scaled into a band).
+  $("app").hidden = false; $("empty").hidden = true;
+  const lines = (doc.events || []).slice().sort((a, b) => a.vtime_ns - b.vtime_ns || (a.seq || 0) - (b.seq || 0));
+  state.events = lines.map((line, index) => Object.assign(classify(line), { index, line }));
+  state.from = doc.from_s; state.to = doc.to_s; state.moment = doc.moment_s;
+  const nodes = new Set();
+  for (const ev of state.events) {
+    if (ev.kind === "output") nodes.add(ev.source);
+    if (ev.fault) for (const node of ev.fault.nodes) nodes.add(node);
+  }
+  state.nodes = [...nodes].sort();
+  const counts = new Map();
+  for (const ev of state.events) counts.set(ev.source, (counts.get(ev.source) || 0) + 1);
+  const order = ["fault", "assert", "event", "kernel", ...state.nodes];
+  for (const source of [...counts.keys()].sort()) if (!order.includes(source)) order.push(source);
+  state.lanes = order.filter((source) => counts.has(source));
+  state.sources = new Map(state.lanes.map((source) => [source, true]));
+  header(doc);
+  failures(doc);
+  chips(counts);
+  render();
+  automations(doc);
+  $("run-text").textContent = JSON.stringify(doc.run_info, null, 2);
+  seek(state.moment);
+  window.addEventListener("resize", strip);
+}
+
+function header(doc) {
+  const request = (doc.run_info && doc.run_info.request) || {};
+  const system = (request.program_asked || request.compose || request.program || "").split("/").pop() || "a system";
+  $("title").textContent = `${system} ${request.scenario || ""}`.trim();
+  document.title = `${system} · run ${doc.run} timeline ${doc.timeline}`;
+  const parts = [
+    ["run", doc.run], ["timeline", doc.timeline], ["moment", fmt(doc.moment_s)],
+    ["window", `${fmt(doc.from_s)} – ${fmt(doc.to_s)}`], ["events", (doc.events || []).length],
+  ];
+  if (request.seed !== undefined && request.seed !== null) parts.push(["seed", request.seed]);
+  if (request.build) parts.push(["build", request.build]);
+  $("meta").innerHTML = parts.map(([key, value]) => `<span>${esc(key)} <b>${esc(value)}</b></span>`).join("");
+}
+
+// Assertions failed inside the window (each message's first), then the run's other failing
+// properties, for context.
+function failures(doc) {
+  const seen = new Map();
+  for (const ev of state.events) if (ev.failed && !seen.has(ev.message)) seen.set(ev.message, ev);
+  const items = [...seen.values()].map((ev) =>
+    `<div class="failure" data-t="${ev.t}" data-index="${ev.index}"><span class="at">${ev.t.toFixed(3)}</span><span class="message">${esc(ev.message)}</span></div>`);
+  // This timeline's own failures outside the window: when, and what they said (a checker's
+  // verdict minutes after the moment shown names what it found there).
+  const elsewhere = new Map();
+  for (const line of doc.timeline_failures || []) {
+    const e = line.event || {};
+    const a = (e.assert || e.antithesis_assert || {});
+    const message = a.message;
+    if (!message || seen.has(message) || elsewhere.has(message)) continue;
+    elsewhere.set(message, { t: (a.at_ns ?? line.vtime_ns ?? 0) / 1e9, details: a.details });
+  }
+  for (const [message, found] of elsewhere) {
+    const where = found.t < doc.from_s ? "before this window" : "after this window";
+    const said = found.details ? JSON.stringify(found.details) : "";
+    items.push(`<div class="failure elsewhere"><span class="at">${found.t.toFixed(3)}</span><span class="message">${esc(message)} <span class="note">(in this timeline, ${where})</span>${said ? `<div class="said">${esc(said.length > 600 ? said.slice(0, 600) + "…" : said)}</div>` : ""}</span></div>`);
+  }
+  const answer = doc.properties;
+  const properties = Array.isArray(answer) ? answer : (answer && answer.properties) || [];
+  for (const p of properties) {
+    if (p.status !== "failing" || seen.has(p.message) || elsewhere.has(p.message)) continue;
+    items.push(`<div class="failure run"><span class="at">run</span><span class="message">${esc(p.message)} <span class="note">(failing in ${p.timelines_failing} other timelines, not in this one)</span></span></div>`);
+  }
+  if (!items.length) return;
+  $("failures").innerHTML = items.join("");
+  $("failures-panel").hidden = false;
+  for (const el of $("failures").querySelectorAll(".failure[data-t]")) {
+    el.addEventListener("click", () => { select(Number(el.dataset.index)); seek(Number(el.dataset.t)); });
+  }
+}
+
+function chips(counts) {
+  $("sources").innerHTML = '<span class="label" style="margin:0 4px 0 0">Sources</span>' + state.lanes.map((source) =>
+    `<button class="chip on" data-source="${esc(source)}">${esc(source)} <span class="note">${counts.get(source)}</span></button>`).join("");
+  for (const chip of $("sources").querySelectorAll(".chip")) {
+    chip.addEventListener("click", () => {
+      const on = !state.sources.get(chip.dataset.source);
+      state.sources.set(chip.dataset.source, on);
+      chip.classList.toggle("on", on);
+      render();
+    });
+  }
+}
+
+function visibleLanes() { return state.lanes.filter((source) => state.sources.get(source)); }
+
+// The log: every row built once per filter change; moving the cursor only changes the rows
+// between the old and the new position.
+function render() {
+  const log = $("log");
+  const columns = $("columns").checked;
+  let pattern = null;
+  try { pattern = $("grep").value ? new RegExp($("grep").value, "i") : null; } catch { pattern = null; }
+  // Side by side: the platform's sources (faults, assertions, events, the kernel) in one column,
+  // each node in its own.
+  const platform = new Set(["fault", "assert", "event", "kernel"]);
+  const laneOf = (source) => columns && platform.has(source) ? "platform" : source;
+  const lanes = [...new Set(visibleLanes().map(laneOf))];
+  log.classList.toggle("columns", columns);
+  log.style.setProperty("--lanes", lanes.length);
+  const html = [];
+  state.rows = [];
+  if (columns) html.push(`<div class="row head"><span class="t">s</span>${lanes.map((l) => `<span class="cell">${esc(l)}</span>`).join("")}</div>`);
+  for (const ev of state.events) {
+    if (!state.sources.get(ev.source)) continue;
+    if (pattern && !pattern.test(ev.text) && !pattern.test(ev.source)) continue;
+    state.rows.push(ev);
+    const kind = `kind-${ev.kind}`;
+    if (columns) {
+      const lane = lanes.indexOf(laneOf(ev.source));
+      const cells = lanes.map((_, i) => `<span class="cell">${i === lane ? esc(ev.text) : ""}</span>`).join("");
+      html.push(`<div class="row ${kind}" data-index="${ev.index}"><span class="t">${ev.t.toFixed(3)}</span>${cells}</div>`);
+    } else {
+      html.push(`<div class="row ${kind}" data-index="${ev.index}"><span class="t">${ev.t.toFixed(3)}</span><span class="src">${esc(ev.source)}</span><span class="text">${esc(ev.text)}</span></div>`);
+    }
+  }
+  log.innerHTML = html.join("");
+  state.elements = [...log.querySelectorAll(".row[data-index]")];
+  state.nowIndex = -1;
+  mark(true);
+  strip();
+}
+
+// The rows up to the cursor are the past; after it, the future (faded or hidden).
+function mark(all) {
+  const hide = $("hide-future").checked;
+  let now = -1;
+  let lo = 0, hi = state.rows.length;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (state.rows[mid].t <= state.cursor) lo = mid + 1; else hi = mid; }
+  now = lo - 1;
+  const previous = state.nowIndex;
+  const [a, b] = all || previous < 0 ? [0, state.rows.length] : [Math.min(previous, now) , Math.max(previous, now) + 1];
+  for (let i = Math.max(0, a); i < Math.min(b + 1, state.elements.length); i++) {
+    const el = state.elements[i];
+    const future = i > now;
+    el.classList.toggle("future", future && !hide);
+    el.classList.toggle("hidden-future", future && hide);
+    el.classList.toggle("now", i === now);
+  }
+  state.nowIndex = now;
+  if (now >= 0 && state.elements[now] && (now !== previous || all)) {
+    const log = $("log"), el = state.elements[now];
+    const top = el.offsetTop - log.offsetTop;
+    if (top < log.scrollTop || top > log.scrollTop + log.clientHeight - 24) log.scrollTop = top - log.clientHeight * 0.7;
+  }
+}
+
+function seek(t) {
+  state.cursor = Math.min(state.to, Math.max(state.from, t));
+  const span = state.to - state.from || 1;
+  $("scrub").value = Math.round((state.cursor - state.from) / span * 100000);
+  const delta = state.cursor - state.moment;
+  $("clock").textContent = `${fmt(state.cursor)} (${delta >= 0 ? "+" : "−"}${Math.abs(delta).toFixed(3)})`;
+  mark(false);
+  cursorLine();
+}
+
+// The strip: a lane per node (its faults as bars, failed assertions about it as marks), one for
+// the window's failures, and causality's failure probability when an analysis of this timeline
+// is in the export.
+function strip() {
+  const svg = $("strip");
+  const width = Math.max(300, svg.clientWidth || 800);
+  const left = width < 480 ? 64 : 92, right = 12, laneHeight = 18;
+  const probability = causalityPoints();
+  const lanes = [...state.nodes, "failures"];
+  const height = (lanes.length + (probability.length ? 2 : 0)) * laneHeight + 26;
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  svg.setAttribute("height", height);
+  const span = state.to - state.from || 1;
+  const x = (t) => left + (Math.min(state.to, Math.max(state.from, t)) - state.from) / span * (width - left - right);
+  const parts = [];
+  lanes.forEach((lane, i) => {
+    const y = 6 + i * laneHeight;
+    parts.push(`<text x="4" y="${y + 12}">${esc(lane)}</text>`);
+    parts.push(`<line x1="${left}" x2="${width - right}" y1="${y + laneHeight / 2}" y2="${y + laneHeight / 2}" stroke="var(--line)"/>`);
+  });
+  for (const ev of state.events) {
+    if (ev.fault) {
+      for (const node of ev.fault.nodes) {
+        const i = state.nodes.indexOf(node);
+        if (i < 0) continue;
+        const y = 6 + i * laneHeight + 3;
+        const x0 = x(ev.t), x1 = Math.max(x0 + 2, x(ev.fault.end));
+        parts.push(`<rect x="${x0}" y="${y}" width="${x1 - x0}" height="${laneHeight - 6}" rx="2" fill="${faultColor(ev.fault.kind)}" opacity=".75"><title>${esc(ev.text)} at ${ev.t.toFixed(3)} s</title></rect>`);
+      }
+    } else if (ev.failed) {
+      const i = ev.node !== undefined && state.nodes.includes(ev.node) ? state.nodes.indexOf(ev.node) : lanes.length - 1;
+      for (const lane of new Set([i, lanes.length - 1])) {
+        const cy = 6 + lane * laneHeight + laneHeight / 2, cx = x(ev.t);
+        parts.push(`<path d="M${cx} ${cy - 6} L${cx + 5} ${cy} L${cx} ${cy + 6} L${cx - 5} ${cy} Z" fill="var(--fail)"><title>${esc(ev.message)} at ${ev.t.toFixed(3)} s</title></path>`);
+      }
+    }
+  }
+  if (probability.length) {
+    const y0 = 6 + lanes.length * laneHeight, h = laneHeight * 2 - 4;
+    parts.push(`<text x="4" y="${y0 + 12}">P(failure)</text>`);
+    const points = probability.map((p) => `${x(p.t)},${y0 + h - p.p * h}`).join(" ");
+    parts.push(`<polyline points="${points}" fill="none" stroke="var(--accent)" stroke-width="1.5"/>`);
+    for (const p of probability) parts.push(`<circle cx="${x(p.t)}" cy="${y0 + h - p.p * h}" r="2.5" fill="var(--accent)"><title>${p.t.toFixed(3)} s: ${(p.p * 100).toFixed(0)}% of ${p.futures} futures fail</title></circle>`);
+  }
+  // The axis: whole seconds when the window is short, else tens.
+  const axisY = height - 8;
+  const step = span <= 20 ? 1 : span <= 120 ? 5 : 30;
+  for (let t = Math.ceil(state.from / step) * step; t <= state.to; t += step) {
+    parts.push(`<text x="${x(t) - 10}" y="${axisY}">${t}</text>`);
+  }
+  parts.push(`<line x1="${x(state.moment)}" x2="${x(state.moment)}" y1="0" y2="${height - 18}" stroke="var(--fail)" stroke-dasharray="3 3"/>`);
+  parts.push(`<line id="cursor-line" x1="0" x2="0" y1="0" y2="${height - 18}" stroke="var(--text)" stroke-width="1.5"/>`);
+  svg.innerHTML = parts.join("");
+  state.stripX = x; state.stripLeft = left; state.stripRight = right; state.stripWidth = width;
+  cursorLine();
+}
+
+function cursorLine() {
+  const line = document.getElementById("cursor-line");
+  if (!line || !state.stripX) return;
+  const cx = state.stripX(state.cursor);
+  line.setAttribute("x1", cx); line.setAttribute("x2", cx);
+}
+
+function causalityPoints() {
+  const analyses = Array.isArray(state.doc.causality) ? state.doc.causality : [];
+  const mine = analyses.filter((a) => a && a.of && a.of.branch === state.doc.timeline && Array.isArray(a.points));
+  if (!mine.length) return [];
+  const last = mine[mine.length - 1];
+  return last.points
+    .map((p) => ({ t: p.vtime_ms / 1000, p: p.probability !== undefined ? p.probability : (p.futures ? p.failing / p.futures : 0), futures: p.futures }))
+    .filter((p) => p.t >= state.from && p.t <= state.to);
+}
+
+function automations(doc) {
+  const list = doc.automations || [];
+  if (!list.length) return;
+  $("automations").innerHTML = list.map((a) =>
+    `<div class="label" style="margin-top:8px">${esc(a.property || "")} · ${esc(((a.vtime_ns || 0) / NS).toFixed(3))} s · ${esc(a.exec || "")}</div><pre>${esc(a.output || "")}</pre>`).join("");
+  $("automations-panel").hidden = false;
+}
+
+function select(index) {
+  for (const el of $("log").querySelectorAll(".row.selected")) el.classList.remove("selected");
+  state.selected = index;
+  const ev = state.events[index];
+  if (!ev) return;
+  const el = $("log").querySelector(`.row[data-index="${index}"]`);
+  if (el) el.classList.add("selected");
+  if ($("details-on").checked) {
+    $("detail-text").textContent = JSON.stringify(ev.line, null, 2);
+    $("detail").hidden = false;
+  }
+}
+
+function step(direction, predicate) {
+  const list = state.rows.filter(predicate);
+  const next = direction > 0 ? list.find((ev) => ev.t > state.cursor + 1e-9) : [...list].reverse().find((ev) => ev.t < state.cursor - 1e-9);
+  if (next) { select(next.index); seek(next.t); }
+}
+
+function tick(now) {
+  if (!state.playing) return;
+  const elapsed = (now - state.last) / 1000;
+  state.last = now;
+  const next = state.cursor + elapsed * Number($("speed").value);
+  if (next >= state.to) { seek(state.to); play(false); return; }
+  seek(next);
+  requestAnimationFrame(tick);
+}
+
+function play(on) {
+  state.playing = on;
+  $("play").textContent = on ? "❚❚ pause" : "▶ play";
+  if (on) {
+    if (state.cursor >= state.to) seek(state.from);
+    state.last = performance.now();
+    requestAnimationFrame(tick);
+  }
+}
+
+$("play").addEventListener("click", () => play(!state.playing));
+$("scrub").addEventListener("input", () => {
+  const span = state.to - state.from;
+  seek(state.from + Number($("scrub").value) / 100000 * span);
+});
+$("to-start").addEventListener("click", () => seek(state.from));
+$("to-moment").addEventListener("click", () => seek(state.moment));
+$("prev-fail").addEventListener("click", () => step(-1, (ev) => ev.failed));
+$("next-fail").addEventListener("click", () => step(1, (ev) => ev.failed));
+$("prev-event").addEventListener("click", () => step(-1, () => true));
+$("next-event").addEventListener("click", () => step(1, () => true));
+$("grep").addEventListener("input", render);
+$("columns").addEventListener("change", render);
+$("hide-future").addEventListener("change", () => mark(true));
+$("details-on").addEventListener("change", () => { if (!$("details-on").checked) $("detail").hidden = true; else select(state.selected); });
+$("log").addEventListener("click", (e) => {
+  const row = e.target.closest(".row[data-index]");
+  if (!row) return;
+  const index = Number(row.dataset.index);
+  select(index);
+  seek(state.events[index].t);
+});
+$("strip").addEventListener("click", (e) => {
+  const box = $("strip").getBoundingClientRect();
+  const scale = state.stripWidth / box.width;
+  const px = (e.clientX - box.left) * scale;
+  const span = state.to - state.from;
+  seek(state.from + (px - state.stripLeft) / (state.stripWidth - state.stripLeft - state.stripRight) * span);
+});
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT" && e.target.type !== "range" && e.target.type !== "checkbox") return;
+  if (e.key === " ") { e.preventDefault(); play(!state.playing); }
+  else if (e.key === "ArrowRight") { e.preventDefault(); step(1, () => true); }
+  else if (e.key === "ArrowLeft") { e.preventDefault(); step(-1, () => true); }
+});
+
+function fail(message) { $("empty").hidden = false; $("load-error").textContent = message; }
+function readFile(file) {
+  file.text().then((text) => load(JSON.parse(text))).catch((error) => fail(`Not an export: ${error.message}`));
+}
+$("file").addEventListener("change", () => { if ($("file").files[0]) readFile($("file").files[0]); });
+document.addEventListener("dragover", (e) => { e.preventDefault(); $("empty").classList.add("over"); });
+document.addEventListener("dragleave", () => $("empty").classList.remove("over"));
+document.addEventListener("drop", (e) => {
+  e.preventDefault();
+  $("empty").classList.remove("over");
+  if (e.dataTransfer.files[0]) readFile(e.dataTransfer.files[0]);
+});
+
+const embedded = $("determinismo-export").textContent.trim();
+const source = new URLSearchParams(location.search).get("src");
+if (embedded.startsWith("{")) {
+  try { load(JSON.parse(embedded)); } catch (error) { fail(`The embedded export does not parse: ${error.message}`); }
+} else if (source) {
+  fetch(source).then((r) => { if (!r.ok) throw new Error(`${r.status}`); return r.json(); })
+    .then(load).catch((error) => fail(`${source}: ${error.message}`));
+} else {
+  $("empty").hidden = false;
+}
+</script>
+</body>
+</html>

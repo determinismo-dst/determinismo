@@ -1,0 +1,537 @@
+// SPDX-License-Identifier: MIT
+//! Where a process crashed, for its `crash_stack` event (cores.zig emits it beside
+//! `core_dump`): the crashed thread's registers and the address its fault was on, from the
+//! core's notes (the dump's first NT_PRSTATUS is the thread the signal went to, NT_SIGINFO its
+//! signal's), and its stack from the core's memory: the instruction it stopped at, the return
+//! addresses its frame pointers chain, and the words at its stack's top that point into code
+//! (code built without frame pointers, as a libc's abort under an assertion, has no chain: the
+//! caller is among those words, with whatever older calls left there). Each address is named by
+//! its source line when the node has its module's table of lines (/symbols/.determinismo,
+//! src/lines.zig: what names coverage's edges), else by its function, file and line when the
+//! module is a Go program (its own .gopclntab, which a stripped release binary keeps:
+//! gopclntab.zig), else by its function and offset from the module's ELF symbols (.symtab, else
+//! a stripped library's .dynsym: libc's exit, abort; elfsyms.zig), else by its module and offset.
+//!
+//! The process's maps are read while it is still there (before its dump is read to its end),
+//! and its modules' tables opened through its root (/proc/<pid>/root) then too.
+const std = @import("std");
+const assert = std.debug.assert;
+const linux = std.os.linux;
+const gopclntab = @import("gopclntab.zig");
+const elfsyms = @import("elfsyms.zig");
+
+pub const frames_max = 12;
+pub const scanned_max = 8;
+/// A name's length at most: the event holds them all in one message (sdk's message_size_max).
+const name_size_max = 96;
+const maps_size_max = 1 << 20;
+const mappings_max = 1024;
+const modules_max = 24;
+const headers_size_max = 1 << 20;
+const notes_size_max = 8 << 20;
+/// How far up the stack's top its words are looked at.
+const scan_size = 2048;
+const frame_size_max = 1 << 20;
+
+const pt_load = 1;
+const pt_note = 4;
+const et_dyn = 3;
+const nt_prstatus = 1;
+const nt_gnu_build_id = 3;
+const nt_siginfo = 0x53494749;
+/// struct elf_prstatus on x86-64: pr_reg (user_regs_struct) at 112; in it rbp is the 5th
+/// register, rip the 17th, rsp the 20th.
+const prstatus_registers = 112;
+const prstatus_size = 336;
+const register_rbp = 4;
+const register_rip = 16;
+const register_rsp = 19;
+/// Signals whose siginfo holds the address at fault: SIGILL, SIGTRAP, SIGBUS, SIGFPE, SIGSEGV.
+const signals_with_address = [_]i32{ 4, 5, 7, 8, 11 };
+
+const Mapping = struct { start: u64, end: u64, offset: u64, executable: bool, path: []const u8 };
+
+/// A crashing process's mappings and its modules' tables of lines, read before its dump is
+/// consumed.
+pub const Process = struct {
+    pid: linux.pid_t,
+    mappings: []const Mapping,
+    modules: []const Module = &.{},
+
+    pub fn read(arena: std.mem.Allocator, pid: linux.pid_t) Process {
+        var path_buffer: [64]u8 = undefined;
+        const path = std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}/maps", .{pid}, 0) catch unreachable;
+        const text = file_read(arena, path, maps_size_max) orelse return .{ .pid = pid, .mappings = &.{} };
+        var mappings: std.ArrayList(Mapping) = .empty;
+        var lines = std.mem.tokenizeScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            if (mappings.items.len == mappings_max) break;
+            // "start-end perms offset dev inode   path"
+            var fields = std.mem.tokenizeScalar(u8, line, ' ');
+            const range = fields.next() orelse continue;
+            const permissions = fields.next() orelse continue;
+            const offset_text = fields.next() orelse continue;
+            _ = fields.next();
+            _ = fields.next();
+            const dash = std.mem.indexOfScalar(u8, range, '-') orelse continue;
+            mappings.append(arena, .{
+                .start = std.fmt.parseInt(u64, range[0..dash], 16) catch continue,
+                .end = std.fmt.parseInt(u64, range[dash + 1 ..], 16) catch continue,
+                .offset = std.fmt.parseInt(u64, offset_text, 16) catch continue,
+                .executable = std.mem.indexOfScalar(u8, permissions, 'x') != null,
+                .path = fields.rest(),
+            }) catch break;
+        }
+        var process: Process = .{ .pid = pid, .mappings = mappings.items };
+        var modules: std.ArrayList(Module) = .empty;
+        next: for (process.mappings) |mapping| {
+            if (!mapping.executable or mapping.path.len == 0 or mapping.path[0] != '/') continue;
+            for (modules.items) |module| if (std.mem.eql(u8, module.path, mapping.path)) continue :next;
+            if (modules.items.len == modules_max) break;
+            modules.append(arena, module_load(arena, &process, mapping.path)) catch break;
+        }
+        process.modules = modules.items;
+        return process;
+    }
+
+    /// Closes its modules' files (a forwarder walks many exits' stacks in its life).
+    pub fn release(process: *const Process) void {
+        for (process.modules) |module| {
+            if (module.table) |fd| _ = linux.close(fd);
+            if (module.go) |go| _ = linux.close(go.fd);
+        }
+    }
+
+    fn module_of(process: *const Process, path: []const u8) ?*const Module {
+        for (process.modules) |*module| {
+            if (std.mem.eql(u8, module.path, path)) return module;
+        }
+        return null;
+    }
+
+    fn code_at(process: *const Process, address: u64) ?Mapping {
+        for (process.mappings) |mapping| {
+            if (mapping.executable and address >= mapping.start and address < mapping.end) return mapping;
+        }
+        return null;
+    }
+
+    /// Where a module's file starts in memory: its lowest mapping.
+    fn base_of(process: *const Process, path: []const u8) u64 {
+        var base: u64 = std.math.maxInt(u64);
+        for (process.mappings) |mapping| {
+            if (std.mem.eql(u8, mapping.path, path)) base = @min(base, mapping.start - @min(mapping.start, mapping.offset));
+        }
+        return base;
+    }
+};
+
+pub const Frame = struct { address: []const u8, at: []const u8 };
+
+pub const Where = struct {
+    rip: []const u8,
+    rsp: []const u8,
+    rbp: []const u8,
+    /// The signal's code (si_code: SEGV_MAPERR 1, SEGV_ACCERR 2, SI_TKILL -6 for an abort).
+    code: i32,
+    /// The address the fault was on (a segfault's, a bus error's); null for another signal.
+    fault_address: ?[]const u8,
+    /// The instruction the thread stopped at, then its callers by its frame pointers.
+    frames: []const Frame,
+    /// Words of the stack's top that point into code and are not among the frames.
+    scanned: []const Frame,
+};
+
+const Load = struct { address: u64, offset: u64, size: u64 };
+
+/// A process's memory as a stack walk reads it: a crashed one's from its core, a live one's from
+/// /proc/<pid>/mem (exits.zig: a process held at its exit).
+const Memory = union(enum) {
+    core: struct { fd: linux.fd_t, loads: []const Load },
+    live: linux.fd_t,
+
+    /// The 8 bytes at `address`, if the memory has them.
+    fn word(memory: *const Memory, address: u64) ?u64 {
+        var bytes: [8]u8 = undefined;
+        switch (memory.*) {
+            .core => |core| {
+                for (core.loads) |load| {
+                    if (address < load.address or address - load.address + 8 > load.size) continue;
+                    if (!pread_all(core.fd, &bytes, load.offset + (address - load.address))) return null;
+                    return std.mem.readInt(u64, &bytes, .little);
+                }
+                return null;
+            },
+            .live => |fd| {
+                if (!pread_all(fd, &bytes, address)) return null;
+                return std.mem.readInt(u64, &bytes, .little);
+            },
+        }
+    }
+};
+
+/// A module's table of lines, looked into where it lies (a large server's is hundreds of MB).
+const Module = struct {
+    path: []const u8,
+    /// What its addresses in memory are above its file's.
+    bias: u64,
+    table: ?linux.fd_t,
+    rows: u64,
+    /// A Go program's own table (gopclntab.zig): its file, the table's offset, its text's address.
+    go: ?struct { fd: linux.fd_t, at: u64, text: u64 } = null,
+};
+
+/// A file read by offset (gopclntab.Source): the context is its descriptor.
+fn descriptor_read(context: *const anyopaque, buffer: []u8, offset: u64) bool {
+    const fd: *const linux.fd_t = @ptrCast(@alignCast(context));
+    return pread_all(fd.*, buffer, offset);
+}
+
+const Names = struct {
+    arena: std.mem.Allocator,
+    process: *const Process,
+    /// Each module's ELF symbols (by its index), read at the first frame in it that nothing
+    /// else names: a walk reads a library's table once, and only the libraries its frames are in.
+    symbols: []?elfsyms.Symbols,
+    symbols_read: []bool,
+
+    fn of(arena: std.mem.Allocator, process: *const Process) Names {
+        const none: Names = .{ .arena = arena, .process = process, .symbols = &.{}, .symbols_read = &.{} };
+        const symbols = arena.alloc(?elfsyms.Symbols, process.modules.len) catch return none;
+        const read = arena.alloc(bool, symbols.len) catch return none;
+        @memset(read, false);
+        return .{ .arena = arena, .process = process, .symbols = symbols, .symbols_read = read };
+    }
+
+    /// `address` (a return address when `returned`: the call is the instruction before it) as
+    /// its source line, its Go function and line, or its ELF function and offset, else its module
+    /// and offset, else itself.
+    fn name(names: *const Names, address: u64, returned: bool) []const u8 {
+        const arena = names.arena;
+        const fallback = std.fmt.allocPrint(arena, "0x{x}", .{address}) catch "";
+        const mapping = names.process.code_at(address) orelse return fallback;
+        const base = std.fs.path.basename(mapping.path);
+        const offset = address - mapping.start + mapping.offset;
+        const by_module = std.fmt.allocPrint(arena, "{s}+0x{x}", .{ if (base.len > 0) base else "?", offset }) catch fallback;
+        const module = names.process.module_of(mapping.path) orelse return by_module;
+        const at = address - module.bias - @intFromBool(returned);
+        if (module.table) |table| return line_of(arena, table, module.rows, at) orelse by_module;
+        if (module.go) |*go| {
+            const source: gopclntab.Source = .{ .context = &go.fd, .read = descriptor_read };
+            if (gopclntab.Table.of(source, go.at, go.text)) |table| if (table.find(arena, at)) |found| {
+                return gopclntab.name(arena, found, name_size_max) orelse by_module;
+            };
+        }
+        const index = (@intFromPtr(module) - @intFromPtr(names.process.modules.ptr)) / @sizeOf(Module);
+        if (index >= names.symbols_read.len) return by_module;
+        if (!names.symbols_read[index]) {
+            names.symbols_read[index] = true;
+            names.symbols[index] = symbols_load(arena, names.process.pid, module.path);
+        }
+        const symbols = names.symbols[index] orelse return by_module;
+        const found = symbols.find(at) orelse return by_module;
+        return elfsyms.name(arena, found, if (base.len > 0) base else "?", name_size_max) orelse by_module;
+    }
+};
+
+/// The ELF symbols of the module at `path`, read through the process's root.
+fn symbols_load(arena: std.mem.Allocator, pid: linux.pid_t, path: []const u8) ?elfsyms.Symbols {
+    var buffer: [512]u8 = undefined;
+    const file = std.fmt.bufPrintSentinel(&buffer, "/proc/{d}/root{s}", .{ pid, path }, 0) catch return null;
+    const opened = linux.open(file, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(opened) != .SUCCESS) return null;
+    const fd: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(fd);
+    return elfsyms.Symbols.load(arena, .{ .context = &fd, .read = descriptor_read });
+}
+
+fn module_load(arena: std.mem.Allocator, process: *const Process, path: []const u8) Module {
+    var module: Module = .{ .path = path, .bias = 0, .table = null, .rows = 0 };
+    var buffer: [512]u8 = undefined;
+    const file = std.fmt.bufPrintSentinel(&buffer, "/proc/{d}/root{s}", .{ process.pid, path }, 0) catch return module;
+    const headers = file_read(arena, file, 64 * 1024) orelse return module;
+    if (headers.len < 64 or !std.mem.eql(u8, headers[0..4], "\x7fELF")) return module;
+    if (std.mem.readInt(u16, headers[16..18], .little) == et_dyn) module.bias = process.base_of(path);
+    // Its table: by its GNU build ID, else by its file's name (lines.zig's names).
+    var key_buffer: [160]u8 = undefined;
+    var key: []const u8 = std.fmt.bufPrint(&key_buffer, "name-{s}", .{std.fs.path.basename(path)}) catch return module;
+    if (build_id_of(headers)) |id| {
+        if (id.len * 2 <= key_buffer.len) {
+            const digits = "0123456789abcdef";
+            for (id, 0..) |byte, index| {
+                key_buffer[index * 2] = digits[byte >> 4];
+                key_buffer[index * 2 + 1] = digits[byte & 0xf];
+            }
+            key = key_buffer[0 .. id.len * 2];
+        }
+    }
+    var table_buffer: [512]u8 = undefined;
+    const table = std.fmt.bufPrintSentinel(&table_buffer, "/proc/{d}/root/symbols/.determinismo/{s}", .{ process.pid, key }, 0) catch return module;
+    const fd = linux.open(table, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) {
+        module.go = go_load(file);
+        return module;
+    }
+    var header: [16]u8 = undefined;
+    if (!pread_all(@intCast(fd), &header, 0) or !std.mem.eql(u8, header[0..8], "DETLINES")) {
+        _ = linux.close(@intCast(fd));
+        return module;
+    }
+    module.table = @intCast(fd);
+    module.rows = std.mem.readInt(u64, header[8..16], .little);
+    return module;
+}
+
+/// A Go program's own table, if the file at `path` has one (its descriptor kept open for it).
+fn go_load(path: [:0]const u8) @FieldType(Module, "go") {
+    const opened = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(opened) != .SUCCESS) return null;
+    const fd: linux.fd_t = @intCast(opened);
+    const sections = gopclntab.sections_of(.{ .context = &fd, .read = descriptor_read }) orelse {
+        _ = linux.close(fd);
+        return null;
+    };
+    if (gopclntab.Table.of(.{ .context = &fd, .read = descriptor_read }, sections.table, sections.text) == null) {
+        _ = linux.close(fd);
+        return null;
+    }
+    return .{ .fd = fd, .at = sections.table, .text = sections.text };
+}
+
+/// The GNU build ID in an ELF file's first bytes (its program headers' notes), if they hold it.
+fn build_id_of(headers: []const u8) ?[]const u8 {
+    const table = std.mem.readInt(u64, headers[32..40], .little);
+    const entry_size = std.mem.readInt(u16, headers[54..56], .little);
+    const count = std.mem.readInt(u16, headers[56..58], .little);
+    if (entry_size < 56) return null;
+    for (0..count) |index| {
+        const at = table + index * entry_size;
+        if (at + 56 > headers.len) return null;
+        const header = headers[at..][0..56];
+        if (std.mem.readInt(u32, header[0..4], .little) != pt_note) continue;
+        const offset = std.mem.readInt(u64, header[8..16], .little);
+        const size = std.mem.readInt(u64, header[32..40], .little);
+        if (offset > headers.len or size > headers.len - offset) continue;
+        var notes: Notes = .{ .bytes = headers[offset..][0..size] };
+        while (notes.next()) |note| {
+            if (note.kind == nt_gnu_build_id and std.mem.eql(u8, note.name, "GNU") and note.data.len > 0) return note.data;
+        }
+    }
+    return null;
+}
+
+const Note = struct { kind: u32, name: []const u8, data: []const u8 };
+
+const Notes = struct {
+    bytes: []const u8,
+    at: usize = 0,
+
+    fn next(notes: *Notes) ?Note {
+        const bytes = notes.bytes;
+        if (notes.at + 12 > bytes.len) return null;
+        const name_size = std.mem.readInt(u32, bytes[notes.at..][0..4], .little);
+        const data_size = std.mem.readInt(u32, bytes[notes.at + 4 ..][0..4], .little);
+        const kind = std.mem.readInt(u32, bytes[notes.at + 8 ..][0..4], .little);
+        const name_start = notes.at + 12;
+        const data_start = name_start + std.mem.alignForward(usize, name_size, 4);
+        if (data_start > bytes.len or data_size > bytes.len - data_start) return null;
+        notes.at = data_start + std.mem.alignForward(usize, data_size, 4);
+        const name = bytes[name_start..][0..name_size];
+        return .{ .kind = kind, .name = std.mem.trimEnd(u8, name, "\x00"), .data = bytes[data_start..][0..data_size] };
+    }
+};
+
+/// "<file>:<line>" of a file address in a table of lines (lines.zig: "DETLINES", the rows'
+/// count, rows by address {address: u64, line: u32, file: u32}, then the files' names): the
+/// last row at or before it.
+fn line_of(arena: std.mem.Allocator, table: linux.fd_t, rows: u64, address: u64) ?[]const u8 {
+    var low: u64 = 0;
+    var high: u64 = rows;
+    var row: [16]u8 = undefined;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        if (!pread_all(table, &row, 16 + middle * 16)) return null;
+        if (std.mem.readInt(u64, row[0..8], .little) <= address) low = middle + 1 else high = middle;
+    }
+    if (low == 0) return null;
+    if (!pread_all(table, &row, 16 + (low - 1) * 16)) return null;
+    const line = std.mem.readInt(u32, row[8..12], .little);
+    const file_at = std.mem.readInt(u32, row[12..16], .little);
+    if (line == 0) return null;
+    var file_buffer: [512]u8 = undefined;
+    const read = linux.pread(table, &file_buffer, file_buffer.len, @intCast(16 + rows * 16 + file_at));
+    if (linux.errno(read) != .SUCCESS or read == 0) return null;
+    const file = std.mem.sliceTo(file_buffer[0..read], 0);
+    // A long path's end: the file's name is what tells.
+    const room = name_size_max - 12;
+    const shown = if (file.len > room) file[file.len - room ..] else file;
+    return std.fmt.allocPrint(arena, "{s}:{d}", .{ shown, line }) catch null;
+}
+
+/// Where the process whose core is at `core_path` crashed; null when the core does not say
+/// (cut before its notes, not an x86-64 one).
+pub fn of(arena: std.mem.Allocator, core_path: [:0]const u8, process: *const Process) ?Where {
+    const fd = linux.open(core_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return null;
+    defer _ = linux.close(@intCast(fd));
+    const headers = fd_read(arena, @intCast(fd), 0, headers_size_max) orelse return null;
+    if (headers.len < 64 or !std.mem.eql(u8, headers[0..4], "\x7fELF")) return null;
+    const table = std.mem.readInt(u64, headers[32..40], .little);
+    const entry_size = std.mem.readInt(u16, headers[54..56], .little);
+    const count = std.mem.readInt(u16, headers[56..58], .little);
+    if (entry_size < 56) return null;
+    var loads: std.ArrayList(Load) = .empty;
+    var registers: ?[]const u8 = null;
+    var code: i32 = 0;
+    var fault: ?u64 = null;
+    for (0..count) |index| {
+        const at = table + index * entry_size;
+        if (at + 56 > headers.len) break;
+        const header = headers[at..][0..56];
+        const kind = std.mem.readInt(u32, header[0..4], .little);
+        const offset = std.mem.readInt(u64, header[8..16], .little);
+        const size = std.mem.readInt(u64, header[32..40], .little);
+        if (kind == pt_load and size > 0) {
+            loads.append(arena, .{ .address = std.mem.readInt(u64, header[16..24], .little), .offset = offset, .size = size }) catch {};
+        }
+        if (kind != pt_note or registers != null) continue;
+        const bytes = fd_read(arena, @intCast(fd), offset, @min(size, notes_size_max)) orelse continue;
+        var notes: Notes = .{ .bytes = bytes };
+        while (notes.next()) |note| {
+            if (!std.mem.eql(u8, note.name, "CORE")) continue;
+            // The first thread's status: the one the signal went to.
+            if (note.kind == nt_prstatus and registers == null and note.data.len >= prstatus_size) registers = note.data;
+            if (note.kind == nt_siginfo and note.data.len >= 24) {
+                const signal = std.mem.readInt(i32, note.data[0..4], .little);
+                code = std.mem.readInt(i32, note.data[8..12], .little);
+                if (std.mem.indexOfScalar(i32, &signals_with_address, signal) != null and code > 0) {
+                    fault = std.mem.readInt(u64, note.data[16..24], .little);
+                }
+            }
+        }
+    }
+    const saved = registers orelse return null;
+    const register = struct {
+        fn of(bytes: []const u8, index: usize) u64 {
+            return std.mem.readInt(u64, bytes[prstatus_registers + index * 8 ..][0..8], .little);
+        }
+    }.of;
+    const rip = register(saved, register_rip);
+    const rsp = register(saved, register_rsp);
+    const rbp = register(saved, register_rbp);
+    const memory: Memory = .{ .core = .{ .fd = @intCast(fd), .loads = loads.items } };
+    const walked = walk(arena, process, &memory, rip, rsp, rbp) orelse return null;
+    return .{
+        .rip = hex(arena, rip),
+        .rsp = hex(arena, rsp),
+        .rbp = hex(arena, rbp),
+        .code = code,
+        .fault_address = if (fault) |address| hex(arena, address) else null,
+        .frames = walked.frames,
+        .scanned = walked.scanned,
+    };
+}
+
+/// Where a live process is (exits.zig: held at its exit_group), from its memory through
+/// /proc/<pid>/mem (`memory`): the instruction it is at, its callers by frame pointers when its
+/// frame pointer is known (`rbp`), and the words of its stack's top that point into code.
+pub fn live(arena: std.mem.Allocator, process: *const Process, memory_fd: linux.fd_t, rip: u64, rsp: u64, rbp: ?u64) ?Walked {
+    const memory: Memory = .{ .live = memory_fd };
+    return walk(arena, process, &memory, rip, rsp, rbp orelse 0);
+}
+
+pub const Walked = struct { frames: []const Frame, scanned: []const Frame };
+
+fn walk(arena: std.mem.Allocator, process: *const Process, memory: *const Memory, rip: u64, rsp: u64, rbp: u64) ?Walked {
+    const names: Names = .of(arena, process);
+    var addresses: [frames_max]u64 = undefined;
+    var frames: std.ArrayList(Frame) = .empty;
+    addresses[0] = rip;
+    frames.append(arena, .{ .address = hex(arena, rip), .at = names.name(rip, false) }) catch return null;
+    // Its callers, while the chain of frame pointers holds: each frame above the last, its
+    // return address in code.
+    var frame = rbp;
+    while (frame != 0 and frames.items.len < frames_max) {
+        const returned = memory.word(frame +% 8) orelse break;
+        const next = memory.word(frame) orelse break;
+        if (process.code_at(returned) == null) break;
+        addresses[frames.items.len] = returned;
+        frames.append(arena, .{ .address = hex(arena, returned), .at = names.name(returned, true) }) catch break;
+        if (next <= frame or next - frame > frame_size_max) break;
+        frame = next;
+    }
+    var scanned: std.ArrayList(Frame) = .empty;
+    var at: u64 = 0;
+    scan: while (at < scan_size and scanned.items.len < scanned_max) : (at += 8) {
+        const word = memory.word(rsp +% at) orelse break;
+        const mapping = process.code_at(word) orelse continue;
+        // A mapping's own start is a pointer to it (the vDSO's, among a process's first words),
+        // not a return into it.
+        if (word == mapping.start) continue;
+        for (addresses[0..frames.items.len]) |known| if (known == word) continue :scan;
+        const address = hex(arena, word);
+        for (scanned.items) |seen| if (std.mem.eql(u8, seen.address, address)) continue :scan;
+        scanned.append(arena, .{ .address = address, .at = names.name(word, true) }) catch break;
+    }
+    return .{ .frames = frames.items, .scanned = scanned.items };
+}
+
+fn hex(arena: std.mem.Allocator, value: u64) []const u8 {
+    return std.fmt.allocPrint(arena, "0x{x}", .{value}) catch "";
+}
+
+fn pread_all(fd: linux.fd_t, buffer: []u8, offset: u64) bool {
+    var done: usize = 0;
+    while (done < buffer.len) {
+        const read = linux.pread(fd, buffer[done..].ptr, buffer.len - done, @intCast(offset + done));
+        if (linux.errno(read) != .SUCCESS or read == 0) return false;
+        done += read;
+    }
+    return true;
+}
+
+/// Up to `size_max` bytes of `fd` from `offset`.
+fn fd_read(arena: std.mem.Allocator, fd: linux.fd_t, offset: u64, size_max: u64) ?[]const u8 {
+    const buffer = arena.alloc(u8, @intCast(size_max)) catch return null;
+    var done: usize = 0;
+    while (done < buffer.len) {
+        const read = linux.pread(fd, buffer[done..].ptr, buffer.len - done, @intCast(offset + done));
+        if (linux.errno(read) != .SUCCESS or read == 0) break;
+        done += read;
+    }
+    return buffer[0..done];
+}
+
+fn file_read(arena: std.mem.Allocator, path: [:0]const u8, size_max: usize) ?[]const u8 {
+    const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return null;
+    defer _ = linux.close(@intCast(fd));
+    // A /proc file has no size to ask for: read until it ends.
+    const buffer = arena.alloc(u8, size_max) catch return null;
+    var done: usize = 0;
+    while (done < buffer.len) {
+        const read = linux.read(@intCast(fd), buffer[done..].ptr, buffer.len - done);
+        if (linux.errno(read) != .SUCCESS or read == 0) break;
+        done += read;
+    }
+    return buffer[0..done];
+}
+
+test "a core's notes: the first thread's registers, the fault's address" {
+    // One note of each kind, as the kernel writes them: name "CORE", data padded to 4.
+    var status: [prstatus_size]u8 = @splat(0);
+    std.mem.writeInt(u64, status[prstatus_registers + register_rip * 8 ..][0..8], 0x401234, .little);
+    std.mem.writeInt(u64, status[prstatus_registers + register_rsp * 8 ..][0..8], 0x7ffd0000, .little);
+    var bytes: [12 + 8 + prstatus_size]u8 = undefined;
+    std.mem.writeInt(u32, bytes[0..4], 5, .little);
+    std.mem.writeInt(u32, bytes[4..8], prstatus_size, .little);
+    std.mem.writeInt(u32, bytes[8..12], nt_prstatus, .little);
+    @memcpy(bytes[12..20], "CORE\x00\x00\x00\x00");
+    @memcpy(bytes[20..], &status);
+    var notes: Notes = .{ .bytes = &bytes };
+    const note = notes.next().?;
+    try std.testing.expectEqual(@as(u32, nt_prstatus), note.kind);
+    try std.testing.expectEqualStrings("CORE", note.name);
+    try std.testing.expectEqual(@as(u64, 0x401234), std.mem.readInt(u64, note.data[prstatus_registers + register_rip * 8 ..][0..8], .little));
+    try std.testing.expectEqual(@as(?Note, null), notes.next());
+}

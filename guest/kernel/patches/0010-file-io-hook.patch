@@ -1,0 +1,36 @@
+--- a/fs/read_write.c
++++ b/fs/read_write.c
+@@ -445,6 +445,16 @@
+ }
+ #endif
+ 
++/*
++ * determinismo: a module may fail a regular file's read or write before it moves any data
++ * (det_guest.ko's file_error fault: ENOSPC, EDQUOT, EIO, as a full or failing disk returns
++ * them). Called for every read and write of a regular file (their p- and v- forms, splice,
++ * sendfile, copy_file_range, io_uring's), in the task's context; a non-zero return is the
++ * call's result. Unset, and nothing changes.
++ */
++int (*det_file_io)(int read_write, struct file *file) __read_mostly;
++EXPORT_SYMBOL_GPL(det_file_io);
++
+ int rw_verify_area(int read_write, struct file *file, const loff_t *ppos, size_t count)
+ {
+ 	int mask = read_write == READ ? MAY_READ : MAY_WRITE;
+@@ -467,6 +477,16 @@
+ 		}
+ 	}
+ 
++	if (S_ISREG(file_inode(file)->i_mode)) {
++		int (*io)(int read_write, struct file *file) = READ_ONCE(det_file_io);
++
++		if (io) {
++			ret = io(read_write, file);
++			if (ret)
++				return ret;
++		}
++	}
++
+ 	ret = security_file_permission(file, mask);
+ 	if (ret)
+ 		return ret;

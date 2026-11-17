@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: MIT
+services:
+  app:
+    build:
+      context: ../..
+      dockerfile: examples/ci-demo/Dockerfile
+    command: ["sleep", "infinity"]

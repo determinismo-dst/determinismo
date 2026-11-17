@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT
+# Crash points on the JVM (sdk/java/DeterminismoCoverage): a server whose role is an enum, under
+# the Java agent, crashed at its state transitions (tools/e2e.zig's crash-points check):
+#   determinismo explore ... --compose tests/antithesis-compat/java/crash-points.yaml \
+#     --scenario crash_points
+services:
+  client:
+    build:
+      context: ../../..
+      dockerfile: tests/antithesis-compat/java/client/Dockerfile
+    command: [sh, -c, "java -cp /app/sdk-classes:/app/classes Ready && exec sleep infinity"]
+    labels:
+      determinismo.no-faults: "true"
+  server:
+    build:
+      context: ../../..
+      dockerfile: tests/antithesis-compat/java/server/Dockerfile
+    command: [sh, -c, "exec java -XX:TieredStopAtLevel=1 -javaagent:/app/determinismo-coverage.jar=StateServer -cp /app/classes:/app/determinismo-coverage.jar StateServer"]
+    labels:
+      determinismo.faults: "+restart"

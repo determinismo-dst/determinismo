@@ -1,0 +1,11 @@
+{
+  "compose": "compose.yaml",
+  "node": "app",
+  "setup": "cd /app && python -m pytest --version",
+  "list": "cd /app && python -m pytest --collect-only -q | grep '::'",
+  "run": "cd /app && python -m pytest --collect-only -q | grep '::' | awk 'NR % {shards} == {shard} % {shards}' | xargs python -m pytest -q -p no:cacheprovider --junitxml /tmp/junit.xml",
+  "junit": "/tmp/junit.xml",
+  "shards": 3,
+  "timelines": 12,
+  "key_files": ["tests", "Dockerfile"]
+}

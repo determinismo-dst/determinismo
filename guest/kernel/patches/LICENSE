@@ -1,0 +1,6 @@
+SPDX-License-Identifier: GPL-2.0-only
+
+These patches modify the Linux kernel and are licensed as Linux is: the GNU General Public
+License, version 2 only. (Kept out of the patches themselves: guest/kernel/build.sh hashes them,
+and a header changed there would rebuild the guest kernel for nothing.) See README.md,
+"Licensing".

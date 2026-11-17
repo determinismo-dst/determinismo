@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: MIT
+# Compose's volumes, one-shots and healthchecks as Docker gives them (src/compose.zig): `init`
+# runs to completion first (`service_completed_successfully`) and leaves a marker in a host
+# directory shared by the three services; `server` reads the marker and the project's own file
+# (copied into its image), and writes a file there two seconds later, which its healthcheck
+# waits for; `client` starts once server is healthy (it exits 1 if the file is not there yet),
+# and its test command reads the file through a read-only mount it cannot write. Any of it
+# missing fails "no unexpected container exits" (server, client) or "test commands exit
+# successfully" (the driver; run in init, ended, when a one-shot's template counted). Run with:
+#   determinismo explore ... --compose tests/antithesis-compat/volumes/compose.yaml --scenario volumes
+services:
+  init:
+    # The client's image, its template too: a one-shot's is never where commands run.
+    build:
+      context: ./node
+      dockerfile: Dockerfile.client
+    command: ["/bin/sh", "-c", "sleep 1 && echo init > /data/shared/marker"]
+    volumes:
+      - /tmp/determinismo-volumes:/data/shared
+  # A Compose name that is no node name (node_names): its node is "the-server-1", this name
+  # resolves to it and is its hostname.
+  the_server_1:
+    build: ./node
+    command: ["/usr/local/bin/server"]
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "test", "-f", "/srv/shared/server"]
+    volumes:
+      - /tmp/determinismo-volumes:/srv/shared
+      - ./config.txt:/etc/server.txt:ro
+  client:
+    build:
+      context: ./node
+      dockerfile: Dockerfile.client
+    command: ["/bin/sh", "-c", "test -f /check/shared/server || { echo started before server was healthy >&2; exit 1; }; exec sleep infinity"]
+    depends_on:
+      the_server_1:
+        condition: service_healthy
+    volumes:
+      - type: bind
+        source: /tmp/determinismo-volumes
+        target: /check/shared
+        read_only: true

@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT
+# nbb at its main branch's commit 60e141d (2026-11-03), built from source (checksummed archive):
+# the nREPL fixes after 1.6.214, unreleased (#418 and #429: bindings per evaluation and state per
+# session; #425, #426, #427, #430, #431), which the `nbb` profile's release lacks. babashka runs
+# nbb's own release task (shadow-cljs on the JVM, its npm dependencies installed), npm packs it,
+# and the runtime image installs that package as the `nbb` profile installs the release.
+FROM docker.io/library/clojure:temurin-25-tools-deps-bookworm AS build
+COPY --from=docker.io/library/node:22-bookworm-slim /usr/local/ /usr/local/
+RUN apt-get update -q && apt-get install -y -q --no-install-recommends curl ca-certificates git \
+ && rm -rf /var/lib/apt/lists/*
+ARG BB_VERSION=1.13.225
+ARG BB_SHA256=ab0e98307405ba19e7c5ba0c3c7cd17a6f90aa90577a72709055f120796d6bfe
+ARG NBB_COMMIT=60e141d65404e72f8991e2a5bfe04d458acc0b49
+ARG NBB_SHA256=94ac17cb8db25188539e0cef7db23c1fef1a2c1507a04066aa353a3befe0c86c
+RUN curl -fsSL -o /tmp/bb.tar.gz "https://github.com/babashka/babashka/releases/download/v${BB_VERSION}/babashka-${BB_VERSION}-linux-amd64-static.tar.gz" \
+ && echo "${BB_SHA256}  /tmp/bb.tar.gz" | sha256sum -c - \
+ && tar -xzf /tmp/bb.tar.gz -C /usr/local/bin bb && rm /tmp/bb.tar.gz \
+ && curl -fsSL -o /tmp/nbb.tar.gz "https://github.com/babashka/nbb/archive/${NBB_COMMIT}.tar.gz" \
+ && echo "${NBB_SHA256}  /tmp/nbb.tar.gz" | sha256sum -c - \
+ && mkdir /src && tar -xzf /tmp/nbb.tar.gz -C /src --strip-components=1 && rm /tmp/nbb.tar.gz
+RUN cd /src && bb release && npm pack && mv nbb-*.tgz /nbb.tgz
+FROM docker.io/library/node:22-alpine
+COPY --from=build /nbb.tgz /tmp/nbb.tgz
+RUN npm install -g /tmp/nbb.tgz && rm /tmp/nbb.tgz
+ENTRYPOINT ["nbb", "nrepl-server", ":port", "7888", ":host", "0.0.0.0"]

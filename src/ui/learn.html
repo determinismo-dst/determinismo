@@ -1,0 +1,638 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- determinismo's Learn page, served by `determinismo serve` at /learn: every technique a run
+     uses, how each works, and how they combine, each with an illustration in the UI's own
+     style. Static: no API calls. Keep it to what is built (docs/ANTITHESIS.md's table). -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Learn determinismo</title>
+<style>
+@font-face { font-family: "TeX Gyre Schola"; src: url("/fonts/texgyreschola-regular.otf"); }
+@font-face { font-family: "TeX Gyre Schola"; src: url("/fonts/texgyreschola-bold.otf"); font-weight: bold; }
+@font-face { font-family: "TeX Gyre Schola"; src: url("/fonts/texgyreschola-italic.otf"); font-style: italic; }
+:root {
+  --bg: #fdf6d8; --panel: #fffbe9; --panel-2: #f6ecc6; --line: #ddd3ab; --text: #1d1b16;
+  --muted: #6b6455; --accent: #1a4f8b; --pass: #2e7d32; --fail: #b3261e; --warn: #a15c00;
+  --code: #f3e9c2; --here: #f1dfa0;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --serif: "TeX Gyre Schola", "Century Schoolbook", Georgia, serif;
+  --slab: "Roboto Slab", "TeX Gyre Schola", Georgia, serif;
+  color-scheme: light;
+}
+* { box-sizing: border-box; }
+html { scroll-padding-top: 16px; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.55 var(--serif); }
+a { color: var(--accent); }
+code { font: 13px var(--mono); background: var(--code); padding: 1px 4px; border-radius: 3px; }
+.layout { display: grid; grid-template-columns: 260px minmax(0, 1fr); max-width: 1180px; margin: 0 auto; }
+nav { position: sticky; top: 0; align-self: start; height: 100vh; overflow-y: auto; padding: 28px 18px; border-right: 1px solid var(--line); font-size: 14px; }
+nav .brand { display: flex; align-items: center; gap: 8px; font: 600 18px var(--slab); color: var(--text); text-decoration: none; margin-bottom: 4px; }
+nav .back { display: block; margin-bottom: 18px; font-size: 13px; }
+nav ol { list-style: none; padding: 0; margin: 0 0 14px; }
+nav li { margin: 2px 0; }
+nav .part { font: 600 12px var(--slab); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 14px 0 4px; }
+nav a { text-decoration: none; }
+nav a:hover { text-decoration: underline; }
+main { padding: 28px 40px 80px; min-width: 0; }
+h1 { font: 600 34px/1.2 var(--slab); margin: 0 0 8px; }
+h2 { font: 600 24px/1.25 var(--slab); margin: 56px 0 6px; padding-top: 10px; border-top: 2px solid var(--text); }
+h3 { font: 600 19px/1.3 var(--slab); margin: 34px 0 4px; }
+.lede { font-size: 18px; color: var(--muted); max-width: 62ch; }
+p, ul { max-width: 70ch; }
+.kicker { font-size: 13px; color: var(--muted); font-style: italic; margin: 0 0 10px; }
+.where { font-size: 13px; color: var(--muted); border-left: 3px solid var(--line); padding: 2px 10px; margin: 10px 0; max-width: 70ch; }
+.where b { color: var(--text); font-weight: 600; }
+figure { margin: 16px 0 6px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 14px; overflow-x: auto; }
+figcaption { font-size: 13px; color: var(--muted); margin-top: 8px; font-style: italic; }
+svg text { font-family: var(--serif); }
+svg .mono { font-family: var(--mono); }
+table { border-collapse: collapse; font-size: 14px; width: 100%; }
+th { font: 600 13px var(--slab); text-align: left; border-bottom: 1px solid var(--text); padding: 4px 8px; }
+td { border-bottom: 1px solid var(--line); padding: 4px 8px; vertical-align: top; }
+td.mono, .mono { font-family: var(--mono); font-size: 12.5px; }
+.pass { color: var(--pass); } .fail { color: var(--fail); } .warn { color: var(--warn); }
+.badge { font: 600 10px var(--slab); letter-spacing: .06em; text-transform: uppercase; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; margin: 14px 0; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; font-size: 14px; }
+.card h4 { font: 600 14px var(--slab); margin: 0 0 4px; }
+.card p { margin: 0; color: var(--muted); }
+.combo { background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 6px; padding: 12px 16px; margin: 18px 0; }
+.combo h3 { margin-top: 0; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 8px; }
+.chip { font-size: 12px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 12px; padding: 1px 9px; }
+.prop { font-size: 14px; }
+.prop .head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.prop .stats { color: var(--muted); font-size: 13px; }
+.note { font-size: 13px; color: var(--muted); }
+.facts { width: 100%; max-width: 760px; margin: 14px 0 4px; font-size: 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; border-collapse: separate; border-spacing: 0; }
+.facts th { width: 110px; font: 600 12px var(--slab); text-transform: uppercase; letter-spacing: .05em; color: var(--muted); border-bottom: 1px solid var(--line); padding: 8px 10px; vertical-align: top; }
+.facts td { border-bottom: 1px solid var(--line); padding: 8px 10px; }
+.facts tr:last-child th, .facts tr:last-child td { border-bottom: 0; }
+.facts ul { margin: 0; padding-left: 18px; }
+.facts li { margin: 2px 0; }
+
+@media (max-width: 820px) {
+  .layout { grid-template-columns: 1fr; }
+  nav { position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--line); padding: 16px; }
+  main { padding: 16px 16px 60px; }
+  h1 { font-size: 28px; }
+}
+</style>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto+Slab:wght@400;500;600&amp;display=swap">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='7' cy='16' r='5' fill='%231a4f8b'/%3E%3Cpath d='M11 16C18 16 18 6 26 6M11 16H26M11 16C18 16 18 26 26 26' stroke='%231a4f8b' stroke-width='3' fill='none'/%3E%3Ccircle cx='27' cy='6' r='3.5' fill='%232e7d32'/%3E%3Ccircle cx='27' cy='16' r='3.5' fill='%232e7d32'/%3E%3Ccircle cx='27' cy='26' r='3.5' fill='%23b3261e'/%3E%3C/svg%3E">
+</head>
+<body>
+<div class="layout">
+<nav>
+  <a class="brand" href="/"><svg width="34" height="26" viewBox="0 0 40 30" aria-hidden="true">
+    <circle cx="8" cy="15" r="5" fill="#1a4f8b"/>
+    <path d="M13 15 C 22 15, 22 5, 32 5 M13 15 L32 15 M13 15 C 22 15, 22 25, 32 25" stroke="#1a4f8b" stroke-width="2.4" fill="none"/>
+    <circle cx="33" cy="5" r="3" fill="#2e7d32"/><circle cx="33" cy="15" r="3" fill="#2e7d32"/><circle cx="33" cy="25" r="3" fill="#b3261e"/></svg>determinismo</a>
+  <a class="back" href="/">← Back to the runs</a>
+  <div class="part">Foundations</div>
+  <ol>
+    <li><a href="#machine">A deterministic machine</a></li>
+    <li><a href="#moments">Timelines, moments, replay</a></li>
+    <li><a href="#tree">The multiverse tree</a></li>
+  </ol>
+  <div class="part">Making timelines differ</div>
+  <ol>
+    <li><a href="#randomness">Randomness and named decisions</a></li>
+    <li><a href="#swarm">Swarm testing</a></li>
+    <li><a href="#faults">Faults</a></li>
+    <li><a href="#timing">Timing faults</a></li>
+    <li><a href="#boundary">The machine's boundary</a></li>
+  </ol>
+  <div class="part">Guidance</div>
+  <ol>
+    <li><a href="#behaviors">Behaviors and novelty</a></li>
+    <li><a href="#sought">Sought and severe states</a></li>
+    <li><a href="#guidance">Guidance and optimization</a></li>
+    <li><a href="#ranges">Learned ranges</a></li>
+    <li><a href="#strategies">Strategies and the bandit</a></li>
+    <li><a href="#targeted">Targeted runs</a></li>
+  </ol>
+  <div class="part">Judging</div>
+  <ol>
+    <li><a href="#assertions">Assertions</a></li>
+    <li><a href="#defaults">Default properties</a></li>
+    <li><a href="#checkers">History checkers</a></li>
+    <li><a href="#tests">Tests as properties (CI)</a></li>
+  </ol>
+  <div class="part">Understanding a failure</div>
+  <ol>
+    <li><a href="#triggers">Triggers and suppressors</a></li>
+    <li><a href="#causality">Causality</a></li>
+    <li><a href="#debugging">Debugging at a moment</a></li>
+    <li><a href="#findings">Findings over runs</a></li>
+  </ol>
+  <div class="part">How they combine</div>
+  <ol>
+    <li><a href="#combinations">Combinations, with examples</a></li>
+  </ol>
+  <div class="part">Samples</div>
+  <ol>
+    <li hidden><a href="#samples">Samples</a></li>
+  </ol>
+</nav>
+
+<main>
+<h1>How determinismo finds bugs</h1>
+<p class="lede">A run is many timelines of one system, each a different way the world could have
+gone: different faults, timings, loads and choices. Every timeline is deterministic, so any one
+of them can be replayed exactly, and opened at any moment. This page explains each technique a
+run uses, and then how they combine.</p>
+
+<!-- ============================== FOUNDATIONS ============================== -->
+<h2 id="machine">1. A deterministic machine</h2>
+<p class="kicker">Foundations</p>
+<p>The system under test runs in a virtual machine whose every input is controlled: a patched KVM
+with one virtual CPU, no hardware randomness, and a clock made of retired branches, the one count
+the hardware keeps deterministic. Given the same seed and inputs, the machine executes the same
+instructions in the same order, every time. Each node of the system (a container from Compose, a
+Kubernetes pod, or a program's own nodes) runs inside it.</p>
+<figure>
+<svg viewBox="0 0 760 120" width="100%" role="img" aria-label="Two runs of the same seed produce the same events">
+  <text x="0" y="24" font-size="13" fill="#6b6455">seed 63d9… run</text>
+  <text x="0" y="74" font-size="13" fill="#6b6455">seed 63d9… again</text>
+  <g stroke="#1d1b16" stroke-width="1.5"><line x1="120" y1="20" x2="740" y2="20"/><line x1="120" y1="70" x2="740" y2="70"/></g>
+  <g fill="#1a4f8b">
+    <circle cx="170" cy="20" r="5"/><circle cx="260" cy="20" r="5"/><circle cx="395" cy="20" r="5" fill="#a15c00"/><circle cx="520" cy="20" r="5"/><circle cx="640" cy="20" r="5" fill="#b3261e"/>
+    <circle cx="170" cy="70" r="5"/><circle cx="260" cy="70" r="5"/><circle cx="395" cy="70" r="5" fill="#a15c00"/><circle cx="520" cy="70" r="5"/><circle cx="640" cy="70" r="5" fill="#b3261e"/>
+  </g>
+  <g font-size="11" fill="#6b6455" text-anchor="middle">
+    <text x="170" y="40">node up</text><text x="260" y="40">write</text><text x="395" y="40">partition</text><text x="520" y="40">read</text><text x="640" y="40">assert fails</text>
+  </g>
+  <text x="120" y="108" font-size="12" class="mono" fill="#2e7d32">events hash a41f…07 = a41f…07: the same history, byte for byte</text>
+</svg>
+<figcaption>The same seed gives the same history. A failure found once is found every time.</figcaption>
+</figure>
+<div class="where"><b>Where you see it:</b> every failing example can be replayed; a run's page says
+its seed and inputs; "Run again" starts a new seed.</div>
+
+<table class="facts"><tr><th>Good for</th><td>Reproducing any failure exactly, however rare: a bug found once is found every time, and fixed against the same timeline.</td></tr><tr><th>Pitfalls</th><td>One virtual CPU per machine: true multi-core effects (weak-memory reorderings) are not reproduced. Virtual time is not real performance. Anything outside the machine needs <a href="#boundary">egress</a>.</td></tr><tr><th>Learn more</th><td><ul><li><a href="https://www.youtube.com/watch?v=4fFDFbi3toc">Will Wilson, “Testing Distributed Systems w/ Deterministic Simulation” (Strange Loop 2014, video)</a></li><li><a href="https://antithesis.com/blog/deterministic_hypervisor/">Antithesis, “So you think you want to write a deterministic hypervisor?”</a></li><li><a href="https://apple.github.io/foundationdb/testing.html">FoundationDB, “Simulation and Testing”</a></li></ul></td></tr></table>
+
+<h2 id="moments">2. Timelines, moments and replay</h2>
+<p class="kicker">Foundations</p>
+<p>A <b>timeline</b> is one execution of the machine from a starting point. A <b>moment</b> is a
+point on it, named by its virtual time. Each timeline keeps a <b>tape</b>: every choice made
+along it (each random draw, each fault, each answer from outside). Replaying the tape reproduces
+the timeline exactly, and stopping the replay at a moment gives a machine you can look into:
+run a command, take a file out, read every thread's stack, or open a REPL there.</p>
+<figure>
+<svg viewBox="0 0 760 110" width="100%" role="img" aria-label="A timeline with a moment and a replay">
+  <line x1="20" y1="40" x2="740" y2="40" stroke="#1d1b16" stroke-width="1.5"/>
+  <g fill="#1a4f8b"><circle cx="80" cy="40" r="4"/><circle cx="160" cy="40" r="4"/><circle cx="250" cy="40" r="4"/><circle cx="330" cy="40" r="4"/><circle cx="470" cy="40" r="4"/><circle cx="590" cy="40" r="4" fill="#b3261e"/></g>
+  <rect x="402" y="20" width="4" height="40" fill="#f1dfa0" stroke="#a15c00"/>
+  <text x="404" y="14" font-size="12" text-anchor="middle" fill="#a15c00">moment 41.2 s</text>
+  <text x="590" y="64" font-size="11" text-anchor="middle" fill="#b3261e">failure</text>
+  <path d="M20 80 H404" stroke="#2e7d32" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="20" y="100" font-size="12" fill="#2e7d32">replay from the tape to the moment, then: exec, extract, stacks, profile, a REPL</text>
+  <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10z" fill="#2e7d32"/></marker></defs>
+</svg>
+<figcaption>Stop a replay just before a failure and the machine is held there, in exactly that state.</figcaption>
+</figure>
+<div class="where"><b>Where you see it:</b> a property's examples ("Causality", "Shrink", "Export"),
+the Logs explorer, <code>determinismo replay --until …</code>, the Notebook's actions.</div>
+
+<table class="facts"><tr><th>Good for</th><td>Looking at a failure from inside: the exact state just before it, as many times as needed.</td></tr><tr><th>Pitfalls</th><td>A tape belongs to one build and its inputs: change the system and old tapes are refused. Late moments of long timelines take a while to reach (snapshots help).</td></tr><tr><th>Learn more</th><td><ul><li><a href="https://www.usenix.org/conference/atc17/technical-sessions/presentation/ocallahan">O’Callahan et al., “Engineering Record and Replay for Deployability” (USENIX ATC 2017)</a></li><li><a href="https://rr-project.org/">rr: lightweight recording &amp; deterministic debugging</a></li></ul></td></tr></table>
+
+<h2 id="tree">3. The multiverse tree</h2>
+<p class="kicker">Foundations</p>
+<p>Instead of many independent runs from the start, determinismo explores a <b>tree</b>. Timelines
+run in generations; one that reached a behavior no timeline had reached is returned to just after
+it (from a snapshot there) and branched with new seeds, so the next timelines start from the
+interesting state instead of rediscovering it. A <code>sometimes</code> or <code>reachable</code>
+assertion made true, or a node printing something that reads as trouble, is returned to first.
+Every timeline's path is kept, so it replays alone.</p>
+<figure>
+<svg viewBox="0 0 760 210" width="100%" role="img" aria-label="A tree of timelines branching from interesting states">
+  <g stroke="#1a4f8b" stroke-width="2" fill="none">
+    <path d="M20 105 H200"/>
+    <path d="M200 105 C 240 105, 240 50, 300 50 H460"/>
+    <path d="M200 105 H520"/>
+    <path d="M200 105 C 240 105, 240 165, 300 165 H560"/>
+    <path d="M460 50 C 500 50, 500 25, 540 25 H740"/>
+    <path d="M460 50 H700"/>
+    <path d="M460 50 C 500 50, 500 80, 540 80 H690"/>
+  </g>
+  <g stroke="#b3261e" stroke-width="2.5" fill="none"><path d="M540 25 H740"/></g>
+  <circle cx="200" cy="105" r="6" fill="#a15c00"/><circle cx="460" cy="50" r="6" fill="#a15c00"/>
+  <circle cx="740" cy="25" r="5" fill="#b3261e"/>
+  <g font-size="12" fill="#1d1b16">
+    <text x="150" y="128">new behavior:</text><text x="150" y="143" class="mono" font-size="11">leader elected</text>
+    <text x="282" y="40">sought: <tspan class="mono" font-size="11">sometimes "txn aborted"</tspan></text>
+    <text x="600" y="16" fill="#b3261e">fails here</text>
+  </g>
+  <g font-size="11" fill="#6b6455"><text x="20" y="200">generation 0</text><text x="290" y="200">generation 1</text><text x="530" y="200">generation 2</text></g>
+</svg>
+<figcaption>Timelines return to where something new happened and branch from there. The failing
+timeline's ancestors are the states it took to get there.</figcaption>
+</figure>
+<div class="where"><b>Where you see it:</b> the Logs explorer's map (one path per timeline), a
+timeline's "why" (the reason its branch point was chosen), the Utilization's discovery curve.</div>
+
+<!-- ============================== VARIETY ============================== -->
+<table class="facts"><tr><th>Good for</th><td>Deep states: a bug that needs a leader change, then a crash, then a partition is reached by building on timelines that already got partway.</td></tr><tr><th>Pitfalls</th><td>It follows novelty, and novelty can be noise: on 2026-11-11 random ids in Kafka's logs made 74% of output kinds look new, until the templates blanked them. States the tree has seen many times get fewer new timelines, even if a bug is one step away.</td></tr><tr><th>Learn more</th><td><ul><li><a href="https://arxiv.org/abs/1901.10995">Ecoffet et al., “Go-Explore: a New Approach for Hard-Exploration Problems” (2019)</a></li><li><a href="https://www.nature.com/articles/s41586-020-03157-9">Ecoffet et al., “First return, then explore” (Nature, 2021)</a></li></ul></td></tr></table>
+
+<h2 id="randomness">4. Randomness and named decisions</h2>
+<p class="kicker">Making timelines differ</p>
+<p>Everything random inside the machine comes from the platform: the kernel is reseeded per
+branch, and the SDKs' random calls draw from the same source. A draw can carry a name
+(<code>decide</code>, <code>random_below_named</code>), which makes it a <b>named decision</b>: the
+report counts what timelines drew for it, and a strategy can steer it. <code>buggify(name)</code>
+makes rare paths common: a code path that runs only on a rare condition runs whenever the draw
+says so.</p>
+<div class="where"><b>Where you see it:</b> the run report's "Named decisions" (what the timelines
+drew, by name), a timeline's tape.</div>
+
+<table class="facts"><tr><th>Good for</th><td>Making rare paths common (<code>buggify</code>), and seeing what timelines chose (named decisions).</td></tr><tr><th>Pitfalls</th><td>A program that seeds its own generator from a constant explores nothing: draw from the SDK or the platform. Too many buggified paths at once and the system never does anything normal.</td></tr><tr><th>Learn more</th><td><ul><li><a href="https://apple.github.io/foundationdb/testing.html">FoundationDB, “Simulation and Testing”</a></li></ul></td></tr></table>
+
+<h2 id="swarm">5. Swarm testing</h2>
+<p class="kicker">Making timelines differ</p>
+<p>Running every feature in every timeline hides bugs that need some features <i>off</i>: a fault
+that keeps resetting a cluster also keeps it from reaching the state where a bug lives. So each
+timeline draws its own configuration (swarm testing, Groce et al. 2012):</p>
+<ul>
+  <li><b>Drivers:</b> which of a scenario's workload drivers run (at least one), and the load's
+  shape in stretches (steady, quiet, a spike).</li>
+  <li><b>Fault kinds:</b> each kept with a drawn probability (a "meta-swarm": how many kinds are
+  kept is itself drawn), each weighted 1 to 64.</li>
+  <li><b>Fault regimes:</b> a rate (a mean gap of 100 ms to 25.6 s) and a duration scale (1 to
+  8), lasting 10 to 120 s, then redrawn with the kinds and weights.</li>
+  <li><b>A workload's own choices:</b> <code>swarm_choice</code> in every SDK, and knobs a node
+  draws (a timeout, a buffer size).</li>
+  <li><b>Guidance itself:</b> which share of learned ranges a timeline keeps (below).</li>
+</ul>
+<figure>
+<table>
+<tr><th>Timeline</th><th>Drivers on</th><th>Fault kinds kept</th><th>Regime</th><th>Knobs</th><th>Property</th></tr>
+<tr><td>3</td><td>append, read</td><td>partition, crash</td><td>gap 400 ms, ×4</td><td class="mono">fsync=batch</td><td class="fail">fails</td></tr>
+<tr><td>6</td><td>append</td><td>crash</td><td>gap 2.1 s, ×1</td><td class="mono">fsync=batch</td><td class="fail">fails</td></tr>
+<tr><td>8</td><td>append, read, scan</td><td>partition, pause, clock</td><td>gap 6 s, ×2</td><td class="mono">fsync=always</td><td class="pass">passes</td></tr>
+<tr><td>9</td><td>read, scan</td><td><i>none</i></td><td>—</td><td class="mono">fsync=batch</td><td class="pass">passes</td></tr>
+</table>
+<figcaption>Each timeline is its own configuration. Here, failures share <i>crash</i> with
+<code>fsync=batch</code>; that comparison is what triggers and suppressors compute.</figcaption>
+</figure>
+<div class="where"><b>Where you see it:</b> <code>fault_swarm</code> and <code>fault_regime</code>
+events, a property example's knobs, "Triggers and suppressors". <code>--no-swarm</code> runs the
+fixed injector, for comparisons.</div>
+
+<table class="facts"><tr><th>Good for</th><td>Bugs that some features hide: a fault that keeps resetting a cluster also keeps it from reaching the state where the bug lives.</td></tr><tr><th>Pitfalls</th><td>A bug that needs several features on at once is rarer (each one is off in some timelines): more timelines are needed. Which feature mattered is not obvious without <a href="#triggers">triggers and suppressors</a>.</td></tr><tr><th>Learn more</th><td><ul><li><a href="https://doi.org/10.1145/2338965.2336763">Groce, Zhang, Eide, Chen, Regehr, “Swarm Testing” (ISSTA 2012)</a></li><li><a href="https://doi.org/10.1109/ISSRE.2013.6698892">Groce et al., “Help, help, I’m being suppressed! The significance of suppressors in software testing” (ISSRE 2013)</a></li></ul></td></tr></table>
+
+<h2 id="faults">6. Faults</h2>
+<p class="kicker">Making timelines differ</p>
+<p>The fault injector acts inside the machine, so faults are part of the timeline: replayed with
+it, and explained by its events. A system's description says which kinds each node allows.</p>
+<div class="grid">
+  <div class="card"><h4>Network</h4><p>Partitions into 2–3 groups (stopped, slowed or jammed; both ways or one way), a node's inbound or outbound clogged, a baseline of delay, jitter and drops per timeline.</p></div>
+  <div class="card"><h4>Nodes</h4><p>Kill and restart, stop (SIGTERM, then a kill), pause, throttle, a process killed; several nodes at once, capped by a scenario's <code>nodes_down_max</code>.</p></div>
+  <div class="card"><h4>Power and disks</h4><p>A power loss keeps only what was synced (<code>crash</code>); half of them persist part of what was not, as a host's flusher may have (partial persistence); <code>outage</code> takes several nodes at once; <code>wipe</code> starts fresh.</p></div>
+  <div class="card"><h4>Disk I/O</h4><p>The disk through device-mapper: every I/O failing, writes failing, or writes acknowledged and never stored. Durability points hold a node's fsyncs while a fault lasts (<code>sync_stall</code>).</p></div>
+  <div class="card"><h4>Time</h4><p>Clock skips forward or back (a quarter permanent), one node's realtime clock skewed (sometimes strobing), and CPU modulation: stretches running up to twice as slow.</p></div>
+  <div class="card"><h4>Concurrency</h4><p>Thread pausing at instrumented points, the guest scheduler's choices drawn (<code>interleave</code>), crash points at a JVM node's state transitions.</p></div>
+  <div class="card"><h4>Processes</h4><p>Signals a process catches, and errors a system call may return, made common for code you cannot edit.</p></div>
+  <div class="card"><h4>Aimed and custom</h4><p><code>fault_aim</code> sends half the faults at the node that matters (the leader, the primary, a coordinator); custom faults run your commands at random times; quiet periods hold faults off.</p></div>
+</div>
+<figure>
+<svg viewBox="0 0 760 150" width="100%" role="img" aria-label="Fault lanes over a timeline, with regimes">
+  <g font-size="12" fill="#6b6455"><text x="0" y="34">network</text><text x="0" y="64">nodes</text><text x="0" y="94">disk</text><text x="0" y="124">time</text></g>
+  <g stroke="#ddd3ab"><line x1="80" y1="30" x2="750" y2="30"/><line x1="80" y1="60" x2="750" y2="60"/><line x1="80" y1="90" x2="750" y2="90"/><line x1="80" y1="120" x2="750" y2="120"/></g>
+  <rect x="80" y="8" width="250" height="128" fill="#f6ecc6" opacity=".6"/><rect x="330" y="8" width="210" height="128" fill="#fffbe9"/><rect x="540" y="8" width="210" height="128" fill="#f6ecc6" opacity=".6"/>
+  <g font-size="11" fill="#6b6455"><text x="86" y="146">regime 1: often, short</text><text x="336" y="146">regime 2: faults off</text><text x="546" y="146">regime 3: rare, long</text></g>
+  <g fill="#1a4f8b"><rect x="100" y="24" width="40" height="12" rx="2"/><rect x="170" y="24" width="25" height="12" rx="2"/><rect x="240" y="54" width="18" height="12" rx="2" fill="#b3261e"/><rect x="290" y="114" width="30" height="12" rx="2" fill="#a15c00"/><rect x="580" y="84" width="120" height="12" rx="2" fill="#6b6455"/><rect x="600" y="24" width="140" height="12" rx="2"/></g>
+  <g font-size="10" fill="#1d1b16"><text x="100" y="21">partition</text><text x="236" y="51">crash</text><text x="282" y="111">skew</text><text x="580" y="81">writes lost</text><text x="600" y="21">clog</text></g>
+</svg>
+<figcaption>Faults come in regimes: kinds, rates and durations drawn for a stretch, then redrawn,
+with stretches of none. Quiet stretches let the system recover, which is where some bugs show.</figcaption>
+</figure>
+<div class="where"><b>Where you see it:</b> <code>fault</code> events in the Logs explorer,
+"During faults" on a property's page, <code>--faults +crash,-partition</code> to choose kinds.</div>
+
+<table class="facts"><tr><th>Good for</th><td>Crash recovery, partitions, lost or unsynced writes, failing disks, clock trouble: what distributed systems get wrong most.</td></tr><tr><th>Pitfalls</th><td>Too many faults keep a system in recovery forever (hence regimes and quiet stretches). A fault the real world cannot produce makes false findings: a power loss's model is checked against stock ext4 before a finding is claimed. Some failures are allowed by the system's own guarantees: read its documentation first.</td></tr><tr><th>Learn more</th><td><ul><li><a href="https://doi.org/10.1145/2639988.2655736">Bailis &amp; Kingsbury, “The Network is Reliable” (ACM Queue, 2014)</a></li><li><a href="https://www.usenix.org/conference/osdi18/presentation/alquraan">Alquraan et al., “An Analysis of Network-Partitioning Failures in Cloud Systems” (OSDI 2018)</a></li><li><a href="https://www.usenix.org/conference/osdi14/technical-sessions/presentation/pillai">Pillai et al., “All File Systems Are Not Created Equal” (OSDI 2014)</a></li><li><a href="https://www.usenix.org/conference/fast17/technical-sessions/presentation/ganesan">Ganesan et al., “Redundancy Does Not Imply Fault Tolerance” (FAST 2017)</a></li><li><a href="https://danluu.com/file-consistency/">Dan Luu, “Files are hard”</a></li><li><a href="https://doi.org/10.1145/2742694.2745385">Justin Sheehy, “There is No Now” (ACM Queue, 2015)</a></li><li><a href="https://www.usenix.org/conference/osdi14/technical-sessions/presentation/yuan">Yuan et al., “Simple Testing Can Prevent Most Critical Failures” (OSDI 2014)</a></li><li><a href="https://doi.org/10.1145/3341301.3359645">Lu et al., “CrashTuner” (SOSP 2019)</a></li></ul></td></tr></table>
+
+<h2 id="timing">7. Timing faults</h2>
+<p class="kicker">Making timelines differ</p>
+<p>Some bugs need no failure at all, only an unlucky order of events. Three techniques change
+timing without breaking anything:</p>
+<ul>
+  <li><b>Thread pausing:</b> instrumentation callbacks (a line, an edge, a branch) are pause points.
+  In one stretch of two seconds in four, one point in 64 becomes slow: every thread reaching it
+  waits 1–10 ms, so a check-then-act's checks run before any of its acts.</li>
+  <li><b>Interleaving:</b> for a while, some of the scheduler's choices among a node's threads are
+  drawn: a woken thread runs first, a tick preempts, a random runnable thread runs next.</li>
+  <li><b>Process pauses and CPU modulation:</b> a node stops for a while; stretches of execution
+  run slower, so interrupts land elsewhere.</li>
+</ul>
+<p>These are what CI jobs use by default (<code>faults: "timing"</code>): a test suite's tests,
+unchanged, under schedules they never see on a laptop.</p>
+
+<table class="facts"><tr><th>Good for</th><td>Races, check-then-act bugs, flaky tests: bugs that need only an unlucky schedule.</td></tr><tr><th>Pitfalls</th><td>Pause points come from instrumentation: uninstrumented code is disturbed only by the scheduler and process pauses. A pause can trip a timeout the code is right to enforce: a timing-sensitive test failing under pauses may be the test's assumption, not a bug.</td></tr><tr><th>Learn more</th><td><ul><li><a href="https://www.microsoft.com/en-us/research/publication/a-randomized-scheduler-with-probabilistic-guarantees-of-finding-bugs/">Burckhardt et al., “A Randomized Scheduler with Probabilistic Guarantees of Finding Bugs” (ASPLOS 2010)</a></li><li><a href="https://doi.org/10.1145/1346281.1346323">Lu et al., “Learning from Mistakes: A Comprehensive Study on Real World Concurrency Bug Characteristics” (ASPLOS 2008)</a></li></ul></td></tr></table>
+
+<h2 id="boundary">8. The machine's boundary: egress and ingress</h2>
+<p class="kicker">Making timelines differ</p>
+<p>A deterministic machine has no network beyond itself. <b>Egress</b> lets a node reach an allowed
+outside server (a model's API, an external service): the explorer makes the real connection on the
+live timeline, and every answer goes on the tape, so a replay answers the same with nobody called.
+Connections can fail at the boundary (refused, reset, slow), drawn per timeline. <b>Ingress</b> is
+its inverse: a browser or curl reaches a node's port through the live timeline's listener, each
+connection's bytes recorded, so a replay delivers them again with nobody outside. While it listens,
+the timeline runs no faster than the wall clock.</p>
+
+<!-- ============================== GUIDANCE ============================== -->
+<table class="facts"><tr><th>Good for</th><td>Testing a system that calls real services (a model, an API), or one driven from a browser, while keeping exact replay.</td></tr><tr><th>Pitfalls</th><td>Live calls cost money and hit rate limits. A replay only answers what was recorded: an explored future that asks something new gets a reset. Plain-HTTP traffic is recorded as is (TLS stays encrypted on the tape).</td></tr><tr><th>Learn more</th><td><ul><li><a href="https://www.usenix.org/conference/atc17/technical-sessions/presentation/ocallahan">O’Callahan et al., “Engineering Record and Replay for Deployability” (USENIX ATC 2017)</a></li><li><a href="https://github.com/facebookexperimental/hermit">Hermit (Meta): deterministic execution of Linux programs</a></li></ul></td></tr></table>
+
+<h2 id="behaviors">9. Behaviors and novelty</h2>
+<p class="kicker">Guidance</p>
+<p>The tree needs to know what is new. A <b>behavior</b> is anything categorical a timeline
+showed: an assertion's outcome, an event with its kind and node, a line or edge of code coverage,
+and a <i>kind</i> of output line (its numbers, hex and random ids blanked, so "took 12 ms" and
+"took 40 ms" are one kind). A timeline that shows a behavior no timeline showed before is where
+the tree returns.</p>
+<figure>
+<svg viewBox="0 0 760 170" width="100%" role="img" aria-label="Discovery curve of distinct behaviors over timelines">
+  <line x1="50" y1="140" x2="740" y2="140" stroke="#1d1b16"/><line x1="50" y1="10" x2="50" y2="140" stroke="#1d1b16"/>
+  <path d="M50 140 C 120 40, 200 34, 300 30 S 500 22, 740 18" fill="none" stroke="#1a4f8b" stroke-width="2.2"/>
+  <path d="M50 140 C 120 80, 220 70, 320 66 S 520 60, 740 58" fill="none" stroke="#6b6455" stroke-width="1.5" stroke-dasharray="4 4"/>
+  <g font-size="11" fill="#6b6455"><text x="56" y="158">timelines →</text><text x="4" y="16">behaviors</text><text x="600" y="14" fill="#1a4f8b">the tree</text><text x="600" y="54">independent runs</text></g>
+</svg>
+<figcaption>A discovery curve: returning to new states keeps finding new behaviors
+after random restarts flatten out.</figcaption>
+</figure>
+<div class="where"><b>Where you see it:</b> the Utilization's discovery curve; coverage comes from
+the language's instrumentation (C, Zig, Rust, Go, Python, the JVM, Node.js, .NET), automatic for
+the JVM.</div>
+
+<table class="facts"><tr><th>Good for</th><td>Noticing that a timeline did something new, with no assertion written for it: new code, new events, new kinds of log line.</td></tr><tr><th>Pitfalls</th><td>Coarse: a new line of code is new once, however differently it is reached later. Noisy logs fake novelty. Each timeline keeps at most 8,192 behaviors: a timeline full of noise drops what comes late.</td></tr><tr><th>Learn more</th><td><ul><li><a href="https://lcamtuf.coredump.cx/afl/technical_details.txt">Michał Zalewski, AFL’s technical whitepaper</a></li><li><a href="https://www.fuzzingbook.org/">Zeller et al., “The Fuzzing Book”</a></li></ul></td></tr></table>
+
+<h2 id="sought">10. Sought and severe states</h2>
+<p class="kicker">Guidance</p>
+<p>Some novelty matters more. A <code>sometimes</code> or <code>reachable</code> assertion made true
+is a state the programmer marked as worth reaching; a node printing an error, an exception or a
+timeout is a state the system itself marks as unusual. The tree returns to these first, so the
+next timelines start where things are already going wrong.</p>
+
+<table class="facts"><tr><th>Good for</th><td>Spending timelines where the programmer or the system says things get interesting.</td></tr><tr><th>Pitfalls</th><td>Routine warnings (a retry, a reconnect) read as trouble too, and pull the tree there.</td></tr><tr><th>Learn more</th><td><ul><li><a href="https://antithesis.com/docs/product/writing_tests/assertions/">Antithesis docs, “Asserting correctness”</a></li></ul></td></tr></table>
+
+<h2 id="guidance">11. Guidance assertions and optimization</h2>
+<p class="kicker">Guidance</p>
+<p>A guidance assertion (<code>alwaysGreaterThan</code>, <code>sometimesLessThan</code>, …) says
+how far a timeline is from a boundary: a timeline that came closer than any before is new. An
+<b>optimization</b> (<code>sdk.optimize</code>) keeps, per bucket, the timeline with the best score
+(the longest queue, the slowest request), and branches from it: each bucket climbs on its own.</p>
+
+<table class="facts"><tr><th>Good for</th><td>Driving toward boundaries and extremes: the fullest queue, the slowest request, the value closest to a limit.</td></tr><tr><th>Pitfalls</th><td>Someone has to write the metric. Climbing one score finds its local best, not necessarily the bug.</td></tr><tr><th>Learn more</th><td><ul><li><a href="https://arxiv.org/abs/1504.04909">Mouret &amp; Clune, “Illuminating search spaces by mapping elites” (2015)</a></li></ul></td></tr></table>
+
+<h2 id="ranges">12. Learned ranges</h2>
+<p class="kicker">Guidance</p>
+<p>Without anyone writing an assertion, the explorer learns each workload event's numeric fields'
+ranges: for every (event, field), the highest and the lowest value seen. A timeline that goes past
+either end has done something unusual, and is returned to (likely invariants, Fioraldi et al. 2021). Identifiers and clocks are left out, and each timeline keeps only a drawn share of the
+fields (none, a quarter, half, three quarters or all), so ranges never crowd out other guidance.</p>
+<div class="where"><b>Where you see it:</b> the report's collapsed "Learned ranges" appendix;
+<code>--no-ranges</code> to compare.</div>
+
+<table class="facts"><tr><th>Good for</th><td>Unusual numbers with nobody writing an assertion: a record retry count, a queue deeper than ever.</td></tr><tr><th>Pitfalls</th><td>Counters that only grow always set new records (identifiers and clocks are left out by name, not every such field). Many ranges dilute other guidance, hence each timeline keeps a drawn share. Useless when a workload reports no numbers.</td></tr><tr><th>Learn more</th><td><ul><li><a href="https://www.usenix.org/conference/usenixsecurity21/presentation/fioraldi">Fioraldi et al., “The Use of Likely Invariants as Feedback for Fuzzers” (USENIX Security 2021)</a></li><li><a href="https://plse.cs.washington.edu/daikon/">The Daikon dynamic invariant detector</a></li></ul></td></tr></table>
+
+<h2 id="strategies">13. Strategies and the bandit</h2>
+<p class="kicker">Guidance</p>
+<p>Where to branch and what to draw can be decided by a <b>strategy</b>: a program speaking a JSON
+protocol, in any language (random, mutation from coverage, extremes, an LLM). The built-in explorer
+is the default. A <b>bandit</b> learns which settings pay off (which fault rates found new
+behaviors) and draws them more often, while still exploring the others.</p>
+
+<table class="facts"><tr><th>Good for</th><td>Adapting a run to what pays: fault rates that found new behaviors are drawn more.</td></tr><tr><th>Pitfalls</th><td>Rewards change as a run goes (what was new becomes known), which bandits assume they do not. Smarter is not always better: in our 2026-11-07 comparisons no LLM or council strategy beat the built-in explorer.</td></tr><tr><th>Learn more</th><td><ul><li><a href="http://incompleteideas.net/book/the-book-2nd.html">Sutton &amp; Barto, “Reinforcement Learning: An Introduction” (chapter 2: multi-armed bandits)</a></li><li><a href="https://www.usenix.org/conference/usenixsecurity20/presentation/yue">Yue et al., “EcoFuzz” (USENIX Security 2020): fuzzing as a multi-armed bandit</a></li></ul></td></tr></table>
+
+<h2 id="targeted">14. Targeted runs</h2>
+<p class="kicker">Guidance</p>
+<p><code>--changed &lt;diff or git range&gt;</code> aims a run at a change: its hunks are matched to
+line coverage, the tree returns first to timelines that ran changed code, and the report says
+which hunks ran in how many timelines, and which never ran.</p>
+
+<!-- ============================== JUDGING ============================== -->
+<table class="facts"><tr><th>Good for</th><td>A pull request's change: did the timelines run it, and does it break under faults?</td></tr><tr><th>Pitfalls</th><td>Only code the instrumentation reports as lines can match a diff. The tree returns to timelines that ran changed code; it does not steer toward changed code no timeline reached yet.</td></tr><tr><th>Learn more</th><td><ul><li><a href="https://doi.org/10.1145/3133956.3134020">Böhme et al., “Directed Greybox Fuzzing” (CCS 2017)</a></li></ul></td></tr></table>
+
+<h2 id="assertions">15. Assertions</h2>
+<p class="kicker">Judging</p>
+<p>Properties are what a run judges. Each SDK (Zig, C/C++, Rust, Go, Python, the JVM, Clojure,
+JavaScript, .NET) has the same kinds:</p>
+<table>
+<tr><th>Kind</th><th>Passes when</th><th>Example</th></tr>
+<tr><td class="mono">always</td><td>true every time it is evaluated, in every timeline</td><td>the balance is conserved</td></tr>
+<tr><td class="mono">always_or_unreachable</td><td>true whenever reached; never reaching it is fine</td><td>a recovered log is contiguous</td></tr>
+<tr><td class="mono">sometimes</td><td>true in at least one timeline</td><td>a transaction was aborted</td></tr>
+<tr><td class="mono">reachable</td><td>reached in at least one timeline</td><td>the leader stepped down</td></tr>
+<tr><td class="mono">unreachable</td><td>never reached</td><td>two leaders in one term</td></tr>
+</table>
+<p>Assertions are declared as code loads, so one never reached still shows: <code>sometimes</code>
+and <code>reachable</code> ones that never came true fail, which says a run did not explore enough.</p>
+<figure class="prop">
+<div class="head"><span class="badge fail">failed</span><b>always "acknowledged writes survive"</b>
+<span class="stats">hit in 12 · failing in 4 · found 4 times independently</span></div>
+<table style="margin-top:8px"><tr><th>Example</th><th>Timeline</th><th>Time</th><th>What it said</th></tr>
+<tr><td class="fail">Failing</td><td>3</td><td>41.9 s</td><td class="mono">key 17: acked 5, read 4</td></tr>
+<tr><td class="fail">Failing</td><td>6</td><td>38.2 s</td><td class="mono">key 3: acked 9, read missing</td></tr>
+<tr><td class="pass">Passing</td><td>0</td><td>60.0 s</td><td></td></tr></table>
+<figcaption>A property as the report shows it: how many timelines reached it, how many failed, and
+examples to open.</figcaption>
+</figure>
+
+<table class="facts"><tr><th>Good for</th><td>Saying what must hold (always), and what must be possible (sometimes): the second also proves a run explored enough.</td></tr><tr><th>Pitfalls</th><td>An assertion stricter than the system's real guarantee fails for nothing. A sometimes never made true fails the run: a workload that never reaches it reads as a failure of exploration, which it is.</td></tr><tr><th>Learn more</th><td><ul><li><a href="https://antithesis.com/docs/product/writing_tests/assertions/">Antithesis docs, “Asserting correctness”</a></li><li><a href="https://doi.org/10.1145/351240.351266">Claessen &amp; Hughes, “QuickCheck” (ICFP 2000)</a></li><li><a href="https://hypothesis.readthedocs.io/">Hypothesis (property-based testing for Python)</a></li></ul></td></tr></table>
+
+<h2 id="defaults">16. Default properties</h2>
+<p class="kicker">Judging</p>
+<p>Every run also judges what any system should do: no process crashes (signals from the kernel's
+log, core dumps kept), no unexpected container exits, test commands exit with zero, peak memory
+under 95%, logging under 200 MB an hour of virtual time, and a language's own failures (Go and
+Rust panics, data races, Java's uncaught exceptions). A node's known failure texts or exits can be
+declared, so they are counted rather than failing.</p>
+
+<table class="facts"><tr><th>Good for</th><td>Catching crashes, exits and runaway memory or logs with nothing written.</td></tr><tr><th>Pitfalls</th><td>A system that exits or crashes by design needs its known exits and texts declared, or every timeline fails.</td></tr><tr><th>Learn more</th><td><ul><li><a href="https://www.usenix.org/conference/osdi14/technical-sessions/presentation/yuan">Yuan et al., “Simple Testing Can Prevent Most Critical Failures” (OSDI 2014)</a></li></ul></td></tr></table>
+
+<h2 id="checkers">17. History checkers</h2>
+<p class="kicker">Judging</p>
+<p>Some guarantees are about whole histories, not single moments: is this history of reads and
+writes serializable? Workloads record their operations, and Elle checks them against the consistency the system
+claims (serializable, snapshot isolation, linearizable…), naming the anomaly it found (G1a, G2,
+lost update) and the operations in it.</p>
+
+<table class="facts"><tr><th>Good for</th><td>Isolation and consistency anomalies (lost updates, G1a, G2) found from histories of reads and writes.</td></tr><tr><th>Pitfalls</th><td>The workload must record its operations, and be checked against what the system itself claims: a weaker claim allows more. Operations whose outcome is unknown (a timeout) weaken what can be concluded.</td></tr><tr><th>Learn more</th><td><ul><li><a href="https://arxiv.org/abs/2003.10554">Kingsbury &amp; Alvaro, “Elle: Inferring Isolation Anomalies from Experimental Observations” (VLDB 2020)</a></li><li><a href="https://jepsen.io/analyses">Jepsen’s analyses</a></li></ul></td></tr></table>
+
+<h2 id="tests">18. Tests as properties (CI)</h2>
+<p class="kicker">Judging</p>
+<p><code>determinismo-ci</code> runs a repository's own test suite inside timelines. Each test is a
+property (<code>test passes: &lt;class&gt;::&lt;name&gt;</code>); a job is one run, its shards
+spread across timelines, under timing faults. A test failing in every timeline fails; one failing
+in some is <b>flaky</b>, and each flaky failure can be replayed exactly. The CI page shows each
+repository's jobs and every test that did not pass everywhere.</p>
+<figure>
+<table><tr><th>Test</th><th>f6e5d4c3b2</th><th>a1b2c3d4e5</th></tr>
+<tr><td class="mono">tests.test_demo::test_always_wrong</td><td class="fail">fail</td><td class="fail">fail</td></tr>
+<tr><td class="mono">tests.test_demo::test_flaky</td><td class="warn">flaky 4/12</td><td class="warn">flaky 5/12</td></tr></table>
+<figcaption>The CI page's grid, from examples/ci-demo's two jobs (12 timelines each).</figcaption>
+</figure>
+
+<!-- ============================== UNDERSTANDING ============================== -->
+<table class="facts"><tr><th>Good for</th><td>A suite people already have: its flaky tests found, each failure replayable at its moment.</td></tr><tr><th>Pitfalls</th><td>Tests that assume timing (a sleep, a short timeout) flake under timing faults by design: the failure may be the test's. A test touching the network outside the machine needs egress.</td></tr><tr><th>Learn more</th><td><ul><li><a href="https://doi.org/10.1145/2635868.2635920">Luo et al., “An Empirical Analysis of Flaky Tests” (FSE 2014)</a></li><li><a href="https://testing.googleblog.com/2016/05/flaky-tests-at-google-and-how-we.html">Google Testing Blog, “Flaky Tests at Google and How We Mitigate Them” (2016)</a></li></ul></td></tr></table>
+
+<h2 id="triggers">19. Triggers and suppressors</h2>
+<p class="kicker">Understanding a failure</p>
+<p>Because each timeline drew its own configuration, failures can be compared with what was drawn:
+a <b>trigger</b> is a feature clearly more common among failing timelines than overall, a
+<b>suppressor</b> one clearly rarer (95% intervals, widened for how many features were tested).
+Fault regimes count by time: a failure counts for the regime active at its moment.</p>
+<figure>
+<table><tr><th>Feature</th><th>At failures</th><th>Overall</th><th>Verdict</th></tr>
+<tr><td>fault kind <code>crash</code> kept</td><td>14 / 15</td><td>48%</td><td class="fail">trigger</td></tr>
+<tr><td>knob <code>fsync=always</code></td><td>0 / 15</td><td>51%</td><td class="pass">suppressor</td></tr>
+<tr><td>driver <code>scan</code> on</td><td>8 / 15</td><td>55%</td><td class="note">no verdict</td></tr></table>
+<figcaption>crashes trigger the failure, syncing every write prevents it. The bug is
+in what is not synced.</figcaption>
+</figure>
+
+<table class="facts"><tr><th>Good for</th><td>Which drawn feature a failure needs, or cannot happen with.</td></tr><tr><th>Pitfalls</th><td>Correlation, not causation: confirm with a replay or a counterfactual. Fewer than five failures give no verdicts.</td></tr><tr><th>Learn more</th><td><ul><li><a href="https://doi.org/10.1109/ISSRE.2013.6698892">Groce et al., “Help, help, I’m being suppressed! The significance of suppressors in software testing” (ISSRE 2013)</a></li><li><a href="https://doi.org/10.1145/1065010.1065014">Liblit et al., “Scalable Statistical Bug Isolation” (PLDI 2005)</a></li></ul></td></tr></table>
+
+<h2 id="causality">20. Causality</h2>
+<p class="kicker">Understanding a failure</p>
+<p>From moments before a failure, many futures are explored: how likely is the bug from each
+moment? The probability jumps where the bug was decided, and the events just before the jump are
+the cause. <b>Shrink</b> then removes what the failure does not need (faults, operations) while it
+still fails.</p>
+<figure>
+<svg viewBox="0 0 760 150" width="100%" role="img" aria-label="Bug probability over time, jumping at one moment">
+  <line x1="50" y1="120" x2="740" y2="120" stroke="#1d1b16"/><line x1="50" y1="10" x2="50" y2="120" stroke="#1d1b16"/>
+  <g fill="#1a4f8b">
+    <rect x="70" y="112" width="40" height="8"/><rect x="130" y="110" width="40" height="10"/><rect x="190" y="111" width="40" height="9"/><rect x="250" y="108" width="40" height="12"/><rect x="310" y="106" width="40" height="14"/>
+    <rect x="370" y="30" width="40" height="90" fill="#b3261e"/><rect x="430" y="26" width="40" height="94" fill="#b3261e"/><rect x="490" y="24" width="40" height="96" fill="#b3261e"/>
+  </g>
+  <line x1="360" y1="10" x2="360" y2="120" stroke="#a15c00" stroke-dasharray="4 3"/>
+  <text x="364" y="20" font-size="11" fill="#a15c00">power loss with the log's tail unsynced</text>
+  <g font-size="11" fill="#6b6455"><text x="4" y="16">P(bug)</text><text x="56" y="138">moments before the failure →</text></g>
+</svg>
+<figcaption>before the jump the bug is rare; after it, almost certain.</figcaption>
+</figure>
+
+<table class="facts"><tr><th>Good for</th><td>Where a failure was decided, and the smallest version of it.</td></tr><tr><th>Pitfalls</th><td>Costly: many futures from each moment. Probabilities from few futures are rough.</td></tr><tr><th>Learn more</th><td><ul><li><a href="https://www.st.cs.uni-saarland.de/papers/tse2002/">Zeller &amp; Hildebrandt, “Simplifying and Isolating Failure-Inducing Input” (TSE 2002)</a></li></ul></td></tr></table>
+
+<h2 id="debugging">21. Debugging at a moment</h2>
+<p class="kicker">Understanding a failure</p>
+<div class="grid">
+  <div class="card"><h4>Run a command</h4><p>In any node at a moment (<code>--exec</code>), the system held while it runs or running on.</p></div>
+  <div class="card"><h4>Files and stacks</h4><p>Take a node's file out exactly as it was; every thread's stack; a profile of where time went.</p></div>
+  <div class="card"><h4>A REPL in the timeline</h4><p>nREPL into a node at a moment; each message a recorded step, the session replayable.</p></div>
+  <div class="card"><h4>Counterfactuals</h4><p>Change something at a moment (a file, a config) and explore its futures: does the bug still happen?</p></div>
+  <div class="card"><h4>Retroactive logging</h4><p>Verbose output turned on after the fact: the replay regenerates it.</p></div>
+  <div class="card"><h4>Queries and the Notebook</h4><p>Every timeline's events in a database: searches, event sets, SQL, and Clojure cells.</p></div>
+</div>
+
+<table class="facts"><tr><th>Good for</th><td>Answering why with the machine itself, not guesses from logs.</td></tr><tr><th>Pitfalls</th><td>A command at a moment can change what happens next: compare with the untouched timeline before concluding.</td></tr><tr><th>Learn more</th><td><ul><li><a href="https://www.usenix.org/conference/atc17/technical-sessions/presentation/ocallahan">O’Callahan et al., “Engineering Record and Replay for Deployability” (USENIX ATC 2017)</a></li><li><a href="https://rr-project.org/">rr: lightweight recording &amp; deterministic debugging</a></li></ul></td></tr></table>
+
+<h2 id="findings">22. Findings over runs</h2>
+<p class="kicker">Understanding a failure</p>
+<p>A run is compared with the previous run of the same system and scenario: each property new,
+ongoing, resolved or rare, with its history. What-if runs can stay out of that history.</p>
+
+<!-- ============================== COMBINATIONS ============================== -->
+<table class="facts"><tr><th>Good for</th><td>Knowing whether a property is new, still failing, or fixed.</td></tr><tr><th>Pitfalls</th><td>“Resolved” can mean the new run never reached the state: check that its timelines got there.</td></tr></table>
+
+<h2 id="combinations">23. How they combine</h2>
+<p class="kicker">How they combine</p>
+<p>No technique finds much alone. A bug needs a state (reached by the tree), a disturbance at the
+right time (faults, timing, swarm), something that notices (a property), and a way to understand
+it (replay, causality, triggers). These combinations found real bugs.</p>
+
+<div class="combo">
+<h3>Power loss × partial persistence × the tree × recovery checks</h3>
+<div class="chips"><span class="chip">crash</span><span class="chip">partial persistence</span><span class="chip">durability points</span><span class="chip">tree returning to new states</span><span class="chip">default: no unexpected exits</span></div>
+<p>A node writes a file it never syncs, then a power loss keeps part of it. The node never starts
+again. A node's identity key, a server's epoch files, a database's version file, a keystore
+and others were found this way: the tree returns to a timeline where the node had just written
+the file, partial persistence decides how much of it survives, and the restart's failure is a
+default property. The replay shows the file's bytes at the moment of the power loss.</p>
+</div>
+
+<div class="combo">
+<h3>Swarm × faults aimed at a coordinator × history checkers</h3>
+<div class="chips"><span class="chip">fault_aim</span><span class="chip">swarm regimes</span><span class="chip">Elle</span><span class="chip">causality</span></div>
+<p>Workloads aim faults at the node that matters: the transaction coordinator, the leader. With
+fault regimes drawn per timeline, some timelines move leadership in a quiet stretch, others during
+load, and checkers judge the histories that result. Bugs of this shape, ownership moving at the
+wrong moment: a group coordinator activated by its own stale load, and a slot
+migration cancelled after handover (a stale owner winning, acknowledged writes deleted).</p>
+</div>
+
+<div class="combo">
+<h3>Clock skew × version ordering × read-after-write</h3>
+<div class="chips"><span class="chip">clock skew</span><span class="chip">swarm</span><span class="chip">properties on reads</span></div>
+<p>One node's clock runs seconds ahead while others write. Two object stores ordered object
+versions by the clock of whichever node coordinated: a later acknowledged version was never the
+latest. Skew is off in some timelines, so triggers compare timelines with and without it.</p>
+</div>
+
+<div class="combo">
+<h3>Thread pausing × coverage × the tree</h3>
+<div class="chips"><span class="chip">instrumentation</span><span class="chip">thread pausing</span><span class="chip">interleave</span><span class="chip">behaviors</span></div>
+<p>The same instrumentation does two jobs: its lines are behaviors the tree seeks, and its callbacks
+are where threads pause. A check-then-act race needs both threads at the check before either acts;
+pausing at a slow point lines them up, and coverage tells the tree when a new interleaving reached
+new code. A database's change stream reporting after a later head was found with thread pausing; the
+64-thread transfer race in <code>examples/race</code> shows the mechanism.</p>
+</div>
+
+<div class="combo">
+<h3>A test suite × timing faults × timelines (CI)</h3>
+<div class="chips"><span class="chip">determinismo-ci</span><span class="chip">tests as properties</span><span class="chip">thread pausing</span><span class="chip">replay</span></div>
+<p>Clojure's own test suite, unchanged: 251 tests across 12 timelines under timing faults. The
+<code>add-watch</code> test failed in some timelines only: its watch also fired for the test's own
+latch, a race in the test. Each flaky failure opened at its moment, with the exact schedule that
+made it fail.</p>
+</div>
+
+<div class="combo">
+<h3>Egress or ingress × tapes × replay</h3>
+<div class="chips"><span class="chip">egress</span><span class="chip">ingress</span><span class="chip">tapes</span><span class="chip">REPL sessions</span></div>
+<p>An agent in a node calls a model's API, or a person drives a node's web UI from a browser. The
+live timeline talks to the outside; the tape keeps every byte. A replay has no side effects and
+needs nobody outside, so a crash during that session is as debuggable as any other.</p>
+</div>
+
+<div class="combo">
+<h3>Learned ranges × swarm × the tree</h3>
+<div class="chips"><span class="chip">learned ranges</span><span class="chip">swarmed share</span><span class="chip">behaviors</span></div>
+<p>A workload reports its numbers (operations, slowest latency, queue depth); the explorer keeps
+their extremes. A timeline with a record-long retry loop is returned to, even though no assertion
+mentions retries. Which share of ranges each timeline keeps is drawn, so ranges help without
+drowning coverage and assertions.</p>
+</div>
+
+<!-- ============================== SAMPLES ============================== -->
+<section id="samples" hidden>
+<h2>24. <span class="samples-title"></span></h2>
+<p class="samples-intro"></p>
+<ul class="samples-list"></ul>
+</section>
+<script>
+// The samples this host offers (serve's /samples.json, from its data directory): none, no section.
+fetch("/samples.json").then((response) => response.ok ? response.json() : null).then((samples) => {
+  if (!samples || !samples.samples || !samples.samples.length) return;
+  const section = document.getElementById("samples");
+  const text = (value) => String(value).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+  section.querySelector(".samples-title").textContent = samples.title || "Samples";
+  section.querySelector(".samples-intro").innerHTML = samples.intro || "";
+  section.querySelector(".samples-list").innerHTML = samples.samples.map((sample) =>
+    `<li><b>${text(sample.name)}</b>: ${sample.text} <a href="${text(sample.launch)}">Launch on AWS</a></li>`).join("");
+  section.hidden = false;
+  const entry = document.querySelector('a[href="#samples"]');
+  if (entry) { entry.textContent = samples.title || "Samples"; entry.parentElement.hidden = false; }
+}).catch(() => {});
+</script>
+
+<p class="note" style="margin-top:40px">See also: docs/ANTITHESIS.md (every capability and its
+status), docs/CI.md, and the runs themselves: <a href="/">every run</a>.</p>
+</main>
+</div>
+</body>
+</html>
