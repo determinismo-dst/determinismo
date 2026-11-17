@@ -1101,7 +1101,11 @@ fn check_coverage(context: *Context) !void {
     };
     const mazes = [_]Maze{
         .{ .label = "C, one worker", .system = &c, .jobs = 1, .branches = 300 },
-        .{ .label = "Zig, one worker", .system = &zig, .jobs = 1, .branches = 300, .lines = "\"name\":\"line [^\"]*tests/selftest/maze.zig:[0-9]+" },
+        // 600: with its own lines for coverage (the SDK leaves the library's and its own
+        // out), seeds 1 to 6 first solve it at timelines 184, 65, 212, 175, 314 and 87
+        // (2026-11-17); 300 held while the debug information's parser, run anew at each
+        // assertion's site, counted as the maze's coverage.
+        .{ .label = "Zig, one worker", .system = &zig, .jobs = 1, .branches = 600, .lines = "\"name\":\"line [^\"]*tests/selftest/maze.zig:[0-9]+" },
         .{ .label = "C, 4 synced workers", .system = &c, .jobs = 4, .branches = 300 },
         .{ .label = "Python, 8 synced workers", .system = &python, .jobs = 8, .branches = 1000 },
         .{ .label = "Java, 8 synced workers", .system = &java, .jobs = 8, .branches = 1000 },
