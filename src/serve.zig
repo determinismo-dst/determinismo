@@ -3070,8 +3070,8 @@ fn machine_create(server: *Server, asked: MachineRequest) !u32 {
     if (asked.from) |reference| try argv.appendSlice(arena, &.{ "--from-snapshot", try checkpoint_path(server, reference) });
     const output = try std.fs.path.join(arena, &.{ directory, "output.log" });
     machine.pid = try spawn_logged(server, try reserved(server, argv.items), output);
-    // Given up, it is stopped: one left waiting for a CPU took it twenty minutes later and ran
-    // on, a machine of no one's, on a core its neighbours' VMs then waited for (2026-11-17).
+    // Given up, it is stopped: one left waiting took a CPU when one came free and ran on, a
+    // machine of no one's, on a core its neighbours' VMs then waited for (2026-11-17).
     errdefer machine_stop(machine);
     // Its pid with it: a serve started again adopts the machine (machines_adopt).
     try std.Io.Dir.cwd().writeFile(server.io, .{

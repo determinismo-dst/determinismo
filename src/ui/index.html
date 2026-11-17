@@ -572,7 +572,7 @@ async function runsIndexDraw() {
   const counts = {};
   for (const run of state.runs) counts[run.state] = (counts[run.state] || 0) + 1;
   const html = `<h2>Runs</h2>
-    <div class="muted index-meta">${state.runs.length.toLocaleString()} runs · ${Object.entries(counts).map(([name, n]) => `${n.toLocaleString()} ${escape(name)}`).join(" · ")}
+    <div class="muted index-meta">${[`${state.runs.length.toLocaleString()} runs`, ...Object.entries(counts).map(([name, n]) => `${n.toLocaleString()} ${escape(name)}`)].join(" · ")}
       ${runsFilter ? ` · ${matching.length.toLocaleString()} matching “${escape(runsFilter)}”` : ""}</div>
     <table class="runs-index"><tr><th>Run</th><th>State</th><th>System</th><th>Scenario</th><th>From</th></tr>
     ${matching.map((run) => `<tr class="clickable" data-id="${run.id}"><td class="mono">${run.id}</td><td>${stateBadge(run.state)}</td>
