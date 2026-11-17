@@ -33,9 +33,12 @@ const event_files = @import("event_files.zig");
 
 const steps_max = 1 << 16;
 const events_size_max = 1 << 30;
-/// Steps of one run: a chain of `.then` this long parses and evaluates in a moment; the parts
-/// follow each other (each part starts from the one before).
-const part_steps_max = 200;
+/// Steps of one run, and runs of one run above them: Quint's evaluator takes a chain of `.then`
+/// as deep as it is long (its input nests 128 deep at most, "recursion limit exceeded", and a
+/// chain of a few hundred runs ends its stack), so the trace is a tree of short chains, as deep
+/// as its levels. A step with the invariant asked after it nests twice as deep: 40 of them were
+/// too many, 20 are not.
+const part_steps_max = 20;
 pub const module_name = "determinismo_trace";
 pub const run_name = "determinismo_trace_run";
 const trace_file = module_name ++ ".qnt";
@@ -46,7 +49,15 @@ const Trace = struct {
     steps: []const Step,
     /// Events the program emitted under names the spec has no action for.
     unnamed: u64,
+    /// Every name the timeline's own events have, in the order they first came: what a spec
+    /// could take as actions.
+    kinds: []const Kind = &.{},
 };
+
+/// An event name of a timeline: how many events have it, and the first one's details as the
+/// argument its action would get ("" for none, or when they are no Quint record).
+pub const Kind = struct { name: []const u8, count: u64, example: []const u8 };
+const kinds_max = 256;
 
 pub fn check(arena: std.mem.Allocator, io: std.Io, arguments: []const [:0]const u8) !u8 {
     var spec: ?[]const u8 = null;
@@ -84,6 +95,9 @@ pub fn check(arena: std.mem.Allocator, io: std.Io, arguments: []const [:0]const 
     if (trace.steps.len == 0) {
         std.debug.print("[determinismo] no event of the timeline is named like an action of the spec " ++
             "({d} actions; {d} events under other names)\n", .{ actions.len, trace.unnamed });
+        for (trace.kinds) |kind| std.debug.print("  {d} {s}{s}{s}\n", .{
+            kind.count, kind.name, if (kind.example.len > 0) " " else "", kind.example,
+        });
         return 1;
     }
     const directory = std.fs.path.dirname(spec_path) orelse ".";
@@ -112,7 +126,57 @@ pub fn check(arena: std.mem.Allocator, io: std.Io, arguments: []const [:0]const 
         else => false,
     };
     const states = cwd.readFileAlloc(io, states_path, arena, .limited(1 << 30)) catch "";
-    return verdict(arena, &trace, invariant, passed, states, result.stdout, result.stderr);
+    var text: std.ArrayList(u8) = .empty;
+    const said = try std.mem.concat(arena, u8, &.{ result.stdout, "\n", result.stderr });
+    const status = try verdict(arena, &trace, invariant, passed, states_of(arena, states), said, &text);
+    std.debug.print("{s}", .{text.items});
+    return status;
+}
+
+/// What serve is asked for a timeline (POST /runs/<id>/quint): the trace's module for a spec
+/// kept elsewhere, and, once Quint ran it there, what its result means.
+pub const Asked = struct {
+    branch: u32,
+    /// The spec's text (its actions are read from it), or its actions' names.
+    spec: ?[]const u8 = null,
+    actions: ?[]const []const u8 = null,
+    /// The spec's module, and its file's name without `.qnt` when it is another.
+    main: []const u8,
+    file: ?[]const u8 = null,
+    invariant: ?[]const u8 = null,
+    /// After Quint ran the module: whether its test passed, and the states it wrote
+    /// (determinismo_trace.itf.json's content).
+    passed: ?bool = null,
+    states: ?std.json.Value = null,
+};
+
+/// The answer, a JSON object. Without `passed`: the module (`module`, to be written as `file`
+/// beside the spec), the command that runs it, and how many events it has. With it: the
+/// verdict's exit status (`status`: 0, 3, 1) and its text, as `determinismo quint` prints them.
+pub fn answer(arena: std.mem.Allocator, io: std.Io, events_directory: []const u8, asked: Asked, out: *std.Io.Writer) !void {
+    if (asked.invariant) |name| if (!identifier(name)) return error.BadRequest;
+    if (!identifier(asked.main)) return error.BadRequest;
+    const actions = asked.actions orelse try actions_of(arena, asked.spec orelse return error.BadRequest);
+    const source = try event_files.read(arena, io, events_directory, asked.branch, .limited(events_size_max));
+    const trace = try trace_read(arena, source, actions);
+    if (asked.passed) |passed| {
+        var text: std.ArrayList(u8) = .empty;
+        const states = if (asked.states) |states| states_in(arena, states) else null;
+        const status = try verdict(arena, &trace, asked.invariant, passed, states, "(its output is where it ran)", &text);
+        try std.json.Stringify.value(.{ .status = status, .text = text.items }, .{}, out);
+    } else {
+        const module = if (trace.steps.len == 0) "" else try trace_module(arena, asked.main, asked.file orelse asked.main, &trace, asked.invariant);
+        try std.json.Stringify.value(.{
+            .file = trace_file,
+            .states = states_file,
+            .command = "quint test " ++ trace_file ++ " --main " ++ module_name ++ " --match ^" ++ run_name ++ "$ --max-samples 1 --out-itf " ++ states_file,
+            .events = trace.steps.len,
+            .unnamed = trace.unnamed,
+            .kinds = trace.kinds,
+            .module = module,
+        }, .{}, out);
+    }
+    try out.writeAll("\n");
 }
 
 /// A timeline's events: a file (plain, or compressed as an ended timeline's), or with a branch
@@ -153,6 +217,7 @@ fn actions_of(arena: std.mem.Allocator, spec: []const u8) ![]const []const u8 {
 
 fn trace_read(arena: std.mem.Allocator, source: []const u8, actions: []const []const u8) !Trace {
     var steps: std.ArrayList(Step) = .empty;
+    var kinds: std.ArrayList(Kind) = .empty;
     var unnamed: u64 = 0;
     var lines = std.mem.tokenizeScalar(u8, source, '\n');
     while (lines.next()) |text| {
@@ -166,6 +231,17 @@ fn trace_read(arena: std.mem.Allocator, source: []const u8, actions: []const []c
             .string => |string| string,
             else => continue,
         };
+        const kind = for (kinds.items) |*kind| {
+            if (std.mem.eql(u8, kind.name, name)) break kind;
+        } else if (kinds.items.len < kinds_max) added: {
+            var example: std.ArrayList(u8) = .empty;
+            if (event.object.get("details")) |details| value_write(arena, &example, details) catch {
+                example.clearRetainingCapacity();
+            };
+            try kinds.append(arena, .{ .name = name, .count = 0, .example = example.items });
+            break :added &kinds.items[kinds.items.len - 1];
+        } else null;
+        if (kind) |known_kind| known_kind.count += 1;
         const known = for (actions) |action| {
             if (std.mem.eql(u8, action, name)) break true;
         } else false;
@@ -186,7 +262,7 @@ fn trace_read(arena: std.mem.Allocator, source: []const u8, actions: []const []c
             .details = details,
         });
     }
-    return .{ .steps = steps.items, .unnamed = unnamed };
+    return .{ .steps = steps.items, .unnamed = unnamed, .kinds = kinds.items };
 }
 
 fn integer_of(value: ?std.json.Value) u64 {
@@ -207,37 +283,56 @@ fn trace_module(
     var out: std.ArrayList(u8) = .empty;
     try out.print(arena, "// Written by `determinismo quint`: a timeline's {d} events as a run of the spec's actions.\n" ++
         "module " ++ module_name ++ " {{\n  import {s}.* from \"./{s}\"\n", .{ trace.steps.len, main, file_stem });
-    const parts = (trace.steps.len + part_steps_max - 1) / part_steps_max;
-    for (0..parts) |part| {
+    // The leaves: the events, twenty a run, the first one from the spec's init.
+    var count = (trace.steps.len + part_steps_max - 1) / part_steps_max;
+    for (0..count) |part| {
         const from = part * part_steps_max;
         const to = @min(trace.steps.len, from + part_steps_max);
-        if (part + 1 == parts) {
-            try out.appendSlice(arena, "\n  run " ++ run_name ++ " =\n");
-        } else {
-            try out.print(arena, "\n  run determinismo_trace_part_{d} =\n", .{part});
-        }
-        if (part == 0) {
-            try out.appendSlice(arena, "    init\n");
-            if (invariant) |name| try out.print(arena, "      .expect({s})\n", .{name});
-        } else {
-            try out.print(arena, "    determinismo_trace_part_{d}\n", .{part - 1});
-        }
-        for (trace.steps[from..to]) |step| {
-            try out.print(arena, "      .then({s}", .{step.name});
+        try run_begin(arena, &out, 0, part, count);
+        for (trace.steps[from..to], from..) |step, index| {
+            if (index == 0) {
+                try out.appendSlice(arena, "    init\n");
+                if (invariant) |name| try out.print(arena, "      .expect({s})\n", .{name});
+            }
+            try out.appendSlice(arena, if (index == from and index != 0) "    " else "      .then(");
+            try out.appendSlice(arena, step.name);
             if (step.details) |details| {
                 try out.append(arena, '(');
                 try value_write(arena, &out, details);
                 try out.append(arena, ')');
             }
-            try out.append(arena, ')');
+            if (index != from or index == 0) try out.append(arena, ')');
             if (invariant) |name| try out.print(arena, ".expect({s})", .{name});
             try out.print(arena, " // event {d} at {d}.{d:0>3} s\n", .{
                 step.seq, step.vtime_ns / std.time.ns_per_s, step.vtime_ns / std.time.ns_per_ms % 1000,
             });
         }
     }
+    // The levels above: twenty runs of the level below one after the other, up to a single run.
+    var level: usize = 0;
+    while (count > 1) : (level += 1) {
+        const above = (count + part_steps_max - 1) / part_steps_max;
+        for (0..above) |group| {
+            try run_begin(arena, &out, level + 1, group, above);
+            const from = group * part_steps_max;
+            for (from..@min(count, from + part_steps_max)) |part| {
+                if (part == from) {
+                    try out.print(arena, "    determinismo_trace_part_{d}_{d}\n", .{ level, part });
+                } else {
+                    try out.print(arena, "      .then(determinismo_trace_part_{d}_{d})\n", .{ level, part });
+                }
+            }
+        }
+        count = above;
+    }
     try out.appendSlice(arena, "}\n");
     return out.items;
+}
+
+/// A run's first line: the trace's whole run when it is its level's only one, else a part.
+fn run_begin(arena: std.mem.Allocator, out: *std.ArrayList(u8), level: usize, part: usize, count: usize) !void {
+    if (count == 1) return out.appendSlice(arena, "\n  run " ++ run_name ++ " =\n");
+    try out.print(arena, "\n  run determinismo_trace_part_{d}_{d} =\n", .{ level, part });
 }
 
 /// A JSON value as a Quint expression: an integer, a boolean, a string, a list, a record. A
@@ -298,23 +393,24 @@ fn verdict(
     trace: *const Trace,
     invariant: ?[]const u8,
     passed: bool,
-    states_text: []const u8,
-    stdout: []const u8,
-    stderr: []const u8,
-) u8 {
+    states_known: ?States,
+    /// What Quint said, shown when it wrote no states.
+    said: []const u8,
+    out: *std.ArrayList(u8),
+) !u8 {
     if (passed) {
-        std.debug.print("[determinismo] the trace ({d} events) is a behavior of the spec", .{trace.steps.len});
-        if (invariant) |name| std.debug.print(", and {s} holds after every one", .{name});
-        std.debug.print(" ({d} events under names the spec has no action for; its states: " ++ states_file ++ ")\n", .{trace.unnamed});
+        try out.print(arena, "[determinismo] the trace ({d} events) is a behavior of the spec", .{trace.steps.len});
+        if (invariant) |name| try out.print(arena, ", and {s} holds after every one", .{name});
+        try out.print(arena, " ({d} events under names the spec has no action for; its states: " ++ states_file ++ ")\n", .{trace.unnamed});
         return 0;
     }
-    const states = states_of(arena, states_text) orelse {
-        std.debug.print("[determinismo] Quint did not run the trace:\n{s}\n{s}\n", .{ stdout, stderr });
+    const states = states_known orelse {
+        try out.print(arena, "[determinismo] Quint did not run the trace:\n{s}\n", .{said});
         return 1;
     };
     // States with variables: init, then one an event taken.
     if (states.whole == 0) {
-        std.debug.print("[determinismo] the spec's init is not enabled\n", .{});
+        try out.print(arena, "[determinismo] the spec's init is not enabled\n", .{});
         return 3;
     }
     const taken = states.whole - 1;
@@ -322,27 +418,27 @@ fn verdict(
         // Every state the run has is whole: it took its last event, and what was expected of
         // the state after it (the invariant) did not hold.
         if (taken == 0) {
-            std.debug.print("[determinismo] {s} does not hold in the spec's first state\n", .{invariant orelse "the run"});
+            try out.print(arena, "[determinismo] {s} does not hold in the spec's first state\n", .{invariant orelse "the run"});
         } else {
             const step = trace.steps[@min(taken, trace.steps.len) - 1];
-            std.debug.print("[determinismo] {s} does not hold after event {d} of {d} ({s}, event {d} at {d}.{d:0>3} s)\n", .{
+            try out.print(arena, "[determinismo] {s} does not hold after event {d} of {d} ({s}, event {d} at {d}.{d:0>3} s)\n", .{
                 invariant orelse "the run",        taken,                                     trace.steps.len, step.name, step.seq,
                 step.vtime_ns / std.time.ns_per_s, step.vtime_ns / std.time.ns_per_ms % 1000,
             });
         }
     } else {
         const step = trace.steps[taken];
-        std.debug.print("[determinismo] the spec refuses event {d} of {d}: {s}", .{ taken + 1, trace.steps.len, step.name });
+        try out.print(arena, "[determinismo] the spec refuses event {d} of {d}: {s}", .{ taken + 1, trace.steps.len, step.name });
         if (step.details) |details| {
-            var text: std.ArrayList(u8) = .empty;
-            value_write(arena, &text, details) catch {};
-            std.debug.print("({s})", .{text.items});
+            try out.append(arena, '(');
+            value_write(arena, out, details) catch {};
+            try out.append(arena, ')');
         }
-        std.debug.print(" (event {d} at {d}.{d:0>3} s): not enabled after the {d} before it\n", .{
+        try out.print(arena, " (event {d} at {d}.{d:0>3} s): not enabled after the {d} before it\n", .{
             step.seq, step.vtime_ns / std.time.ns_per_s, step.vtime_ns / std.time.ns_per_ms % 1000, taken,
         });
     }
-    if (states.last) |state| std.debug.print("[determinismo] the spec's state there: {s}\n", .{state});
+    if (states.last) |state| try out.print(arena, "[determinismo] the spec's state there: {s}\n", .{state});
     return 3;
 }
 
@@ -352,7 +448,10 @@ const States = struct { count: usize, whole: usize, last: ?[]const u8 };
 /// run did not reach has its "#meta" alone), and the last of those as text.
 fn states_of(arena: std.mem.Allocator, text: []const u8) ?States {
     if (text.len == 0) return null;
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch return null;
+    return states_in(arena, std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch return null);
+}
+
+fn states_in(arena: std.mem.Allocator, parsed: std.json.Value) ?States {
     if (parsed != .object) return null;
     const states = switch (parsed.object.get("states") orelse return null) {
         .array => |array| array.items,
@@ -460,6 +559,11 @@ test "a timeline's events as a run: the spec's actions only, a record for the de
     const trace = try trace_read(arena, source, &.{ "init", "transfer", "audit" });
     try std.testing.expectEqual(2, trace.steps.len);
     try std.testing.expectEqual(1, trace.unnamed);
+    try std.testing.expectEqual(3, trace.kinds.len);
+    try std.testing.expectEqualStrings("fault", trace.kinds[1].name);
+    try std.testing.expectEqual(1, trace.kinds[1].count);
+    try std.testing.expectEqualStrings("{ kind: \"pause\" }", trace.kinds[1].example);
+    try std.testing.expectEqualStrings("", trace.kinds[2].example); // audit: no details.
     const module = try trace_module(arena, "bank", "bank", &trace, null);
     try std.testing.expectEqualStrings(
         \\// Written by `determinismo quint`: a timeline's 2 events as a run of the spec's actions.
@@ -476,6 +580,22 @@ test "a timeline's events as a run: the spec's actions only, a record for the de
     const asked = try trace_module(arena, "bank", "bank", &trace, "conserved");
     try std.testing.expect(std.mem.indexOf(u8, asked, "    init\n      .expect(conserved)\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, asked, "ok: true })).expect(conserved) // event 1") != null);
+}
+
+test "a long trace is a tree of short runs" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var steps: [45]Step = undefined;
+    for (&steps, 0..) |*step, index| step.* = .{ .seq = index, .vtime_ns = 0, .name = "tick", .details = null };
+    const module = try trace_module(arena, "clock", "clock", &.{ .steps = &steps, .unnamed = 0 }, null);
+    // Three leaves (20, 20, 5 events), the first from init, the others from their first event.
+    try std.testing.expect(std.mem.indexOf(u8, module, "  run determinismo_trace_part_0_0 =\n    init\n      .then(tick) // event 0 at") != null);
+    try std.testing.expect(std.mem.indexOf(u8, module, "  run determinismo_trace_part_0_1 =\n    tick // event 20 at") != null);
+    try std.testing.expect(std.mem.indexOf(u8, module, "  run determinismo_trace_part_0_2 =\n    tick // event 40 at") != null);
+    try std.testing.expect(std.mem.endsWith(u8, module, "  run determinismo_trace_run =\n    determinismo_trace_part_0_0\n" ++
+        "      .then(determinismo_trace_part_0_1)\n      .then(determinismo_trace_part_0_2)\n}\n"));
+    try std.testing.expectEqual(45, std.mem.count(u8, module, " // event "));
 }
 
 test "the run's states say where it stopped" {

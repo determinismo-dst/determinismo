@@ -61,11 +61,33 @@ events the program emitted, in the order they happened, must be a run of the spe
 
 - Exit 1: nothing could be checked (no event named like an action, Quint did not run).
 
+## The events' order is the trace
+
+An event is said where the program is when it calls `sdk.event`, which is not always where
+the step happened. A client that says "I wrote" after the server's reply says it when it next
+runs, and by then another client's read of that write may have been said: the trace has the
+read before the write it saw, and a spec that follows the events refuses it.
+
+- Say a step where it happens (in the server that takes it), or
+- make the step and its event one: the bank's scenario `bank_steps` (examples/bank) takes a
+  lock around each step at Redis and its event, so the events are in the order Redis took the
+  steps. Its e2e check (`bank-steps`) runs each timeline's events against the bank they
+  describe: none out of order with the lock, a third of them without it.
+
+## From another machine
+
+`clients/quint/trace.sh <serve's URL> <run> <timeline> <spec.qnt> [--invariant <name>]` does
+the same for a spec and a Quint that are not where the run is (someone's laptop, an agent's
+machine): serve gives the timeline's run (`POST /runs/<run>/quint`), Quint runs it there, and
+serve says what the result means. Same answers, same exit statuses (clients/quint/README.md).
+
 ## Writing a spec from a trace
 
 A spec that matches a timeline is written the way a test is made to pass:
 
-1. Read the timeline's events and pick the ones that are the system's steps.
+1. Read the timeline's events and pick the ones that are the system's steps. Against a spec
+   with no action of their names, the command lists the names the timeline's own events have,
+   how many of each, and an example of each one's details.
 2. Write an action for each event name, taking the event's details as its argument: its guard
    says when the step can happen, its updates what it changes.
 3. Run `determinismo quint`. A refused event and the spec's state before it say what the spec
@@ -73,12 +95,16 @@ A spec that matches a timeline is written the way a test is made to pass:
 4. Ask the property the program asserts as an invariant (`--invariant`), and let Quint look for
    it in the spec alone: `quint run bank.qnt --invariant total_conserved`.
 
-An agent does the same from outside: it needs the timeline's events, the spec's file and this
-command (docs/AGENTS.md).
+An agent does the same from its own machine with `clients/quint/trace.sh`: it reads a
+timeline's events from serve, writes the spec, and runs the script until it exits 0
+(examples/bank/quint has the one written so for `bank_steps`).
 
 ## Limits
 
-- 65,536 events a trace.
+- 65,536 events a trace. Quint takes about 5 ms an event (a 3,000-event timeline: 18 s on a
+  Xeon E-2276G, 4 s on an Apple M-series).
+- The run is a tree of short runs (20 events each): Quint's evaluator takes a chain of `.then`
+  as deep as it is long, and a long one ends it ("recursion limit exceeded").
 - Events as actions, not states: Quint's simulator cannot be asked whether some step of a spec
   leads to a given state (an action cannot constrain the state it leads to). A check of states
   is `determinismo tla`, with TLC.

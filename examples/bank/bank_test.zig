@@ -16,8 +16,18 @@
 //!   bank_hot   2 accounts: every transfer collides
 //!   bank_cold  40 accounts: transfers seldom collide, so a timeline that loses money was
 //!              decided at its colliding transfers (what causality analysis looks for)
+//!   bank_steps 4 accounts, and each step said as an event of its own: `bank_read` (what a
+//!              transfer read), `bank_commit` (what it wrote), `bank_reject`, `bank_audit`
+//!              (the balances and their total), each with the driver's process as its
+//!              `client`. A step at Redis and its event are under one lock, so the events
+//!              are in the order Redis took the steps: without it a client that has its
+//!              reply says so only when it runs again, after others' steps (a write's event
+//!              after the event of a read that saw it). The bug is as it was: a transfer's
+//!              read and its write are two steps. The trace a spec is checked against
+//!              (`determinismo quint`, docs/QUINT.md; examples/bank/quint).
 const std = @import("std");
 const assert = std.debug.assert;
+const linux = std.os.linux;
 const sdk = @import("determinismo");
 const Connection = @import("resp");
 
@@ -41,10 +51,11 @@ pub fn main(init: std.process.Init) !void {
     return System.main(init, .{
         .describe = describe,
         .scenarios = .{
-            .bank = Bank(10).scenario,
-            .bank_hot = Bank(2).scenario,
-            .bank_cold = Bank(40).scenario,
-            .bank_drawn = Bank(10).scenario_drawn,
+            .bank = Bank(10, false).scenario,
+            .bank_hot = Bank(2, false).scenario,
+            .bank_cold = Bank(40, false).scenario,
+            .bank_drawn = Bank(10, false).scenario_drawn,
+            .bank_steps = Bank(4, true).scenario,
         },
     });
 }
@@ -82,8 +93,9 @@ fn describe(d: *System.Describe) !void {
     });
 }
 
-/// Everything about a bank of `account_count` accounts: its scenario and its commands.
-fn Bank(comptime account_count: u32) type {
+/// Everything about a bank of `account_count` accounts: its scenario and its commands. `steps`:
+/// each step said as an event (the scenario bank_steps).
+fn Bank(comptime account_count: u32, comptime steps: bool) type {
     comptime assert(account_count >= 2);
     comptime assert(account_count <= Connection.array_count_max);
     return struct {
@@ -135,23 +147,48 @@ fn Bank(comptime account_count: u32) type {
             const source_key = account_key(&source_key_buffer, source);
             const target_key = account_key(&target_key_buffer, target);
             // The bug: these reads are not protected by WATCH, so they can be stale by the EXEC.
-            const source_balance = try read_balance(connection, source_key);
-            const target_balance = try read_balance(connection, target_key);
+            const client = if (steps) linux.getpid() else 0;
+            var source_balance: i64 = undefined;
+            var target_balance: i64 = undefined;
+            {
+                const step = step_begin();
+                defer step_end(step);
+                source_balance = try read_balance(connection, source_key);
+                target_balance = try read_balance(connection, target_key);
+                if (steps) sdk.event("bank_read", .{
+                    .client = client,
+                    .source = source,
+                    .target = target,
+                    .source_balance = source_balance,
+                    .target_balance = target_balance,
+                });
+            }
             if (source_balance < amount) {
                 const details = .{ .amount = amount };
                 sdk.sometimes(true, "transfer rejected for insufficient funds", details);
+                if (steps) sdk.event("bank_reject", .{ .client = client, .amount = amount });
                 return;
             }
             var source_value_buffer: [24]u8 = undefined;
             var target_value_buffer: [24]u8 = undefined;
             const source_value = try print_balance(&source_value_buffer, source_balance - amount);
             const target_value = try print_balance(&target_value_buffer, target_balance + amount);
-            _ = try connection.call(&.{"MULTI"});
-            _ = try connection.call(&.{ "SET", source_key, source_value });
-            _ = try connection.call(&.{ "SET", target_key, target_value });
-            var exec_replies: [2]?[]const u8 = undefined;
-            const exec_count = try connection.call_array(&.{"EXEC"}, &exec_replies, &.{});
-            assert(exec_count == 2); // Both SETs ran: nothing was WATCHed, so EXEC never aborts.
+            {
+                const step = step_begin();
+                defer step_end(step);
+                _ = try connection.call(&.{"MULTI"});
+                _ = try connection.call(&.{ "SET", source_key, source_value });
+                _ = try connection.call(&.{ "SET", target_key, target_value });
+                var exec_replies: [2]?[]const u8 = undefined;
+                const exec_count = try connection.call_array(&.{"EXEC"}, &exec_replies, &.{});
+                assert(exec_count == 2); // Both SETs ran: nothing was WATCHed, so EXEC never aborts.
+                if (steps) sdk.event("bank_commit", .{
+                    .client = client,
+                    .amount = amount,
+                    .source_balance = source_balance - amount,
+                    .target_balance = target_balance + amount,
+                });
+            }
             sdk.reachable("transfer committed", .{ .amount = amount });
         }
 
@@ -180,17 +217,44 @@ fn Bank(comptime account_count: u32) type {
             }
             var values: [account_count]?[]const u8 = undefined;
             var storage: [account_count * balance_digits_max]u8 = undefined;
+            const audit_step = step_begin();
+            defer step_end(audit_step);
             const count = try connection.call_array(&command, &values, &storage);
             assert(count == account_count);
             var total: i64 = 0;
-            for (values) |value| {
-                const balance = value orelse return error.MissingAccount;
-                total += try std.fmt.parseInt(i64, balance, 10);
+            if (steps) {
+                var balances: [account_count]i64 = undefined;
+                for (values, &balances) |value, *balance| {
+                    balance.* = try std.fmt.parseInt(i64, value orelse return error.MissingAccount, 10);
+                    total += balance.*;
+                }
+                sdk.event("bank_audit", .{ .balances = balances, .total = total });
+            } else {
+                for (values) |value| {
+                    const balance = value orelse return error.MissingAccount;
+                    total += try std.fmt.parseInt(i64, balance, 10);
+                }
             }
             const details = .{ .total = total, .phase = phase, .accounts = account_count };
             sdk.always(total == balance_total, "total balance is conserved", details);
             if (std.mem.eql(u8, phase, "anytime")) sdk.sometimes(true, "anytime audit ran", .{});
             if (std.mem.eql(u8, phase, "finally")) sdk.sometimes(true, "finally audit ran", .{});
+        }
+
+        /// bank_steps: a step at Redis and its event under one lock (a file's, across the
+        /// drivers' processes), taken here and given back by step_end.
+        fn step_begin() linux.fd_t {
+            if (!steps) return -1;
+            const opened = linux.open("/run/bank-steps.lock", .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o600);
+            assert(linux.errno(opened) == .SUCCESS);
+            const fd: linux.fd_t = @intCast(opened);
+            while (linux.errno(linux.flock(fd, std.posix.LOCK.EX)) == .INTR) {}
+            return fd;
+        }
+
+        fn step_end(fd: linux.fd_t) void {
+            if (!steps) return;
+            _ = linux.close(fd); // Its lock goes with it.
         }
 
         fn account_key(buffer: *[16]u8, account: u64) []const u8 {

@@ -196,63 +196,64 @@ fn scratches_sweep(io: std.Io, arena: std.mem.Allocator, scratches: []const u8) 
 /// and counts them.
 fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
     const checks = .{
-        .{ "bank", check_bank },                           .{ "shop", check_shop },
-        .{ "tapes", check_tapes },                         .{ "debugging", check_debugging },
-        .{ "python", check_python_strategy },              .{ "egress", check_egress },
-        .{ "ingress", check_ingress },                     .{ "ingress-session", check_ingress_session },
-        .{ "moments", check_moments },                     .{ "properties", check_builtin_properties },
-        .{ "entropy", check_kernel_entropy },              .{ "quiet", check_quiet_period },
-        .{ "clock_jitter", check_clock_jitter },           .{ "query", check_query },
-        .{ "progress", check_progress_while_quiet },       .{ "network", check_network_faults },
-        .{ "serve", check_serve },                         .{ "until", check_until_and_causality },
-        .{ "coverage-gate", check_coverage_gate },         .{ "coverage", check_coverage },
-        .{ "parallel", check_parallel },                   .{ "fork", check_fork },
-        .{ "tree", check_tree },                           .{ "startup-coverage", check_startup_coverage },
-        .{ "memory-climb", check_memory_climb },           .{ "disk", check_disk },
-        .{ "shape", check_shape },                         .{ "end", check_end },
-        .{ "plans", check_plans },                         .{ "durability", check_durability },
-        .{ "mutate", check_mutate },                       .{ "interleave", check_interleave },
-        .{ "checks", check_host_checks },                  .{ "pausing", check_pausing },
-        .{ "shrink", check_shrink },                       .{ "holds", check_holds },
-        .{ "coverage-set", check_coverage_set },           .{ "inject", check_inject },
-        .{ "aim", check_aim },                             .{ "aftershock", check_aftershock },
-        .{ "record-power-loss", check_record_power_loss }, .{ "errno-storm", check_errno_storm },
-        .{ "compose", check_compose },                     .{ "shards", check_shards },
-        .{ "stress", check_stress },                       .{ "controller", check_controller },
-        .{ "clojure", check_clojure },                     .{ "k3s", check_k3s },
-        .{ "script", check_script },                       .{ "modulation", check_cpu_modulation },
-        .{ "profile", check_profile },                     .{ "catalog", check_catalog },
-        .{ "guidance", check_guidance },                   .{ "voidstar", check_voidstar },
-        .{ "changed", check_changed },                     .{ "readdress", check_readdress },
-        .{ "unlist", check_unlist },                       .{ "signal", check_signal },
-        .{ "syscall_error", check_syscall_error },         .{ "swarm", check_swarm },
-        .{ "metastable", check_metastable },               .{ "file_error", check_file_error },
-        .{ "retroactive", check_retroactive },             .{ "epoch", check_epoch },
-        .{ "drive", check_drive },                         .{ "hang", check_hang },
-        .{ "pinned", check_pinned },                       .{ "slow", check_slow },
-        .{ "ending-window", check_ending_window },         .{ "sought", check_sought },
-        .{ "optimize", check_optimize },                   .{ "states", check_states },
-        .{ "crash-points", check_crash_points },           .{ "nodes-down", check_nodes_down },
-        .{ "stale-pid", check_stale_pid },                 .{ "memory-growth", check_memory_growth },
-        .{ "upgrade", check_upgrade },                     .{ "knobs", check_knobs },
-        .{ "quorum", check_quorum },                       .{ "spare", check_spare },
-        .{ "saved", check_saved },                         .{ "concurrent", check_concurrent },
-        .{ "resume", check_resume },                       .{ "ui", check_ui },
-        .{ "runs", check_runs },                           .{ "kubernetes", check_kubernetes },
-        .{ "steps", check_steps },                         .{ "before-nodes", check_before_nodes },
-        .{ "session", check_session },                     .{ "fast", check_fast },
-        .{ "sandbox", check_sandbox },                     .{ "devproxy", check_devproxy },
-        .{ "sandbox-egress", check_sandbox_egress },       .{ "ci", check_ci },
-        .{ "repl", check_repl },                           .{ "mechanics", check_mechanics },
-        .{ "budget", check_budget },                       .{ "sinks", check_sinks },
-        .{ "dotnet", check_dotnet },                       .{ "lines", check_lines },
-        .{ "voidstar-static", check_voidstar_static },     .{ "frozen-start", check_frozen_start },
-        .{ "hangup", check_hangup },                       .{ "frozen-step", check_frozen_step },
-        .{ "templates", check_templates },                 .{ "volumes", check_volumes },
-        .{ "setup-mode", check_setup_mode },               .{ "jank", check_jank_repl },
-        .{ "checkpoint", check_session_checkpoint },       .{ "ingress-checkpoint", check_ingress_checkpoint },
-        .{ "ingress-crash", check_ingress_crash },         .{ "draws", check_draws },
-        .{ "exit-stack", check_exit_stack },               .{ "plan-calls", check_plan_calls },
+        .{ "bank", check_bank },                             .{ "shop", check_shop },
+        .{ "tapes", check_tapes },                           .{ "debugging", check_debugging },
+        .{ "python", check_python_strategy },                .{ "egress", check_egress },
+        .{ "ingress", check_ingress },                       .{ "ingress-session", check_ingress_session },
+        .{ "moments", check_moments },                       .{ "properties", check_builtin_properties },
+        .{ "entropy", check_kernel_entropy },                .{ "quiet", check_quiet_period },
+        .{ "clock_jitter", check_clock_jitter },             .{ "query", check_query },
+        .{ "progress", check_progress_while_quiet },         .{ "network", check_network_faults },
+        .{ "serve", check_serve },                           .{ "until", check_until_and_causality },
+        .{ "coverage-gate", check_coverage_gate },           .{ "coverage", check_coverage },
+        .{ "parallel", check_parallel },                     .{ "fork", check_fork },
+        .{ "tree", check_tree },                             .{ "startup-coverage", check_startup_coverage },
+        .{ "memory-climb", check_memory_climb },             .{ "disk", check_disk },
+        .{ "shape", check_shape },                           .{ "end", check_end },
+        .{ "plans", check_plans },                           .{ "durability", check_durability },
+        .{ "mutate", check_mutate },                         .{ "interleave", check_interleave },
+        .{ "checks", check_host_checks },                    .{ "pausing", check_pausing },
+        .{ "shrink", check_shrink },                         .{ "holds", check_holds },
+        .{ "coverage-set", check_coverage_set },             .{ "inject", check_inject },
+        .{ "aim", check_aim },                               .{ "aftershock", check_aftershock },
+        .{ "record-power-loss", check_record_power_loss },   .{ "errno-storm", check_errno_storm },
+        .{ "compose", check_compose },                       .{ "shards", check_shards },
+        .{ "stress", check_stress },                         .{ "controller", check_controller },
+        .{ "clojure", check_clojure },                       .{ "k3s", check_k3s },
+        .{ "script", check_script },                         .{ "modulation", check_cpu_modulation },
+        .{ "profile", check_profile },                       .{ "catalog", check_catalog },
+        .{ "guidance", check_guidance },                     .{ "voidstar", check_voidstar },
+        .{ "changed", check_changed },                       .{ "readdress", check_readdress },
+        .{ "unlist", check_unlist },                         .{ "signal", check_signal },
+        .{ "syscall_error", check_syscall_error },           .{ "swarm", check_swarm },
+        .{ "metastable", check_metastable },                 .{ "file_error", check_file_error },
+        .{ "retroactive", check_retroactive },               .{ "epoch", check_epoch },
+        .{ "drive", check_drive },                           .{ "hang", check_hang },
+        .{ "pinned", check_pinned },                         .{ "slow", check_slow },
+        .{ "ending-window", check_ending_window },           .{ "sought", check_sought },
+        .{ "optimize", check_optimize },                     .{ "states", check_states },
+        .{ "crash-points", check_crash_points },             .{ "nodes-down", check_nodes_down },
+        .{ "stale-pid", check_stale_pid },                   .{ "memory-growth", check_memory_growth },
+        .{ "upgrade", check_upgrade },                       .{ "knobs", check_knobs },
+        .{ "quorum", check_quorum },                         .{ "spare", check_spare },
+        .{ "saved", check_saved },                           .{ "concurrent", check_concurrent },
+        .{ "resume", check_resume },                         .{ "ui", check_ui },
+        .{ "runs", check_runs },                             .{ "kubernetes", check_kubernetes },
+        .{ "steps", check_steps },                           .{ "before-nodes", check_before_nodes },
+        .{ "session", check_session },                       .{ "fast", check_fast },
+        .{ "sandbox", check_sandbox },                       .{ "devproxy", check_devproxy },
+        .{ "sandbox-egress", check_sandbox_egress },         .{ "ci", check_ci },
+        .{ "repl", check_repl },                             .{ "mechanics", check_mechanics },
+        .{ "budget", check_budget },                         .{ "sinks", check_sinks },
+        .{ "dotnet", check_dotnet },                         .{ "lines", check_lines },
+        .{ "voidstar-static", check_voidstar_static },       .{ "frozen-start", check_frozen_start },
+        .{ "hangup", check_hangup },                         .{ "frozen-step", check_frozen_step },
+        .{ "templates", check_templates },                   .{ "volumes", check_volumes },
+        .{ "setup-mode", check_setup_mode },                 .{ "jank", check_jank_repl },
+        .{ "bank-steps", check_bank_steps },                 .{ "checkpoint", check_session_checkpoint },
+        .{ "ingress-checkpoint", check_ingress_checkpoint }, .{ "ingress-crash", check_ingress_crash },
+        .{ "draws", check_draws },                           .{ "exit-stack", check_exit_stack },
+        .{ "plan-calls", check_plan_calls },
     };
     // A check's whole name runs it alone (check.sh's `ui` ran guidance and quiet too).
     var exact = std.mem.eql(u8, only, "tla");
@@ -6648,6 +6649,92 @@ fn check_sought(context: *Context) !void {
         .{ "returns go just after the sometimes first, saying so", whys[0] },
         .{ "without --prefer-sometimes, none says so", !whys[1] },
     }, "sought: the tree returns just after a sometimes made true first, saying why", .{});
+}
+
+/// The bank's scenario bank_steps says each step as an event (bank_read, bank_commit,
+/// bank_reject, bank_audit), a step at Redis and its event under one lock: a timeline's events
+/// are its steps in the order Redis took them, the trace a spec is checked against (determinismo
+/// quint). Each timeline's events are run here against the bank they describe: a read must see
+/// the balances the commits before it left, a commit write what its read gave it, an audit list
+/// them. Without the lock a client that has Redis's reply says so only when it runs again,
+/// after others' steps: the 61st event of a timeline was a read of what a commit said after it
+/// had written (2026-11-17). The bug is in the trace too: some commit writes from a stale read.
+fn check_bank_steps(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
+    const events = try std.fs.path.join(arena, &.{ context.scratch, "bank-steps-events" });
+    std.Io.Dir.cwd().deleteTree(context.io, events) catch {};
+    const report = try explore(context, &.{
+        "--program",   program, "--scenario", "bank_steps", "--seed",       "1",    "--branches", "4",
+        "--branching", "flat",  "--timeline", "8s",         "--events-dir", events,
+    });
+    var branches: [4]Branch = undefined;
+    const count = parse_branches(report, &branches);
+    try events_plain(context, events);
+    const account_count = 4;
+    const Read = struct { client: i64, source: usize, target: usize, source_balance: i64, target_balance: i64 };
+    var steps: u64 = 0;
+    var misfits: u64 = 0;
+    var stale: u64 = 0;
+    var misfit_first: []const u8 = "";
+    for (0..4) |index| {
+        const path = try std.fmt.allocPrint(arena, "{s}/branch-{d}.jsonl", .{ events, index });
+        const text = std.Io.Dir.cwd().readFileAlloc(context.io, path, arena, .limited(1 << 28)) catch continue;
+        var balances: [account_count]i64 = @splat(100);
+        var reads: std.ArrayList(Read) = .empty;
+        var lines = std.mem.tokenizeScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.indexOf(u8, line, "\"event\":{\"event\":\"bank_") == null) continue;
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch continue;
+            const event = parsed.object.get("event").?.object;
+            const name = event.get("event").?.string;
+            const details = event.get("details").?.object;
+            steps += 1;
+            var fits = true;
+            if (std.mem.eql(u8, name, "bank_audit")) {
+                for (details.get("balances").?.array.items, balances) |said, balance| fits = fits and said.integer == balance;
+            } else {
+                const client = details.get("client").?.integer;
+                const held: ?usize = for (reads.items, 0..) |read, at| {
+                    if (read.client == client) break at;
+                } else null;
+                if (std.mem.eql(u8, name, "bank_read")) {
+                    const read: Read = .{
+                        .client = client,
+                        .source = @intCast(details.get("source").?.integer),
+                        .target = @intCast(details.get("target").?.integer),
+                        .source_balance = details.get("source_balance").?.integer,
+                        .target_balance = details.get("target_balance").?.integer,
+                    };
+                    fits = held == null and read.source_balance == balances[read.source] and
+                        read.target_balance == balances[read.target];
+                    if (held == null) try reads.append(arena, read);
+                } else if (held) |at| {
+                    const read = reads.swapRemove(at);
+                    if (std.mem.eql(u8, name, "bank_commit")) {
+                        const amount = details.get("amount").?.integer;
+                        fits = details.get("source_balance").?.integer == read.source_balance - amount and
+                            details.get("target_balance").?.integer == read.target_balance + amount;
+                        // The bug: what it read is no longer what is there.
+                        if (balances[read.source] != read.source_balance or balances[read.target] != read.target_balance) stale += 1;
+                        balances[read.source] = read.source_balance - amount;
+                        balances[read.target] = read.target_balance + amount;
+                    }
+                } else fits = false; // A commit or a reject of no read.
+            }
+            if (!fits) {
+                misfits += 1;
+                if (misfit_first.len == 0) misfit_first = line[0..@min(line.len, 200)];
+            }
+        }
+    }
+    expect_all(context, &.{
+        .{ "4 timelines", count == 4 },
+        .{ "they said their steps", steps > 400 },
+        .{ "every step fits the steps before it", misfits == 0 },
+        .{ "some commit wrote from a stale read (the bug)", stale > 0 },
+    }, "bank-steps: {d} steps of 4 timelines in the order Redis took them, {d} that do not fit ({s}); " ++
+        "{d} commits from a stale read", .{ steps, misfits, misfit_first, stale });
 }
 
 /// Drivers slower than their timeline's limit allows: no driver starts past half the limit, and

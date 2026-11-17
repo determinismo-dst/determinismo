@@ -92,6 +92,7 @@ const build_options = @import("build_options");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const query = @import("query.zig");
+const quint = @import("quint.zig");
 /// Where sessions' timelines begin in a run's indices (tape.zig).
 const event_sets = @import("event_sets.zig");
 const extract = @import("extract.zig");
@@ -1448,6 +1449,20 @@ fn run_route(
         const verb = parts.next() orelse return error.NotFound;
         if (eql(u8, verb, "stop") and eql(u8, request.method, "POST")) return job_stop(server, run, action, index, out);
         return error.NotFound;
+    }
+    // A timeline's own events as a run of a Quint spec's actions (docs/QUINT.md): the module
+    // `determinismo quint` writes, for a spec and a Quint that are somewhere else (an agent's
+    // machine), and what Quint's result on it means.
+    if (eql(u8, action, "quint")) {
+        if (!eql(u8, request.method, "POST")) return error.NotFound;
+        const asked = std.json.parseFromSliceLeaky(quint.Asked, server.arena, request.body, .{ .ignore_unknown_fields = true }) catch return error.BadRequest;
+        const events = try std.fs.path.join(server.arena, &.{ try run_directory(server, run.id), "events" });
+        quint.answer(server.arena, server.io, events, asked, out) catch |err| switch (err) {
+            error.BadRequest, error.FieldNotAnIdentifier, error.EmptyRecord, error.UnsupportedValue, error.DetailsNotARecord => return error.BadRequest,
+            error.FileNotFound => return error.NotFound,
+            else => return err,
+        };
+        return 200;
     }
     // The rest is the run's events database's.
     const reads = [_][]const u8{ "timelines", "properties", "discovery", "failures", "logged" };
