@@ -199,15 +199,29 @@ pub const Pool = struct {
             _ = linux.flock(fd, std.posix.LOCK.UN);
         };
         // The run's turn: its other processes queue behind this one (in the kernel, asleep).
+        // What its holders waited for memory meanwhile is this one's memory wait too: a run
+        // whose VMs did not fit queued behind its one waiter, and booked it all as a CPU's (run
+        // 2060, Kafka's 8 GB guests on 40 workers: 40,472 s of CPU wait, 2,112 of memory, with
+        // most of the host's CPUs idle).
+        var memory_wait_ns: u64 = 0;
+        var turn: TurnMemory = .{};
         if (!cpu_first) {
+            const queued_at = TurnMemory.read(pool.turn_fd).at(asked_ns);
             while (linux.errno(linux.flock(pool.turn_fd, std.posix.LOCK.EX)) == .INTR) {}
+            turn = TurnMemory.read(pool.turn_fd);
+            const now = monotonic_ns();
+            memory_wait_ns = @min(turn.at(now) -| queued_at, now - asked_ns);
+            // A holder that died waiting left its wait open: closed as of now.
+            if (turn.since_ns != 0) {
+                turn = .{ .total_ns = turn.at(now) };
+                turn.write(pool.turn_fd);
+            }
         }
         defer if (!cpu_first) {
             _ = linux.flock(pool.turn_fd, std.posix.LOCK.UN);
         };
         // Host-side only (which CPU a timeline runs on never changes it): any seed will do.
         var random: std.Random.DefaultPrng = .init(@as(u64, @intCast(linux.getpid())) ^ monotonic_ns());
-        var memory_wait_ns: u64 = 0;
         var memory_since: ?u64 = null;
         var memory_said_ns: u64 = 0;
         while (true) {
@@ -218,6 +232,10 @@ pub const Pool = struct {
                         _ = linux.flock(fd, std.posix.LOCK.UN);
                     };
                     if (memory_wanted_open()) |fd| _ = linux.flock(fd, std.posix.LOCK.UN);
+                    if (!cpu_first) {
+                        turn = .{ .total_ns = turn.at(monotonic_ns()) };
+                        turn.write(pool.turn_fd);
+                    }
                 }
                 return null;
             }
@@ -239,6 +257,11 @@ pub const Pool = struct {
             if (below or !pool.claim_fits(claim_bytes)) {
                 if (memory_since == null) {
                     memory_since = monotonic_ns();
+                    // The run's processes queued behind this one wait for it too.
+                    if (!cpu_first) {
+                        turn = .{ .since_ns = memory_since.?, .total_ns = turn.total_ns };
+                        turn.write(pool.turn_fd);
+                    }
                     // A check waiting for memory: the runs leave it the sessions' room.
                     if (pool.priority) if (memory_priority_open()) |fd| {
                         _ = linux.flock(fd, std.posix.LOCK.SH);
@@ -273,7 +296,12 @@ pub const Pool = struct {
                 continue;
             }
             if (memory_since) |since| {
-                memory_wait_ns += monotonic_ns() - since;
+                const now = monotonic_ns();
+                memory_wait_ns += now - since;
+                if (!cpu_first) {
+                    turn = .{ .total_ns = turn.at(now) };
+                    turn.write(pool.turn_fd);
+                }
                 if (pool.priority) if (memory_priority_open()) |fd| {
                     _ = linux.flock(fd, std.posix.LOCK.UN);
                 };
@@ -348,12 +376,45 @@ pub const Pool = struct {
 
 pub const Held = struct {
     slot: u32,
-    /// How long the take waited for the host's memory (other runs' VMs and holders claim it):
-    /// a run whose VMs mostly wait for memory runs fewer timelines at once than it has CPUs.
+    /// How long the take waited for the host's memory (other runs' VMs and holders claim it),
+    /// its own wait and its run's waiter's ahead of it while it queued for the run's turn: a run
+    /// whose VMs mostly wait for memory runs fewer timelines at once than it has CPUs.
     memory_wait_ns: u64 = 0,
     /// And for a CPU, the rest of the take: every CPU held (by other runs' VMs, a priority
     /// process, or this run's own replays and workers), each attempt a pause of 10 to 30 ms.
     cpu_wait_ns: u64 = 0,
+};
+
+/// A run's turn file's content: how long the turn's holders waited for memory, for the run's
+/// processes queued behind them (each books the part of its queueing that a memory wait ahead of
+/// it took as memory wait). Written by the turn's holder alone, whole, in one write.
+const TurnMemory = extern struct {
+    /// When the holder's wait for memory began (monotonic, the host's), 0: none.
+    since_ns: u64 = 0,
+    /// The holders' memory waits that ended.
+    total_ns: u64 = 0,
+
+    /// The holders' memory waiting up to `now`.
+    fn at(state: TurnMemory, now: u64) u64 {
+        return state.total_ns + if (state.since_ns != 0) now -| state.since_ns else 0;
+    }
+
+    /// The file's, nothing waited when it has none yet (a new run's). A reader not holding the
+    /// turn reads it until two reads agree: a holder's write is never seen half done.
+    fn read(fd: linux.fd_t) TurnMemory {
+        var last: TurnMemory = .{};
+        for (0..4) |_| {
+            var state: TurnMemory = .{};
+            if (linux.pread(fd, std.mem.asBytes(&state), @sizeOf(TurnMemory), 0) != @sizeOf(TurnMemory)) return .{};
+            if (std.meta.eql(state, last)) return state;
+            last = state;
+        }
+        return last;
+    }
+
+    fn write(state: TurnMemory, fd: linux.fd_t) void {
+        _ = linux.pwrite(fd, std.mem.asBytes(&state), @sizeOf(TurnMemory), 0);
+    }
 };
 
 /// The pool directory's `<kind>-<cpu>` file, opened (made if new).
@@ -1069,6 +1130,55 @@ test "a judgment's maker takes a CPU past its run's turn, a plain take waits beh
     turn_held = false;
     thread.join();
     try std.testing.expect(plain_done.load(.acquire));
+}
+
+test "a take queued behind its run's waiter for memory books that wait as memory's" {
+    // The host's: claims are host-wide, whatever this test's cgroup limit (a check's unit).
+    const total = meminfo("MemTotal:");
+    if (total == 0) return error.SkipZigTest;
+    const saved = claim_bytes;
+    defer claim_bytes = saved;
+    claim_bytes = total / 2; // One VM's claim fits at a time.
+    var holder: Pool = undefined;
+    try holder.open();
+    defer holder.close();
+    var front: Pool = undefined;
+    try front.open();
+    defer front.close();
+    var queued: Pool = undefined;
+    try queued.open();
+    defer queued.close();
+    for ([_]*Pool{ &holder, &front, &queued }) |pool| pool.available_counts = false;
+    const held = holder.take();
+    unpin();
+    var holder_given = false;
+    defer if (!holder_given) holder.give(held);
+    const Take = struct {
+        fn run(pool: *Pool, out: *?Held) void {
+            out.* = pool.take_unless(Pool.never);
+            unpin();
+        }
+    };
+    // The front takes the run's turn and waits for memory (the holder's claim leaves no room);
+    // the other queues behind the turn meanwhile.
+    var front_held: ?Held = null;
+    const front_thread = try std.Thread.spawn(.{}, Take.run, .{ &front, &front_held });
+    const settle: linux.timespec = .{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+    _ = linux.nanosleep(&settle, null);
+    var queued_held: ?Held = null;
+    const queued_thread = try std.Thread.spawn(.{}, Take.run, .{ &queued, &queued_held });
+    const blocked: linux.timespec = .{ .sec = 0, .nsec = 400 * std.time.ns_per_ms };
+    _ = linux.nanosleep(&blocked, null);
+    holder.give(held);
+    holder_given = true;
+    front_thread.join();
+    front.give(front_held.?); // The queued one's claim fits now: it takes a CPU at once.
+    queued_thread.join();
+    const taken = queued_held.?;
+    defer queued.give(taken);
+    // Some 400 ms queued while the front waited for memory: memory's, not a CPU's.
+    try std.testing.expect(taken.memory_wait_ns >= 300 * std.time.ns_per_ms);
+    try std.testing.expect(taken.cpu_wait_ns < taken.memory_wait_ns);
 }
 
 test "a check waiting for memory is seen by the runs" {
