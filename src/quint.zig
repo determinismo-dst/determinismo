@@ -181,6 +181,7 @@ pub fn answer(arena: std.mem.Allocator, io: std.Io, events_directory: []const u8
             .events = trace.steps.len,
             .event = event,
             .state = state,
+            .series = if (asked.states) |raw| series_of(arena, raw) catch null else null,
         }, .{}, out);
     } else {
         const module = if (trace.steps.len == 0) "" else try trace_module(arena, asked.main, asked.file orelse asked.main, &trace, asked.invariant);
@@ -524,6 +525,68 @@ fn plain(arena: std.mem.Allocator, value: std.json.Value) ItfError!std.json.Valu
     }
 }
 
+/// The run's states as numbers a client can draw: for each of the spec's variables that is a
+/// number, or a map, record or list of numbers ("balances.0"), its value in every whole
+/// state, the first state's first. As a JSON object of lists; the variables are those of the
+/// first state, `series_max` of them at most.
+const series_max = 32;
+
+fn series_of(arena: std.mem.Allocator, parsed: std.json.Value) ItfError!std.json.Value {
+    var series: std.json.ObjectMap = .empty;
+    if (parsed != .object) return .{ .object = series };
+    const states = switch (parsed.object.get("states") orelse return .{ .object = series }) {
+        .array => |array| array.items,
+        else => return .{ .object = series },
+    };
+    for (states, 0..) |state_raw, index| {
+        if (state_raw != .object or state_raw.object.count() <= 1) break; // Where the run stopped.
+        const state = try plain(arena, state_raw);
+        var variables = state.object.iterator();
+        while (variables.next()) |variable| {
+            switch (variable.value_ptr.*) {
+                .integer => try series_add(arena, &series, variable.key_ptr.*, "", index, variable.value_ptr.*),
+                .object => |fields| {
+                    var inner = fields.iterator();
+                    while (inner.next()) |field| {
+                        if (field.value_ptr.* == .integer) try series_add(arena, &series, variable.key_ptr.*, field.key_ptr.*, index, field.value_ptr.*);
+                    }
+                },
+                .array => |items| for (items.items, 0..) |item, at| {
+                    if (item != .integer) continue;
+                    var name_buffer: [20]u8 = undefined;
+                    const name = std.fmt.bufPrint(&name_buffer, "{d}", .{at}) catch unreachable;
+                    try series_add(arena, &series, variable.key_ptr.*, name, index, item);
+                },
+                else => {},
+            }
+        }
+    }
+    return .{ .object = series };
+}
+
+/// One state's value of a series; a series is of the first state's variables, a value for
+/// every state (one that lacks it, a map's key not there yet, repeats the one before).
+fn series_add(
+    arena: std.mem.Allocator,
+    series: *std.json.ObjectMap,
+    variable: []const u8,
+    field: []const u8,
+    index: usize,
+    value: std.json.Value,
+) ItfError!void {
+    const name = if (field.len == 0) variable else std.fmt.allocPrint(arena, "{s}.{s}", .{ variable, field }) catch return error.OutOfMemory;
+    const entry = series.getPtr(name) orelse added: {
+        if (index != 0 or series.count() == series_max) return;
+        try series.put(arena, name, .{ .array = .init(arena) });
+        break :added series.getPtr(name).?;
+    };
+    while (entry.array.items.len < index) {
+        const before: std.json.Value = if (entry.array.items.len == 0) value else entry.array.items[entry.array.items.len - 1];
+        try entry.array.append(before);
+    }
+    if (entry.array.items.len == index) try entry.array.append(value);
+}
+
 fn plain_items(arena: std.mem.Allocator, items: []const std.json.Value) ItfError!std.json.Value {
     var array: std.json.Array = .init(arena);
     for (items) |item| try array.append(try plain(arena, item));
@@ -714,6 +777,15 @@ test "the run's states say where it stopped" {
     try std.testing.expectEqualStrings("behavior", outcome_of(&trace, true, null).kind);
     const plain_state = try plain(arena, states.last_value.?);
     try std.testing.expectEqual(7, plain_state.object.get("x").?.integer);
+    const drawn = try series_of(arena, try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"states":[{"#meta":{"index":0},"n":{"#bigint":"1"},"b":{"#map":[[{"#bigint":"0"},{"#bigint":"100"}],[{"#bigint":"1"},{"#bigint":"100"}]]},"r":{"#map":[]}},
+        \\{"#meta":{"index":1},"n":{"#bigint":"2"},"b":{"#map":[[{"#bigint":"0"},{"#bigint":"93"}],[{"#bigint":"1"},{"#bigint":"107"}]]},"r":{"#map":[]}},
+        \\{"#meta":{"index":2}}]}
+    , .{}));
+    try std.testing.expectEqual(3, drawn.object.count()); // n, b.0, b.1: r has no number.
+    try std.testing.expectEqual(2, drawn.object.get("n").?.array.items.len);
+    try std.testing.expectEqual(93, drawn.object.get("b.0").?.array.items[1].integer);
+    try std.testing.expectEqual(107, drawn.object.get("b.1").?.array.items[1].integer);
     try std.testing.expect(states_of(arena, "") == null);
     const value = try std.json.parseFromSliceLeaky(std.json.Value, arena,
         \\{"#meta":{"index":4},"balances":{"#map":[[{"#bigint":"0"},{"#bigint":"95"}],[{"#bigint":"1"},{"#bigint":"107"}]]},"reads":{"#map":[]},"seen":{"#set":["a"]},"pair":{"#tup":[true,[1]]}}

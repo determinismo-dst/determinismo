@@ -9,20 +9,25 @@
 # ($DETERMINISMO_DUCKDB or ~/opt/duckdb-x86_64-musl) src/main.zig's tests cannot link: the others
 # still build (pass patterns that leave it out).
 #   infra/host/unit.sh <ip> kafka sdk-zig
+# --tree <name>: the host's directory in place of determinismo-unit (two people's runs on one
+# host: each syncs its repository there, and one's sync under the other's running tests gives
+# them files of another tree).
 # --cpus <list>: the CPUs the tests run on, instead of the host's reserved ones (a host shared
 # by cores with someone whose work has those), as check.sh's.
 set -euo pipefail
 
-usage="usage: $0 <ip> [<pattern>...] [--user <user>] [--cpus <list>]"
+usage="usage: $0 <ip> [<pattern>...] [--user <user>] [--cpus <list>] [--tree <name>]"
 ip=${1:?$usage}
 shift
 user=det
 cpus_given=
+tree=determinismo-unit
 patterns=()
 while [ $# -gt 0 ]; do
   case $1 in
     --user) user=$2; shift ;;
     --cpus) cpus_given=$2; shift ;;
+    --tree) tree=$2; shift ;;
     -*) echo "error: unknown option $1 ($usage)" >&2; exit 2 ;;
     *) patterns+=("$1") ;;
   esac
@@ -48,17 +53,17 @@ for binary in "$repo"/zig-out-unit/tests/*; do
   done
 done
 [ ${#chosen[@]} -gt 0 ] || { echo "error: no unit test matches ${patterns[*]}" >&2; exit 2; }
-ssh "${ssh_opts[@]}" "$user@$ip" mkdir -p determinismo-unit
+ssh "${ssh_opts[@]}" "$user@$ip" mkdir -p "$tree"
 rsync -az --delete -e "ssh ${ssh_opts[*]}" --exclude-from "$repo/infra/host/rsync-excludes" \
-  "$repo/" "$user@$ip:determinismo-unit/"
-ssh "${ssh_opts[@]}" "$user@$ip" mkdir -p determinismo-unit/zig-out-unit
-rsync -az --delete -e "ssh ${ssh_opts[*]}" "$repo/zig-out-unit/tests/" "$user@$ip:determinismo-unit/zig-out-unit/tests/"
+  "$repo/" "$user@$ip:$tree/"
+ssh "${ssh_opts[@]}" "$user@$ip" mkdir -p "$tree/zig-out-unit"
+rsync -az --delete -e "ssh ${ssh_opts[*]}" "$repo/zig-out-unit/tests/" "$user@$ip:$tree/zig-out-unit/tests/"
 # Shipped: the local build goes (1.2 GB a build; the Mac's disk filled on 2026-11-08).
 rm -rf "$repo/zig-out-unit"
 # Each binary run in turn in one unit; its last lines and its verdict, then the count failed.
-ssh "${ssh_opts[@]}" "$user@$ip" "env CPUS=$(printf %q "$cpus_given") bash -s -- $(printf '%q ' "${chosen[@]}")" <<'EOF'
+ssh "${ssh_opts[@]}" "$user@$ip" "env CPUS=$(printf %q "$cpus_given") TREE=$(printf %q "$tree") bash -s -- $(printf '%q ' "${chosen[@]}")" <<'EOF'
 set -uo pipefail
-cd ~/determinismo-unit
+cd ~/"$TREE"
 cat > zig-out-unit/run.sh <<'RUN'
 failed=0
 for name in "$@"; do
