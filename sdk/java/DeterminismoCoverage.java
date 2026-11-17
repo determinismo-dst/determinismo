@@ -70,7 +70,16 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class DeterminismoCoverage {
   static final List<String> lines = new ArrayList<>();
   private static final Map<String, Integer> ids = new HashMap<>();
-  private static volatile boolean[] reported = new boolean[1024];
+  /** The lines' and fields' names by id, for a probe's own report: read with no lock, each
+   * array published whole (a volatile store) once a name is in it, before its class runs. */
+  private static volatile String[] lineNames = new String[1024];
+  private static volatile String[] fieldNames = new String[64];
+  /** Lines reported, in pages of 65,536 ids. A page never moves once made: a probe marks its
+   * line there itself, and no mark is lost to a copy (an array grown by copying lost the mark
+   * of a probe that wrote the old one meanwhile, and its line took the slow path ever after). */
+  private static final int REPORTED_PAGE_BITS = 16;
+  private static final java.util.concurrent.atomic.AtomicReferenceArray<boolean[]> reported =
+      new java.util.concurrent.atomic.AtomicReferenceArray<>(1 << (30 - REPORTED_PAGE_BITS));
   static final List<String> fields = new ArrayList<>();
   private static final Map<String, Integer> fieldIds = new HashMap<>();
   /** Transitions reported: field id, old ordinal + 1 (0 for null), new ordinal + 1. */
@@ -105,10 +114,56 @@ public final class DeterminismoCoverage {
 
   /** Called by instrumented code at the start of each line. */
   public static void line(int id) {
-    boolean[] seen = reported;
-    if ((id >= seen.length || !seen[id]) && queued.add(id)) send(id);
+    boolean[] page = reported.get(id >>> REPORTED_PAGE_BITS);
+    if ((page == null || !page[id & ((1 << REPORTED_PAGE_BITS) - 1)]) && queued.add(id)) first(id);
     if (crashAfterThread != null) crashAfterReached();
     pausing(id);
+  }
+
+  /*
+   * A line's first run, and a state's first transition, are reported by the thread that ran
+   * them, as they happen: the event is that thread's (its source the program's, as its decisions
+   * are) and comes before what the line does next. Through the sender they came some 0.1 to 1
+   * ms late and as the sender's: the tree's return just after a new state landed past the
+   * program's next draws, and a strategy changing the decisions of the process that reached a
+   * feature changed the sender's own (e2e `states`, 0 of 256 timelines solved, and the Java
+   * maze of `coverage`, none of 134 past the second digit: det-strategy-mutate's frontier was
+   * the sender's "crash points" draw). No lock on the way (below): one write to the device,
+   * names and marks read and written with none. A virtual thread's go through the sender still
+   * (its write would park it; its source is its carrier's anyway), and every report outside
+   * determinismo (the SDK's local output is a stream with a lock of its own).
+   */
+  private static boolean direct() {
+    if (!pausingInside) return false;
+    String kind = Thread.currentThread().getClass().getName();
+    return !kind.equals("java.lang.VirtualThread") && !kind.endsWith("BoundVirtualThread");
+  }
+
+  private static void first(int id) {
+    if (direct()) {
+      String[] names = lineNames;
+      String name = id < names.length ? names[id] : null;
+      StringBuilder details = new StringBuilder(48).append("{\"name\":\"line ");
+      if (name != null) details.append(name);
+      else details.append('?').append(id);
+      if (Determinismo.eventUnlocked("coverage", details.append("\"}").toString())) {
+        mark(id);
+        return;
+      }
+    }
+    send(id);
+  }
+
+  /** The line is reported: its probes take the fast path from now on. */
+  private static void mark(int id) {
+    int index = id >>> REPORTED_PAGE_BITS;
+    boolean[] page = reported.get(index);
+    if (page == null) {
+      reported.compareAndSet(index, null, new boolean[1 << REPORTED_PAGE_BITS]);
+      page = reported.get(index);
+    }
+    page[id & ((1 << REPORTED_PAGE_BITS) - 1)] = true;
+    reported.set(index, page); // Publishes the write to the probes (a volatile store).
   }
 
   /** Called by instrumented code after each conditional branch: a point for thread pausing. */
@@ -259,15 +314,17 @@ public final class DeterminismoCoverage {
   /*
    * A probe waits for no lock: it may run in any class's initializer, with other threads (a
    * carrier among them, pinned) waiting for that initialization, and a lock's holder may wait
-   * for it too. Its reports, and the stretches' draws, go to a sender thread of the agent's
-   * through a lock-free queue; the sender calls the SDK (whose emit is synchronized). Probes
-   * calling the SDK deadlocked JVMs twice (core.async, hunt runs 1115 and 1122): an instrumented
+   * for it too. What it reports itself (`first`, a state's transition) is one write to the
+   * device. The rest goes to a sender thread of the agent's through a lock-free queue: the
+   * stretches' draws, crash requests, a virtual thread's reports and every report outside
+   * determinismo; the sender calls the SDK (whose emit is synchronized). Probes calling the
+   * SDK's emit deadlocked JVMs twice (core.async, hunt runs 1115 and 1122): an instrumented
    * initializer's first probe waited for the agent's monitor, then for the SDK's, each held by a
    * virtual thread that needed the only carrier, pinned waiting for that initialization
    * (sdk/java/coverage_test.zig).
    */
 
-  /** Lines whose first report is queued (the sender marks them reported). */
+  /** Lines whose first report was taken: by their probe's thread, or queued for the sender. */
   private static final Set<Integer> queued = ConcurrentHashMap.newKeySet();
   /** Reports for the sender: a line's id, or a state transition's event. */
   private static final java.util.concurrent.ConcurrentLinkedQueue<Object> outbox =
@@ -324,12 +381,9 @@ public final class DeterminismoCoverage {
     if (report instanceof Integer id) {
       String line;
       synchronized (DeterminismoCoverage.class) {
-        if (id >= reported.length) reported = Arrays.copyOf(reported, Math.max(id + 1, 2 * id));
-        boolean[] seen = reported;
-        seen[id] = true;
-        reported = seen; // Publishes the write to the probes (a volatile store).
         line = id < lines.size() ? lines.get(id) : "?" + id;
       }
+      mark(id);
       Determinismo.event("coverage", "{\"name\":\"line " + line + "\"}");
     } else if (report instanceof Object[] state) {
       String name;
@@ -369,6 +423,16 @@ public final class DeterminismoCoverage {
         | (next.ordinal() + 1);
     crashPoint(key, id, before == null ? "null" : before.name(), next.name());
     if (!transitions.add(key)) return;
+    if (direct()) {
+      String[] names = fieldNames;
+      String name = id < names.length ? names[id] : null;
+      StringBuilder details = new StringBuilder(96).append("{\"name\":\"state ");
+      if (name != null) details.append(name);
+      else details.append('?').append(id);
+      details.append(": ").append(before == null ? "null" : before.name()).append(" -> ")
+          .append(next.name()).append("\"}");
+      if (Determinismo.eventUnlocked("state", details.toString())) return;
+    }
     send(new Object[] {id, before == null ? "null" : before.name(), next.name()});
   }
 
@@ -413,7 +477,17 @@ public final class DeterminismoCoverage {
     if (id != null) return id;
     fieldIds.put(field, fields.size());
     fields.add(field);
+    fieldNames = named(fieldNames, fields.size() - 1, field);
     return fields.size() - 1;
+  }
+
+  /** `names` with `name` at `id` (grown when it must), for its volatile field: the store that
+   * shows the probes the name. Under this class's monitor, or as it loads. */
+  private static String[] named(String[] names, int id, String name) {
+    String[] known = id < names.length
+        ? names : Arrays.copyOf(names, Math.max(id + 1, 2 * names.length));
+    known[id] = name;
+    return known;
   }
 
   /** Block probes' ids: their own numbers, with this bit (lines' ids are below it). */
@@ -429,6 +503,7 @@ public final class DeterminismoCoverage {
     if (id != null) return id;
     ids.put(line, lines.size());
     lines.add(line);
+    lineNames = named(lineNames, lines.size() - 1, line);
     return lines.size() - 1;
   }
 
@@ -464,9 +539,11 @@ public final class DeterminismoCoverage {
         } else if (section.equals("@lines")) {
           ids.put(line, lines.size());
           lines.add(line);
+          lineNames = named(lineNames, lines.size() - 1, line);
         } else if (section.equals("@fields")) {
           fieldIds.put(line, fields.size());
           fields.add(line);
+          fieldNames = named(fieldNames, fields.size() - 1, line);
         } else if (section.equals("@classes")) {
           ahead.add(line);
         }

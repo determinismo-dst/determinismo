@@ -516,6 +516,26 @@ public final class Determinismo {
     emit("{\"event\":" + quote(name) + ",\"details\":" + orEmpty(details) + "}");
   }
 
+  /**
+   * An event written by the thread it happened in, with no lock: for the coverage agent's probes,
+   * which wait for no monitor (DeterminismoCoverage). One write to the device, one event, as
+   * emit's; no string concatenation, whose first use links a call site (nothing a probe inside a
+   * class's initializer should start). Inside determinismo only: false outside, or when the
+   * device refused it, and the caller's own path reports it.
+   */
+  static boolean eventUnlocked(String name, String details) {
+    if (device == null) return false;
+    StringBuilder line = new StringBuilder(32 + name.length() + details.length());
+    line.append("{\"event\":").append(quote(name)).append(",\"details\":").append(details)
+        .append('}');
+    try {
+      device.write(line.toString().getBytes(StandardCharsets.UTF_8));
+      return true;
+    } catch (IOException refused) {
+      return false;
+    }
+  }
+
   /** An objective's direction ({@link #optimize}). */
   public enum Goal { MAXIMIZE, MINIMIZE }
 
