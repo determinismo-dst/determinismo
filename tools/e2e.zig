@@ -5645,6 +5645,32 @@ fn check_disk(context: *Context) !void {
     }, "disk: a crash keeps what was synced and loses the rest, a wipe loses both; dropped " ++
         "writes vanish, refused ones fail, a slow disk is slow, and it works again; an outage " ++
         "takes two nodes down at once, each keeping what it synced; a timeline replays exactly", .{});
+    // A delayed disk is waited for, not polled: Linux's dm-delay starts a kthread for a delay
+    // under 50 ms ("dm-delay-flush-worker") that loops for as long as a bio is delayed, and the
+    // disk baseline is 0 to 2 ms on every durable disk. A guest computed through every delayed
+    // write and read no clock doing it: three quarters of an etcd timeline's exact stops
+    // (guest/kernel/patches/0011). Each timeline at the moment its baseline is set: the delay
+    // it drew, and the kernel's threads of that name.
+    var delayed: u32 = 0;
+    var polling: u32 = 0;
+    for ([_][]const u8{ "0", "1", "2" }) |branch| {
+        const looked = try explore(context, &(common ++ [_][]const u8{
+            "--branch",                                                                                                                                                         branch, "--until", "event=disk_baseline", "--exec",
+            // What it prints is not in what it is (the command's text is in the output too).
+            "printf 'baseline-%s=%s polling-%s=%s.\n' ms \"$(cat /run/det/nodes/disk_baseline_ms)\" threads \"$(cat /proc/[0-9]*/comm 2>/dev/null | grep -c dm-delay-flush)\"",
+        }));
+        const baseline_at = std.mem.indexOf(u8, looked, "baseline-ms=") orelse continue;
+        const said = looked[baseline_at + "baseline-ms=".len ..];
+        if (said.len == 0 or said[0] < '1' or said[0] > '9') continue;
+        delayed += 1;
+        // Not said: not shown to be none.
+        if (std.mem.indexOf(u8, said[0..@min(said.len, 40)], "polling-threads=0.") == null) polling += 1;
+    }
+    expect_all(context, &.{
+        .{ "a timeline drew a delay", delayed > 0 },
+        .{ "none of them has a polling thread", polling == 0 },
+    }, "disk: a disk with a baseline delay is waited for, no kernel thread polling it ({d} of 3 timelines " ++
+        "drew a delay, {d} with a dm-delay-flush thread)", .{ delayed, polling });
     // A node with a drawn flusher (a 1 s window: on, its disk synced every second, as a host's
     // flusher would; off, strict) keeps across a crash what it wrote unsynced once the flusher
     // synced it, and in some timelines its flusher stays off: the bug a strict disk shows.
