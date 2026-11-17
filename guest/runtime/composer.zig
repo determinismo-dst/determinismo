@@ -432,6 +432,9 @@ pub fn main(init: std.process.Init) !void {
         run_singleton(&composer);
     } else {
         length_end_ns = run_drivers(&composer, scenario.drive_ms_max orelse drive_max_default_ms(), scenario.parallel_max);
+        while (drive_again(drive_start_ns)) {
+            length_end_ns = run_drivers(&composer, scenario.drive_ms_max orelse drive_max_default_ms(), scenario.parallel_max);
+        }
     }
     // The ending, as Antithesis's: an eventually command kills every command still running
     // (and the faults stop); a finally one waits for them to end on their own, and runs only
@@ -777,6 +780,27 @@ fn timeline_length_ns() ?u64 {
 /// in nanoseconds.
 fn timeline_limit_ns() ?u64 {
     return cmdline_ms("det.timeline_limit_ms=");
+}
+
+/// Whether the timeline drives another phase after this one: the explorer's decision
+/// ("composer.again"). An exploring explorer answers it (advisor.zig): no, but for a timeline
+/// the tree returned to an objective's best (a node's memory growth), once. That branch goes on
+/// a phase past where its parent stopped and adds to what the parent built up, so a path grows a
+/// phase a generation. Before it, a returned timeline ended when its parent would (its starts
+/// or its length are drawn once, at its phase's start): whatever the tree returned to, a path
+/// leaked one timeline's worth and a leak slower than a timeline was out of reach (e2e
+/// memory-climb, 2026-11-17).
+/// Yes is the answer 1 of again_range: where nothing answers (a plain run, a machine), the
+/// timeline's own draw says it once in 2^62, so nothing but the explorer turns it on, and the
+/// machine boots as it always did (a word on the kernel's command line to ask by made replays
+/// boot other inputs than their tapes': refused).
+/// Not asked past a quarter of the timeline's limit since the first phase began: another phase
+/// and the ending have the rest.
+const again_range = 1 << 62;
+
+fn drive_again(drive_start_ns: u64) bool {
+    if (timeline_limit_ns()) |limit_ns| if (now_ns() - drive_start_ns >= limit_ns / 4) return false;
+    return sdk.random_below_named("composer.again", again_range) == 1;
 }
 
 fn cmdline_ms(comptime key: []const u8) ?u64 {

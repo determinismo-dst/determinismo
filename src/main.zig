@@ -121,6 +121,10 @@ const usage =
     \\                            [--no-memory-objective]   (on by default: each node's anonymous
     \\                            memory above its least is an objective the tree climbs, a slow
     \\                            leak grown into an OOM kill; without it, not counted)
+    \\                            [--no-objective-extend]   (on by default: a timeline the tree
+    \\                            returns to an objective's best drives one more phase past its
+    \\                            parent's end, so a path grows a phase a generation; without
+    \\                            it, a return ends when its parent would)
     \\                            [--no-config-bandit]   (on by default: a tree's configuration
     \\                            draws, fault regimes' and the composer's, come more often at the
     \\                            values that found new behaviors or failures, never only those;
@@ -474,6 +478,11 @@ const Arguments = struct {
     /// the OOM killer climbed by the tree), `--no-memory-objective`: not counted, for comparisons.
     memory_objective: bool = true,
     memory_objective_given: bool = false,
+    /// A tree's return to an objective's best goes on a driver phase past its parent's end
+    /// (composer.zig's drive_again asks, advisor.zig answers), `--no-objective-extend`: it ends
+    /// when its parent would, for comparisons.
+    objective_extend: bool = true,
+    objective_extend_given: bool = false,
     /// The tree's bandit over configuration draws (`--no-config-bandit`: independent draws).
     config_bandit: bool = true,
     /// Setup mode (`--setup-only`, Antithesis's): the system built and booted, its setup run to
@@ -1600,6 +1609,13 @@ fn alternatives_say(scenario: anytype) void {
     if (ending > 1) std.debug.print("[determinismo] scenario {s}: {d} eventually and finally commands, a timeline runs one of them\n", .{ scenario.name, ending });
 }
 
+/// Whether the explorer answers its timelines' composers' asks for another driver phase
+/// (advisor.zig): an exploration with the extension on. Nothing of it is in what a machine
+/// boots with: a replay boots its tape's inputs, and the answers are on the tape.
+fn objective_extends(arguments: *const Arguments) bool {
+    return arguments.command == .explore and arguments.objective_extend;
+}
+
 fn cmdline_build(
     arena: std.mem.Allocator,
     base: []const u8,
@@ -1809,7 +1825,7 @@ fn resume_settings_adopt(arena: std.mem.Allocator, io: std.Io, arguments: *Argum
     const path = arguments.record_path orelse return;
     const source = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch return;
     const first = source[0 .. std.mem.indexOfScalar(u8, source, '\n') orelse source.len];
-    const Line = struct { run: ?struct { pipeline: ?u32 = null, archive: ?bool = null, prefer_sometimes: ?bool = null, prefer_severe: ?bool = null, ranges: ?bool = null, memory_objective: ?bool = null, tsc_jitter_seed: ?[]const u8 = null } = null };
+    const Line = struct { run: ?struct { pipeline: ?u32 = null, archive: ?bool = null, prefer_sometimes: ?bool = null, prefer_severe: ?bool = null, ranges: ?bool = null, memory_objective: ?bool = null, objective_extend: ?bool = null, tsc_jitter_seed: ?[]const u8 = null } = null };
     const line = std.json.parseFromSliceLeaky(Line, arena, first, .{ .ignore_unknown_fields = true }) catch return;
     const run = line.run orelse return;
     if (!arguments.archive_given) if (run.archive) |archive| {
@@ -1821,6 +1837,8 @@ fn resume_settings_adopt(arena: std.mem.Allocator, io: std.Io, arguments: *Argum
     if (!arguments.ranges_given) arguments.ranges = run.ranges orelse false;
     // On since 2026-11-08, recorded since 2026-11-12: a run recorded between had it.
     if (!arguments.memory_objective_given) arguments.memory_objective = run.memory_objective orelse true;
+    // Recorded before it existed: it ran without.
+    if (!arguments.objective_extend_given) arguments.objective_extend = run.objective_extend orelse false;
     if (!arguments.pipeline_given) if (run.pipeline) |pipeline| {
         arguments.pipeline = pipeline;
     };
@@ -2093,6 +2111,7 @@ fn summary_load(summary: *Summary, bytes: []const u8) void {
     summary.last_pull_ns = header.last_pull_ns;
     summary.cut = header.cut != 0;
     summary.ended_early = false;
+    summary.again_ns = null;
     summary.holder_count = 0; // Gone with the run: its moments are made again by replay.
     summary.failing_count = 0; // Its holders went with the run: no ladder to save.
     summary.bandit_use_count = 0; // Not on disk: nothing to credit.
@@ -2227,6 +2246,7 @@ fn command_explore(
                 .prefer_severe = arguments.prefer_severe,
                 .ranges = arguments.ranges,
                 .memory_objective = arguments.memory_objective,
+                .objective_extend = arguments.objective_extend,
                 .horizon_ns = arguments.horizon_ns,
                 .return_branches = arguments.return_branches,
                 .jobs = jobs_count(arguments),
@@ -2992,6 +3012,9 @@ const Branches = struct {
     deadline_ns: ?u64 = null,
     /// The driver phase's length bucket the tree chose for this timeline (Novelty), if any.
     drive_k: ?u8 = null,
+    /// The tree returned it to an objective's best: it drives one more phase when its composer
+    /// asks (advisor.zig's again_left).
+    again: bool = false,
     /// The tree's bandit over configuration draws, as this timeline forks with it.
     bandit: ?*const bandit_zig.Bandit = null,
     /// Where a live timeline's named draws are noted (draws.zig), written beside its events:
@@ -3224,6 +3247,8 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
             .learned = branches.bandit,
             .draws = if (exploration.replay == null) branches.draws else null,
             .fixed = branches.arguments.decide,
+            .again_asked = exploration.replay == null and objective_extends(branches.arguments),
+            .again_left = @intFromBool(branches.again),
         };
         if (advice.draws) |draws| draws.reset(.first);
         vm.advisor = advice.advisor();
@@ -3280,7 +3305,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         // A tree timeline's summary on disk before its line in the record: killed between the
         // two, the resumed run runs it again (once), never takes it as recorded without one.
         if (branches.summaries) |summaries| {
-            summaries.note(vm, place, outcome, if (branches.holders != null) owner.holders() else &.{}, advice.uses[0..advice.use_count]);
+            summaries.note(vm, place, outcome, if (branches.holders != null) owner.holders() else &.{}, advice.uses[0..advice.use_count], advice.again_ns);
             if (tree_summaries_fd) |fd| summary_write(fd, &summaries.items[summaries.count - 1]);
         }
         const vtime_before_ns = branches.multiverse.vtime_ns;
@@ -3415,6 +3440,11 @@ const Summary = struct {
     ended_early: bool = false,
     /// When its driver phase ended (Events.drive_end_ns), if it did in this timeline.
     drive_end_ns: ?u64 = null,
+    /// The last event's moment before its composer last asked whether to drive another phase
+    /// (advisor.zig's again_ns), if it asked in this timeline: a return to an objective's best
+    /// lands no later, so its branches meet the ask. Not on disk: a resumed run's recorded
+    /// timelines are returned to where their best was.
+    again_ns: ?u64 = null,
     /// When its workload said its state looked hopeless (Events.doomed_ns: sdk.doomed), if it did.
     doomed_ns: ?u64 = null,
     /// The properties it fails (their messages' hashes), up to `failing_max`: the explorer saves
@@ -3441,6 +3471,7 @@ const Summaries = struct {
         kept: []const holders.Held,
         /// The configuration draws' buckets it drew (advisor.zig), credited when judged.
         uses: []const bandit_zig.Use,
+        again_ns: ?u64,
     ) void {
         assert(summaries.count < summaries.items.len);
         const summary = &summaries.items[summaries.count];
@@ -3454,6 +3485,7 @@ const Summaries = struct {
         summary.cut = place.horizon_ns != null and outcome == .moment_reached;
         summary.ended_early = outcome == .strategy_ended;
         summary.drive_end_ns = vm.events.drive_end_ns;
+        summary.again_ns = again_ns;
         summary.doomed_ns = vm.events.doomed_ns;
         summary.bandit_use_count = @intCast(uses.len);
         @memcpy(summary.bandit_uses[0..uses.len], uses);
@@ -3808,6 +3840,12 @@ fn explore_tree(
                 if (state.ends_count > 0) mine.end_ns_expected = state.ends_ns_sum / state.ends_count;
             }
             if (branches.arguments.drive_steered_max_ms) |max_ms| mine.drive_k = state.novelty.choose(max_ms, place.index);
+            // A return to an objective's best state: its branch goes on a driver phase past
+            // where its parent stopped (advisor.zig answers its composer's ask yes, once).
+            mine.again = objective_extends(branches.arguments) and if (place.cell) |hash|
+                (if (state.cells.getPtr(hash)) |cell| cell.best != null else false)
+            else
+                false;
             if (branches.arguments.config_bandit) mine.bandit = &state.bandit;
             running[running_count] = try timeline_start(context, vm, options, mine, &batch);
             running_count += 1;
@@ -6090,7 +6128,9 @@ fn archive_add(arena: std.mem.Allocator, state: *TreeState, plan: []const Planne
     if (!state.archive) return;
     for (summary.behaviors[0..summary.behavior_count]) |behavior| {
         if (behavior.vtime_ns <= summary.start_ns) continue; // Its ancestors' (reached before).
-        const at = behavior.vtime_ns + return_after_ns;
+        // An objective's state: no later than just before its composer's ask (objective_place).
+        const reached = behavior.vtime_ns + return_after_ns;
+        const at = if (behavior.score != null) objective_place(summary, reached) else reached;
         const open = summary.cut or at < summary.last_pull_ns;
         if (!open or at >= summary.end_ns) continue;
         const entry = try state.cells.getOrPut(arena, behavior.hash);
@@ -6131,6 +6171,18 @@ fn archive_add(arena: std.mem.Allocator, state: *TreeState, plan: []const Planne
         };
         entry.value_ptr.places[0] = .{ .branch = summary.index, .vtime_ns = at, .doomed = doomed_at(summary, behavior.vtime_ns) };
     }
+}
+
+/// Where the tree returns for an objective's best state reached at `at`: there, or just before
+/// the timeline's composer last asked whether to drive another phase when the best came after
+/// it (a node's memory is sampled every two seconds: its highest often shows once the phase's
+/// last commands are in). A branch from after the ask can only end; from before it, it goes on a
+/// phase (Branches.again).
+fn objective_place(summary: *const Summary, at: u64) u64 {
+    const asked_ns = summary.again_ns orelse return at;
+    const before = asked_ns -| return_after_ns;
+    if (at <= before or before <= summary.start_ns + return_after_ns) return at;
+    return before;
 }
 
 /// The explorer's memory forgets as it goes: each generation keeps a drawn share of what it
@@ -7617,6 +7669,11 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
         if (std.mem.eql(u8, argv[index], "--memory-objective") or std.mem.eql(u8, argv[index], "--no-memory-objective")) {
             arguments.memory_objective = std.mem.eql(u8, argv[index], "--memory-objective");
             arguments.memory_objective_given = true;
+            continue;
+        }
+        if (std.mem.eql(u8, argv[index], "--objective-extend") or std.mem.eql(u8, argv[index], "--no-objective-extend")) {
+            arguments.objective_extend = std.mem.eql(u8, argv[index], "--objective-extend");
+            arguments.objective_extend_given = true;
             continue;
         }
         if (std.mem.eql(u8, argv[index], "--prefer-severe") or std.mem.eql(u8, argv[index], "--no-prefer-severe")) {

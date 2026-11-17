@@ -1610,6 +1610,9 @@ pub const RunRequest = struct {
     /// false: the nodes' memory-growth objective not counted (--no-memory-objective), for
     /// comparisons.
     memory_objective: bool = true,
+    /// false: a tree's return to an objective's best ends when its parent would
+    /// (--no-objective-extend), for comparisons.
+    objective_extend: bool = true,
     /// A CI job's (determinismo-ci): where its tests come from, for the UI's CI page (each
     /// repository's jobs, each test's verdict across them).
     ci: ?CiJob = null,
@@ -1988,6 +1991,7 @@ fn explore_arguments(
     if (!asked.prefer_severe) try argv.append(server.arena, "--no-prefer-severe");
     if (!asked.ranges) try argv.append(server.arena, "--no-ranges");
     if (!asked.memory_objective) try argv.append(server.arena, "--no-memory-objective");
+    if (!asked.objective_extend) try argv.append(server.arena, "--no-objective-extend");
     if (!asked.swarm) try argv.append(server.arena, "--no-swarm");
     if (asked.pipeline) |depth| {
         try argv.appendSlice(server.arena, &.{ "--pipeline", try print(server, "{d}", .{depth}) });

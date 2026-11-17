@@ -6210,13 +6210,19 @@ fn check_memory_growth(context: *Context) !void {
 /// down a tree that climbs the objective, and seldom without it (`--no-memory-objective`). jank's
 /// leak reached it within a timeline either way (runs 1912 and 1913: 10 kills each), which showed
 /// nothing of the objective.
-/// Red since the leak is truly under the limit in one timeline (2026-11-17: 0 against 0 in the
-/// four seeds), and what it asks is not built: a timeline returned to a moment ends when its
-/// parent would (its driver phase's starts or length are drawn once, at its start), so what a
-/// path leaks is one timeline's at most, whatever the tree returns to. Children of the
-/// objective's best moment had 2 driver starts left and ended a second later; 380 of 384
-/// timelines were fresh or one return deep. Its green of before (106 against 76) counted
-/// timelines of 58 starts dying alone and the returns near them, in either arm.
+/// The leak is truly under the limit in one timeline (2 MiB a start, 63 starts at most: a
+/// green of before, 106 against 76, counted timelines of 58 starts dying alone and the returns
+/// near them, in either arm). What adds a path's leaks up is the objective's extension: a
+/// timeline returned to the objective's best drives one more phase past where its parent
+/// stopped (composer.zig's drive_again, answered by the explorer); without it a return ended
+/// when its parent would and no tree reached the limit (0 against 0, 2026-11-17). One of the
+/// killed timelines, a path of several phases, replays to its recorded history from its tape.
+/// Trees of 160 timelines, ten generations: a path gains about 30 MiB a generation (the best of
+/// a return's four branches) from a first generation's 50 to 60, so the limit is four or five
+/// returns deep, and a tree of 96 has three or four (it reached 98 to 155 MiB, one kill in the
+/// four seeds). With 160, twice on one host: 10, 25, 6, 23 and 14, 18, 19, 22 killed with the
+/// objective, none without either time. The counts move from run to run (a tree takes fresh
+/// timelines while a judgment is pending, as its workers' timing has it): the total is the claim.
 fn check_memory_climb(context: *Context) !void {
     const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
     const property = "the kernel kills no process for lack of memory";
@@ -6224,13 +6230,20 @@ fn check_memory_climb(context: *Context) !void {
     // objective's tree OOM-killed more often in all, and never less in one.
     const seeds = [_][]const u8{ "1", "2", "3", "4" };
     var killed: [seeds.len][2]f64 = undefined;
-    for (seeds, &killed) |seed, *pair| {
+    var climbed: [seeds.len][]const u8 = undefined; // Each seed's tree with the objective.
+    var tapes: [seeds.len][]const u8 = undefined;
+    for (seeds, &killed, &climbed, &tapes) |seed, *pair, *report, *tape_directory| {
+        tape_directory.* = try std.fmt.allocPrint(context.arena, "{s}/climb-tapes-{s}", .{ context.scratch, seed });
         for ([_]bool{ true, false }, pair) |on, *count| {
             const common = [_][]const u8{
                 "--program",  program, "--profile",   "climb", "--scenario",   "leak_climb", "--seed", seed,
-                "--branches", "96",    "--branching", "tree",  "--generation", "16",         "--jobs", "4",
+                "--branches", "160",   "--branching", "tree",  "--generation", "16",         "--jobs", "4",
             };
-            const output = try explore(context, if (on) &common else &(common ++ [_][]const u8{"--no-memory-objective"}));
+            const output = try explore(context, if (on)
+                &(common ++ [_][]const u8{ "--tape-dir", tape_directory.* })
+            else
+                &(common ++ [_][]const u8{"--no-memory-objective"}));
+            if (on) report.* = output;
             // "failing in    3  the kernel kills ...": the count padded.
             const line = try lines_with(context.arena, output, &.{property});
             const after = if (std.mem.indexOf(u8, line, "failing in")) |at| std.mem.trimStart(u8, line[at + "failing in".len ..], " ") else "";
@@ -6247,11 +6260,31 @@ fn check_memory_climb(context: *Context) !void {
         never_less = never_less and pair[0] >= pair[1];
         try margins.print(context.arena, " seed {s}: {d} against {d};", .{ seed, pair[0], pair[1] });
     }
+    // A killed timeline of the first tree that has one: its line, its tape, its replay.
+    var replayed_same = false;
+    var replayed_index: u32 = 0;
+    find: for (climbed, tapes) |report, tape_directory| {
+        var lines = std.mem.tokenizeScalar(u8, report, '\n');
+        while (lines.next()) |line| {
+            if (!std.mem.startsWith(u8, line, "[branch ") or std.mem.indexOf(u8, line, property) == null) continue;
+            var one: [1]Branch = undefined;
+            if (parse_branches(line, &one) != 1) continue;
+            replayed_index = one[0].index;
+            const tape = try std.fmt.allocPrint(context.arena, "{s}/branch-{d}.jsonl", .{ tape_directory, one[0].index });
+            const replay = try explore(context, &.{ "--program", program, "--profile", "climb", "--scenario", "leak_climb", "--tape", tape });
+            var again: [1]Branch = undefined;
+            replayed_same = parse_branches(replay, &again) == 1 and std.mem.eql(u8, again[0].events_hash, one[0].events_hash);
+            break :find;
+        }
+    }
     expect_all(context, &.{
         .{ "climbing the objective reaches the OOM killer", on_total > 0 },
         .{ "more often than without it, over the four seeds", on_total > off_total },
         .{ "and no less in any one", never_less },
-    }, "memory-climb: timelines OOM-killed with the objective against without (96 a tree):{s} {d} against {d} in all", .{ margins.items, on_total, off_total });
+        .{ "a killed timeline, its path several phases long, replays to its recorded history", replayed_same },
+    }, "memory-climb: timelines OOM-killed with the objective against without (160 a tree):{s} {d} against {d} in all; timeline {d} replayed", .{
+        margins.items, on_total, off_total, replayed_index,
+    });
 }
 
 /// A scenario's quorum (schema.Scenario.quorum): faults leave a majority of its nodes up, linked and

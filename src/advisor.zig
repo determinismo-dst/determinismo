@@ -17,6 +17,12 @@ const Draws = @import("draws.zig").Draws;
 pub const Fixed = struct { name: []const u8, value: []const u8 };
 const fixed_reason = "fixed by --decide";
 
+/// The composer's "another driver phase?" (guest/runtime/composer.zig's drive_again): an
+/// exploring explorer answers every ask, 1 for yes, so the timeline's own draw (yes once in
+/// 2^62) never decides it.
+const again_label_prefix = "{\"name\":\"composer.again\"";
+const again_reason = "another driver phase: the tree returned here for an objective's best, to go on past its parent's end";
+
 /// Labels the VM answers itself after the advisor's turn (vm.zig: the driver phase's length, a
 /// fork's index): what the advisor sees of them is not what the guest gets, so not recorded.
 const answered_after = [_][]const u8{ "{\"name\":\"composer.drive_ms\"", "{\"name\":\"det.fork_index\"" };
@@ -30,10 +36,18 @@ pub const Explorer = struct {
     /// The timeline's named draws, as answered (draws.zig): none in a replay, which asks nothing.
     draws: ?*Draws = null,
     fixed: []const Fixed = &.{},
+    /// This answers the composer's asks whether to drive another phase (an exploration with the
+    /// objective's extension on): yes `again_left` times, then no.
+    again_asked: bool = false,
+    again_left: u8 = 0,
+    /// The moment of the last event before the composer last asked, if it did: a branch from
+    /// before it meets the ask (main.zig: a return to an objective's best lands no later).
+    again_ns: ?u64 = null,
+    last_event_ns: u64 = 0,
 
     /// None when there is nothing to ask.
     pub fn advisor(explorer: *Explorer) ?VM.Advisor {
-        if (explorer.strategy == null and explorer.learned == null and explorer.draws == null and explorer.fixed.len == 0) return null;
+        if (explorer.strategy == null and explorer.learned == null and explorer.draws == null and explorer.fixed.len == 0 and !explorer.again_asked) return null;
         return .{
             .context = explorer,
             .wants_moment = explorer.strategy != null,
@@ -61,6 +75,15 @@ pub const Explorer = struct {
                 std.mem.writeInt(u64, asked.value[0..8], index, .little);
                 return .{ .overridden = true, .reason = fixed_reason, .decision = true, .done = true };
             }
+        };
+        if (explorer.again_asked) if (asked.label) |text| if (asked.value.len == 8 and std.mem.startsWith(u8, text, again_label_prefix)) {
+            // Yes only into a tape: an answer nothing records no replay could repeat.
+            const yes = explorer.again_left > 0 and asked.taped;
+            if (yes) explorer.again_left -= 1;
+            explorer.again_ns = explorer.last_event_ns;
+            std.mem.writeInt(u64, asked.value[0..8], @intFromBool(yes), .little);
+            // On the tape either way (a replay repeats it unasked); said in the timeline when yes.
+            return .{ .overridden = true, .reason = if (yes) again_reason else "", .decision = yes, .done = true };
         };
         var ended = false;
         if (explorer.strategy) |strategy| {
@@ -109,6 +132,7 @@ pub const Explorer = struct {
 
     fn event(context: *anyopaque, moment: Events.Moment, source: []const u8, line: []const u8) anyerror!bool {
         const explorer: *Explorer = @ptrCast(@alignCast(context));
+        explorer.last_event_ns = moment.vtime_ns;
         if (explorer.draws) |draws| draws.event_seen(moment.vtime_ns);
         const strategy = explorer.strategy orelse return false;
         if (!strategy.told(line)) return false;
@@ -148,6 +172,31 @@ fn fixed_answer(fixed: []const Fixed, announcement: []const u8) ?u64 {
         if (option == .string and std.mem.eql(u8, option.string, asked.value)) return index;
     }
     return std.fmt.parseInt(u64, asked.value, 10) catch null;
+}
+
+test "the composer's ask for another driver phase: yes as many times as the tree gave, then no, never the timeline's draw" {
+    var explorer: Explorer = .{ .strategy = null, .learned = null, .again_asked = true, .again_left = 1 };
+    try std.testing.expect(explorer.advisor() != null);
+    var value: [8]u8 = @splat(0xff); // What the timeline's randomness would have said.
+    const asked: VM.Pull = .{ .pull = 7, .moment = .{ .vtime_ns = 0, .branches = 0 }, .source = "runner", .label = "{\"name\":\"composer.again\",\"range\":4611686018427387904}", .value = &value, .taped = true };
+    explorer.last_event_ns = 5_000;
+    const first = try explorer.answer(asked);
+    try std.testing.expect(first.overridden and first.decision and first.done);
+    try std.testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, &value, .little));
+    try std.testing.expectEqual(@as(?u64, 5_000), explorer.again_ns);
+    value = @splat(0xff);
+    explorer.last_event_ns = 9_000;
+    const second = try explorer.answer(asked);
+    try std.testing.expect(second.overridden and !second.decision and second.done);
+    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, &value, .little));
+    try std.testing.expectEqual(@as(?u64, 9_000), explorer.again_ns);
+    // Another label is not its to answer; nor the ask where the run does not have it.
+    value = @splat(0xff);
+    var other = asked;
+    other.label = "{\"name\":\"composer.starts\",\"range\":32}";
+    try std.testing.expect(!(try explorer.answer(other)).overridden);
+    var without: Explorer = .{ .strategy = null, .learned = null };
+    try std.testing.expect(without.advisor() == null);
 }
 
 test "a fixed decision answers its name: a range's number, an option by name or index" {

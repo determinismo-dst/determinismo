@@ -299,7 +299,10 @@ Inside determinismo a process opens `/dev/determinismo` read-write.
     objective (goal maximize or minimize). Each bucket (its strings and booleans) is explored
     evenly, keeping the state with its best value; the tree returns to it (`sdk.optimize` in Zig,
     `det_optimize` in C, `optimize` in Python, Rust, JavaScript and Clojure, `Optimize` in Go,
-    `Determinismo.optimize` in Java, `Lifecycle.Optimize` in .NET);
+    `Determinismo.optimize` in Java, `Lifecycle.Optimize` in .NET). A timeline returned to an
+    objective's best state drives one more phase past where its parent stopped, so what builds
+    up along a path (a leak, a queue, a counter) keeps growing a generation at a time, to the
+    timeline's limit (`--no-objective-extend`: it ends when its parent would);
   - `{"decision":{"name":"...","options":["a","b"]}}` or `{"decision":{"name":"...","range":10}}`
     before the read that draws it;
   - `{"lifecycle":"setup_complete","details":{...}}`;
