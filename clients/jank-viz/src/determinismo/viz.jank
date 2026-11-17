@@ -28,6 +28,7 @@
 (def green 0x2e7d32)
 (def blue 0x1a4f8b)
 (def orange 0xb86b00)
+(def purple 0x6a1b9a)
 
 ;; A game's crates on a screen (a session's frames), each its id's last digit's colour.
 (def ^:private digit-of (zipmap (map str (range 10)) (range 10)))
@@ -310,6 +311,33 @@
     (do (show-run! (:run data))
         (swap! told conj [kind data]))
 
+    ;; A timeline checked against a Quint spec: where the spec's invariant was lost, or the
+    ;; event the spec refuses, a ring on the timeline's row beside its own first failure.
+    (= kind :quint-check)
+    (do (look! (:run data) (:timeline data))
+        (when-let [event (:event (:verdict data))]
+          (swap! state (fn [s] (assoc s :marks (vec (distinct (conj (:marks s)
+                                                                   {:timeline (:timeline data) :kind :quint
+                                                                    :at-ns (:vtime_ns event)
+                                                                    :what (or (:invariant data) (:action event))})))))))
+        (swap! told conj [kind data]))
+
+    (= kind :quint-kinds)
+    (do (look! (:run data) (:timeline data))
+        (swap! told conj [kind data]))
+
+    ;; An agent at work: each thing it runs and each answer of its checks, on one card as it
+    ;; comes (the evaluation ends when the agent does).
+    (= kind :quint-agent)
+    (swap! state (fn [s]
+                   (let [cards (:cards s)
+                         newest (last cards)]
+                     (if (:agent newest)
+                       (assoc s :cards (conj (vec (butlast cards))
+                                             (assoc newest :lines (vec (take-last 12 (conj (:lines newest) (str (:line data))))))))
+                       (assoc s :cards (conj (vec cards) {:code "the agent" :view :lines :agent true
+                                                         :lines [(str (:line data))]}))))))
+
     :else
     (swap! told conj [kind data]))
   nil)
@@ -534,6 +562,9 @@
         split (last-told :draw/split happened)
         sets (last-told :draw/sets happened)
         drawn (last-told :draws happened)
+        quint (last-told :quint-check happened)
+        quint-kinds (last-told :quint-kinds happened)
+        simulated (last-told :quint-simulate happened)
         value (if (var? value) (deref value) value)
         now (:session s)
         context (cond session (str "timeline #" (:from session) (when (:at-ns session) (str " at " (seconds (:at-ns session)))))
@@ -544,6 +575,14 @@
         view
         (cond
        error {:view :error :said error}
+       quint {:view :quint :verdict (:verdict quint) :invariant (:invariant quint)}
+       simulated {:view :quint-run :violation (:violation simulated) :invariant (:invariant simulated)
+                  :step (:step simulated) :states (vec (take-last 6 (:states simulated)))
+                  :count (count (:states simulated))}
+       ;; The names a timeline's events have: those the evaluation kept, when it kept some.
+       quint-kinds (let [rows (if (and (sequential? value) (:name (first value))) value (:kinds quint-kinds))]
+                     {:view :table :count (count rows)
+                      :rows (mapv (fn [k] {:event (:name k) :count (:count k) :example (brief (:example k))}) (take 8 rows))})
        poke (let [was (memory-before cards (:address poke))]
               {:view :memory :address (:address poke) :bytes (:bytes poke) :was was :poked true
                :instructions (instructions (:bytes poke))
@@ -708,6 +747,10 @@
                             (line! (- mx 6) (- ty 6) (+ mx 6) (+ ty 6) red 2.5)
                             (line! (- mx 6) (+ ty 6) (+ mx 6) (- ty 6) red 2.5))
           (= kind :found) (when large (ring! mx ty 7.0 blue 2.0))
+          ;; Where a Quint spec's invariant was lost (or the event it refuses).
+          (= kind :quint) (when large
+                            (ring! mx ty 9.0 purple 2.5)
+                            (line! mx (- ty 16) mx (- ty 9) purple 2.5))
           ;; A session's checkpoint: a flag where a session can come back to.
           (= kind :checkpoint) (when large
                                  (line! mx (- ty 8) mx (+ ty 6) green 2.0)
@@ -833,6 +876,8 @@
       (= view :events) (+ (apply + (map (fn [event] (+ 26 (* 20 (count (:lines event))))) (:events c)))
                           (if (> (:count c) (count (:events c))) 20 0))
       (= view :numbers) 100
+      (= view :quint) (+ 34 (if (:event (:verdict c)) 24 0) (if (seq (:series (:verdict c))) 190 0))
+      (= view :quint-run) (+ 34 (* 22 (count (:states c))))
       (= view :plan) (+ 22 (* 20 (count (:rows c))) (if (:board c) 168 0) 26)
       (= view :run-plan) (+ (* 20 (count (:lines c))) 6 (* 44 (count (:labels c))))
       (= view :draw-split) (+ 24 (* 44 (count (:labels c))))
@@ -1032,6 +1077,96 @@
               (rect! cx cy (+ cx 7) (+ cy 7) (nth crate-colors (get digit-of (str ch) 0)) 0.9 1.0))))))
     (text! x (+ below (if (:board c) 168 0) 4) muted small (:cost c))))
 
+(defn- numbers-of
+  "A variable of a spec's state that is numbers by key ({:0 113 :1 77}), in its keys' order:
+  the first such variable of `state`, [name [values]]."
+  [state]
+  (first (keep (fn [[k v]]
+                 (when (and (map? v) (seq v) (every? number? (vals v)))
+                   [(name k) (mapv second (sort-by (fn [[key _]] (str (if (keyword? key) (name key) key))) v))]))
+               (sort-by (fn [[k _]] (name k)) state))))
+
+(defn- draw-quint
+  "A timeline against a Quint spec: the verdict, the event it stopped at, and the spec's
+  numbers along the run (a line a number, their sum above them, the event marked)."
+  [c x y width]
+  (let [verdict (:verdict c)
+        kind (:kind verdict)
+        event (:event verdict)
+        good (= kind "behavior")
+        said (cond good (str "a behavior of the spec" (when (:invariant c) (str ", " (:invariant c) " holds")))
+                   (= kind "invariant") (str (or (:invariant c) "the invariant") " lost after event " (:index event) " of " (:of event))
+                   (= kind "refused") (str "the spec refuses event " (:index event) " of " (:of event))
+                   (= kind "nothing") "no event is named like an action of the spec"
+                   :else "Quint did not run the trace")
+        events (str (:events verdict) " events")]
+    (text! x y (if good green red) big said)
+    (text! (- (+ x width) (text-width small events)) (+ y 6) muted small events)
+    (when event
+      (let [moment (str "event " (:seq event) " at " (seconds (:vtime_ns event)))]
+        (text! x (+ y 32) ink mono
+               (clip mono (- width 20 (text-width small moment)) (str (:action event) " " (said-of (:argument event)))))
+        (text! (- (+ x width) (text-width small moment)) (+ y 34) blue small moment)))
+    ;; The first group of the spec's numbers ("balances.0", "balances.1", ...), each a line over
+    ;; the events; their sum in a strip above, red from where it leaves what it was.
+    (let [series (sort-by (fn [[k _]] (name k)) (:series verdict))
+          group (when (seq series) (first (str/split (name (first (first series))) #"\.")))
+          lines (vec (filter (fn [[k _]] (= group (first (str/split (name k) #"\.")))) series))
+          n (count (second (first lines)))]
+      (when (and (seq lines) (> n 1))
+        (let [top (+ y (if event 62 38))
+              sum-floor (+ top 34)
+              floor (+ top 170)
+              plot-width (- width 120)
+              at-x (fn [i] (+ x (* plot-width (/ (* 1.0 i) (dec n)))))
+              values (mapcat second lines)
+              low (apply min values)
+              high (max (inc low) (apply max values))
+              at-y (fn [v] (- floor (* 118.0 (/ (* 1.0 (- v low)) (- high low)))))
+              sums (mapv (fn [i] (apply + (map (fn [[_ vs]] (nth vs i)) lines))) (range n))
+              sum0 (first sums)
+              sum-low (apply min sums)
+              sum-high (max (inc sum-low) (apply max sums))
+              sum-y (fn [v] (- sum-floor (* 24.0 (/ (* 1.0 (- v sum-low)) (- sum-high sum-low)))))
+              stride (max 1 (quot n 400))]
+          (text! (+ x plot-width 8) (- sum-floor 20) muted small "sum")
+          (text! (+ x plot-width 8) (- sum-floor 6) (if (= (last sums) sum0) ink red) small (str (last sums)))
+          (doseq [i (range stride n stride)]
+            (let [before (- i stride)]
+              (line! (at-x before) (sum-y (nth sums before)) (at-x i) (sum-y (nth sums i))
+                     (if (= (nth sums i) sum0) ink red) 2.0)))
+          (line! x floor (+ x plot-width) floor rule 1.0)
+          (text! (+ x plot-width 8) (+ sum-floor 14) muted small group)
+          (doseq [[li [k vs]] (map-indexed vector lines)]
+            (let [color (nth crate-colors (mod li (count crate-colors)))]
+              (doseq [i (range stride n stride)]
+                (line! (at-x (- i stride)) (at-y (nth vs (- i stride))) (at-x i) (at-y (nth vs i)) color 1.5))
+              ;; Its name (what follows the group's) and its last value, one under the other.
+              (text! (+ x plot-width 8) (+ sum-floor 32 (* 18 li)) color small
+                     (str (subs (name k) (min (count (name k)) (inc (count group)))) "  " (last vs)))))
+          (when (and event (= kind "invariant"))
+            (line! (at-x (dec n)) (- top 2) (at-x (dec n)) floor purple 2.0)))))))
+
+(defn- draw-quint-run
+  "What Quint's simulator found in the spec alone: its last states, a row a state, the first
+  numbers of each with their sum (red where it is not the first state's)."
+  [c x y width]
+  (let [states (:states c)
+        from (- (:count c) (count states))
+        first-sum (when-let [[_ values] (numbers-of (first states))] (apply + values))]
+    (text! x y (if (:violation c) red green) big
+           (if (:violation c)
+             (str (:invariant c) " can be lost: in " (dec (:count c)) " steps of the spec")
+             (str "no state without " (:invariant c) " found" (when (:step c) (str " with " (:step c))))))
+    (doseq [[i state] (map-indexed vector states)]
+      (when-let [[variable values] (numbers-of state)]
+        (let [sy (+ y 36 (* 22 i))
+              sum (apply + values)]
+          (text! x sy muted small (str "state " (+ from i)))
+          (text! (+ x 70) sy ink mono (clip mono (- width 190) (str variable " " (str/join "  " values))))
+          (text! (- (+ x width) 100) sy (if (and first-sum (not= sum first-sum) (= i (dec (count states)))) red ink) mono
+                 (str "sum " sum)))))))
+
 (defn- draw-card
   "One card at (x, y): its code, where it was, its body. Returns its height."
   [c x y width dim]
@@ -1064,6 +1199,8 @@
       (= view :draw-split) (draw-draws c bx by inner true)
       (= view :draw-sets) (draw-draws c bx by inner false)
       (= view :numbers) (draw-numbers c bx by inner)
+      (= view :quint) (draw-quint c bx by inner)
+      (= view :quint-run) (draw-quint-run c bx by inner)
       (= view :translate) (do (text! bx by ink big (str (:virtual c)))
                               (text! (+ bx 20 (text-width big (str (:virtual c)))) by muted big "→")
                               (text! (+ bx 52 (text-width big (str (:virtual c)))) by ink big (str (:physical c))))

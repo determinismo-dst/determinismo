@@ -53,6 +53,29 @@ void determinismo_quint_write(std::string const &path, std::string const &conten
   std::ofstream file(path, std::ios::binary | std::ios::trunc);
   file << content;
 }
+
+// A command read a line at a time as it prints: open, lines until \"\\x01\" (its end), close
+// (its exit status).
+static FILE *determinismo_quint_pipe = nullptr;
+void determinismo_quint_open(std::string const &command) { determinismo_quint_pipe = popen(command.c_str(), \"r\"); }
+std::string determinismo_quint_line() {
+  std::string line;
+  if (!determinismo_quint_pipe) return std::string(\"\\x01\");
+  int c;
+  bool any = false;
+  while ((c = fgetc(determinismo_quint_pipe)) != EOF) {
+    any = true;
+    if (c == 10) return line;
+    line.push_back(static_cast<char>(c));
+  }
+  return any ? line : std::string(\"\\x01\");
+}
+std::string determinismo_quint_close() {
+  if (!determinismo_quint_pipe) return std::string(\"-1\");
+  int ended = pclose(determinismo_quint_pipe);
+  determinismo_quint_pipe = nullptr;
+  return std::to_string(WIFEXITED(ended) ? WEXITSTATUS(ended) : -1);
+}
 "))
 
 (defn- sh
@@ -63,6 +86,23 @@ void determinismo_quint_write(std::string const &path, std::string const &conten
      :jank (let [answer (str (cpp/determinismo_quint_sh (cpp/cast cpp/std.string command)))
                  cut (str/index-of answer "\n")]
              [(parse-long (subs answer 0 cut)) (subs answer (inc cut))])))
+
+(defn- each-line
+  "Calls `f` with each line a shell command prints, as it prints it. Its exit status."
+  [command f]
+  #?(:clj (let [process (.start (doto (ProcessBuilder. ["sh" "-c" command]) (.redirectErrorStream true)))]
+            (with-open [reader (java.io.BufferedReader. (java.io.InputStreamReader. (.getInputStream process)))]
+              (loop []
+                (when-let [line (.readLine reader)]
+                  (f line)
+                  (recur))))
+            (.waitFor process))
+     :jank (do (cpp/determinismo_quint_open (cpp/cast cpp/std.string command))
+               (loop []
+                 (let [line (str (cpp/determinismo_quint_line))]
+                   (if (= line "\u0001")
+                     (parse-long (str (cpp/determinismo_quint_close)))
+                     (do (f line) (recur))))))))
 
 (defn- read-file
   "A file's content, or nil when it is not there (or empty)."
@@ -183,3 +223,31 @@ void determinismo_quint_write(std::string const &path, std::string const &conten
     (tap/tell :quint-simulate {:spec spec :invariant (:invariant options) :step (:step options)
                                :violation (:violation answer) :states states}
               answer)))
+
+(def ^:private agent-steps
+  "jq's program over Claude Code's stream of messages: what the agent runs and writes, and what
+  its checks (./trace.sh, quint run) answer, a line each; its turns and seconds at the end."
+  "\n  def short: gsub(\"\\n\"; \" \") | .[0:74];\n  def answers: split(\"\\n\")\n    | map(select(test(\"\\\\[determinismo\\\\] (the trace|the spec refuses|[a-z_]+ does not hold)|\\\\[violation\\\\]|\\\\[ok\\\\] No violation\")))\n    | .[0:3] | map(\"    \" + (sub(\"\\\\[determinismo\\\\] \"; \"\") | short));\n  foreach inputs as $m ({ran: {}, out: []};\n    .out = []\n    | if $m.type == \"assistant\" then\n        reduce ($m.message.content[]? | select(.type == \"tool_use\")) as $c (.;\n          .ran[$c.id] = ($c.input.command // \"\")\n          | .out += [if $c.name == \"Bash\" then \"$ \" + ($c.input.command | short)\n                     else ($c.name | ascii_downcase) + \" \" + (($c.input.file_path // \"\") | split(\"/\") | last) end])\n      elif $m.type == \"user\" then\n        reduce ($m.message.content[]? | select(.type == \"tool_result\")) as $c (.;\n          if (.ran[$c.tool_use_id] // \"\") | test(\"\\\\./trace\\\\.sh|quint run\") then\n            .out += ($c.content | if type == \"array\" then map(.text? // \"\") | join(\"\\n\") else tostring end | answers)\n          else . end)\n      elif $m.type == \"result\" then\n        .out += [\"agent done: \\($m.num_turns) turns, \\(($m.duration_ms // 0) / 1000 | floor) s\"]\n      else . end;\n    .out[])")
+
+(defn agent
+  "An agent (Claude Code: `claude -p`) at work in `directory` on the task its file `prompt`
+  says, allowed to read and write files there and to run ./trace.sh (clients/quint), quint and
+  a few shell tools: what writes a spec from a run's timelines with no source of the system.
+  Each thing it runs and each answer of its checks is told as it comes (:quint-agent). Needs
+  `claude` and `jq`. {:status (its exit status) :steps (how many lines it told) :said (its last
+  one: its turns and seconds)}."
+  [directory prompt]
+  (let [steps (atom 0)
+        said (atom nil)
+        command (str "cd '" directory "' && claude -p \"$(cat '" prompt "')\""
+                     " --permission-mode acceptEdits --max-turns 80"
+                     " --allowedTools Read Write Edit 'Bash(./trace.sh:*)' 'Bash(quint:*)' 'Bash(cat:*)'"
+                     " 'Bash(ls:*)' 'Bash(head:*)' 'Bash(tail:*)' 'Bash(grep:*)' 'Bash(jq:*)' 'Bash(wc:*)'"
+                     " 'Bash(echo:*)' 'Bash(for:*)'"
+                     " --output-format stream-json --verbose < /dev/null 2>/dev/null"
+                     " | jq -rn --unbuffered '" agent-steps "'")
+        status (each-line command (fn [line]
+                                    (swap! steps inc)
+                                    (reset! said line)
+                                    (tap/tell :quint-agent {:directory directory :line line} nil)))]
+    {:status status :steps @steps :said @said}))
