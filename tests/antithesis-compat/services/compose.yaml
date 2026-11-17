@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: MIT
+# A Compose project of 20 services (src/compose.zig, schema.nodes_max; Vitess's Antithesis
+# project has 20): nineteen servers, each answering its own name on port 7000, and a client that
+# waits for every one before the setup is complete. Its test command asks each again. Run with:
+#   determinismo explore ... --compose tests/antithesis-compat/services/compose.yaml --scenario services
+services:
+  s01:
+    build: ./node
+    command: ["/usr/local/bin/server", "s01"]
+  s02:
+    build: ./node
+    command: ["/usr/local/bin/server", "s02"]
+  s03:
+    build: ./node
+    command: ["/usr/local/bin/server", "s03"]
+  s04:
+    build: ./node
+    command: ["/usr/local/bin/server", "s04"]
+  s05:
+    build: ./node
+    command: ["/usr/local/bin/server", "s05"]
+  s06:
+    build: ./node
+    command: ["/usr/local/bin/server", "s06"]
+  s07:
+    build: ./node
+    command: ["/usr/local/bin/server", "s07"]
+  s08:
+    build: ./node
+    command: ["/usr/local/bin/server", "s08"]
+  s09:
+    build: ./node
+    command: ["/usr/local/bin/server", "s09"]
+  s10:
+    build: ./node
+    command: ["/usr/local/bin/server", "s10"]
+  s11:
+    build: ./node
+    command: ["/usr/local/bin/server", "s11"]
+  s12:
+    build: ./node
+    command: ["/usr/local/bin/server", "s12"]
+  s13:
+    build: ./node
+    command: ["/usr/local/bin/server", "s13"]
+  s14:
+    build: ./node
+    command: ["/usr/local/bin/server", "s14"]
+  s15:
+    build: ./node
+    command: ["/usr/local/bin/server", "s15"]
+  s16:
+    build: ./node
+    command: ["/usr/local/bin/server", "s16"]
+  s17:
+    build: ./node
+    command: ["/usr/local/bin/server", "s17"]
+  s18:
+    build: ./node
+    command: ["/usr/local/bin/server", "s18"]
+  s19:
+    build: ./node
+    command: ["/usr/local/bin/server", "s19"]
+  client:
+    build:
+      context: ./node
+      dockerfile: Dockerfile.client
+    command: ["/usr/local/bin/ready"]

@@ -253,7 +253,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "bank-steps", check_bank_steps },                 .{ "checkpoint", check_session_checkpoint },
         .{ "ingress-checkpoint", check_ingress_checkpoint }, .{ "ingress-crash", check_ingress_crash },
         .{ "draws", check_draws },                           .{ "exit-stack", check_exit_stack },
-        .{ "plan-calls", check_plan_calls },
+        .{ "plan-calls", check_plan_calls },                 .{ "services", check_services },
     };
     // A check's whole name runs it alone (check.sh's `ui` ran guidance and quiet too).
     var exact = std.mem.eql(u8, only, "tla");
@@ -7896,6 +7896,30 @@ fn check_volumes(context: *Context) !void {
         .{ "no node exited unexpectedly", !line_with(report, "FAIL", "no unexpected container exits") },
         .{ "the commands exited 0", !line_with(report, "FAIL", "test commands exit successfully") },
     }, "volumes: a one-shot ends first, a healthcheck holds its dependents, a shared directory is shared, a project file is in the image", .{});
+}
+
+/// A Compose project of 20 services (tests/antithesis-compat/services; Vitess's Antithesis
+/// project has 20, schema.nodes_max was 15): nineteen servers and a client, every one a node,
+/// each server answering the client's test command by its own name. No faults: the command
+/// asks every server.
+fn check_services(context: *Context) !void {
+    const compose = "tests/antithesis-compat/services/compose.yaml";
+    const everyone = "s01,s02,s03,s04,s05,s06,s07,s08,s09,s10,s11,s12,s13,s14,s15,s16,s17,s18,s19,client";
+    const report = try explore(context, &.{ "--compose", compose, "--scenario", "services", "--seed", "1", "--branches", "1", "--no-faults", everyone });
+    const line_with = struct {
+        fn line_with(text: []const u8, first: []const u8, second: []const u8) bool {
+            var lines = std.mem.tokenizeScalar(u8, text, '\n');
+            while (lines.next()) |line| {
+                if (std.mem.indexOf(u8, line, first) != null and std.mem.indexOf(u8, line, second) != null) return true;
+            }
+            return false;
+        }
+    }.line_with;
+    expect_all(context, &.{
+        .{ "the driver ran and passed", line_with(report, "PASS reachable", "test command completed: singleton_driver_services.sh") },
+        .{ "no node exited unexpectedly", !line_with(report, "FAIL", "no unexpected container exits") },
+        .{ "the commands exited 0", !line_with(report, "FAIL", "test commands exit successfully") },
+    }, "services: a Compose project of 20 services, every one a node the others reach by name", .{});
 }
 
 /// Setup mode (Antithesis's): the setup alone, to setup_complete, its events kept, no timeline,

@@ -1788,26 +1788,134 @@ test "a quorum is a majority linked pairwise, one of them reachable from the run
     try std.testing.expect(quorum_clique(&system, &all, 2, &c_cut_too));
 }
 
-/// Whether `needed` of the healthy nodes are linked pairwise and one of them to the runner (the
-/// subsets of at most 15 nodes tried in turn).
+/// Whether `needed` of the healthy nodes are linked pairwise and one of them to the runner: a
+/// clique of that size with a node the runner reaches in it (clique_reached).
 fn quorum_clique(system: *const schema.System, healthy: []const usize, needed: usize, candidate: ?*const Active) bool {
     assert(healthy.len <= schema.nodes_max);
-    const subsets: u32 = @as(u32, 1) << @intCast(healthy.len);
-    var subset: u32 = 0;
-    next: while (subset < subsets) : (subset += 1) {
-        if (@popCount(subset) < needed) continue;
-        var reachable = false;
-        for (healthy, 0..) |a, i| {
-            if (subset & (@as(u32, 1) << @intCast(i)) == 0) continue;
-            reachable = reachable or !quorum_link_broken(system, 0, a + 1, candidate);
-            for (healthy[i + 1 ..], i + 1..) |b, j| {
-                if (subset & (@as(u32, 1) << @intCast(j)) == 0) continue;
-                if (quorum_link_broken(system, a + 1, b + 1, candidate)) continue :next;
-            }
+    var linked: [schema.nodes_max]u32 = @splat(0);
+    var reached: u32 = 0;
+    for (healthy, 0..) |a, i| {
+        if (!quorum_link_broken(system, 0, a + 1, candidate)) reached |= @as(u32, 1) << @intCast(i);
+        for (healthy[i + 1 ..], i + 1..) |b, j| {
+            if (quorum_link_broken(system, a + 1, b + 1, candidate)) continue;
+            linked[i] |= @as(u32, 1) << @intCast(j);
+            linked[j] |= @as(u32, 1) << @intCast(i);
         }
-        if (reachable) return true;
+    }
+    return clique_reached(linked[0..healthy.len], needed, reached);
+}
+
+/// Whether the graph holds a clique of `needed` nodes or more with one of `reached` in it;
+/// `linked[i]` is the bit set of node i's neighbours. Bron and Kerbosch's search with a pivot,
+/// on a stack of its own (a clique's nodes deep at most). Its first form tried every subset in
+/// turn: 2^15 at most then, 2^25 with schema.nodes_max now.
+fn clique_reached(linked: []const u32, needed: usize, reached: u32) bool {
+    comptime assert(schema.nodes_max <= 32);
+    assert(linked.len <= schema.nodes_max);
+    // A frame: its clique, the nodes linked to all of it still to try (open) and tried
+    // (closed), and of the open ones those this frame still branches on (left), once chosen.
+    const Frame = struct { clique: u32, open: u32, closed: u32, left: u32 = 0, chosen: bool = false };
+    var stack: [schema.nodes_max + 1]Frame = undefined;
+    const all: u32 = @intCast((@as(u64, 1) << @intCast(linked.len)) - 1);
+    stack[0] = .{ .clique = 0, .open = all, .closed = 0 };
+    var depth: usize = 1;
+    while (depth > 0) {
+        const frame = &stack[depth - 1];
+        if (!frame.chosen) {
+            if (@popCount(frame.clique) >= needed and frame.clique & reached != 0) return true;
+            // Nothing through here grows to `needed` nodes, or holds a node reached.
+            const short = @popCount(frame.clique) + @popCount(frame.open) < needed;
+            if (short or (frame.clique | frame.open) & reached == 0) {
+                depth -= 1;
+                continue;
+            }
+            // The pivot: of the open and closed nodes, the one with most neighbours open. A
+            // maximal clique from here holds it or an open node it is not linked to.
+            var pivot_linked: u32 = 0;
+            var most: ?u32 = null;
+            var rest = frame.open | frame.closed;
+            while (rest != 0) : (rest &= rest - 1) {
+                const index = @ctz(rest);
+                const count: u32 = @popCount(frame.open & linked[index]);
+                if (most == null or count > most.?) {
+                    most = count;
+                    pivot_linked = linked[index];
+                }
+            }
+            frame.left = frame.open & ~pivot_linked;
+            frame.chosen = true;
+        }
+        if (frame.left == 0) {
+            depth -= 1;
+            continue;
+        }
+        const index = @ctz(frame.left);
+        const node = @as(u32, 1) << @intCast(index);
+        frame.left &= ~node;
+        const next: Frame = .{ .clique = frame.clique | node, .open = frame.open & linked[index], .closed = frame.closed & linked[index] };
+        frame.open &= ~node;
+        frame.closed |= node;
+        assert(depth < stack.len);
+        stack[depth] = next;
+        depth += 1;
     }
     return false;
+}
+
+/// clique_reached's first form, every subset in turn: what the search is checked against.
+fn clique_reached_exhaustive(linked: []const u32, needed: usize, reached: u32) bool {
+    const subsets: u32 = @as(u32, 1) << @intCast(linked.len);
+    var subset: u32 = 0;
+    next: while (subset < subsets) : (subset += 1) {
+        if (@popCount(subset) < needed or subset & reached == 0) continue;
+        for (linked, 0..) |neighbours, index| {
+            const node = @as(u32, 1) << @intCast(index);
+            if (subset & node != 0 and subset & ~node & ~neighbours != 0) continue :next;
+        }
+        return true;
+    }
+    return false;
+}
+
+test "a clique of the size needed with a node reached in it, among 25 nodes at once" {
+    // Two groups linked pairwise, of 13 and of 12, one link between them.
+    var linked: [25]u32 = @splat(0);
+    for (0..25) |a| for (0..25) |b| {
+        if (a != b and (a < 13) == (b < 13)) linked[a] |= @as(u32, 1) << @intCast(b);
+    };
+    linked[12] |= 1 << 13;
+    linked[13] |= 1 << 12;
+    const everyone: u32 = (1 << 25) - 1;
+    try std.testing.expect(clique_reached(&linked, 13, 1 << 0));
+    try std.testing.expect(!clique_reached(&linked, 14, everyone));
+    // Thirteen are in the first group alone, and the runner reaches a node of the second.
+    try std.testing.expect(!clique_reached(&linked, 13, 1 << 20));
+    try std.testing.expect(clique_reached(&linked, 12, 1 << 20));
+    try std.testing.expect(!clique_reached(&linked, 1, 0));
+    // No link at all: a node alone is a clique of one.
+    const apart: [25]u32 = @splat(0);
+    try std.testing.expect(clique_reached(&apart, 1, 1 << 24));
+    try std.testing.expect(!clique_reached(&apart, 2, everyone));
+    try std.testing.expect(!clique_reached(&.{}, 1, 0));
+    // Against every subset in turn, on random graphs of up to 12 nodes.
+    var random_state: std.Random.DefaultPrng = .init(0x636c69717565);
+    const random = random_state.random();
+    for (0..2000) |_| {
+        const count = random.uintLessThan(usize, 13);
+        var graph: [12]u32 = @splat(0);
+        const density = random.uintLessThan(u32, 101);
+        for (0..count) |a| for (a + 1..count) |b| {
+            if (random.uintLessThan(u32, 100) >= density) continue;
+            graph[a] |= @as(u32, 1) << @intCast(b);
+            graph[b] |= @as(u32, 1) << @intCast(a);
+        };
+        const some = random.int(u32) & ((@as(u32, 1) << @intCast(count)) - 1);
+        const size = random.uintLessThan(usize, count + 2);
+        try std.testing.expectEqual(
+            clique_reached_exhaustive(graph[0..count], size, some),
+            clique_reached(graph[0..count], size, some),
+        );
+    }
 }
 
 /// Whether a fault takes its node down (its processes gone a while).

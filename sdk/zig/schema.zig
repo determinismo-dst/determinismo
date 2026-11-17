@@ -11,7 +11,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 pub const version: u32 = 1;
-pub const nodes_max = 15; // Plus disk 0, within the VMM's 16 disks.
+pub const nodes_max = 25; // Plus disk 0, within the VMM's 26 disks: vda to vdz (node_disk).
 pub const scenarios_max = 64;
 pub const commands_max = 64;
 /// Node names become host names and interface names ("d-<name>", at most 15 bytes).

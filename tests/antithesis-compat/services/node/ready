@@ -1,0 +1,6 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# The client: the setup is complete once every server has answered.
+/usr/local/bin/ask 300 || exit 1
+printf '%s\n' '{"antithesis_setup":{"status":"complete","details":null}}' >> "$ANTITHESIS_OUTPUT_DIR/setup.jsonl"
+exec sleep infinity

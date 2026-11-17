@@ -507,7 +507,8 @@ pub const modulation_stretch_default = [2]u64{ 10 * std.time.ns_per_ms, 200 * st
 
 /// A read-only disk image, open for the whole process (branches share it).
 pub const Disk = struct { fd: linux.fd_t, size: u64 };
-pub const disks_max = 16;
+/// The system's disk and a node's each (schema.nodes_max): the guest's vda to vdz.
+pub const disks_max = 26;
 
 /// The clock's jitter of an exploration given none (Options.tsc_jitter_seed): from its seed, never
 /// 0 (the exact clock). serve's runs too: drawn at random, two runs of one seed began apart (the

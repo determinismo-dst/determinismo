@@ -1,0 +1,6 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# server <name>: answers its name to each connection on port 7000, under its own hostname.
+name=$1
+[ "$(hostname)" = "$name" ] || { echo "hostname $(hostname), not $name" >&2; exit 1; }
+while true; do echo "$name" | nc -l -p 7000 > /dev/null; done

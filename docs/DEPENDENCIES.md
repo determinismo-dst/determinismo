@@ -46,7 +46,8 @@ services:
 ```
 
 Node names are lowercase letters, digits and dashes (Antithesis's `infra.` and `service.`
-prefixes become `infra-` and `service-`). With a test program (`--program`), the same goes in
+prefixes become `infra-` and `service-`). A system has up to 25 nodes, one-shot services among
+them. With a test program (`--program`), the same goes in
 its profile through the SDK:
 `.{ .name = "postgres", .source = .{ .image = "..." }, .ready = .{ .tcp = 5432 } }`, and
 `.after = &.{"postgres"}` on the nodes that use it.

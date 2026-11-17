@@ -1,0 +1,14 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# ask <attempts>: every server asked for its name, each up to <attempts> times (a server is
+# between two connections for a moment); exit 1 naming the first that never answered.
+attempts=$1
+for number in $(seq 1 19); do
+  name=$(printf 's%02d' "$number")
+  answered=0
+  for _ in $(seq 1 "$attempts"); do
+    if [ "$(nc -w 2 "$name" 7000 < /dev/null)" = "$name" ]; then answered=1; break; fi
+    sleep 0.2
+  done
+  [ "$answered" = 1 ] || { echo "$name did not answer" >&2; exit 1; }
+done

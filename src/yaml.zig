@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
 //! The subset of YAML that Compose files use, read into a tree: block mappings and sequences by
 //! indentation, flow sequences `[a, b]` and mappings `{a: b}` (over several lines too: Compose's
-//! `test:` lists, a trailing comma allowed), plain and quoted scalars, block
-//! scalars (`|`, `>`), comments. No anchors, tags or multi-document streams (rejected, not
+//! `test:` lists, a trailing comma allowed), plain and quoted scalars (over several lines
+//! too, folded), block scalars (`|`, `>`), comments. No anchors, tags or multi-document streams (rejected, not
 //! misread).
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 
 pub const Value = union(enum) {
@@ -54,9 +55,9 @@ pub fn parse(arena: std.mem.Allocator, source: []const u8) !Value {
     var parser = Parser{ .arena = arena, .lines = lines.items };
     parser.skip_blank();
     if (parser.index == parser.lines.len) return .empty;
-    const value = try parser.block(parser.lines[parser.index].indent, 0);
+    const value = parser.block(parser.lines[parser.index].indent, 0) catch |err| return parser.failed(err);
     parser.skip_blank();
-    if (parser.index != parser.lines.len) return error.UnexpectedIndentation;
+    if (parser.index != parser.lines.len) return parser.failed(error.UnexpectedIndentation);
     return value;
 }
 
@@ -65,6 +66,16 @@ const Parser = struct {
     /// Owned: a "- key: value" line is rewritten in place as "key: value", one level deeper.
     lines: []Line,
     index: usize = 0,
+
+    /// Says where the file stopped being read: the line the parser was at (a value's own
+    /// lines are consumed before what follows them is judged, so it is that line or the one
+    /// before). Tests expect errors and stay quiet.
+    fn failed(parser: *const Parser, err: anyerror) anyerror {
+        if (builtin.is_test or parser.lines.len == 0) return err;
+        const line = parser.lines[@min(parser.index, parser.lines.len - 1)];
+        std.debug.print("[determinismo] yaml: {s} at line {d}: {s}\n", .{ @errorName(err), line.number, line.text });
+        return err;
+    }
 
     fn skip_blank(parser: *Parser) void {
         while (parser.index < parser.lines.len) : (parser.index += 1) {
@@ -151,6 +162,9 @@ const Parser = struct {
     }
 
     fn scalar_or_flow(parser: *Parser, text: []const u8, indent: u32, depth: u32) anyerror!Value {
+        if (text.len > 0 and (text[0] == '"' or text[0] == '\'') and quote_end(text[0], text, 1) == null) {
+            return .{ .scalar = try unquote(parser.arena, try parser.quoted_text(text)) };
+        }
         const value = strip_comment(text);
         if (value.len == 0) return .empty;
         if (value[0] == '&' or value[0] == '*' or value[0] == '!') return error.UnsupportedYaml;
@@ -162,7 +176,70 @@ const Parser = struct {
             if (flow.position != flow.text.len) return error.TrailingCharacters;
             return parsed;
         }
-        return .{ .scalar = try unquote(parser.arena, value) };
+        if (value[0] == '"' or value[0] == '\'') return .{ .scalar = try unquote(parser.arena, value) };
+        // A comment ends a plain scalar: nothing after it goes on with it.
+        if (value.len != text.len) return .{ .scalar = value };
+        return .{ .scalar = try parser.plain_text(value, indent) };
+    }
+
+    /// A plain scalar goes on over the next lines indented deeper than its key or dash
+    /// (Vitess's Compose file: an environment entry's flags on two lines), folded as YAML folds
+    /// them: a line break is a space, each blank line between two of its lines a line break. A
+    /// comment ends it. A deeper line that reads as a key or a sequence item continues nothing:
+    /// it stays the caller's error, as a file's mistake more often than a scalar's text.
+    fn plain_text(parser: *Parser, first: []const u8, indent: u32) ![]const u8 {
+        var joined: std.ArrayList(u8) = .empty;
+        while (true) {
+            var next = parser.index;
+            while (next < parser.lines.len and parser.lines[next].text.len == 0) next += 1;
+            if (next == parser.lines.len) break;
+            const line = parser.lines[next];
+            if (line.indent <= indent or line.text[0] == '#') break;
+            if (mapping_key(line.text) != null or is_sequence_item(line.text)) break;
+            const text = strip_comment(line.text);
+            if (joined.items.len == 0) try joined.appendSlice(parser.arena, first);
+            const blank = next - parser.index;
+            if (blank == 0) {
+                try joined.append(parser.arena, ' ');
+            } else {
+                try joined.appendNTimes(parser.arena, '\n', blank);
+            }
+            try joined.appendSlice(parser.arena, text);
+            parser.index = next + 1;
+            if (text.len != line.text.len) break;
+        }
+        return if (joined.items.len == 0) first else joined.items;
+    }
+
+    /// A quoted scalar that goes on over the next lines (Vitess's Compose file: a `sh -c`
+    /// command of five in single quotes), up to its closing quote, folded as a plain one's: a
+    /// line break is a space, each blank line a line break. Nothing but a comment follows it.
+    fn quoted_text(parser: *Parser, first: []const u8) ![]const u8 {
+        var joined: std.ArrayList(u8) = .empty;
+        try joined.appendSlice(parser.arena, first);
+        var blank: usize = 0;
+        while (parser.index < parser.lines.len) {
+            const text = parser.lines[parser.index].text;
+            parser.index += 1;
+            if (text.len == 0) {
+                blank += 1;
+                continue;
+            }
+            if (blank == 0) {
+                try joined.append(parser.arena, ' ');
+            } else {
+                try joined.appendNTimes(parser.arena, '\n', blank);
+            }
+            blank = 0;
+            const end = quote_end(first[0], text, 0) orelse {
+                try joined.appendSlice(parser.arena, text);
+                continue;
+            };
+            try joined.appendSlice(parser.arena, text[0..end]);
+            if (strip_comment(std.mem.trimStart(u8, text[end..], " ")).len > 0) return error.TrailingCharacters;
+            return joined.items;
+        }
+        return error.UnterminatedQuote;
     }
 
     /// A flow collection that goes on over the next lines (the Kafka demo's DynamoDB healthcheck,
@@ -376,6 +453,26 @@ fn mapping_key(text: []const u8) ?Split {
     return null;
 }
 
+/// Where a quoted scalar ends in `text`, past its closing quote, looking from `start`; null when
+/// it goes on past the line. Two single quotes are one inside single quotes; a backslash escapes
+/// the next byte inside double ones.
+fn quote_end(open: u8, text: []const u8, start: usize) ?usize {
+    var index = start;
+    while (index < text.len) : (index += 1) {
+        if (open == '"' and text[index] == '\\') {
+            index += 1;
+            continue;
+        }
+        if (text[index] != open) continue;
+        if (open == '\'' and index + 1 < text.len and text[index + 1] == '\'') {
+            index += 1;
+            continue;
+        }
+        return index + 1;
+    }
+    return null;
+}
+
 fn strip_comment(text: []const u8) []const u8 {
     var quote: ?u8 = null;
     for (text, 0..) |byte, index| {
@@ -470,4 +567,92 @@ test "anchors are rejected" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     try std.testing.expectError(error.UnsupportedYaml, parse(arena_state.allocator(), "a: &x 1"));
+}
+
+test "a plain scalar over several lines is one, folded" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Vitess's Compose file: an environment entry's flags go on over a second line.
+    const source =
+        \\services:
+        \\  vtorc:
+        \\    environment:
+        \\      - TOPOLOGY_FLAGS=--topo_implementation etcd2 --topo_global_server_address etcd:2379
+        \\        --topo_global_root /vitess/global
+        \\      - WEB_PORT=8080
+        \\    command: sh -c
+        \\      /script/vtorc-up.sh
+        \\
+        \\      --verbose
+        \\    image: docker.io/vitess/lite:latest
+        \\    healthcheck:
+        \\      test: /usr/bin/mysql --user=root --execute
+        \\        "SHOW DATABASES;"
+        \\      timeout: 10s
+    ;
+    const vtorc = (try parse(arena, source)).get("services").?.get("vtorc").?;
+    const environment = vtorc.get("environment").?.sequence;
+    try std.testing.expectEqual(@as(usize, 2), environment.len);
+    try std.testing.expectEqualStrings(
+        "TOPOLOGY_FLAGS=--topo_implementation etcd2 --topo_global_server_address etcd:2379 --topo_global_root /vitess/global",
+        environment[0].scalar,
+    );
+    try std.testing.expectEqualStrings("WEB_PORT=8080", environment[1].scalar);
+    // A line break folds into a space, a blank line into a line break.
+    try std.testing.expectEqualStrings("sh -c /script/vtorc-up.sh\n--verbose", vtorc.get("command").?.scalar);
+    try std.testing.expectEqualStrings("docker.io/vitess/lite:latest", vtorc.get("image").?.scalar);
+    // A quote inside a plain scalar is its text.
+    const healthcheck = vtorc.get("healthcheck").?;
+    try std.testing.expectEqualStrings(
+        "/usr/bin/mysql --user=root --execute \"SHOW DATABASES;\"",
+        healthcheck.get("test").?.scalar,
+    );
+    try std.testing.expectEqualStrings("10s", healthcheck.get("timeout").?.scalar);
+    // A deeper line that reads as a key is no scalar's continuation, nor is one after a quoted
+    // scalar: both stay errors.
+    try std.testing.expectError(error.UnexpectedIndentation, parse(arena, "a: b\n  c: d\n"));
+    try std.testing.expectError(error.UnexpectedIndentation, parse(arena, "a: \"b\"\n  c\n"));
+    try std.testing.expectError(error.BadSequence, parse(arena, "- a\n  c: d\n"));
+    // A comment ends a plain scalar.
+    try std.testing.expectError(error.UnexpectedIndentation, parse(arena, "a: b # c\n  d\n"));
+}
+
+test "a quoted scalar over several lines is one, folded, up to its closing quote" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Vitess's Compose file: a `sh -c` command of several lines in single quotes.
+    const source =
+        \\services:
+        \\  vtctld:
+        \\    command:
+        \\      - sh
+        \\      - -c
+        \\      - ' /vt/bin/vtctld --topo_global_server_address etcd:2379
+        \\        --topo_global_root /vitess/global --cell test
+        \\        --service_map ''grpc-vtctl,grpc-vtctld'' --port 8080 '
+        \\    depends_on:
+        \\      etcd:
+        \\          condition: service_healthy
+        \\    labels:
+        \\      note: "a: b
+        \\
+        \\        c \"d\" # e"   # A comment after it.
+        \\      last: x
+    ;
+    const vtctld = (try parse(arena, source)).get("services").?.get("vtctld").?;
+    const command = vtctld.get("command").?.sequence;
+    try std.testing.expectEqual(@as(usize, 3), command.len);
+    try std.testing.expectEqualStrings(
+        " /vt/bin/vtctld --topo_global_server_address etcd:2379 --topo_global_root /vitess/global --cell test " ++
+            "--service_map 'grpc-vtctl,grpc-vtctld' --port 8080 ",
+        command[2].scalar,
+    );
+    try std.testing.expectEqualStrings("service_healthy", vtctld.get("depends_on").?.get("etcd").?.get("condition").?.scalar);
+    // In double quotes: a blank line is a line break; a `#` inside is its text.
+    try std.testing.expectEqualStrings("a: b\nc \"d\" # e", vtctld.get("labels").?.get("note").?.scalar);
+    try std.testing.expectEqualStrings("x", vtctld.get("labels").?.get("last").?.scalar);
+    try std.testing.expectError(error.UnterminatedQuote, parse(arena, "a: 'b\n  c\n"));
+    try std.testing.expectError(error.TrailingCharacters, parse(arena, "a: 'b\n  c' d\n"));
 }
