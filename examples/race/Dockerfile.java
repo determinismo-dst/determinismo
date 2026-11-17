@@ -4,7 +4,7 @@
 # pausing pauses threads.
 FROM docker.io/library/clojure:temurin-25-tools-deps-alpine
 WORKDIR /app
-COPY sdk/java/Determinismo.java sdk/java/DeterminismoCatalog.java sdk/java/DeterminismoCoverage.java /app/sdk/
+COPY sdk/java/Determinismo.java sdk/java/DeterminismoCatalog.java sdk/java/DeterminismoCoverage.java sdk/java/DeterminismoCoverageInstrument.java /app/sdk/
 COPY examples/race/java/Race.java examples/race/java/RaceRun.java /app/race/
 RUN mkdir -p /app/sdk-classes /app/classes && javac -d /app/sdk-classes /app/sdk/*.java && \
     printf 'Premain-Class: DeterminismoCoverage\n' > /app/coverage.manifest && \

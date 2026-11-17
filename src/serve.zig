@@ -644,7 +644,8 @@ fn run_update(server: *Server, id: u32) !void {
 /// without its language's instrumentation is explored blind: no guidance from its code, no
 /// thread-pause points in it. Its workload needs a build with it (Go's determinismo-toolexec,
 /// rustc's or clang's trace-pc-guard with the binary in /symbols, a JVM of 24 or later for the
-/// agent, Python's coverage). Whatever started the run: a hunt, a calibration, a trial, explore.
+/// agent or jars instrumented ahead of time, Python's coverage). Whatever started the run: a
+/// hunt, a calibration, a trial, explore.
 const coverage_gate_timelines = 4;
 
 fn coverage_gate(server: *Server, id: u32, connection: *duckdb.Connection) void {

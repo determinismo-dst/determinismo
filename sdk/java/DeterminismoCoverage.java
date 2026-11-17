@@ -1,9 +1,15 @@
 // SPDX-License-Identifier: MIT
 /*
- * Code coverage for strategies on the JVM (JDK 24+, through the java.lang.classfile API): a Java
- * agent that makes each source line of the classes it is told about emit a "coverage" event the
- * first time it runs ({"name":"line <class>:<line>"}), as the C, Zig and Python SDKs do.
- * Strategies such as det-strategy-mutate keep the timelines that reach new code.
+ * Code coverage for strategies on the JVM: a Java agent that makes each source line of the
+ * classes it is told about emit a "coverage" event the first time it runs ({"name":"line
+ * <class>:<line>"}), as the C, Zig and Python SDKs do. Strategies such as det-strategy-mutate
+ * keep the timelines that reach new code.
+ *
+ * This class is what instrumented code calls (the probes, thread pausing, crash points, their
+ * reports), for Java 17 and later; DeterminismoCoverageInstrument rewrites the classes, through
+ * JDK 24's java.lang.classfile API: as they load on a JVM of 24 or later, or ahead of time (below)
+ * with a JDK of 24 or later, for a program then run on any JVM from 17 on (Cassandra's, pinned
+ * to 17 or 21 by its scripts).
  *
  *   java -javaagent:determinismo-coverage.jar[=<class name prefixes, comma-separated>] ...
  *
@@ -12,17 +18,19 @@
  * schema.Coverage: class name prefixes, those starting with "-" excluded): the set, from a test
  * program's profile, scopes it at no change to the image.
  *
- * The jar holds this class and Determinismo, with "Premain-Class: DeterminismoCoverage" in its
- * manifest. Classes defined at run time (Clojure's, for instance) are instrumented too.
+ * The jar holds this class, the instrumenter and Determinismo, with "Premain-Class:
+ * DeterminismoCoverageBoot" in its manifest. Classes defined at run time (Clojure's, for
+ * instance) are instrumented too.
  *
  * Or ahead of time, at an image's build, with no agent at run time:
  *
  *   java -cp determinismo-coverage.jar:<the program's classpath> DeterminismoCoverage \
  *       instrument <prefixes> <in.jar> <out.jar> [<in.jar> <out.jar>]...
  *
- * rewrites the classes under the prefixes of each jar with the same probes, the table of their
- * ids (lines, fields, blocks, the classes) a resource of the first jar written; the coverage
- * jar on the classpath then reads it as this class loads. Classes are then loaded as they are,
+ * (a JDK of 24 or later) rewrites the classes under the prefixes of each jar with the same
+ * probes, the table of their ids (lines, fields, blocks, the classes) a resource of the first jar
+ * written; the coverage jar on the classpath then reads it as this class loads (the agent on a
+ * JVM's JAVA_TOOL_OPTIONS puts it there). Classes are then loaded as they are,
  * so a JDK AOT cache holds for them: an agent transforming at load costs a JVM most of its
  * start and the cache's help (a Datalevin server: 16.5 s to load with the agent, 4.7 s with
  * its cache and no agent, on one of srv4's cores). The agent leaves the table's classes alone. A probe
@@ -50,29 +58,7 @@
  * Stores to fields whose names say they hold the node's view of the cluster (leader, epoch, term,
  * session, member, owner...: CrashTuner's meta-info, whatever their type) are points the same way.
  */
-import java.lang.classfile.ClassFile;
-import java.lang.classfile.ClassHierarchyResolver;
-import java.lang.classfile.ClassModel;
-import java.lang.classfile.ClassTransform;
-import java.lang.classfile.CodeTransform;
-import java.lang.classfile.MethodModel;
-import java.lang.classfile.MethodTransform;
-import java.lang.classfile.Opcode;
-import java.lang.classfile.instruction.BranchInstruction;
-import java.lang.classfile.Instruction;
-import java.lang.classfile.Label;
-import java.lang.classfile.instruction.FieldInstruction;
-import java.lang.classfile.instruction.LabelTarget;
-import java.lang.classfile.instruction.LineNumber;
-import java.lang.classfile.instruction.LocalVariable;
-import java.lang.classfile.instruction.LocalVariableType;
-import java.lang.constant.ClassDesc;
-import java.lang.constant.ConstantDescs;
-import java.lang.constant.MethodTypeDesc;
-import java.lang.reflect.AccessFlag;
-import java.lang.instrument.ClassFileTransformer;
 import java.lang.instrument.Instrumentation;
-import java.security.ProtectionDomain;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -82,58 +68,40 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 public final class DeterminismoCoverage {
-  private static final ClassDesc SELF = ClassDesc.of("DeterminismoCoverage");
-  private static final MethodTypeDesc PROBE = MethodTypeDesc.of(ConstantDescs.CD_void,
-      ConstantDescs.CD_int);
-  private static final List<String> lines = new ArrayList<>();
+  static final List<String> lines = new ArrayList<>();
   private static final Map<String, Integer> ids = new HashMap<>();
   private static volatile boolean[] reported = new boolean[1024];
-  private static final MethodTypeDesc STATE = MethodTypeDesc.of(ConstantDescs.CD_void,
-      ConstantDescs.CD_Object, ConstantDescs.CD_Object, ConstantDescs.CD_int);
-  private static final List<String> fields = new ArrayList<>();
+  static final List<String> fields = new ArrayList<>();
   private static final Map<String, Integer> fieldIds = new HashMap<>();
   /** Transitions reported: field id, old ordinal + 1 (0 for null), new ordinal + 1. */
   private static final Set<Long> transitions = ConcurrentHashMap.newKeySet();
   /** The table of an ahead-of-time instrumentation: a resource of its first jar. */
-  private static final String TABLE = "determinismo-coverage.table";
+  static final String TABLE = "determinismo-coverage.table";
   /** Classes instrumented ahead of time (internal names): the agent leaves them alone. */
-  private static final Set<String> ahead = ConcurrentHashMap.newKeySet();
+  static final Set<String> ahead = ConcurrentHashMap.newKeySet();
 
   private DeterminismoCoverage() {}
 
   /**
-   * The classes covered (internal-name prefixes; none: every class but the JDK's). Narrowed by a
-   * later agent given prefixes: the platform's (every node's JAVA_TOOL_OPTIONS, loaded first)
-   * covers everything until a program's own -javaagent=prefixes says what it wants.
+   * The agent's start, on JDK 24 or later: the platform's jar's DeterminismoCoverageBoot calls it,
+   * and a program's own agent jar names this class its Premain-Class (`=<class name prefixes>`
+   * narrowing what is covered). The instrumenter, which needs JDK 24's java.lang.classfile,
+   * installs its transformer; a jar without it (its Dockerfile copied no
+   * DeterminismoCoverageInstrument.java) says so, and the program runs uninstrumented.
    */
-  private static volatile String[] coveredPrefixes = new String[0];
-  private static boolean installed;
-
-  public static synchronized void premain(String arguments, Instrumentation instrumentation) {
-    String[] prefixes = arguments == null || arguments.isEmpty()
-        ? new String[0] : arguments.replace('.', '/').split(",");
-    if (prefixes.length > 0 || !installed) coveredPrefixes = prefixes;
-    if (installed) return; // One transformer a JVM: the platform's agent and a program's own.
-    installed = true;
-    String[] set = setEntries(System.getenv("DETERMINISMO_COVERAGE"));
-    instrumentation.addTransformer(new ClassFileTransformer() {
-      @Override
-      public byte[] transform(ClassLoader loader, String name, Class<?> redefined,
-          ProtectionDomain domain, byte[] bytes) {
-        String[] covered = coveredPrefixes;
-        if (name == null || name.startsWith("Determinismo") || ahead.contains(name)
-            || !(covered.length == 0 ? !jdk(name) : matches(name, covered))
-            || !setContains(set, name)) {
-          return null;
-        }
-        try {
-          return instrument(name.replace('/', '.'), bytes, loader);
-        } catch (Throwable unsupported) {
-          return null; // Left as it is: coverage is best effort, the program must still run.
-        }
-      }
-    });
+  public static void premain(String arguments, Instrumentation instrumentation) {
+    try {
+      Class.forName("DeterminismoCoverageInstrument")
+          .getMethod("premain", String.class, Instrumentation.class)
+          .invoke(null, arguments, instrumentation);
+    } catch (ReflectiveOperationException | LinkageError failed) {
+      System.err.println("[determinismo] the coverage agent did not start: " + failed);
+    }
   }
+
+  /** Initializes this class (its sender, its exit hook, an ahead-of-time table): the
+   * instrumenter's premain calls it before it transforms any class. */
+  static void start() {}
 
   /** Called by instrumented code at the start of each line. */
   public static void line(int id) {
@@ -404,7 +372,7 @@ public final class DeterminismoCoverage {
     send(new Object[] {id, before == null ? "null" : before.name(), next.name()});
   }
 
-  private static boolean matches(String name, String[] prefixes) {
+  static boolean matches(String name, String[] prefixes) {
     for (String prefix : prefixes) {
       if (name.startsWith(prefix)) return true;
     }
@@ -412,19 +380,19 @@ public final class DeterminismoCoverage {
   }
 
   /** The JDK's own classes, left alone when the agent is given no prefixes. */
-  private static boolean jdk(String name) {
+  static boolean jdk(String name) {
     return name.startsWith("java/") || name.startsWith("javax/") || name.startsWith("jdk/")
         || name.startsWith("sun/") || name.startsWith("com/sun/");
   }
 
   /** A coverage set's entries, in class files' form ("org/apache/x", "-org/apache/x/y"). */
-  private static String[] setEntries(String text) {
+  static String[] setEntries(String text) {
     if (text == null || text.isEmpty()) return new String[0];
     return text.replace('.', '/').split(",");
   }
 
   /** Whether the set holds the class: under an included prefix (or none is given), no excluded. */
-  private static boolean setContains(String[] set, String name) {
+  static boolean setContains(String[] set, String name) {
     boolean included = true;
     for (String entry : set) {
       if (entry.startsWith("-")) {
@@ -440,159 +408,7 @@ public final class DeterminismoCoverage {
     return false;
   }
 
-  private static byte[] instrument(String className, byte[] bytes, ClassLoader loader) {
-    ClassModel model = ClassFile.of().parse(bytes);
-    // The stack maps of the probed code need the classes' hierarchy: from their class files, the
-    // class being defined from its own bytes, never by loading a class. The JDK's default
-    // resolver falls back to loading, and a class it loads while it is itself being defined is
-    // defined twice: the JVM refuses the second ("duplicate class definition": ZooKeeper's
-    // LearnerHandler died at each follower's connection, ObserverMaster, and no ensemble formed;
-    // srv4, 2026-10-31).
-    ClassDesc self = model.thisClass().asSymbol();
-    ClassHierarchyResolver own = described -> {
-      if (!described.equals(self)) return null;
-      if (model.flags().has(AccessFlag.INTERFACE)) return ClassHierarchyResolver.ClassHierarchyInfo.ofInterface();
-      return ClassHierarchyResolver.ClassHierarchyInfo.ofClass(
-          model.superclass().map(entry -> entry.asSymbol()).orElse(null));
-    };
-    ClassLoader source = loader != null ? loader : ClassLoader.getSystemClassLoader();
-    ClassHierarchyResolver resolver = own.orElse(ClassHierarchyResolver.ofResourceParsing(source)).cached();
-    ClassFile files = ClassFile.of(ClassFile.ClassHierarchyResolverOption.of(resolver));
-    return files.transformClass(model, (classes, element) -> {
-      if (!(element instanceof MethodModel method)) {
-        classes.with(element);
-        return;
-      }
-      // Initializers' stores set first states (an enum's its constants), and a constructor's
-      // fields may not be readable yet (before super()): only their lines.
-      boolean initializer = method.methodName().equalsString("<init>")
-          || method.methodName().equalsString("<clinit>");
-      classes.transformMethod(method, MethodTransform.transformingCode(probes(className, !initializer)));
-    });
-  }
-
-  private static CodeTransform probes(String className, boolean states) {
-    // Per method: forward conditional branches' targets awaiting their label (how many branches
-    // reach it), labels passed, and whether the last instruction never falls through (a label
-    // after it is reached by jumps alone).
-    Map<Label, int[]> targets = new HashMap<>();
-    Set<Label> passed = new java.util.HashSet<>();
-    boolean[] noFallThrough = {false};
-    // Whether that instruction was a goto back to a label passed: a loop's, and the label after
-    // it the loop's exit.
-    boolean[] backward = {false};
-    return (code, element) -> {
-      if (element instanceof LabelTarget target) {
-        code.with(element);
-        passed.add(target.label());
-        int[] reaching = targets.remove(target.label());
-        // The branch's taken side, when only it reaches the label (no fall-through into it, no
-        // other branch to it): a point for thread pausing of its own.
-        if (reaching != null && reaching[0] == 1 && noFallThrough[0] && !backward[0]) {
-          code.loadConstant(BLOCKS | nextBlock());
-          code.invokestatic(SELF, "block", PROBE);
-        }
-        noFallThrough[0] = false;
-        backward[0] = false;
-        return;
-      }
-      if (element instanceof Instruction instruction) {
-        noFallThrough[0] = switch (instruction.opcode()) {
-          case GOTO, GOTO_W, ATHROW, RETURN, IRETURN, LRETURN, FRETURN, DRETURN, ARETURN,
-              TABLESWITCH, LOOKUPSWITCH -> true;
-          default -> false;
-        };
-        backward[0] = element instanceof BranchInstruction jump
-            && (jump.opcode() == Opcode.GOTO || jump.opcode() == Opcode.GOTO_W)
-            && passed.contains(jump.target());
-      }
-      // Local variable tables are debugging information only, and dropped: the API sizes the
-      // locals from the code, so a variable only the table names (one Clojure never loads or
-      // stores) would point past them, and the JVM refuses the class (ClassFormatError).
-      if (element instanceof LocalVariable || element instanceof LocalVariableType) return;
-      if (states && element instanceof FieldInstruction field && metaInfo(field)) {
-        code.loadConstant(registerField(field.owner().asInternalName().replace('/', '.') + "."
-            + field.name().stringValue()));
-        code.invokestatic(SELF, "crashStore", PROBE);
-      }
-      if (states && element instanceof FieldInstruction field && mayHoldState(field)) {
-        // The value about to be stored and the field's value now, both left as they were.
-        int id = registerField(field.owner().asInternalName().replace('/', '.') + "."
-            + field.name().stringValue());
-        if (field.opcode() == Opcode.PUTFIELD) {
-          code.dup2(); // object, value, object, value
-          code.swap(); // object, value, value, object
-          code.getfield(field.field()); // object, value, value, old
-        } else {
-          code.dup(); // value, value
-          code.getstatic(field.field()); // value, value, old
-        }
-        code.loadConstant(id);
-        code.invokestatic(SELF, "state", STATE);
-      }
-      code.with(element);
-      if (element instanceof LineNumber number) {
-        code.loadConstant(register(className + ":" + number.line()));
-        code.invokestatic(SELF, "line", PROBE);
-      } else if (element instanceof BranchInstruction branch && branch.opcode() != Opcode.GOTO
-          && branch.opcode() != Opcode.GOTO_W) {
-        Label to = branch.target();
-        int[] known = targets.get(to);
-        if (passed.contains(to)) {
-          code.loadConstant(BLOCKS | nextBlock()); // A loop's branch back: no pair.
-          code.invokestatic(SELF, "block", PROBE);
-        } else {
-          if (known != null) known[0]++; // A second branch to the label: its taken side has none.
-          else targets.put(to, new int[] {1});
-          code.loadConstant(BLOCKS | nextBlock()); // The fall-through side.
-          code.invokestatic(SELF, "block", PROBE);
-        }
-      }
-    };
-  }
-
-  /**
-   * A store to a field whose name says it holds the node's view of the cluster (CrashTuner's
-   * meta-info: a leader, an epoch or term, a session, a member, an owner...), whatever its type
-   * (an epoch is a long): a crash point too. Enum-typed ones are the states' already.
-   */
-  private static boolean metaInfo(FieldInstruction field) {
-    if (field.opcode() != Opcode.PUTFIELD && field.opcode() != Opcode.PUTSTATIC) return false;
-    return metaInfoName(field.name().stringValue());
-  }
-
-  /** Whether one of a name's words (camelCase or snake_case; a plural too) is a meta-info word:
-   * `currentTerm`, `leader_id`, `members`, but not `terminated`, `released`, `remembered`. */
-  static boolean metaInfoName(String name) {
-    int start = 0;
-    for (int index = 1; index <= name.length(); index++) {
-      boolean end = index == name.length() || name.charAt(index) == '_' || name.charAt(index) == '$'
-          || (Character.isUpperCase(name.charAt(index)) && Character.isLowerCase(name.charAt(index - 1)));
-      if (!end) continue;
-      String word = name.substring(start, index).toLowerCase(java.util.Locale.ROOT);
-      for (String meta : META_INFO_WORDS) {
-        if (word.equals(meta) || word.equals(meta + "s")) return true;
-      }
-      start = index < name.length() && (name.charAt(index) == '_' || name.charAt(index) == '$') ? index + 1 : index;
-    }
-    return false;
-  }
-
-  private static final String[] META_INFO_WORDS = {"leader", "epoch", "term", "session", "member",
-      "owner", "coordinator", "master", "primary", "quorum", "lease", "zxid", "generation", "peer"};
-
-  /** A store to a field typed by a class of the program's own: an enum constant, maybe. */
-  private static boolean mayHoldState(FieldInstruction field) {
-    if (field.opcode() != Opcode.PUTFIELD && field.opcode() != Opcode.PUTSTATIC) return false;
-    String type = field.typeSymbol().descriptorString();
-    if (!type.startsWith("L")) return false; // Primitives and arrays.
-    for (String library : new String[] {"Ljava/", "Ljavax/", "Ljdk/", "Lsun/", "Lscala/", "Lkotlin/", "Lclojure/"}) {
-      if (type.startsWith(library)) return false;
-    }
-    return true;
-  }
-
-  private static synchronized int registerField(String field) {
+  static synchronized int registerField(String field) {
     Integer id = fieldIds.get(field);
     if (id != null) return id;
     fieldIds.put(field, fields.size());
@@ -601,14 +417,14 @@ public final class DeterminismoCoverage {
   }
 
   /** Block probes' ids: their own numbers, with this bit (lines' ids are below it). */
-  private static final int BLOCKS = 1 << 30;
-  private static int blocks;
+  static final int BLOCKS = 1 << 30;
+  static int blocks;
 
-  private static synchronized int nextBlock() {
+  static synchronized int nextBlock() {
     return blocks++;
   }
 
-  private static synchronized int register(String line) {
+  static synchronized int register(String line) {
     Integer id = ids.get(line);
     if (id != null) return id;
     ids.put(line, lines.size());
@@ -616,78 +432,19 @@ public final class DeterminismoCoverage {
     return lines.size() - 1;
   }
 
-  /** `instrument <prefixes> <in.jar> <out.jar>...`: ahead-of-time instrumentation. */
+  /** `instrument <prefixes> <in.jar> <out.jar>...`: ahead-of-time instrumentation, by the
+   * instrumenter (a JDK of 24 or later). */
   public static void main(String[] arguments) throws Exception {
-    if (arguments.length < 4 || !arguments[0].equals("instrument") || arguments.length % 2 != 0) {
-      System.err.println("usage: DeterminismoCoverage instrument <class name prefixes, "
-          + "comma-separated> <in.jar> <out.jar> [<in.jar> <out.jar>]...");
+    try {
+      Class.forName("DeterminismoCoverageInstrument").getMethod("main", String[].class)
+          .invoke(null, (Object) arguments);
+    } catch (java.lang.reflect.InvocationTargetException failed) {
+      if (failed.getCause() instanceof Exception cause) throw cause;
+      throw failed;
+    } catch (UnsupportedClassVersionError old) {
+      System.err.println("determinismo-coverage: instrumenting needs a JDK of 24 or later "
+          + "(java.lang.classfile); this is Java " + System.getProperty("java.specification.version"));
       System.exit(2);
-    }
-    String[] prefixes = arguments[1].replace('.', '/').split(",");
-    java.net.URL[] urls = new java.net.URL[(arguments.length - 2) / 2];
-    for (int i = 2; i < arguments.length; i += 2) {
-      urls[(i - 2) / 2] = java.nio.file.Path.of(arguments[i]).toUri().toURL();
-    }
-    // The hierarchy for stack maps from class files, never loaded: the jars', and the
-    // classpath's this runs with (their dependencies': run it with the program's classpath).
-    try (java.net.URLClassLoader loader =
-        new java.net.URLClassLoader(urls, ClassLoader.getSystemClassLoader())) {
-      // The first jar last: the table, every jar's ids, goes at its end.
-      for (int i = arguments.length - 2; i >= 2; i -= 2) {
-        instrumentJar(prefixes, arguments[i], arguments[i + 1], loader, i == 2);
-      }
-    }
-    System.out.println("determinismo-coverage: " + ahead.size() + " classes, " + lines.size()
-        + " lines, " + blocks + " blocks, " + fields.size() + " fields");
-  }
-
-  private static void instrumentJar(String[] prefixes, String input, String output,
-      ClassLoader loader, boolean table) throws java.io.IOException {
-    try (java.util.jar.JarFile jar = new java.util.jar.JarFile(input);
-        java.util.jar.JarOutputStream out = new java.util.jar.JarOutputStream(
-            java.nio.file.Files.newOutputStream(java.nio.file.Path.of(output)))) {
-      for (java.util.Enumeration<java.util.jar.JarEntry> entries = jar.entries();
-          entries.hasMoreElements(); ) {
-        java.util.jar.JarEntry entry = entries.nextElement();
-        String name = entry.getName();
-        // A signature no longer holds for rewritten classes; an old table is replaced.
-        if (name.equals(TABLE) || name.startsWith("META-INF/") && (name.endsWith(".SF")
-            || name.endsWith(".RSA") || name.endsWith(".DSA") || name.endsWith(".EC"))) {
-          continue;
-        }
-        byte[] bytes;
-        try (java.io.InputStream in = jar.getInputStream(entry)) {
-          bytes = in.readAllBytes();
-        }
-        if (!entry.isDirectory() && name.endsWith(".class") && !name.endsWith("module-info.class")) {
-          String internal = name.substring(0, name.length() - ".class".length());
-          if (!internal.startsWith("Determinismo") && matches(internal, prefixes)) {
-            try {
-              bytes = instrument(internal.replace('/', '.'), bytes, loader);
-              ahead.add(internal);
-            } catch (Throwable unsupported) {
-              // Left as it is: coverage is best effort, the program must still run.
-            }
-          }
-        }
-        java.util.jar.JarEntry copy = new java.util.jar.JarEntry(name);
-        copy.setTime(entry.getTime()); // Clojure loads a class newer than its source.
-        out.putNextEntry(copy);
-        out.write(bytes);
-        out.closeEntry();
-      }
-      if (table) {
-        StringBuilder text = new StringBuilder("@lines\n");
-        for (String line : lines) text.append(line).append('\n');
-        text.append("@fields\n");
-        for (String field : fields) text.append(field).append('\n');
-        text.append("@classes\n");
-        for (String internal : ahead) text.append(internal).append('\n');
-        text.append("@blocks ").append(blocks).append('\n');
-        out.putNextEntry(new java.util.jar.JarEntry(TABLE));
-        out.write(text.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
-        out.closeEntry();
-      }
     }
   }
 

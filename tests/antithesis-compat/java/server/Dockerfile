@@ -2,7 +2,7 @@
 # The crash points' server (crash-points.yaml): the SDK and its coverage agent in one jar, the
 # server next to it; no test templates (the client's are the scenario's).
 FROM docker.io/library/eclipse-temurin:25-jdk-alpine
-COPY sdk/java/Determinismo.java sdk/java/DeterminismoCoverage.java /app/sdk/
+COPY sdk/java/Determinismo.java sdk/java/DeterminismoCoverage.java sdk/java/DeterminismoCoverageInstrument.java /app/sdk/
 COPY tests/antithesis-compat/java/server/StateServer.java /app/src/
 RUN javac -d /app/sdk-classes /app/sdk/*.java && \
     printf 'Premain-Class: DeterminismoCoverage\n' > /app/manifest && \

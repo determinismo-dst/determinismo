@@ -35,7 +35,8 @@ const environment_max = 128;
 /// determinismo's JVM coverage agent (build.zig, tools/initramfs.zig), on every node's
 /// JAVA_TOOL_OPTIONS: each JVM's code covered (every class but the JDK's, narrowed by a program's
 /// own -javaagent=<prefixes>), and where thread pausing pauses, with no change to an image, as
-/// Antithesis instruments the JVM on its side. A JVM before 24 says it is not instrumented.
+/// Antithesis instruments the JVM on its side. A JVM before 24 says it instruments nothing as
+/// it loads: from 17 on, only classes instrumented ahead of time at the image's build report.
 const coverage_agent = "-javaagent:/opt/determinismo/lib/determinismo-coverage.jar";
 
 const JavaOptions = struct {

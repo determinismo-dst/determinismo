@@ -6,7 +6,7 @@ FROM docker.io/library/clojure:temurin-25-tools-deps-alpine
 # C1 only: short timelines and restarted JVMs never repay C2's compiling (examples/ignite/README.md).
 ENV JAVA_TOOL_OPTIONS="-XX:TieredStopAtLevel=1"
 WORKDIR /app
-COPY sdk/java/Determinismo.java sdk/java/DeterminismoCoverage.java /sdk/
+COPY sdk/java/Determinismo.java sdk/java/DeterminismoCoverage.java sdk/java/DeterminismoCoverageInstrument.java /sdk/
 RUN mkdir -p /sdk/classes && javac -d /sdk/classes /sdk/*.java && \
     printf 'Premain-Class: DeterminismoCoverage\n' > /sdk/manifest && \
     jar cfm /sdk/determinismo-coverage.jar /sdk/manifest -C /sdk/classes .

@@ -15,6 +15,7 @@ const sources = [_]struct { name: []const u8, text: []const u8 }{
     .{ .name = "Determinismo.java", .text = @embedFile("Determinismo.java") },
     .{ .name = "DeterminismoCatalog.java", .text = @embedFile("DeterminismoCatalog.java") },
     .{ .name = "DeterminismoCoverage.java", .text = @embedFile("DeterminismoCoverage.java") },
+    .{ .name = "DeterminismoCoverageInstrument.java", .text = @embedFile("DeterminismoCoverageInstrument.java") },
     .{ .name = "CoverageLockCheck.java", .text = lock_check },
 };
 
@@ -118,7 +119,7 @@ test "a class instrumented ahead of time reports its lines with no agent" {
     const probe_classes = try std.fmt.allocPrint(arena, "{s}/probe", .{directory});
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(arena, &.{ "javac", "-d", sdk_classes });
-    for (sources[0..3]) |source| {
+    for (sources[0..4]) |source| {
         const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ directory, source.name });
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = source.text });
         try argv.append(arena, path);
@@ -142,6 +143,50 @@ test "a class instrumented ahead of time reports its lines with no agent" {
     try std.testing.expect(std.mem.indexOf(u8, ran.stdout, "sum 3") != null);
     const reported = try std.Io.Dir.cwd().readFileAlloc(io, events, arena, .limited(1 << 20));
     std.debug.print("events: {s}", .{reported});
+    try std.testing.expect(std.mem.indexOf(u8, reported, "\"name\":\"line Probe:4\"") != null);
+}
+
+test "a class instrumented ahead of time runs on the runtime alone, compiled for Java 17" {
+    // A program pinned below JDK 24 (Cassandra's scripts: 11 to 21) is instrumented at its
+    // image's build by a JDK of 24 or later, then runs on its own JVM: the probes' runtime alone
+    // on the classpath (the agent's jar there), built for Java 17, the instrumenter not.
+    const io = std.testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const major = java_major(arena, io) orelse return error.SkipZigTest;
+    if (major < 24) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const runtime_classes = try std.fmt.allocPrint(arena, "{s}/runtime", .{directory});
+    const instrument_classes = try std.fmt.allocPrint(arena, "{s}/instrument", .{directory});
+    const probe_classes = try std.fmt.allocPrint(arena, "{s}/probe", .{directory});
+    var paths: [sources.len][]const u8 = undefined;
+    for (sources, 0..) |source, index| {
+        paths[index] = try std.fmt.allocPrint(arena, "{s}/{s}", .{ directory, source.name });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = paths[index], .data = source.text });
+    }
+    // Determinismo.java and DeterminismoCoverage.java: the runtime, for Java 17.
+    try run_ok(arena, io, &.{ "javac", "--release", "17", "-d", runtime_classes, paths[0], paths[2] });
+    try run_ok(arena, io, &.{ "javac", "-cp", runtime_classes, "-d", instrument_classes, paths[3] });
+    const probe_path = try std.fmt.allocPrint(arena, "{s}/Probe.java", .{directory});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = probe_path, .data = probe_java });
+    try run_ok(arena, io, &.{ "javac", "--release", "17", "-g", "-d", probe_classes, probe_path });
+    const plain = try std.fmt.allocPrint(arena, "{s}/probe.jar", .{directory});
+    const instrumented = try std.fmt.allocPrint(arena, "{s}/probe-instrumented.jar", .{directory});
+    try run_ok(arena, io, &.{ "jar", "cf", plain, "-C", probe_classes, "." });
+    const tool_classpath = try std.fmt.allocPrint(arena, "{s}:{s}", .{ runtime_classes, instrument_classes });
+    try run_ok(arena, io, &.{ "java", "-cp", tool_classpath, "DeterminismoCoverage", "instrument", "Probe", plain, instrumented });
+    const events = try std.fmt.allocPrint(arena, "{s}/events.jsonl", .{directory});
+    const classpath = try std.fmt.allocPrint(arena, "{s}:{s}", .{ instrumented, runtime_classes });
+    var environment = std.process.Environ.Map.init(arena);
+    try environment.put("DETERMINISMO_SDK_LOCAL_OUTPUT", events);
+    try environment.put("PATH", "/usr/bin:/bin");
+    const ran = try std.process.run(arena, io, .{ .argv = &.{ "java", "-cp", classpath, "Probe" }, .environ_map = &environment });
+    try std.testing.expect(ran.term == .exited and ran.term.exited == 0);
+    try std.testing.expect(std.mem.indexOf(u8, ran.stdout, "sum 3") != null);
+    const reported = try std.Io.Dir.cwd().readFileAlloc(io, events, arena, .limited(1 << 20));
     try std.testing.expect(std.mem.indexOf(u8, reported, "\"name\":\"line Probe:4\"") != null);
 }
 
@@ -181,7 +226,7 @@ test "a branch's sides are blocks of their own: the instrumented class runs, no 
     const probe_classes = try std.fmt.allocPrint(arena, "{s}/probe", .{directory});
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(arena, &.{ "javac", "-d", sdk_classes });
-    for (sources[0..3]) |source| {
+    for (sources[0..4]) |source| {
         const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ directory, source.name });
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = source.text });
         try argv.append(arena, path);
@@ -275,6 +320,7 @@ test "the coverage agent loading while the JVM shuts down: no error, the JVM exi
     const files = [_]struct { name: []const u8, text: []const u8 }{
         .{ .name = sources[0].name, .text = sources[0].text },
         .{ .name = sources[2].name, .text = sources[2].text },
+        .{ .name = sources[3].name, .text = sources[3].text },
         .{ .name = "DeterminismoCoverageBoot.java", .text = @embedFile("DeterminismoCoverageBoot.java") },
         .{ .name = "ExitingAgent.java", .text = exiting_agent_java },
         .{ .name = "ExitingMain.java", .text = exiting_main_java },

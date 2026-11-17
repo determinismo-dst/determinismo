@@ -70,7 +70,8 @@ The tests' code is covered with nothing in your repository asking for it, so exp
 the timelines that reach new code and serve can tell a job that ran from one that did not
 (it stops a run whose first timelines report no coverage):
 
-- **JVM** (24 or later): determinismo's agent, on `JAVA_TOOL_OPTIONS`.
+- **JVM** (24 or later): determinismo's agent, on `JAVA_TOOL_OPTIONS`; 17 to 23, only jars
+  instrumented ahead of time (docs/PLUGINS.md).
 - **Python** (3.12 or later): each Python process the run command starts reports the lines of
   its own code: every file but the interpreter's library and the installed packages (the
   node's `DETERMINISMO_COVERAGE` narrows it). A `sitecustomize` of your own still runs.

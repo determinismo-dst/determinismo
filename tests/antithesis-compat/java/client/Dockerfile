@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 FROM docker.io/library/eclipse-temurin:25-jdk-alpine
-COPY sdk/java/Determinismo.java sdk/java/DeterminismoCoverage.java /app/sdk/
+COPY sdk/java/Determinismo.java sdk/java/DeterminismoCoverage.java sdk/java/DeterminismoCoverageInstrument.java /app/sdk/
 COPY tests/antithesis-compat/java/client/Maze.java tests/antithesis-compat/java/client/StateMaze.java tests/antithesis-compat/java/client/Ready.java /app/src/
 COPY tests/antithesis-compat/java/client/maze/ /opt/antithesis/test/v1/maze/
 COPY tests/antithesis-compat/java/client/state/ /opt/antithesis/test/v1/state/

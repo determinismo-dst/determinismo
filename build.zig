@@ -240,9 +240,10 @@ pub fn build(b: *std.Build) void {
     phases.guest.dependOn(&voidstar_installed.step);
     b.getInstallStep().dependOn(&voidstar_installed.step);
 
-    // The JVM coverage agent (sdk/java/DeterminismoCoverage.java, JDK 24+: java.lang.classfile),
-    // its entry point compiled for Java 8 (DeterminismoCoverageBoot: any JVM loads it, and an old
-    // one says it is not instrumented): in every initramfs at /opt/determinismo/lib, on every
+    // The JVM coverage agent: its runtime for Java 17 (sdk/java/DeterminismoCoverage.java, what
+    // instrumented code calls), its instrumenter for JDK 24+ (DeterminismoCoverageInstrument.java:
+    // java.lang.classfile), its entry point compiled for Java 8 (DeterminismoCoverageBoot: any JVM
+    // loads it, and an old one says it instruments nothing as it loads): in every initramfs at /opt/determinismo/lib, on every
     // node's JAVA_TOOL_OPTIONS (guest/runtime/nodes.zig). Built with a JDK 25 (infra/host/tools.sh:
     // ~/opt/jdk-25), entries dated alike so the jar, part of every timeline, is reproducible.
     const jdk = b.option([]const u8, "jdk", "A JDK 25 for the JVM coverage agent ($HOME/opt/jdk-25)") orelse
@@ -250,9 +251,10 @@ pub fn build(b: *std.Build) void {
     const coverage_jar = b.addSystemCommand(&.{
         "sh",           "-c",
         \\set -eu
-        \\jdk=$1 out=$2 sdk=$3 boot=$4 agent=$5
+        \\jdk=$1 out=$2 sdk=$3 boot=$4 agent=$5 instrument=$6
         \\work=$(mktemp -d); trap 'rm -rf "$work"' EXIT; mkdir "$work/classes"
-        \\"$jdk/bin/javac" --release 24 -d "$work/classes" "$sdk" "$agent"
+        \\"$jdk/bin/javac" --release 17 -d "$work/classes" "$sdk" "$agent"
+        \\"$jdk/bin/javac" --release 24 -cp "$work/classes" -d "$work/classes" "$instrument"
         \\"$jdk/bin/javac" --release 8 -Xlint:-options -d "$work/classes" "$boot"
         \\printf 'Premain-Class: DeterminismoCoverageBoot\n' > "$work/manifest"
         \\"$jdk/bin/jar" --create --date=1980-01-01T00:00:02Z --file "$out" --manifest "$work/manifest" -C "$work/classes" .
@@ -263,6 +265,7 @@ pub fn build(b: *std.Build) void {
     coverage_jar.addFileArg(b.path("sdk/java/Determinismo.java"));
     coverage_jar.addFileArg(b.path("sdk/java/DeterminismoCoverageBoot.java"));
     coverage_jar.addFileArg(b.path("sdk/java/DeterminismoCoverage.java"));
+    coverage_jar.addFileArg(b.path("sdk/java/DeterminismoCoverageInstrument.java"));
     const coverage_jar_installed = b.addInstallFileWithDir(coverage_jar_file, .bin, "determinismo-coverage.jar");
     phases.guest.dependOn(&coverage_jar_installed.step);
     b.getInstallStep().dependOn(&coverage_jar_installed.step);

@@ -184,6 +184,10 @@ For code coverage:
   `sdk/java/DeterminismoCoverage.java`, `-javaagent:determinismo-coverage.jar=<class prefixes>`;
   each source line of those classes reports itself the first time it runs (`"line
   <class>:<n>"`), classes defined at run time included (see `tests/antithesis-compat/java`).
+  A program pinned to Java 17 to 23: its jars instrumented ahead of time at the image's build
+  by a JDK of 24 or later (`java -cp determinismo-coverage.jar:<its classpath>
+  DeterminismoCoverage instrument <prefixes> <in.jar> <out.jar>...`), then run on its own JVM
+  with the agent (determinismo's, on `JAVA_TOOL_OPTIONS`) holding their runtime.
   States too, as SGFuzz finds them (enum-typed variables are a program's state): each store
   outside initializers of one of the program's enum constants to a field reports the
   transition the first time it happens (a `state` event, `"state <class>.<field>: OLD ->
