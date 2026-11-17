@@ -196,62 +196,63 @@ fn scratches_sweep(io: std.Io, arena: std.mem.Allocator, scratches: []const u8) 
 /// and counts them.
 fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
     const checks = .{
-        .{ "bank", check_bank },                           .{ "shop", check_shop },
-        .{ "tapes", check_tapes },                         .{ "debugging", check_debugging },
-        .{ "python", check_python_strategy },              .{ "egress", check_egress },
-        .{ "ingress", check_ingress },                     .{ "ingress-session", check_ingress_session },
-        .{ "moments", check_moments },                     .{ "properties", check_builtin_properties },
-        .{ "entropy", check_kernel_entropy },              .{ "quiet", check_quiet_period },
-        .{ "clock_jitter", check_clock_jitter },           .{ "query", check_query },
-        .{ "progress", check_progress_while_quiet },       .{ "network", check_network_faults },
-        .{ "serve", check_serve },                         .{ "until", check_until_and_causality },
-        .{ "coverage-gate", check_coverage_gate },         .{ "coverage", check_coverage },
-        .{ "parallel", check_parallel },                   .{ "fork", check_fork },
-        .{ "tree", check_tree },                           .{ "startup-coverage", check_startup_coverage },
-        .{ "memory-climb", check_memory_climb },           .{ "disk", check_disk },
-        .{ "shape", check_shape },                         .{ "end", check_end },
-        .{ "plans", check_plans },                         .{ "durability", check_durability },
-        .{ "mutate", check_mutate },                       .{ "interleave", check_interleave },
-        .{ "checks", check_host_checks },                  .{ "pausing", check_pausing },
-        .{ "shrink", check_shrink },                       .{ "holds", check_holds },
-        .{ "coverage-set", check_coverage_set },           .{ "inject", check_inject },
-        .{ "aim", check_aim },                             .{ "aftershock", check_aftershock },
-        .{ "record-power-loss", check_record_power_loss }, .{ "errno-storm", check_errno_storm },
-        .{ "compose", check_compose },                     .{ "shards", check_shards },
-        .{ "stress", check_stress },                       .{ "controller", check_controller },
-        .{ "clojure", check_clojure },                     .{ "k3s", check_k3s },
-        .{ "script", check_script },                       .{ "modulation", check_cpu_modulation },
-        .{ "profile", check_profile },                     .{ "catalog", check_catalog },
-        .{ "guidance", check_guidance },                   .{ "voidstar", check_voidstar },
-        .{ "changed", check_changed },                     .{ "readdress", check_readdress },
-        .{ "unlist", check_unlist },                       .{ "signal", check_signal },
-        .{ "syscall_error", check_syscall_error },         .{ "swarm", check_swarm },
-        .{ "metastable", check_metastable },               .{ "file_error", check_file_error },
-        .{ "retroactive", check_retroactive },             .{ "epoch", check_epoch },
-        .{ "drive", check_drive },                         .{ "hang", check_hang },
-        .{ "pinned", check_pinned },                       .{ "slow", check_slow },
-        .{ "ending-window", check_ending_window },         .{ "sought", check_sought },
-        .{ "optimize", check_optimize },                   .{ "states", check_states },
-        .{ "crash-points", check_crash_points },           .{ "nodes-down", check_nodes_down },
-        .{ "stale-pid", check_stale_pid },                 .{ "memory-growth", check_memory_growth },
-        .{ "upgrade", check_upgrade },                     .{ "knobs", check_knobs },
-        .{ "quorum", check_quorum },                       .{ "spare", check_spare },
-        .{ "saved", check_saved },                         .{ "concurrent", check_concurrent },
-        .{ "resume", check_resume },                       .{ "ui", check_ui },
-        .{ "runs", check_runs },                           .{ "kubernetes", check_kubernetes },
-        .{ "steps", check_steps },                         .{ "before-nodes", check_before_nodes },
-        .{ "session", check_session },                     .{ "fast", check_fast },
-        .{ "sandbox", check_sandbox },                     .{ "devproxy", check_devproxy },
-        .{ "ci", check_ci },                               .{ "repl", check_repl },
-        .{ "mechanics", check_mechanics },                 .{ "budget", check_budget },
-        .{ "sinks", check_sinks },                         .{ "dotnet", check_dotnet },
-        .{ "lines", check_lines },                         .{ "frozen-start", check_frozen_start },
-        .{ "hangup", check_hangup },                       .{ "frozen-step", check_frozen_step },
-        .{ "templates", check_templates },                 .{ "volumes", check_volumes },
-        .{ "setup-mode", check_setup_mode },               .{ "jank", check_jank_repl },
-        .{ "checkpoint", check_session_checkpoint },       .{ "ingress-checkpoint", check_ingress_checkpoint },
-        .{ "ingress-crash", check_ingress_crash },         .{ "draws", check_draws },
-        .{ "exit-stack", check_exit_stack },               .{ "plan-calls", check_plan_calls },
+        .{ "bank", check_bank },                             .{ "shop", check_shop },
+        .{ "tapes", check_tapes },                           .{ "debugging", check_debugging },
+        .{ "python", check_python_strategy },                .{ "egress", check_egress },
+        .{ "ingress", check_ingress },                       .{ "ingress-session", check_ingress_session },
+        .{ "moments", check_moments },                       .{ "properties", check_builtin_properties },
+        .{ "entropy", check_kernel_entropy },                .{ "quiet", check_quiet_period },
+        .{ "clock_jitter", check_clock_jitter },             .{ "query", check_query },
+        .{ "progress", check_progress_while_quiet },         .{ "network", check_network_faults },
+        .{ "serve", check_serve },                           .{ "until", check_until_and_causality },
+        .{ "coverage-gate", check_coverage_gate },           .{ "coverage", check_coverage },
+        .{ "parallel", check_parallel },                     .{ "fork", check_fork },
+        .{ "tree", check_tree },                             .{ "startup-coverage", check_startup_coverage },
+        .{ "memory-climb", check_memory_climb },             .{ "disk", check_disk },
+        .{ "shape", check_shape },                           .{ "end", check_end },
+        .{ "plans", check_plans },                           .{ "durability", check_durability },
+        .{ "mutate", check_mutate },                         .{ "interleave", check_interleave },
+        .{ "checks", check_host_checks },                    .{ "pausing", check_pausing },
+        .{ "shrink", check_shrink },                         .{ "holds", check_holds },
+        .{ "coverage-set", check_coverage_set },             .{ "inject", check_inject },
+        .{ "aim", check_aim },                               .{ "aftershock", check_aftershock },
+        .{ "record-power-loss", check_record_power_loss },   .{ "errno-storm", check_errno_storm },
+        .{ "compose", check_compose },                       .{ "shards", check_shards },
+        .{ "stress", check_stress },                         .{ "controller", check_controller },
+        .{ "clojure", check_clojure },                       .{ "k3s", check_k3s },
+        .{ "script", check_script },                         .{ "modulation", check_cpu_modulation },
+        .{ "profile", check_profile },                       .{ "catalog", check_catalog },
+        .{ "guidance", check_guidance },                     .{ "voidstar", check_voidstar },
+        .{ "changed", check_changed },                       .{ "readdress", check_readdress },
+        .{ "unlist", check_unlist },                         .{ "signal", check_signal },
+        .{ "syscall_error", check_syscall_error },           .{ "swarm", check_swarm },
+        .{ "metastable", check_metastable },                 .{ "file_error", check_file_error },
+        .{ "retroactive", check_retroactive },               .{ "epoch", check_epoch },
+        .{ "drive", check_drive },                           .{ "hang", check_hang },
+        .{ "pinned", check_pinned },                         .{ "slow", check_slow },
+        .{ "ending-window", check_ending_window },           .{ "sought", check_sought },
+        .{ "optimize", check_optimize },                     .{ "states", check_states },
+        .{ "crash-points", check_crash_points },             .{ "nodes-down", check_nodes_down },
+        .{ "stale-pid", check_stale_pid },                   .{ "memory-growth", check_memory_growth },
+        .{ "upgrade", check_upgrade },                       .{ "knobs", check_knobs },
+        .{ "quorum", check_quorum },                         .{ "spare", check_spare },
+        .{ "saved", check_saved },                           .{ "concurrent", check_concurrent },
+        .{ "resume", check_resume },                         .{ "ui", check_ui },
+        .{ "runs", check_runs },                             .{ "kubernetes", check_kubernetes },
+        .{ "steps", check_steps },                           .{ "before-nodes", check_before_nodes },
+        .{ "session", check_session },                       .{ "fast", check_fast },
+        .{ "sandbox", check_sandbox },                       .{ "devproxy", check_devproxy },
+        .{ "sandbox-egress", check_sandbox_egress },         .{ "ci", check_ci },
+        .{ "repl", check_repl },                             .{ "mechanics", check_mechanics },
+        .{ "budget", check_budget },                         .{ "sinks", check_sinks },
+        .{ "dotnet", check_dotnet },                         .{ "lines", check_lines },
+        .{ "frozen-start", check_frozen_start },             .{ "hangup", check_hangup },
+        .{ "frozen-step", check_frozen_step },               .{ "templates", check_templates },
+        .{ "volumes", check_volumes },                       .{ "setup-mode", check_setup_mode },
+        .{ "jank", check_jank_repl },                        .{ "checkpoint", check_session_checkpoint },
+        .{ "ingress-checkpoint", check_ingress_checkpoint }, .{ "ingress-crash", check_ingress_crash },
+        .{ "draws", check_draws },                           .{ "exit-stack", check_exit_stack },
+        .{ "plan-calls", check_plan_calls },
     };
     // A check's whole name runs it alone (check.sh's `ui` ran guidance and quiet too).
     var exact = std.mem.eql(u8, only, "tla");
@@ -1934,6 +1935,148 @@ fn check_sandbox(context: *Context) !void {
         .{ "a deleted sandbox's machine is gone", machine > 0 and std.mem.indexOf(u8, machines, try std.fmt.allocPrint(arena, "\"machine\":{d},", .{machine})) == null },
     }, "sandbox: {d}, exec {d}, read \"{s}\", checkpoint {s}, forks {d} ({d} saw it), a fork's CPUs \"{s}\", rewound \"{s}\", replay run {d}, explore run {d}", .{
         id, hello.status, read, checkpoint, forks.len, forks_see_before, std.mem.trim(u8, fork_cpus.output, " \n"), rewound, replay_id, explore_id,
+    });
+}
+
+/// A sandbox's egress, carried by its checkpoints (docs/SANDBOXES.md), on a serve given two run
+/// CPUs: a node allowed a local site reads a page through its proxy; a fork of a checkpoint
+/// taken after that reads it too, and so does the sandbox rewound to it (the proxy came with the
+/// checkpoint, the host's relay is added: an agent's model calls in its forks), and its steps
+/// replayed in a deterministic machine (the run's egress, the proxy asking its channel at each
+/// connection). With both CPUs held by machines, one more is refused at once, saying so (it
+/// waited ten minutes for a CPU that could not come, then failed without a reason); and one
+/// asked of a second serve on the same CPUs, which has no machine of its own to count, is given
+/// up after that serve's `--machine-start-seconds` and its process stopped (it was left, and
+/// took a CPU when one came free: a machine of no one's). A deleted sandbox leaves the list.
+fn check_sandbox_egress(context: *Context) !void {
+    const arena = context.arena;
+    const linux = std.os.linux;
+    const address = "127.0.0.1:7911";
+    const url = "http://" ++ address;
+    const site_address = "127.0.0.1:7912";
+    const site = try std.fs.path.join(arena, &.{ context.scratch, "sandbox-egress-site" });
+    try std.Io.Dir.cwd().createDirPath(context.io, site);
+    try std.Io.Dir.cwd().writeFile(context.io, .{
+        .sub_path = try std.fs.path.join(arena, &.{ site, "page.txt" }),
+        .data = "out of the sandbox and back\n",
+    });
+    var site_server = try std.process.spawn(context.io, .{
+        .argv = &.{ "python3", "-m", "http.server", "7912", "--bind", "127.0.0.1", "--directory", site },
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer site_server.kill(context.io);
+    // serve on two of this process's CPUs: its pool (cpus.zig: the CPUs it was given).
+    var given: linux.cpu_set_t = @splat(0);
+    _ = linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &given);
+    var two: std.ArrayList(u8) = .empty;
+    var taken: u32 = 0;
+    const bits = @bitSizeOf(@TypeOf(given[0]));
+    for (0..given.len * bits) |cpu| {
+        if (taken == 2) break;
+        if (given[cpu / bits] >> @intCast(cpu % bits) & 1 == 0) continue;
+        try two.print(arena, "{s}{d}", .{ if (taken > 0) "," else "", cpu });
+        taken += 1;
+    }
+    const data = try std.fs.path.join(arena, &.{ context.scratch, "serve-sandbox-egress" });
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{ "taskset", "-c", two.items, context.determinismo, "serve", "--listen", address, "--data", data });
+    try argv.appendSlice(arena, context.machine);
+    var server = try std.process.spawn(context.io, .{ .argv = argv.items, .stdout = .ignore, .stderr = .ignore });
+    defer server.kill(context.io);
+    for (0..50) |_| {
+        const listed: []const u8 = curl(context, &.{url ++ "/machines"}) catch "";
+        if (listed.len > 0) break;
+        sleep_ms(100);
+    }
+    const tool = struct {
+        /// The tool's standard output, then its standard error (a refusal's reason is there).
+        fn run(c: *Context, args: []const []const u8) []const u8 {
+            var command: std.ArrayList([]const u8) = .empty;
+            const binary = std.fs.path.join(c.arena, &.{ c.bin, "determinismo-sandbox" }) catch return "";
+            const sandboxes = std.fs.path.join(c.arena, &.{ c.scratch, "sandboxes-egress" }) catch return "";
+            // Bounded: a fetch through a proxy with no way out waits its 20 s at each try.
+            command.appendSlice(c.arena, &.{ "timeout", "700", binary, "--serve", "http://127.0.0.1:7911", "--data", sandboxes }) catch return "";
+            command.appendSlice(c.arena, args) catch return "";
+            const result = run_kept(c, command.items) catch return "";
+            return std.mem.concat(c.arena, u8, &.{ std.mem.trimEnd(u8, result.stdout, "\n"), result.stderr }) catch "";
+        }
+    }.run;
+    // The page through the node's proxy: a CONNECT to the site, then a GET inside it; tried
+    // again (a deterministic machine draws faults at the boundary).
+    const fetch = "for i in 1 2 3 4 5 6 7 8; do out=$( (printf 'CONNECT " ++ site_address ++ " HTTP/1.1\\r\\nHost: site\\r\\n\\r\\n'; sleep 1; " ++
+        "printf 'GET /page.txt HTTP/1.0\\r\\nHost: site\\r\\n\\r\\n'; sleep 2) | timeout 20 nc 127.0.0.1 3128 2>&1 ); " ++
+        "case \"$out\" in *'and back'*) echo \"$out\" | tail -1; break;; esac; done";
+    const page = "out of the sandbox and back";
+    const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
+    const Made = struct { sandbox: u32 = 0 };
+    const id = (std.json.parseFromSliceLeaky(Made, arena, tool(context, &.{ "create", "--program", program, "--scenario", "bank", "--vcpus", "2" }), .{ .ignore_unknown_fields = true }) catch Made{}).sandbox;
+    const id_text = try std.fmt.allocPrint(arena, "{d}", .{id});
+    const allowed = tool(context, &.{ "egress", id_text, "redis", site_address });
+    const first = tool(context, &.{ "exec", id_text, "redis", fetch });
+    const Checkpoint = struct { checkpoint: []const u8 = "" };
+    const checkpoint = (std.json.parseFromSliceLeaky(Checkpoint, arena, tool(context, &.{ "checkpoint", id_text }), .{ .ignore_unknown_fields = true }) catch Checkpoint{}).checkpoint;
+    // A step after the checkpoint, in its record: what a replay from it runs again.
+    _ = tool(context, &.{ "exec", id_text, "redis", fetch });
+    const Forked = struct { sandboxes: []const u32 = &.{} };
+    const forks = (std.json.parseFromSliceLeaky(Forked, arena, tool(context, &.{ "fork", id_text, checkpoint, "1" }), .{ .ignore_unknown_fields = true }) catch Forked{}).sandboxes;
+    const fork_text = if (forks.len == 1) try std.fmt.allocPrint(arena, "{d}", .{forks[0]}) else "0";
+    const forked = if (forks.len == 1) tool(context, &.{ "exec", fork_text, "redis", fetch }) else "";
+    // Both CPUs held by machines now: a third is refused at once.
+    const refused_start = monotonic_ns();
+    const refused = tool(context, &.{ "fork", id_text, checkpoint, "1" });
+    const refused_s = (monotonic_ns() - refused_start) / std.time.ns_per_s;
+    // A second serve on the same two CPUs, giving a machine 5 s to start: its machine waits
+    // for a CPU the first serve's machines hold, is given up, and is stopped.
+    const other_data = try std.fs.path.join(arena, &.{ context.scratch, "serve-sandbox-egress-other" });
+    var other_argv: std.ArrayList([]const u8) = .empty;
+    try other_argv.appendSlice(arena, &.{
+        "taskset", "-c", two.items, context.determinismo, "serve", "--listen", "127.0.0.1:7913", "--data", other_data, "--machine-start-seconds", "5",
+    });
+    try other_argv.appendSlice(arena, context.machine);
+    var other = try std.process.spawn(context.io, .{ .argv = other_argv.items, .stdout = .ignore, .stderr = .ignore });
+    defer other.kill(context.io);
+    for (0..50) |_| {
+        const up: []const u8 = curl(context, &.{"http://127.0.0.1:7913/machines"}) catch "";
+        if (up.len > 0) break;
+        sleep_ms(100);
+    }
+    const given_up = (run_kept(context, &.{
+        "curl",                                                                                                 "-s",                             "-H", "Content-Type: application/json", "-d",
+        try std.fmt.allocPrint(arena, "{{\"program\":\"{s}\",\"scenario\":\"bank\",\"vcpus\":2}}", .{program}), "http://127.0.0.1:7913/machines",
+    }) catch return error.RequestFailed).stdout;
+    const given_up_pid_text = std.Io.Dir.cwd().readFileAlloc(context.io, try std.fs.path.join(arena, &.{ other_data, "machines", "1", "pid" }), arena, .limited(64)) catch "";
+    const given_up_pid = std.fmt.parseInt(i32, std.mem.trim(u8, given_up_pid_text, " \n"), 10) catch 0;
+    sleep_ms(500);
+    const given_up_runs = given_up_pid > 0 and linux.errno(linux.kill(given_up_pid, @fromBackingInt(@intCast(0)))) == .SUCCESS;
+    _ = tool(context, &.{ "delete", fork_text });
+    const listed = tool(context, &.{"list"});
+    _ = tool(context, &.{ "rewind", id_text, checkpoint });
+    const rewound = tool(context, &.{ "exec", id_text, "redis", fetch });
+    const Run = struct { run: u32 = 0 };
+    const replay_id = (std.json.parseFromSliceLeaky(Run, arena, tool(context, &.{ "replay", id_text, checkpoint }), .{ .ignore_unknown_fields = true }) catch Run{}).run;
+    if (replay_id > 0) for (0..1200) |_| {
+        const run_state = curl(context, &.{try std.fmt.allocPrint(arena, url ++ "/runs/{d}", .{replay_id})}) catch "";
+        if (run_state.len > 0 and std.mem.indexOf(u8, run_state, "\"state\":\"running\"") == null) break;
+        sleep_ms(500);
+    };
+    const replayed = if (replay_id > 0) curl(context, &.{try std.fmt.allocPrint(arena, url ++ "/runs/{d}/output", .{replay_id})}) catch "" else "";
+    _ = tool(context, &.{ "delete", id_text });
+    expect_all(context, &.{
+        .{ "a sandbox's node is given a way out", id > 0 and std.mem.indexOf(u8, allowed, "\"proxy\"") != null },
+        .{ "it reads the allowed site's page", std.mem.indexOf(u8, first, page) != null },
+        .{ "a fork of a checkpoint taken after reads it too", forks.len == 1 and std.mem.indexOf(u8, forked, page) != null },
+        .{ "with every CPU held by a machine, one more is refused at once, saying so", refused_s < 30 and std.mem.indexOf(u8, refused, "is held by a machine") != null },
+        .{ "a machine that got no CPU in its serve's time is given up, saying so", std.mem.indexOf(u8, given_up, "was not up after 5 s") != null },
+        .{ "and its process is stopped", given_up_pid > 0 and !given_up_runs },
+        .{ "a deleted sandbox leaves the list", forks.len == 1 and std.mem.indexOf(u8, listed, try std.fmt.allocPrint(arena, "\"sandbox\":{s},", .{fork_text})) == null and
+            std.mem.indexOf(u8, listed, try std.fmt.allocPrint(arena, "\"sandbox\":{d},", .{id})) != null },
+        .{ "the sandbox rewound to the checkpoint reads it", std.mem.indexOf(u8, rewound, page) != null },
+        .{ "its steps replayed in a deterministic machine read it", replay_id > 0 and std.mem.indexOf(u8, replayed, page) != null },
+    }, "sandbox-egress: {d}, first \"{s}\", fork {s} \"{s}\", a third machine refused in {d} s (\"{s}\"), another serve's given up \"{s}\" (pid {d}, {s}), rewound \"{s}\", replay run {d}", .{
+        id,                                             std.mem.trim(u8, first[0..@min(first.len, 60)], " \n"),      fork_text,                                                     std.mem.trim(u8, forked[0..@min(forked.len, 60)], " \n"),
+        refused_s,                                      std.mem.trim(u8, refused[0..@min(refused.len, 140)], " \n"), std.mem.trim(u8, given_up[0..@min(given_up.len, 160)], " \n"), given_up_pid,
+        if (given_up_runs) "still running" else "gone", std.mem.trim(u8, rewound[0..@min(rewound.len, 60)], " \n"),  replay_id,
     });
 }
 

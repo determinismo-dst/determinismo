@@ -9,16 +9,20 @@
 # ($DETERMINISMO_DUCKDB or ~/opt/duckdb-x86_64-musl) src/main.zig's tests cannot link: the others
 # still build (pass patterns that leave it out).
 #   infra/host/unit.sh <ip> kafka sdk-zig
+# --cpus <list>: the CPUs the tests run on, instead of the host's reserved ones (a host shared
+# by cores with someone whose work has those), as check.sh's.
 set -euo pipefail
 
-usage="usage: $0 <ip> [<pattern>...] [--user <user>]"
+usage="usage: $0 <ip> [<pattern>...] [--user <user>] [--cpus <list>]"
 ip=${1:?$usage}
 shift
 user=det
+cpus_given=
 patterns=()
 while [ $# -gt 0 ]; do
   case $1 in
     --user) user=$2; shift ;;
+    --cpus) cpus_given=$2; shift ;;
     -*) echo "error: unknown option $1 ($usage)" >&2; exit 2 ;;
     *) patterns+=("$1") ;;
   esac
@@ -52,7 +56,7 @@ rsync -az --delete -e "ssh ${ssh_opts[*]}" "$repo/zig-out-unit/tests/" "$user@$i
 # Shipped: the local build goes (1.2 GB a build; the Mac's disk filled on 2026-11-08).
 rm -rf "$repo/zig-out-unit"
 # Each binary run in turn in one unit; its last lines and its verdict, then the count failed.
-ssh "${ssh_opts[@]}" "$user@$ip" "bash -s -- $(printf '%q ' "${chosen[@]}")" <<'EOF'
+ssh "${ssh_opts[@]}" "$user@$ip" "env CPUS=$(printf %q "$cpus_given") bash -s -- $(printf '%q ' "${chosen[@]}")" <<'EOF'
 set -uo pipefail
 cd ~/determinismo-unit
 cat > zig-out-unit/run.sh <<'RUN'
@@ -75,9 +79,21 @@ for name in "$@"; do
 done
 exit $failed
 RUN
+cpus=${CPUS:-$(infra/host/own-cpus.sh)}
+# Through taskset, its CPUs read back first, as check.sh's units (a unit's AllowedCPUs is merged
+# with the reserved cores' drop-in for all services: alone it does not confine).
+run() { sudo -n systemd-run --uid="$USER" --gid="$(id -g)" --quiet --wait --pipe --collect \
+  -p AllowedCPUs="$cpus" -p CPUWeight=20 -p MemoryMax=16G \
+  --working-directory="$PWD" taskset -c "$cpus" "$@"; }
+allowed=$(run grep Cpus_allowed_list /proc/self/status < /dev/null | cut -f2) || allowed=
+if ! python3 -c 'import sys
+cpus = lambda text: {cpu for part in text.split(",") for cpu in range(int(part.split("-")[0]), int(part.split("-")[-1]) + 1)}
+sys.exit(0 if sys.argv[2] and cpus(sys.argv[2]) <= cpus(sys.argv[1]) else 1)' "$cpus" "$allowed"; then
+  echo "error: the tests' unit may run on CPUs '$allowed', not within '$cpus': nothing was run" >&2
+  exit 2
+fi
+echo "== the tests' CPUs: $allowed"
 status=0
-sudo -n systemd-run --uid="$USER" --gid="$(id -g)" --quiet --wait --pipe --collect --unit "unit-tests-$$" \
-  -p AllowedCPUs="$(infra/host/own-cpus.sh)" -p CPUWeight=20 -p MemoryMax=16G \
-  --working-directory="$PWD" /bin/bash zig-out-unit/run.sh "$@" || status=$?
+run /bin/bash zig-out-unit/run.sh "$@" < /dev/null || status=$?
 exit $status
 EOF

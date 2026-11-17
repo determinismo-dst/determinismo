@@ -100,6 +100,7 @@ const store = @import("store.zig");
 const holders = @import("holders.zig");
 const replay_snapshots = @import("core").replay_snapshots;
 const activity = @import("activity.zig");
+const cpus = @import("cpus.zig");
 const host_core = @import("host_core.zig");
 const host_runs = @import("runs.zig");
 const VM = @import("core").vm;
@@ -140,6 +141,9 @@ pub const Options = struct {
     /// client went away (a killed script, a closed REPL) and would hold its machine and one of
     /// sessions_max slots until serve restarts.
     session_idle_ns: u64 = 30 * std.time.ns_per_min,
+    /// A machine asked for is given up when it is not up after this long
+    /// (`--machine-start-seconds`): it waits for a CPU of its pool, which others' VMs may hold.
+    machine_start_ns: u64 = 600 * std.time.ns_per_s,
 };
 
 const runs_max = host_runs.runs_max;
@@ -1081,7 +1085,7 @@ fn handle(server: *Server, client: linux.fd_t) void {
         break :blk @as(u16, switch (err) {
             error.NotFound => 404,
             error.BadRequest, error.SyntaxError, error.UnexpectedToken => 400,
-            error.AddressInUse, error.ExplorerTooOld => 409,
+            error.AddressInUse, error.ExplorerTooOld, error.NoFreeCpu => 409,
             else => 500,
         });
     };
@@ -3016,7 +3020,22 @@ fn machine_create(server: *Server, asked: MachineRequest) !u32 {
     if ((asked.program == null) == (asked.compose == null)) return error.BadRequest;
     if (asked.vcpus < 2 or asked.vcpus > 32) return error.BadRequest;
     const shared = server.shared;
+    // A machine holds a CPU of its pool for its life (`run` takes it as it starts, and a machine
+    // does not end by itself): with every one held by a machine, another waited ten minutes for
+    // a CPU that could not come and failed without a word (MachineFailed: the agent demo's
+    // fourth sandbox, on three reserved cores). Refused at once, saying so.
+    const pool_cpus = try machine_cpus(server);
     shared.lock();
+    var alive: u32 = 0;
+    for (&shared.machines) |*other| {
+        // One being made (its slot taken, its process not started yet) will hold a CPU too.
+        if (other.id != 0 and (other.pid <= 0 or other.alive())) alive += 1;
+    }
+    if (alive >= pool_cpus) {
+        shared.unlock();
+        server.detail = try print(server, "every CPU machines run on is held by a machine ({d} of {d}): delete one first", .{ alive, pool_cpus });
+        return error.NoFreeCpu;
+    }
     const machine = for (&shared.machines) |*slot| {
         if (slot.id == 0) {
             slot.* = .{ .id = shared.machine_next };
@@ -3049,7 +3068,11 @@ fn machine_create(server: *Server, asked: MachineRequest) !u32 {
         "--dev",        directory,
     });
     if (asked.from) |reference| try argv.appendSlice(arena, &.{ "--from-snapshot", try checkpoint_path(server, reference) });
-    machine.pid = try spawn_logged(server, try reserved(server, argv.items), try std.fs.path.join(arena, &.{ directory, "output.log" }));
+    const output = try std.fs.path.join(arena, &.{ directory, "output.log" });
+    machine.pid = try spawn_logged(server, try reserved(server, argv.items), output);
+    // Given up, it is stopped: one left waiting for a CPU took it twenty minutes later and ran
+    // on, a machine of no one's, on a core its neighbours' VMs then waited for (2026-11-17).
+    errdefer machine_stop(machine);
     // Its pid with it: a serve started again adopts the machine (machines_adopt).
     try std.Io.Dir.cwd().writeFile(server.io, .{
         .sub_path = try std.fs.path.join(arena, &.{ directory, "pid" }),
@@ -3059,15 +3082,26 @@ fn machine_create(server: *Server, asked: MachineRequest) !u32 {
     machine.checkpoints = 0;
     // Its events file appears once its machine is up.
     const events = try std.fs.path.join(arena, &.{ directory, "events.jsonl" });
-    for (0..6000) |_| {
+    const start_seconds = server.options.machine_start_ns / std.time.ns_per_s;
+    for (0..start_seconds * 10) |_| {
         std.Io.Dir.cwd().access(server.io, events, .{}) catch {
-            if (!machine.alive()) return error.MachineFailed;
+            if (!machine.alive()) {
+                server.detail = try print(server, "the machine ended as it started: {s}", .{try output_last(server, output)});
+                return error.MachineFailed;
+            }
             sleep_ms(100);
             continue;
         };
         break;
-    } else return error.MachineFailed;
-    machine.ready_wait(arena, asked.from != null, 1800) catch return error.MachineFailed;
+    } else {
+        server.detail = try print(server, "the machine was not up after {d} s and was stopped (before its boot it waits " ++
+            "for a CPU of its pool and for memory, which others' VMs may hold): {s}", .{ start_seconds, try output_last(server, output) });
+        return error.MachineFailed;
+    }
+    machine.ready_wait(arena, asked.from != null, 1800) catch {
+        server.detail = try print(server, "the machine's system was not ready and it was stopped: {s}", .{try output_last(server, output)});
+        return error.MachineFailed;
+    };
     try machine_watch(server, machine);
     return machine.id;
 }
@@ -3211,6 +3245,34 @@ fn machine_reference(server: *Server, machine: *const Machine) []const u8 {
 fn checkpoint_path(server: *Server, reference: []const u8) ![]const u8 {
     if (std.mem.indexOf(u8, reference, "..") != null or reference.len == 0 or reference[0] == '/') return error.BadRequest;
     return std.fs.path.join(server.arena, &.{ server.options.data_directory, "machines", reference });
+}
+
+/// How many CPUs machines can take: their pool's size, asked where they run (`reserved`: the
+/// reserved cores' scope when serve has them; serve's own CPUs, the runs', are not theirs).
+fn machine_cpus(server: *Server) !u32 {
+    const result = try replay_run(server, &.{ server.options.self, "cpus" });
+    const Pool = struct { cpus: u32 = 0 };
+    const pool = std.json.parseFromSliceLeaky(Pool, server.arena, result.stdout, .{ .ignore_unknown_fields = true }) catch Pool{};
+    if (pool.cpus == 0) {
+        server.detail = try print(server, "`{s} cpus` did not say how many CPUs machines have: {s}", .{
+            server.options.self, std.mem.trim(u8, result.stderr[0..@min(result.stderr.len, 300)], " \n"),
+        });
+        return error.MachineCpusUnknown;
+    }
+    return pool.cpus;
+}
+
+/// The last line of a machine's output (what it said before it ended or was given up), or
+/// that it said nothing.
+fn output_last(server: *Server, path: []const u8) ![]const u8 {
+    const text = std.Io.Dir.cwd().readFileAlloc(server.io, path, server.arena, .limited(16 << 20)) catch "";
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    var last: []const u8 = "";
+    while (lines.next()) |line| {
+        if (std.mem.trim(u8, line, " \r\t").len > 0) last = line;
+    }
+    if (last.len == 0) return "it printed nothing";
+    return print(server, "its output's last line: {s}", .{last[0..@min(last.len, 300)]});
 }
 
 fn machine_stop(machine: *Machine) void {

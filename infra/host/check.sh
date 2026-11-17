@@ -10,15 +10,19 @@
 # Without DuckDB's x86_64-musl libraries here ($DETERMINISMO_DUCKDB or ~/opt/duckdb-x86_64-musl),
 # the host builds instead (--build-on host).
 # Usage: infra/host/check.sh <ip> <check>... [--user <user>] [--kernel] [--build-on here|host]
+#          [--tree <name>] [--cpus <list>]
+# --cpus: the CPUs the checks run on, instead of the host's reserved ones (a host shared with
+# someone whose work has those: the checks on the CPUs agreed).
 set -euo pipefail
 
-ip=${1:?usage: $0 <ip> <check>... [--user <user>] [--kernel] [--build-on here|host] [--tree <name>]}
+ip=${1:?usage: $0 <ip> <check>... [--user <user>] [--kernel] [--build-on here|host] [--tree <name>] [--cpus <list>]}
 shift
 user=det
 kernel=0
 # The tree on the host the checks run in (and <tree>-guest beside it): one a session, never two
 # runs in one (they overwrite each other's binaries, guest and logs: 2026-11-11, two sessions).
 tree=determinismo-check
+cpus_given=
 duckdb_here=${DETERMINISMO_DUCKDB:-$HOME/opt/duckdb-x86_64-musl}
 build_on=host
 [ -f "$duckdb_here/libduckdb_static.a" ] && build_on=here
@@ -29,6 +33,7 @@ while [ $# -gt 0 ]; do
     --kernel) kernel=1 ;;
     --build-on) build_on=$2; shift ;;
     --tree) tree=$2; shift ;;
+    --cpus) cpus_given=$2; shift ;;
     -*) echo "error: unknown option $1" >&2; exit 2 ;;
     *) checks+=("$1") ;;
   esac
@@ -57,7 +62,7 @@ if [ "$build_on" = here ]; then
 fi
 
 # Quoted for the host's shell: ssh joins its arguments into one command line.
-ssh "${ssh_opts[@]}" "$user@$ip" "env BUILD_ON=$(printf %q "$build_on") KERNEL=$kernel TREE=$(printf %q "$tree")" \
+ssh "${ssh_opts[@]}" "$user@$ip" "env BUILD_ON=$(printf %q "$build_on") KERNEL=$kernel TREE=$(printf %q "$tree") CPUS=$(printf %q "$cpus_given")" \
   "STEPS=$(printf %q "${steps[*]}") CHECKS=$(printf %q "${checks[*]}") bash -s" <<'EOF'
 set -euo pipefail
 cd ~/"$TREE"
@@ -67,15 +72,31 @@ mkdir -p "$guest"
 # siblings too (sharing a hunt's physical cores cost Conductor's run 443 40% of its timelines).
 # A host without reserved cores (serve on every CPU: a small rented machine, a user's own) has no
 # hunt's cores to keep apart: the checks take every CPU, at their low weight still, and say so.
-if ! cpus=$(infra/host/own-cpus.sh 2>/dev/null); then
+if [ -n "$CPUS" ]; then
+  cpus=$CPUS
+elif ! cpus=$(infra/host/own-cpus.sh 2>/dev/null); then
   cpus=0-$(( $(nproc --all) - 1 ))
   echo "== no reserved CPUs here: the checks run on all of them ($cpus), beside any run at weight 20"
 fi
 # OOMPolicy: a VM the kernel's OOM killer takes is the check's to judge, not a reason for systemd to
 # stop the unit (its default; trial.sh's run 689, 2026-11-02).
+# taskset beside AllowedCPUs: on a host with reserved cores every service is given them by a
+# drop-in for all services (isolate.sh's service.d), and systemd merges that list with a unit's
+# own: a unit asked onto other CPUs is allowed both (checks asked onto 3-5 of a shared host ran on
+# 0-5, their VMs on the neighbour's cores, 2026-11-17). The command's own affinity is what its
+# children inherit and what the CPU pool reads (cpus.zig: the CPUs a process was given).
 run() { sudo -n systemd-run --uid="$USER" --gid="$(id -g)" --quiet --wait --collect --pipe \
   -p AllowedCPUs="$cpus" -p CPUWeight=20 -p MemoryMax=24G -p OOMPolicy=continue \
-  --working-directory="$PWD" "$@"; }
+  --working-directory="$PWD" taskset -c "$cpus" "$@"; }
+# Read back before anything runs: what a process of the checks' unit is allowed.
+allowed=$(run grep Cpus_allowed_list /proc/self/status < /dev/null | cut -f2) || allowed=
+if ! python3 -c 'import sys
+cpus = lambda text: {cpu for part in text.split(",") for cpu in range(int(part.split("-")[0]), int(part.split("-")[-1]) + 1)}
+sys.exit(0 if sys.argv[2] and cpus(sys.argv[2]) <= cpus(sys.argv[1]) else 1)' "$cpus" "$allowed"; then
+  echo "error: the checks' unit may run on CPUs '$allowed', not within '$cpus': nothing was run" >&2
+  exit 2
+fi
+echo "== the checks' CPUs: $allowed"
 if [ "$BUILD_ON" = host ]; then
   echo "== the build, on the host"
   run ~/opt/zig/zig build $STEPS -Drelease
@@ -86,7 +107,7 @@ if [ "$KERNEL" = 1 ]; then
 else
   cp ~/guest/vmlinuz ~/guest/det_guest.ko "$guest/"
 fi
-zig-out/bin/det-initramfs --bin zig-out/bin --module "$guest/det_guest.ko" \
+run "$PWD/zig-out/bin/det-initramfs" --bin zig-out/bin --module "$guest/det_guest.ko" \
   --busybox /usr/bin/busybox --e2fsck /sbin/e2fsck.static --out "$guest/base.cpio" > /dev/null
 # The UI's check (tests/ui: Playwright, in a browser against a serve of the check's own). Its
 # packages live in this tree (node_modules, kept through the syncs) and its browser in the

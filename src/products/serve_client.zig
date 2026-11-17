@@ -4,6 +4,15 @@
 //! of serve and nothing else: the machines (/machines) and runs (/runs) are its.
 const std = @import("std");
 
+/// serve's URL when no `--serve` names one: `DETERMINISMO_SERVE` (a serve on another port or
+/// host, said once for every command of a shell), else the local default.
+pub fn url_default() []const u8 {
+    if (std.c.getenv("DETERMINISMO_SERVE")) |value| {
+        if (std.mem.span(value).len > 0) return std.mem.span(value);
+    }
+    return "http://127.0.0.1:7878";
+}
+
 pub const Client = struct {
     arena: std.mem.Allocator,
     io: std.Io,

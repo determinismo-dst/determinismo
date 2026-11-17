@@ -59,7 +59,10 @@ const usage =
     \\                            property's first failing timeline saved to disk as soon as it
     \\                            is found, for analyses to start at once; off: a replay each)
     \\                            [--failure-analysis]   (each analyzed at once, in the background,
-    \\                            on 4 CPUs beside the runs) <machine options>
+    \\                            on 4 CPUs beside the runs)
+    \\                            [--machine-start-seconds <s>]   (how long a machine asked for
+    \\                            may wait for a CPU before it is given up, 600 by default)
+    \\                            <machine options>
     \\       determinismo mcp     <machine options>   (an MCP server on stdio, for agents)
     \\       determinismo verify  <explore options> --record <run.jsonl> --tape-dir <dir>
     \\                            [--sample <n>] [--jobs <n>]   (a sample of a run's timelines
@@ -740,6 +743,17 @@ pub fn main(init: std.process.Init) !void {
     for (verdicts) |failing| if (failing > 0) std.process.exit(3);
 }
 
+/// `determinismo cpus`: how many CPUs this process's VMs can take (its pool: the CPUs it was
+/// given, one thread per core), as JSON. serve asks it where machines run (the reserved cores'
+/// scope when it has them), whose CPUs are not serve's own.
+fn cpus_print(io: std.Io) !u8 {
+    var buffer: [64]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(io, &buffer);
+    try stdout.interface.print("{{\"cpus\":{d}}}\n", .{cpus.usable_count()});
+    try stdout.interface.flush();
+    return 0;
+}
+
 /// `determinismo cpuid`: this host's deterministic guest CPUID table (cpuid.table_write's
 /// text), for another CPU model to replay this host's runs with `--cpuid <file>`.
 fn cpuid_print(io: std.Io, rest: []const [:0]const u8) !u8 {
@@ -799,6 +813,8 @@ fn command_tool(
         bundle.run(arena, io, rest)
     else if (eql(u8, name, "cpuid"))
         cpuid_print(io, rest)
+    else if (eql(u8, name, "cpus"))
+        cpus_print(io)
     else
         return null;
     // The usage for a usage error only: after another (a run's events held by serve, a missing
@@ -1311,6 +1327,7 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
     var failure_snapshots = false;
     var failure_analysis = false;
     var session_idle_minutes: u64 = 30;
+    var machine_start_seconds: u64 = 600;
     var bb: []const u8 = "bb";
     var machine: std.ArrayList([]const u8) = .empty;
     var index: usize = 0;
@@ -1342,6 +1359,10 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
             session_idle_minutes = try std.fmt.parseInt(u64, value, 10);
             if (session_idle_minutes == 0) return error.SessionIdleMinutes;
             index += 1;
+        } else if (std.mem.eql(u8, flag, "--machine-start-seconds")) {
+            machine_start_seconds = try std.fmt.parseInt(u64, value, 10);
+            if (machine_start_seconds == 0) return error.MachineStartSeconds;
+            index += 1;
         } else if (std.mem.eql(u8, flag, "--explorer")) {
             explorer = value; // Self-tests: a stand-in for `determinismo explore`.
             index += 1;
@@ -1367,6 +1388,7 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
         .failure_snapshots = failure_snapshots,
         .failure_analysis = failure_analysis,
         .session_idle_ns = session_idle_minutes * std.time.ns_per_min,
+        .machine_start_ns = machine_start_seconds * std.time.ns_per_s,
     });
 }
 

@@ -40,11 +40,14 @@ pub fn main(init: std.process.Init) !void {
     };
     sdk.event("egress_ready", .{ .port = port });
     // A deterministic machine's connections go through egress decisions (the VM connects,
-    // replays answer from the tape); a fast VM's through the host's relay.
-    const channel = sdk.egress_channel();
+    // replays answer from the tape); a fast VM's through the host's relay. Asked at each
+    // connection, not once at the start: a proxy started in a fast VM goes on in the
+    // deterministic machines made from its checkpoints (a sandbox's replays and explorations),
+    // where one fixed on the relay had every connection wait for a host that is not there.
     // Faults at the boundary, a deterministic machine's: how many connections in eight fail,
-    // drawn per timeline (none in a quarter of them; the bandit learns which rates pay).
-    const fault_eighths: u64 = if (channel == .decisions) sdk.random_config("egress.fault_eighths", 4) else 0;
+    // drawn per timeline at its first connection there (none in a quarter of them; the bandit
+    // learns which rates pay).
+    var fault_eighths: ?u64 = null;
     var next: u32 = 1;
     while (true) {
         const accepted = linux.accept4(listener, null, null, linux.SOCK.CLOEXEC);
@@ -52,12 +55,14 @@ pub fn main(init: std.process.Init) !void {
         if (linux.errno(accepted) != .SUCCESS) continue;
         const id = next;
         next += 1;
+        const channel = sdk.egress_channel();
+        if (channel == .decisions and fault_eighths == null) fault_eighths = sdk.random_config("egress.fault_eighths", 4);
         const pid = linux.fork();
         if (pid == 0) {
             _ = linux.close(listener);
             switch (channel) {
                 .relay => connection(@intCast(accepted), port, id),
-                .decisions => connection_deterministic(@intCast(accepted), id, fault_eighths),
+                .decisions => connection_deterministic(@intCast(accepted), id, fault_eighths.?),
             }
             linux.exit_group(0);
         }

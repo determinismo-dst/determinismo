@@ -6,7 +6,8 @@
 //! what it boots), `record.jsonl` (each step: exec, write, checkpoint, rewind) and `writes/` (each
 //! written file's bytes, for replays).
 //!
-//!   determinismo-sandbox [--serve <url>] [--data <dir>] <command>:
+//!   determinismo-sandbox [--serve <url>] [--data <dir>] <command>   (serve: DETERMINISMO_SERVE,
+//!   else http://127.0.0.1:7878):
 //!     create (--compose <file> | --program <p>) [--profile p] [--scenario s] [--vcpus n] [--memory-mib n]
 //!     exec <sandbox> <node> <command>         its status and output
 //!     write <sandbox> <node> <path> <file> [--secret]   (`-`: stdin; --secret: no copy kept)
@@ -37,7 +38,11 @@ const Request = struct {
     memory_mib: u32 = 2048,
 };
 
-const State = struct { machine: u32, request: Request };
+/// A node's way out (`egress`): the hosts its proxy may reach. Part of a sandbox's state as its
+/// files are: a checkpoint's forks, rewinds, replays and explorations have what it had.
+const Egress = struct { node: []const u8, allow: []const []const u8 };
+
+const State = struct { machine: u32, request: Request, egress: []const Egress = &.{}, deleted: bool = false };
 
 const Context = struct {
     arena: std.mem.Allocator,
@@ -49,7 +54,7 @@ const Context = struct {
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const argv = try init.minimal.args.toSlice(arena);
-    var serve_url: []const u8 = "http://127.0.0.1:7878";
+    var serve_url: []const u8 = @import("serve_client.zig").url_default();
     var data: ?[]const u8 = null;
     var index: usize = 1;
     while (index + 1 < argv.len) {
@@ -107,13 +112,14 @@ fn command_run(context: Context, command: []const u8, args: []const []const u8) 
                 request.memory_mib = try std.fmt.parseInt(u32, value, 10);
             } else return error.Usage;
         }
-        const id = try sandbox_new(context, request, null);
+        const id = try sandbox_new(context, request, null, &.{});
         return std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(.{ .sandbox = id }, .{})});
     }
     if (eql(u8, command, "list")) return list(context);
     if (args.len == 0) return error.Usage;
     const id = std.fmt.parseInt(u32, args[0], 10) catch return error.Usage;
     var state = try state_read(context, id);
+    if (state.deleted) return error.NoSuchSandbox;
     if (eql(u8, command, "exec")) {
         if (args.len != 3) return error.Usage;
         const result = try context.client.exec(state.machine, args[1], args[2], 600);
@@ -146,21 +152,28 @@ fn command_run(context: Context, command: []const u8, args: []const []const u8) 
     }
     if (eql(u8, command, "checkpoint")) {
         const name = try context.client.checkpoint(state.machine);
-        try record(context, id, .{ .op = "checkpoint", .checkpoint = name });
+        try record(context, id, .{ .op = "checkpoint", .checkpoint = name, .egress = state.egress });
         return std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(.{ .checkpoint = name }, .{})});
     }
     if (eql(u8, command, "fork")) {
         if (args.len != 3) return error.Usage;
         const count = try std.fmt.parseInt(u32, args[2], 10);
         if (count == 0 or count > 32) return error.Usage;
+        const carried = try checkpoint_egress(context, id, args[1]);
         var ids: std.ArrayList(u32) = .empty;
-        for (0..count) |_| try ids.append(arena, try sandbox_new(context, state.request, args[1]));
+        for (0..count) |_| try ids.append(arena, try sandbox_new(context, state.request, args[1], carried));
         return std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(.{ .sandboxes = ids.items }, .{})});
     }
     if (eql(u8, command, "rewind")) {
         if (args.len != 2) return error.Usage;
+        const carried = try checkpoint_egress(context, id, args[1]);
         try context.client.delete(state.machine);
         state.machine = try machine_new(context, state.request, args[1]);
+        // Its machine now, whatever its egress's attaching says next.
+        state.egress = &.{};
+        try state_write(context, id, state);
+        for (carried) |entry| _ = try egress_attach(context, state.machine, entry);
+        state.egress = carried;
         try state_write(context, id, state);
         try record(context, id, .{ .op = "rewind", .checkpoint = args[1] });
         return std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(.{ .sandbox = id, .machine = state.machine }, .{})});
@@ -168,34 +181,80 @@ fn command_run(context: Context, command: []const u8, args: []const []const u8) 
     if (eql(u8, command, "explore")) {
         if (args.len < 2) return error.Usage;
         const branches: u32 = if (args.len > 2) try std.fmt.parseInt(u32, args[2], 10) else 16;
-        return run_start(context, state.request, args[1], .{ .branches = branches, .time_budget = if (args.len > 3) args[3] else null });
+        return run_start(context, state.request, args[1], .{
+            .branches = branches,
+            .time_budget = if (args.len > 3) args[3] else null,
+            .egress = try egress_hosts(arena, try checkpoint_egress(context, id, args[1])),
+        });
     }
     if (eql(u8, command, "replay")) {
         if (args.len < 2) return error.Usage;
         const until: ?u32 = if (args.len > 2) try std.fmt.parseInt(u32, args[2], 10) else null;
         const steps = try replay_steps(context, id, args[1], until);
-        return run_start(context, state.request, args[1], .{ .branches = 1, .steps = steps });
+        return run_start(context, state.request, args[1], .{
+            .branches = 1,
+            .steps = steps,
+            .egress = try egress_hosts(arena, try checkpoint_egress(context, id, args[1])),
+        });
     }
     if (eql(u8, command, "egress")) {
         // A way out for a node: an HTTPS proxy in it for the hosts named (serve's egress).
         if (args.len < 3) return error.Usage;
-        const body = try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(.{ .node = args[1], .allow = args[2..] }, .{})});
-        const reply = try context.client.call("POST", try std.fmt.allocPrint(arena, "/machines/{d}/egress", .{state.machine}), body);
-        if (reply.status != 200) return error.EgressRefused;
+        const entry: Egress = .{ .node = args[1], .allow = args[2..] };
+        const answer = try egress_attach(context, state.machine, entry);
+        state.egress = try std.mem.concat(arena, Egress, &.{ state.egress, &.{entry} });
+        try state_write(context, id, state);
         try record(context, id, .{ .op = "egress", .node = args[1], .allow = args[2..] });
-        return reply.body;
+        return answer;
     }
     if (eql(u8, command, "delete")) {
         try context.client.delete(state.machine);
+        state.deleted = true;
+        try state_write(context, id, state);
         try record(context, id, .{ .op = "delete" });
         return std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(.{ .sandbox = id, .deleted = true }, .{})});
     }
     return error.Usage;
 }
 
-/// A new sandbox: its machine (from a checkpoint for a fork), its state, its record begun.
-fn sandbox_new(context: Context, request: Request, from: ?[]const u8) !u32 {
+/// serve's egress for a machine's node (its proxy in the node, the host's relay for the hosts
+/// allowed): serve's answer. On a machine made from a checkpoint the proxy is there already,
+/// brought by the checkpoint (det-egress says so), and the relay is what this adds.
+fn egress_attach(context: Context, machine: u32, entry: Egress) ![]const u8 {
+    const body = try std.fmt.allocPrint(context.arena, "{f}", .{std.json.fmt(.{ .node = entry.node, .allow = entry.allow }, .{})});
+    const reply = try context.client.call("POST", try std.fmt.allocPrint(context.arena, "/machines/{d}/egress", .{machine}), body);
+    if (reply.status != 200) return error.EgressRefused;
+    return reply.body;
+}
+
+/// The egress a sandbox had when it took `checkpoint` (its record's checkpoint step, or the
+/// step that made it a fork of that checkpoint): none for one this sandbox never recorded.
+fn checkpoint_egress(context: Context, id: u32, checkpoint: []const u8) ![]const Egress {
+    const text = std.Io.Dir.cwd().readFileAlloc(context.io, try sandbox_path(context, id, "record.jsonl"), context.arena, .limited(64 << 20)) catch "";
+    const Step = struct { op: []const u8 = "", checkpoint: []const u8 = "", egress: []const Egress = &.{} };
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const step = std.json.parseFromSliceLeaky(Step, context.arena, line, .{ .ignore_unknown_fields = true }) catch continue;
+        const made = std.mem.eql(u8, step.op, "checkpoint") or std.mem.eql(u8, step.op, "forked");
+        if (made and std.mem.eql(u8, step.checkpoint, checkpoint)) return step.egress;
+    }
+    return &.{};
+}
+
+/// Every host the entries allow: a run's `egress` (its timelines' det-egress may reach them).
+fn egress_hosts(arena: std.mem.Allocator, entries: []const Egress) ![]const []const u8 {
+    var hosts: std.ArrayList([]const u8) = .empty;
+    for (entries) |entry| try hosts.appendSlice(arena, entry.allow);
+    return hosts.items;
+}
+
+/// A new sandbox: its machine (from a checkpoint for a fork, with the egress the checkpoint
+/// had), its state, its record begun.
+fn sandbox_new(context: Context, request: Request, from: ?[]const u8, egress: []const Egress) !u32 {
     const machine = try machine_new(context, request, from);
+    // A fork that cannot have its checkpoint's way out is no fork: its machine goes with it.
+    errdefer context.client.delete(machine) catch {};
+    for (egress) |entry| _ = try egress_attach(context, machine, entry);
     var highest: u32 = 0;
     var directory = try std.Io.Dir.cwd().openDir(context.io, context.data, .{ .iterate = true });
     defer directory.close(context.io);
@@ -203,8 +262,8 @@ fn sandbox_new(context: Context, request: Request, from: ?[]const u8) !u32 {
     while (try entries.next(context.io)) |entry| highest = @max(highest, std.fmt.parseInt(u32, entry.name, 10) catch 0);
     const id = highest + 1;
     try std.Io.Dir.cwd().createDirPath(context.io, try sandbox_path(context, id, ""));
-    try state_write(context, id, .{ .machine = machine, .request = request });
-    if (from) |checkpoint| try record(context, id, .{ .op = "forked", .checkpoint = checkpoint });
+    try state_write(context, id, .{ .machine = machine, .request = request, .egress = egress });
+    if (from) |checkpoint| try record(context, id, .{ .op = "forked", .checkpoint = checkpoint, .egress = egress });
     return id;
 }
 
@@ -234,7 +293,13 @@ fn write(context: Context, id: u32, state: State, node: []const u8, path: []cons
     return std.fmt.allocPrint(context.arena, "{f}", .{std.json.fmt(.{ .written = bytes.len }, .{})});
 }
 
-const RunOptions = struct { branches: u32, time_budget: ?[]const u8 = null, steps: []const []const u8 = &.{} };
+const RunOptions = struct {
+    branches: u32,
+    time_budget: ?[]const u8 = null,
+    steps: []const []const u8 = &.{},
+    /// The hosts the checkpoint's egress allowed: the run's timelines may reach them too.
+    egress: []const []const u8 = &.{},
+};
 
 /// A run of serve's from a checkpoint: its scenario's timelines, or (with steps) held timelines
 /// running them in order. Its id.
@@ -250,6 +315,7 @@ fn run_start(context: Context, request: Request, checkpoint: []const u8, options
         .time_budget = options.time_budget,
         .checkpoint = checkpoint,
         .checkpoint_steps = options.steps,
+        .egress = options.egress,
     }, .{ .emit_null_optional_fields = false })});
     const started = try context.client.json(Started, "POST", "/runs", body);
     return std.fmt.allocPrint(context.arena, "{f}", .{std.json.fmt(.{ .run = started.id }, .{})});
@@ -315,6 +381,7 @@ fn list(context: Context) ![]const u8 {
     while (try entries.next(context.io)) |entry| {
         const id = std.fmt.parseInt(u32, entry.name, 10) catch continue;
         const state = state_read(context, id) catch continue;
+        if (state.deleted) continue; // Its record stays; the sandbox is gone.
         if (!first) try out.append(arena, ',');
         first = false;
         try out.print(arena, "{f}", .{std.json.fmt(.{ .sandbox = id, .machine = state.machine }, .{})});

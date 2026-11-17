@@ -119,7 +119,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn run(arena: std.mem.Allocator, io: std.Io, argv: []const [:0]const u8) !u8 {
     var config_path: []const u8 = ".determinismo/ci.json";
-    var serve_url: []const u8 = "http://127.0.0.1:7878";
+    var serve_url: []const u8 = @import("serve_client.zig").url_default();
     var cache_directory: ?[]const u8 = null;
     // Where the tests come from (serve's CI page): the flags (a GitHub Action's, its checkout
     // copied without its .git), else the repository's git.

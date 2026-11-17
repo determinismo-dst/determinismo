@@ -37,16 +37,41 @@ its machine: a rewind replaces the machine, a replay runs the record.
 determinismo-sandbox [--serve <url>] [--data <dir>] <command>
   create (--compose <file> | --program <p>) [--profile p] [--scenario s] [--vcpus n] [--memory-mib n]
   exec <sandbox> <node> <command>         its status and output
-  write <sandbox> <node> <path> <file>    (`-`: stdin)
+  write <sandbox> <node> <path> <file> [--secret]   (`-`: stdin)
   read <sandbox> <node> <path>
   checkpoint <sandbox>                    the machine saved, going on
   fork <sandbox> <checkpoint> <count>     new sandboxes, each from the checkpoint
   rewind <sandbox> <checkpoint>
   explore <sandbox> <checkpoint> [branches] [time budget]   timelines with faults (a run)
   replay <sandbox> <checkpoint> [until]   its steps after the checkpoint, deterministic (a run)
+  egress <sandbox> <node> <host>...       an HTTPS proxy in the node for those hosts
   delete <sandbox> | list
   mcp                                     the same as MCP tools, over stdio
 ```
+
+serve's address: `--serve`, else `DETERMINISMO_SERVE`, else `http://127.0.0.1:7878`.
+
+## Egress
+
+A sandbox's nodes reach nothing outside by default. `egress <sandbox> <node> <host>...` starts
+a proxy in the node (`http://127.0.0.1:3128`, for `HTTPS_PROXY`) that reaches only the hosts
+named: an agent's model, a package index.
+
+The permission is part of the sandbox's state, as its files are. A checkpoint records it, so:
+
+- a **fork** or a **rewind** of that checkpoint has the same way out (an agent in each fork
+  calls its model);
+- a **replay** or an **exploration** from it may reach the same hosts. There the connections
+  are decisions on the timeline's tape: a replay of a recorded timeline answers from the tape
+  and reaches nothing.
+
+## CPUs
+
+A sandbox's machine holds one CPU for its life, whatever its vCPUs: the CPUs serve's machines
+run on (the reserved cores when serve has them, `serve.sh --reserved-cores`; serve's own
+otherwise) bound how many sandboxes are alive at once. One more is refused at once
+(`every CPU machines run on is held by a machine`): delete a sandbox first. A deleted sandbox
+keeps its record and checkpoints and leaves `list`.
 
 ## Secrets
 
