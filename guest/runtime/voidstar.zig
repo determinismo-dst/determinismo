@@ -261,6 +261,20 @@ fn map(size: usize, fd: ?linux.fd_t) ?[]align(std.heap.page_size_min) u8 {
 
 var guard_next = std.atomic.Value(u32).init(1);
 
+/// Whether the program's guards were numbered here, at a first call: a program without a C runtime
+/// (its own _start, as a Zig program's) runs no constructor, so trace-pc-guard's never calls
+/// the init. Linked in statically (lib/libvoidstar.o), the linker's symbols for the guards'
+/// section bound them; in a shared library the section is the library's own, which has none
+/// (it is not instrumented), and the program's constructor numbers its guards.
+var numbered_static = std.atomic.Value(bool).init(false);
+
+fn number_static() void {
+    if (numbered_static.swap(true, .acq_rel)) return;
+    const start = @extern(?[*]u32, .{ .name = "__start___sancov_guards", .linkage = .weak }) orelse return;
+    const stop = @extern(?[*]u32, .{ .name = "__stop___sancov_guards", .linkage = .weak }) orelse return;
+    __sanitizer_cov_trace_pc_guard_init(start, stop);
+}
+
 export fn __sanitizer_cov_trace_pc_guard_init(start: [*]u32, stop: [*]u32) void {
     if (start == stop or start[0] != 0) return; // Already numbered.
     const count: u32 = @intCast(stop - start);
@@ -275,8 +289,14 @@ const edge_reported: u32 = 0x8000_0000;
 /// Each edge once, as the C SDK's: as the source line its call is on, when known. Every pass a
 /// point where thread pausing may pause.
 export fn __sanitizer_cov_trace_pc_guard(guard: *u32) void {
-    const seen = @atomicLoad(u32, guard, .monotonic);
-    if (seen == 0) return;
+    var seen = @atomicLoad(u32, guard, .monotonic);
+    if (seen == 0) {
+        // Left out by the coverage set (zeroed below), or never numbered: once, numbered here.
+        if (numbered_static.load(.acquire)) return;
+        number_static();
+        seen = @atomicLoad(u32, guard, .monotonic);
+        if (seen == 0) return;
+    }
     if (seen & edge_reported != 0) return pausing_at(seen & ~edge_reported);
     const place_known = native_place(@returnAddress());
     if (!coverage_holds(if (place_known) |place| place.file else "")) {

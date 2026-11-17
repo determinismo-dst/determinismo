@@ -69,6 +69,23 @@ pub fn build(b: *std.Build) void {
     const sdk_tar = sdk_pack_run.addOutputFileArg("sdk.tar");
     sdk_pack_run.addDirectoryArg(b.path("sdk"));
     program_inputs(b, sdk_pack_run, "sdk", "");
+    // libvoidstar as an object (lib/libvoidstar.o) for programs linked statically without libc
+    // (a Zig program's own _start, as TigerBeetle's): its trace-pc-guard callbacks, system calls
+    // only, needing memcpy, memset and getauxval of the program. A fixed target and mode and no
+    // debug info, so its bytes are the same wherever the explorer is built: the tar's hash names
+    // the build context, and podman caches a COPY by its content.
+    const voidstar_object = b.addObject(.{
+        .name = "libvoidstar",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("guest/runtime/voidstar.zig"),
+            .target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .none, .cpu_model = .baseline }),
+            .optimize = .ReleaseSafe,
+            .pic = true,
+            .strip = true,
+            .stack_check = false,
+        }),
+    });
+    sdk_pack_run.addPrefixedFileArg("lib/libvoidstar.o=", voidstar_object.getEmittedBin());
     const sdk_tar_module = b.createModule(.{ .root_source_file = sdk_tar });
     const exe = b.addExecutable(.{
         .name = "determinismo",

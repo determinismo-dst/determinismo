@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: MIT
+# A static program without libc, linked with the SDK's lib/libvoidstar.o (as a statically linked
+# Zig program is): its edges reported as source lines though no constructor of it ran.
+#   determinismo explore ... --compose tests/antithesis-compat/static/compose.yaml --scenario run
+# The build context is the repository root, as the other compat projects'.
+services:
+  static:
+    build:
+      context: ../../..
+      dockerfile: tests/antithesis-compat/static/Dockerfile
+    command: [sleep, infinity]

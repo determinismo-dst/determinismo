@@ -246,6 +246,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "repl", check_repl },                             .{ "mechanics", check_mechanics },
         .{ "budget", check_budget },                         .{ "sinks", check_sinks },
         .{ "dotnet", check_dotnet },                         .{ "lines", check_lines },
+        .{ "voidstar-static", check_voidstar_static },
         .{ "frozen-start", check_frozen_start },             .{ "hangup", check_hangup },
         .{ "frozen-step", check_frozen_step },               .{ "templates", check_templates },
         .{ "volumes", check_volumes },                       .{ "setup-mode", check_setup_mode },
@@ -7087,6 +7088,26 @@ fn check_changed_commit(context: *Context, file: []const u8) !void {
         .{ "lines 23-24 ran in every timeline", std.mem.indexOf(u8, report, both) != null },
         .{ "line 17 is one of them", std.mem.indexOf(u8, report, first) != null },
     }, "changed: a targeted run by a commit of a repository fetched by its URL", .{});
+}
+
+/// A static program without libc (its own _start, so no constructor runs, as a Zig program's),
+/// built with trace-pc-guard and linked with the SDK's lib/libvoidstar.o (from the build context
+/// determinismo-sdk): libvoidstar numbers its guards at their first call, and its edges are
+/// source lines.
+fn check_voidstar_static(context: *Context) !void {
+    const arena = context.arena;
+    const events = try std.fmt.allocPrint(arena, "{s}/voidstar-static", .{context.scratch});
+    const report = try explore(context, &.{
+        "--compose", "tests/antithesis-compat/static/compose.yaml", "--scenario",   "run",
+        "--seed",    "1",                                           "--branches",   "1",
+        "--events-dir", events,
+    });
+    const ran = try run_kept(context, &.{ "grep", "-rlF", "static-prog ran", events });
+    const coverage = try run_kept(context, &.{ "grep", "-rlF", "\"name\":\"line /src/static/prog.c:", events });
+    expect_all(context, &.{
+        .{ "the program ran", ran.stdout.len > 0 },
+        .{ "its edges are source lines, though no constructor of it ran", coverage.stdout.len > 0 },
+    }, "voidstar-static: a static program without libc, linked with lib/libvoidstar.o, reports its coverage ({d} bytes of report)", .{report.len});
 }
 
 /// C built as Antithesis builds it (clang's trace-pc-guard, linked against libvoidstar, the binary

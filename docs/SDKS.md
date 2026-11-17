@@ -53,7 +53,14 @@ that reads its own stderr, or a production log, sees nothing of ours. Buggify po
 false there, and nothing is announced; the catalog still lists.
 
 Code coverage, for strategies that keep timelines reaching new code: C and Zig with
-`-fsanitize-coverage=trace-pc-guard` (`sanitize_coverage_trace_pc_guard`); Rust with the
+`-fsanitize-coverage=trace-pc-guard` (`sanitize_coverage_trace_pc_guard`); a program linked
+statically without libc (its own `_start`, as a Zig program's: no C runtime, no constructor run)
+with the same flag and the SDK's `lib/libvoidstar.o` (in a node image's build context,
+`COPY --from=determinismo-sdk lib/libvoidstar.o`): the callbacks with system calls only,
+x86_64-linux, freestanding, position-independent, needing `memcpy`, `memset` and `getauxval`
+of the program, its guards numbered at their first call when no constructor did (a Zig
+compiler without the flag: its `-femit-llvm-ir` compiled by clang of the same LLVM, then linked
+with the object); Rust with the
 feature `coverage` and `RUSTFLAGS="-C passes=sancov-module -C llvm-args=-sanitizer-coverage-level=3
 -C llvm-args=-sanitizer-coverage-trace-pc-guard"`, building with `--target <triple>`; Python
 (3.12+) with `coverage_start()`, or unchanged with `python3 -m determinismo run <script> [argument]...` (its directory's code, or the node's coverage set; Antithesis's `python -m antithesis`), and with nothing to do in a command run covered (`det-nodes exec --coverage`, determinismo-ci's tests: docs/CI.md); the JVM with nothing to do: determinismo puts its coverage agent on every node's `JAVA_TOOL_OPTIONS` (JDK 24+; every class but the JDK's, narrowed by the node's coverage set or a program's own `-javaagent:determinismo-coverage.jar=<prefixes>`; an older JVM runs uninstrumented and says so on standard error), as Antithesis instruments the JVM on its side; Node.js with `coverageStart()`;
