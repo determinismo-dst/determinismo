@@ -145,9 +145,10 @@
                      (assoc s
                             :info info
                             :timelines (if (map? timelines) [timelines] (vec timelines))
-                            ;; What the last query found, and checkpoints said before the
-                            ;; store has their session's events.
-                            :marks (vec (distinct (concat marks (filter (fn [mark] (contains? #{:found :checkpoint} (:kind mark))) (:marks s)))))
+                            ;; What the last query found, checkpoints said before the store
+                            ;; has their session's events, and where a Quint spec's
+                            ;; invariant was lost (serve has none of those).
+                            :marks (vec (distinct (concat marks (filter (fn [mark] (contains? #{:found :checkpoint :quint} (:kind mark))) (:marks s)))))
                             :live (= "running" (:state info)))))))
   nil)
 
