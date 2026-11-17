@@ -1088,6 +1088,14 @@
                    [(name k) (mapv second (sort-by (fn [[key _]] (str (if (keyword? key) (name key) key))) v))]))
                (sort-by (fn [[k _]] (name k)) state))))
 
+(defn- first-group
+  "The first group of a verdict's series (\"balances.0\", \"balances.1\", ...): its name and its
+  series, [name [[key values]]]."
+  [verdict]
+  (let [series (sort-by (fn [[k _]] (name k)) (:series verdict))
+        group (when (seq series) (first (str/split (name (first (first series))) #"\.")))]
+    [group (vec (filter (fn [[k _]] (= group (first (str/split (name k) #"\.")))) series))]))
+
 (defn- draw-quint
   "A timeline against a Quint spec: the verdict, the event it stopped at, and the spec's
   numbers along the run (a line a number, their sum above them, the event marked)."
@@ -1111,9 +1119,7 @@
         (text! (- (+ x width) (text-width small moment)) (+ y 34) blue small moment)))
     ;; The first group of the spec's numbers ("balances.0", "balances.1", ...), each a line over
     ;; the events; their sum in a strip above, red from where it leaves what it was.
-    (let [series (sort-by (fn [[k _]] (name k)) (:series verdict))
-          group (when (seq series) (first (str/split (name (first (first series))) #"\.")))
-          lines (vec (filter (fn [[k _]] (= group (first (str/split (name k) #"\.")))) series))
+    (let [[group lines] (first-group verdict)
           n (count (second (first lines)))]
       (when (and (seq lines) (> n 1))
         (let [top (+ y (if event 62 38))
@@ -1153,7 +1159,9 @@
     (when-let [steps (seq (:steps verdict))]
       (let [top (+ y (if event 62 38) (if (seq (:series verdict)) 190 0))
             sums (mapv (fn [step] (when-let [[_ values] (numbers-of (:state step))] (apply + values))) steps)
-            first-sum (first sums)
+            ;; The sum the spec began with (the plot's), or the first one listed.
+            lines (second (first-group verdict))
+            first-sum (if (seq lines) (apply + (map (fn [[_ vs]] (first vs)) lines)) (first sums))
             values-x (- (+ x width) 250)]
         (text! x top muted small "event")
         (text! (+ x 52) top muted small "at")
