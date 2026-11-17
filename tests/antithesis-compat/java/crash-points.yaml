@@ -16,5 +16,9 @@ services:
       context: ../../..
       dockerfile: tests/antithesis-compat/java/server/Dockerfile
     command: [sh, -c, "exec java -XX:TieredStopAtLevel=1 -javaagent:/app/determinismo-coverage.jar=StateServer -cp /app/classes:/app/determinismo-coverage.jar StateServer"]
+    # Crash points in every stretch, not one in eight: the check counts where they are asked
+    # (transitions, the epoch's stores), and a handful of asks decided it by chance.
+    environment:
+      DETERMINISMO_CRASH_POINTS: "1"
     labels:
       determinismo.faults: "+restart"

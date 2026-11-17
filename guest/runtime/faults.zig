@@ -1399,7 +1399,7 @@ fn apply(arena: std.mem.Allocator, system: *const schema.System, applied: *const
         .pod_isolate,
         .pod_degrade,
         .pod_partition,
-        => node_start(system, applied),
+        => _ = node_start(system, applied),
         .outage => outage_start(system, applied),
         .process_kill => apply_process_kill(system, applied),
         .signal => apply_signal(applied),
@@ -1852,15 +1852,17 @@ fn takes_down(kind: Kind) bool {
     };
 }
 
-fn node_start(system: *const schema.System, applied: *const Applied) void {
+/// A fault of one node begins, unless the node is turned away (below): whether it began. The
+/// only place its admission is drawn (node_admits draws the regime's overlap at each call).
+fn node_start(system: *const schema.System, applied: *const Applied) bool {
     const layer = layer_of(applied.kind);
-    const slot = node_slot(system, applied.node, layer) orelse return;
+    const slot = node_slot(system, applied.node, layer) orelse return false;
     // Busy in its layer, or in the other without the regime's overlap: skipped, not logged.
-    if (!node_admits(node_slot_index(system, applied.node).?, layer)) return;
+    if (!node_admits(node_slot_index(system, applied.node).?, layer)) return false;
     // Crash points and aftershocks start here, not through apply.
     if (!quorum_kept(system, applied)) {
         sdk.event("fault_skipped", .{ .kind = @tagName(applied.kind), .node = applied.node, .err = "QuorumKept" });
-        return;
+        return false;
     }
     if (nodes_down_max > 0 and takes_down(applied.kind)) {
         var active: [schema.nodes_max]bool = @splat(false);
@@ -1875,14 +1877,14 @@ fn node_start(system: *const schema.System, applied: *const Applied) void {
         );
         if (down >= nodes_down_max) {
             sdk.event("fault_skipped", .{ .node = applied.node, .err = "NodesDownMax" });
-            return;
+            return false;
         }
     }
     // Not running: a spare not started yet, a member a driver took out, or a node that exited on
     // its own. A restart would start it behind the scenario's back.
     if (nodes.state_of(applied.node) == .stopped) {
         sdk.event("fault_skipped", .{ .node = applied.node, .err = "NotRunning" });
-        return;
+        return false;
     }
     var fault = NodeFault{ .applied = applied.*, .end_ns = monotonic_ns() + applied.duration_ns };
     const started: anyerror!void = switch (applied.kind) {
@@ -1909,7 +1911,7 @@ fn node_start(system: *const schema.System, applied: *const Applied) void {
         const skipped = err == error.NoPods or err == error.OnePod or err == error.ThreadPending or
             err == error.SkewApart or err == error.SyscallErrorElsewhere;
         sdk.event(if (skipped) "fault_skipped" else "fault_failed", .{ .node = applied.node, .err = @errorName(err) });
-        return;
+        return false;
     };
     slot.* = fault;
     switch (applied.kind) {
@@ -1922,6 +1924,7 @@ fn node_start(system: *const schema.System, applied: *const Applied) void {
     if (node_fault.pod.path_size > 0) node_fault.applied.pod = node_fault.pod.name();
     if (node_fault.peer.path_size > 0) node_fault.applied.peer_pod = node_fault.peer.name();
     sdk.event("fault", node_fault.applied);
+    return true;
 }
 
 fn node_end(system: *const schema.System, slot: *?NodeFault) void {
@@ -2535,7 +2538,11 @@ fn aftershock_arm(index: usize, name: []const u8, cause: []const u8) void {
 /// once as one of the node's crash faults the swarm keeps now (a kill or a power loss, drawn:
 /// `fault.crash_point_kind`), `why: crash_point`; not in a quiet period, not for a node another
 /// fault holds, and not for a request older than the asking thread waits (the injector busy
-/// meanwhile: the crash would come elsewhere). Said either way (`crash_point`).
+/// meanwhile: the crash would come elsewhere). Said either way (`crash_point`), "crashed" once
+/// the crash began: said before, with the node's admission drawn here and again by node_start,
+/// a node held by a fault of the other layer was "crashed" at the first draw and turned away
+/// at the second, no kill and no fault following (e2e crash-points with points in every
+/// stretch: 132 crashed, 131 faults; the server asked again two seconds later).
 const crash_point_age_ns_max = 400 * std.time.ns_per_ms;
 
 /// What a crash point may be granted now, where every node reads it (its /opt/determinismo is the
@@ -2612,7 +2619,8 @@ fn crash_point_asked(system: *const schema.System, body: []const u8) void {
         if (asked_ns != 0 and now_ns > asked_ns + crash_point_age_ns_max) break :outcome "late";
         if (quiet_until_ns > now_ns) break :outcome "quiet";
         const index = node_slot_index(system, name) orelse break :outcome "unknown node";
-        if (!node_admits(index, .process)) break :outcome "faulted";
+        // Its own layer's fault holds it: no draw (node_start draws the other layer's overlap).
+        if (nodes_faulted[index][@backingInt(Layer.process)] != null) break :outcome "faulted";
         var kept: [2]*const Fault = undefined;
         var count: usize = 0;
         for (faults_active) |*fault| {
@@ -2623,10 +2631,15 @@ fn crash_point_asked(system: *const schema.System, body: []const u8) void {
         }
         if (count == 0) break :outcome "no crash fault";
         const fault = kept[sdk.random_below_named("fault.crash_point_kind", count)];
-        sdk.event("crash_point", .{ .node = name, .point = point, .kind = @tagName(fault.kind), .outcome = "crashed" });
         var applied = draw(fault);
         applied.why = .crash_point;
-        node_start(system, &applied);
+        const began = node_start(system, &applied);
+        sdk.event("crash_point", .{
+            .node = name,
+            .point = point,
+            .kind = @tagName(fault.kind),
+            .outcome = if (began) "crashed" else "turned away",
+        });
         return;
     };
     sdk.event("crash_point", .{ .node = name, .point = point, .outcome = outcome });
@@ -2651,7 +2664,7 @@ fn aftershock_expire(system: *const schema.System, now_ns: u64) void {
         const fault = crash_fault_of(system.nodes[index].name) orelse continue;
         var applied = draw(fault);
         applied.why = .aftershock;
-        node_start(system, &applied);
+        _ = node_start(system, &applied);
     }
 }
 

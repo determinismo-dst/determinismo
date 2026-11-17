@@ -145,7 +145,8 @@ eight (a named decision, `crash points`), one transition in four is a point, and
 thread reaches asks the fault injector to crash its node there (`det-faults crash-point`), the
 thread waiting for it before the store or just after (drawn). The injector grants it as one of
 the node's crash faults the swarm keeps now (a kill or a power loss: `why: crash_point`), outside
-quiet periods; `crash_point` events say each request's outcome (a request the injector would
+quiet periods; `crash_point` events say each request's outcome (`crashed` once the crash began,
+`turned away` when the node's other faults or the scenario's limits kept it out; a request the injector would
 refuse, in a quiet period or for a node whose crash faults the swarm left out, is refused by
 `det-faults` at once from `/opt/determinismo/crash-points`, the thread going on). Stores to fields whose names say
 they hold the node's view of the cluster (a word of `leader`, `epoch`, `term`, `session`,
