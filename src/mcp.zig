@@ -191,6 +191,27 @@ fn tool_call(
         const result = try std.process.run(arena, io, .{ .argv = argv.items });
         return result.stderr;
     }
+    // A timeline's own events run as the actions of a Quint spec (quint.zig, docs/QUINT.md).
+    if (eql(u8, name, "quint")) {
+        const Quint = struct {
+            events_dir: []const u8,
+            branch: u32,
+            spec: []const u8,
+            invariant: ?[]const u8 = null,
+            main: ?[]const u8 = null,
+            quint: ?[]const u8 = null,
+        };
+        const asked = try std.json.parseFromValueLeaky(Quint, arena, value, .{ .ignore_unknown_fields = true });
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(arena, &.{
+            options.self, "quint", "--spec", asked.spec, "--events", asked.events_dir, "--branch", try number(arena, asked.branch),
+        });
+        if (asked.invariant) |invariant| try argv.appendSlice(arena, &.{ "--invariant", invariant });
+        if (asked.main) |main| try argv.appendSlice(arena, &.{ "--main", main });
+        if (asked.quint) |command| try argv.appendSlice(arena, &.{ "--quint", command });
+        const result = try std.process.run(arena, io, .{ .argv = argv.items });
+        return result.stderr;
+    }
     const arguments = try std.json.parseFromValueLeaky(Arguments, arena, value, .{
         .ignore_unknown_fields = true,
     });

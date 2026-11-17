@@ -551,5 +551,43 @@
         "run"
       ]
     }
+  },
+  {
+    "name": "quint",
+    "description": "Check a timeline against a Quint spec (docs/QUINT.md): the timeline's own events (sdk.event) whose name is an action of the spec are run as the spec's actions, each event's details the action's argument. Answers whether the trace is a behavior of the spec; if not, the first event the spec refuses with the spec's state there; with `invariant`, the event after which the spec's invariant fails. With a spec that has no action of the events' names, lists the names the timeline's events have with an example each: what a spec could take. Writes determinismo_trace.qnt and determinismo_trace.itf.json (the spec's states along the run) beside the spec. Needs Quint where determinismo runs.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "events_dir": {
+          "type": "string",
+          "description": "The exploration's events directory (a run's `events`, an --events-dir)"
+        },
+        "branch": {
+          "type": "integer",
+          "description": "The timeline"
+        },
+        "spec": {
+          "type": "string",
+          "description": "The Quint spec's path (<module>.qnt)"
+        },
+        "invariant": {
+          "type": "string",
+          "description": "A val of the spec asked in the first state and after every event"
+        },
+        "main": {
+          "type": "string",
+          "description": "The spec's module, when it is not named like its file"
+        },
+        "quint": {
+          "type": "string",
+          "description": "Quint's command (default `quint`; e.g. `npx -y @informalsystems/quint`)"
+        }
+      },
+      "required": [
+        "events_dir",
+        "branch",
+        "spec"
+      ]
+    }
   }
 ]

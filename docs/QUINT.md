@@ -81,6 +81,11 @@ the same for a spec and a Quint that are not where the run is (someone's laptop,
 machine): serve gives the timeline's run (`POST /runs/<run>/quint`), Quint runs it there, and
 serve says what the result means. Same answers, same exit statuses (clients/quint/README.md).
 
+- From a REPL (Clojure, babashka, jank): `determinismo.quint` (clients/clojure) has `kinds`,
+  `check`, `simulate` and `agent`; a check answers the verdict as data (its kind, the event,
+  the spec's state there, the spec's numbers along the run), which clients/jank-viz draws.
+- For an agent where determinismo runs: the MCP server's `quint` tool (`determinismo mcp`).
+
 ## Writing a spec from a trace
 
 A spec that matches a timeline is written the way a test is made to pass:
