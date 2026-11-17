@@ -280,6 +280,20 @@ fn number_static() void {
     }
 }
 
+/// SanitizerCoverage's stack depth (`stack-depth`, which Zig's own trace-pc-guard turns on): each
+/// instrumented function's entry stores its stack pointer here when it is lower. The coverage
+/// runtime defines it (compiler-rt's: a thread-local of this name); nothing here reads it. In
+/// the object alone (lib/libvoidstar.o): without it a Zig program built with
+/// `sanitize_coverage_trace_pc_guard` did not link ("undefined symbol: __sancov_lowest_stack",
+/// TigerBeetle 0.17.9 with Zig 0.14.1).
+const stack_depth = if (builtin.output_mode == .Obj) struct {
+    export threadlocal var __sancov_lowest_stack: usize = std.math.maxInt(usize);
+} else struct {};
+
+comptime {
+    _ = stack_depth;
+}
+
 export fn __sanitizer_cov_trace_pc_guard_init(start: [*]u32, stop: [*]u32) void {
     if (start == stop or start[0] != 0) return; // Already numbered.
     const count: u32 = @intCast(stop - start);

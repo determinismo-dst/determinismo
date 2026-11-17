@@ -2,8 +2,14 @@
 // A static program without libc, as a Zig program with its own _start is (TigerBeetle's): no C
 // runtime, so no constructor runs, the trace-pc-guard one included. libvoidstar
 // (lib/libvoidstar.o) numbers its guards at their first call instead, and reports its edges as
-// source lines. It supplies what libvoidstar takes from a program: memcpy, memset, getauxval.
+// source lines. It supplies what libvoidstar takes from a program: memcpy, memset, getauxval;
+// and a thread pointer, as a program's start code sets one: its functions' entries write the
+// stack depth's thread-local (libvoidstar's __sancov_lowest_stack) below it.
 typedef unsigned long size_t;
+
+// The thread's block: the thread pointer in its middle (x86-64 keeps a thread's variables
+// below it), pointing at itself.
+__attribute__((aligned(16))) char thread_block[128];
 
 __attribute__((no_sanitize("coverage"))) void *memcpy(void *to, const void *from, size_t n) {
     char *a = to;
@@ -48,6 +54,11 @@ __attribute__((naked, noreturn)) void _start(void) {
     __asm__ volatile(
         "xor %rbp, %rbp\n"
         "and $-16, %rsp\n"
+        "lea thread_block+64(%rip), %rsi\n"
+        "mov %rsi, (%rsi)\n"
+        "mov $0x1002, %edi\n" // ARCH_SET_FS
+        "mov $158, %eax\n" // arch_prctl
+        "syscall\n"
         "call main\n"
         "mov %eax, %edi\n"
         "mov $60, %eax\n" // exit
