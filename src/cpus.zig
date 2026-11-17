@@ -299,6 +299,12 @@ pub const Pool = struct {
                                 "grow to its guest's size)\n", .{ waited_s, claim_bytes >> 20 });
                         }
                     }
+                }
+                // Asleep between two looks, as the plain takes are at the loop's top: a maker or
+                // a holder (`first`) waiting here had no sleep at all, a CPU each reading the
+                // cgroup's memory in a loop (two holders of 16 GB guests, 26 minutes: 1,260 s
+                // of system time each).
+                if (cpu_first) {
                     const pause: linux.timespec = .{ .sec = 0, .nsec = @intCast(wait_ns_max) };
                     _ = linux.nanosleep(&pause, null);
                 }
@@ -1377,6 +1383,30 @@ test "a machine's memory claim counts while it has its place, and a gone machine
 var test_give_up_at_ns: u64 = 0;
 fn test_give_up() bool {
     return monotonic_ns() >= test_give_up_at_ns;
+}
+
+var test_give_up_calls: u32 = 0;
+fn test_give_up_counted() bool {
+    test_give_up_calls += 1;
+    return monotonic_ns() >= test_give_up_at_ns;
+}
+
+test "a maker waiting for memory sleeps between its looks" {
+    // A claim the host never fits: the take waits for memory until it gives up.
+    const saved = claim_bytes;
+    defer claim_bytes = saved;
+    claim_bytes = meminfo("MemTotal:") * 2;
+    if (claim_bytes == 0) return error.SkipZigTest;
+    var maker: Pool = undefined;
+    try maker.open();
+    defer maker.close();
+    maker.first = true;
+    const waited_ns = 300 * std.time.ns_per_ms;
+    test_give_up_calls = 0;
+    test_give_up_at_ns = monotonic_ns() + waited_ns;
+    try std.testing.expect(maker.take_unless(test_give_up_counted) == null);
+    // A look every wait_ns_max: ten in 300 ms, where the loop without its sleep made thousands.
+    try std.testing.expect(test_give_up_calls <= waited_ns / wait_ns_max + 2);
 }
 
 test "a judgment's maker takes a CPU past its run's turn, a plain take waits behind it" {
