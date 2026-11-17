@@ -5,7 +5,7 @@
 # workloads it runs built here (release, cross-compiled: 26 s on an M3 Max where srv4's busy cores
 # took minutes) and shipped, the initramfs built on the host from them (with the host's guest
 # kernel and module, or with --kernel the repository's guest/kernel built into the check's own
-# guest directory), then each check in a unit on every CPU at a low weight (20: the hunts keep
+# guest directory, in a kernel tree of its own), then each check in a unit on every CPU at a low weight (20: the hunts keep
 # precedence) with its memory capped. Each check's verdict printed; exit 1 when one failed.
 # Without DuckDB's x86_64-musl libraries here ($DETERMINISMO_DUCKDB or ~/opt/duckdb-x86_64-musl),
 # the host builds instead (--build-on host).
@@ -103,7 +103,15 @@ if [ "$BUILD_ON" = host ]; then
 fi
 if [ "$KERNEL" = 1 ]; then
   echo "== the guest kernel"
-  run "$PWD/guest/kernel/build.sh" "$guest" > /dev/null
+  # In a kernel tree of the check's own (<tree>-kernel), begun as a copy of the host's (what
+  # changed is all that compiles): a branch's patch applied to the host's tree made the next
+  # deploy from main start that tree again from the source (build.sh: a series that does not
+  # extend the tree's), and two trees' checks would have patched one tree.
+  kernel_tree=~/"$TREE"-kernel
+  if [ ! -d "$kernel_tree" ] && [ -d ~/guest-kernel ]; then cp -a ~/guest-kernel "$kernel_tree"; fi
+  started=$(date +%s)
+  run env DETERMINISMO_GUEST_KERNEL="$kernel_tree" "$PWD/guest/kernel/build.sh" "$guest" > /dev/null
+  echo "== the guest kernel built in $(( $(date +%s) - started )) s"
 else
   cp ~/guest/vmlinuz ~/guest/det_guest.ko "$guest/"
 fi

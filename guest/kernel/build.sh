@@ -4,13 +4,14 @@
 # guest/kernel/patches applied and x86_64_defconfig plus guest/kernel/determinismo.config, and
 # det_guest.ko against it.
 # Runs on the Linux host. Usage: guest/kernel/build.sh <out-dir>
+# The kernel's tree: ~/guest-kernel, or $DETERMINISMO_GUEST_KERNEL (a check's own: check.sh).
 set -euo pipefail
 out=${1:?usage: $0 <out-dir>}
 here=$(cd "$(dirname "$0")" && pwd)
 version=6.12
 tarball=/usr/src/linux-source-$version.tar.xz
 [ -f "$tarball" ] || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q linux-source-$version
-work=$HOME/guest-kernel
+work=${DETERMINISMO_GUEST_KERNEL:-$HOME/guest-kernel}
 mkdir -p "$work" "$out"
 tree="$work/linux-source-$version"
 # The patches the tree has, in order (their hashes, `.det-patches`): the series now must extend
