@@ -254,6 +254,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "ingress-checkpoint", check_ingress_checkpoint }, .{ "ingress-crash", check_ingress_crash },
         .{ "draws", check_draws },                           .{ "exit-stack", check_exit_stack },
         .{ "plan-calls", check_plan_calls },                 .{ "services", check_services },
+        .{ "sites", check_sites },
     };
     // A check's whole name runs it alone (check.sh's `ui` ran guidance and quiet too).
     var exact = std.mem.eql(u8, only, "tla");
@@ -7982,6 +7983,66 @@ fn check_volumes(context: *Context) !void {
         .{ "no node exited unexpectedly", !line_with(report, "FAIL", "no unexpected container exits") },
         .{ "the commands exited 0", !line_with(report, "FAIL", "test commands exit successfully") },
     }, "volumes: a one-shot ends first, a healthcheck holds its dependents, a shared directory is shared, a project file is in the image", .{});
+}
+
+/// A Zig program's sites come from its table of lines (src/lines.zig: made when the system is
+/// prepared, on the system disk), not from its debug information. A workload's drivers are
+/// processes, and each one parsing its DWARF for its first assertion computed where the guest
+/// would have idled: an exact stop is a timer that found no clock read, and 88% of a bank
+/// timeline's were in that parse (411 a virtual second over six 60 s timelines, 14 without
+/// it, 2026-11-17). The bound is between the two.
+fn check_sites(context: *Context) !void {
+    const arena = context.arena;
+    const stops_a_second_max = 100;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
+    const events = try std.fs.path.join(arena, &.{ context.scratch, "sites-events" });
+    std.Io.Dir.cwd().deleteTree(context.io, events) catch {};
+    const report = try explore(context, &.{
+        "--program",   program, "--scenario", "bank", "--seed",       "3",    "--branches", "4",
+        "--branching", "flat",  "--timeline", "10s",  "--events-dir", events,
+    });
+    try events_plain(context, events);
+    // The program's assertions: each with its file, a line and the function it is in.
+    var sites: u64 = 0;
+    var unnamed: u64 = 0;
+    var example: []const u8 = "none";
+    for (0..4) |index| {
+        const path = try std.fmt.allocPrint(arena, "{s}/branch-{d}.jsonl", .{ events, index });
+        const text = std.Io.Dir.cwd().readFileAlloc(context.io, path, arena, .limited(1 << 28)) catch continue;
+        var lines = std.mem.tokenizeScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            const at = std.mem.indexOf(u8, line, "\"location\":{") orelse continue;
+            const end = std.mem.indexOfScalarPos(u8, line, at, '}') orelse continue;
+            const location = std.json.parseFromSliceLeaky(
+                struct { file: []const u8 = "", line: u64 = 0, function: []const u8 = "" },
+                arena,
+                line[at + "\"location\":".len .. end + 1],
+                .{ .ignore_unknown_fields = true },
+            ) catch continue;
+            if (!std.mem.endsWith(u8, location.file, "bank_test.zig")) continue;
+            sites += 1;
+            if (location.line == 0 or location.function.len == 0) unnamed += 1;
+            if (sites == 1) example = try std.fmt.allocPrint(arena, "bank_test.zig:{d} {s}", .{ location.line, location.function });
+        }
+    }
+    // "... after <n> counter overflows, ...": the run's exact stops; "(one core; <s>s virtual".
+    const stops: f64 = stops: {
+        const end = std.mem.indexOf(u8, report, " counter overflows") orelse break :stops -1;
+        var start = end;
+        while (start > 0 and std.ascii.isDigit(report[start - 1])) start -= 1;
+        break :stops std.fmt.parseFloat(f64, report[start..end]) catch -1;
+    };
+    const virtual_s = number_after(report, "(one core; ") orelse 0;
+    const rate = if (virtual_s > 0) stops / virtual_s else -1;
+    expect_all(context, &.{
+        .{ "the program's assertions have their sites", sites > 0 },
+        .{ "each with a line and a function", unnamed == 0 },
+        .{ "the run's exact stops and virtual time are printed", stops >= 0 and virtual_s > 0 },
+        .{ "the drivers read no debug information (exact stops a virtual second)", rate >= 0 and rate < stops_a_second_max },
+    }, "sites: a Zig program's sites come from its table of lines ({d} assertions' sites, the first {s}), " ++
+        "its drivers read no debug information ({d:.0} exact stops in {d:.1} virtual seconds: {d:.1} a second, under {d})", .{
+        sites, example, stops, virtual_s, rate, stops_a_second_max,
+    });
 }
 
 /// A Compose project of 20 services (tests/antithesis-compat/services; Vitess's Antithesis
