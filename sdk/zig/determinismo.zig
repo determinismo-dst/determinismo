@@ -1621,7 +1621,7 @@ fn emit_assertion(
 /// `,"location":{"file","line","function"}` for a return address, from the program's table of
 /// lines (`sites`); nothing when there is none or it does not fit.
 fn location_write(writer: *std.Io.Writer, address: usize) void {
-    const place = sites.place(address) orelse return;
+    const place = sites.place(address, .call) orelse return;
     var buffer: [512]u8 = undefined;
     var location: std.Io.Writer = .fixed(&buffer);
     location.writeAll(",\"location\":{\"file\":") catch return;
@@ -1665,22 +1665,27 @@ const sites = struct {
         bias: usize = 0,
     };
     const Place = struct { file: []const u8, line: u32, function: []const u8 };
+    /// What of a return address is asked for: the call that returns there (an assertion's
+    /// site: the instruction before it), or the code it returns to (a coverage edge: the
+    /// block the callback was called from. The Zig compiler gives the callback's call the line
+    /// of the statement it emitted last, not the block's: the then-blocks of four nested ifs
+    /// were all the innermost one's line, and the instruction after the call has the block's).
+    const Of = enum { call, code_after };
 
     var state: std.atomic.Value(State) = .init(.unread);
     var table: Table = .{};
 
-    /// The line and function of a return address (the call is just before it); null without a
-    /// table, or a line there.
-    fn place(return_address: usize) ?Place {
+    /// The line and function of a return address; null without a table, or a line there.
+    fn place(return_address: usize, of: Of) ?Place {
         @disableInstrumentation();
         if (!ready()) return null;
-        return place_in(&table, return_address);
+        return place_in(&table, return_address, of);
     }
 
-    fn place_in(known: *const Table, return_address: usize) ?Place {
+    fn place_in(known: *const Table, return_address: usize, of: Of) ?Place {
         @disableInstrumentation();
         if (known.rows.len == 0 or return_address <= known.bias) return null;
-        const address: u64 = return_address - known.bias - 1;
+        const address: u64 = return_address - known.bias - @intFromBool(of == .call);
         var low: usize = 0;
         var high: usize = known.rows.len;
         while (low < high) { // The last row at or before the address.
@@ -1890,22 +1895,24 @@ test "sites: a return address's line and function from a table, none past its co
 
     // A program loaded 0x400000 above where it says it is.
     const known = sites.load(path, 0x400000).?;
-    const first = sites.place_in(&known, 0x400000 + 0x1011).?; // A call ending at 0x1010: line 11.
+    const first = sites.place_in(&known, 0x400000 + 0x1011, .call).?; // A call ending at 0x1010: line 11.
     try std.testing.expectEqualStrings("a.zig", first.file);
     try std.testing.expectEqual(11, first.line);
     try std.testing.expectEqualStrings("first", first.function);
-    const earlier = sites.place_in(&known, 0x400000 + 0x1010).?; // The call before 0x1010: line 10.
+    const earlier = sites.place_in(&known, 0x400000 + 0x1010, .call).?; // The call before 0x1010: line 10.
     try std.testing.expectEqual(10, earlier.line);
-    const second = sites.place_in(&known, 0x400000 + 0x2005).?;
+    // The code a callback returns to at 0x1010 is line 11's, where its call was line 10's.
+    try std.testing.expectEqual(11, sites.place_in(&known, 0x400000 + 0x1010, .code_after).?.line);
+    const second = sites.place_in(&known, 0x400000 + 0x2005, .call).?;
     try std.testing.expectEqualStrings("b.zig", second.file);
     try std.testing.expectEqualStrings("second", second.function);
-    try std.testing.expectEqual(@as(?sites.Place, null), sites.place_in(&known, 0x400000 + 0x1800)); // Between the two.
-    try std.testing.expectEqual(@as(?sites.Place, null), sites.place_in(&known, 0x400000 + 0x800)); // Before the first.
-    try std.testing.expectEqual(@as(?sites.Place, null), sites.place_in(&known, 0x1000)); // Below the program.
+    try std.testing.expectEqual(@as(?sites.Place, null), sites.place_in(&known, 0x400000 + 0x1800, .call)); // Between the two.
+    try std.testing.expectEqual(@as(?sites.Place, null), sites.place_in(&known, 0x400000 + 0x800, .call)); // Before the first.
+    try std.testing.expectEqual(@as(?sites.Place, null), sites.place_in(&known, 0x1000, .call)); // Below the program.
     // No table, or a file that is not one: no place.
     try std.testing.expectEqual(@as(?sites.Table, null), sites.load("/tmp/det-sites-test-none", 0));
     try std.testing.expectEqual(@as(?sites.Table, null), sites.load("/proc/self/environ", 0));
-    try std.testing.expectEqual(@as(?sites.Place, null), sites.place_in(&.{}, 0x400000 + 0x1011));
+    try std.testing.expectEqual(@as(?sites.Place, null), sites.place_in(&.{}, 0x400000 + 0x1011, .call));
 }
 
 fn json_write(writer: *std.Io.Writer, value: anytype) void {
@@ -2313,11 +2320,11 @@ pub const coverage = struct {
         }
     };
 
-    /// "line <file>:<n>" for a code address (a return address: the call is just before it), or
-    /// null without a line there (no table of the program's: `sites`).
+    /// "line <file>:<n>" for the code an edge's callback returns to (the block it was called
+    /// from), or null without a line there (no table of the program's: `sites`).
     fn line_of(address: usize, buffer: []u8) ?[]const u8 {
         @disableInstrumentation();
-        const place = sites.place(address) orelse return null;
+        const place = sites.place(address, .code_after) orelse return null;
         return std.fmt.bufPrint(buffer, "line {s}:{d}", .{ place.file, place.line }) catch null;
     }
 };

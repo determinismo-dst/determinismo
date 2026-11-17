@@ -36,9 +36,10 @@ pub const FunctionRow = extern struct { address: u64, name: u32, reserved: u32 =
 pub const Trailer = extern struct { functions_at: u64, functions_count: u64, magic: [8]u8 };
 /// A function row's name where no function is.
 pub const name_none = std.math.maxInt(u32);
-/// A file with more debug information than this has no functions in its table (a huge C++
-/// server's: every DIE of it read to find them): its lines only.
-pub const functions_debug_info_size_max = 256 << 20;
+/// A file with more debug information than this has no functions in its table (a large C++
+/// server's: every DIE of it read to find them, for names only the Zig SDK asks for): its
+/// lines only.
+pub const functions_debug_info_size_max = 64 << 20;
 
 comptime {
     assert(@sizeOf(Row) == 16);

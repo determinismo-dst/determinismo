@@ -31,7 +31,7 @@ the same capabilities in each, in that language's idiom.
 | Named decisions | `decide`, `random_below_named` | `det_decide`, `det_random_below_named` | ✓ | ✓ | ✓ | `decide`, `randomBelowNamed` | ✓ | `Decide`, `RandomBelowNamed` | `Decide`, `RandomBelowNamed` |
 | Buggify, and its pauses | `buggify`, `buggify_pause` | `det_buggify`, `det_buggify_pause` | ✓ | `buggify`, `buggifyPause` | ✓ | `buggify`, `buggifyPause` | ✓ | `Buggify`, `BuggifyPause` | `Buggify`, `BuggifyPause` |
 | always, always_or_unreachable, sometimes, reachable, unreachable | ✓ | `DET_*` macros | ✓ | ✓ | macros | ✓ | macros | ✓ | ✓ |
-| The assertion's place in the code | debug info | `__FILE__`, `__LINE__` | the frame | the stack | the stack | the stack | `file!`, `line!`, `column!` | `runtime.Caller` | caller attributes |
+| The assertion's place in the code | its table of lines | `__FILE__`, `__LINE__` | the frame | the stack | the stack | the stack | `file!`, `line!`, `column!` | `runtime.Caller` | caller attributes |
 | Guidance comparisons (8) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | always_some, sometimes_all | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (`NamedBool`) | ✓ |
 | Every evaluation an event, or first pass and first failure | `assertion_events` | `det_first_pass_first_failure` | `assertion_events` | `firstPassFirstFailure` | `first-pass-first-failure!` | `setAssertionEvents` | `set_assertion_events` | `SetAssertionEvents` | `Assert.FirstPassFirstFailure` |
@@ -91,8 +91,12 @@ CommonJS file's set before a worker runs it; an ES module's once a thread parsed
 its edges, for targeted runs (`--changed`) and for reading what ran before a crash; a node given
 as a binary (`.binary`) has its table made with its disk, nothing to place: keep the debug information (`-g`; for Rust, a
 release profile with `debug = true` and `strip = false`: Cargo strips it by default since 1.77,
-whatever `RUSTFLAGS` ask). Zig programs report their edges' lines from their own debug
-information wherever they run (not stripped: Zig keeps it but in ReleaseSmall).
+whatever `RUSTFLAGS` ask). A Zig program's edges' lines and its assertions' places come from
+the same kind of table, made from its debug information when the system is prepared (Zig keeps
+it but in ReleaseSmall): the test program's with the system's own disk, a Zig node's as other
+native code's (a `.binary` node, or its unstripped binary in the image's `/symbols`). The
+program reads no debug information as it runs: a workload's drivers are processes, and each
+would parse it again.
 
 A run without coverage is explored blind, so serve does not let one go unnoticed: a run whose
 first 4 ended timelines report none is stopped, and one that ended by itself before that keeps

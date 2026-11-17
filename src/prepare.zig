@@ -599,6 +599,19 @@ fn image_disk(
     const templates = try std.fmt.allocPrint(context.arena, "{s}.templates", .{disk});
     const lines_note = try std.fmt.allocPrint(context.arena, "{s}.lines-{d}", .{ disk, source_lines.format_version });
     if (exists(context, disk) and exists(context, templates) and exists(context, lines_note)) return disk;
+    // An image an earlier format found no symbols in has none now: its disk is as it was, not
+    // flattened again (every image on a host, at the format's change).
+    if (exists(context, disk) and exists(context, templates)) {
+        var earlier: u32 = source_lines.format_version;
+        while (earlier > 1) {
+            earlier -= 1;
+            const note = try std.fmt.allocPrint(context.arena, "{s}.lines-{d}", .{ disk, earlier });
+            const said = std.Io.Dir.cwd().readFileAlloc(context.io, note, context.arena, .limited(64)) catch continue;
+            if (!std.mem.eql(u8, std.mem.trim(u8, said, " \n"), "0")) break;
+            try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = lines_note, .data = "0\n" });
+            return disk;
+        }
+    }
     std.debug.print("[determinismo] flattening {s} into {s}\n", .{ reference, disk });
     const container = std.mem.trim(u8, try tool(context, &.{
         "podman", "create", "--quiet", reference,
