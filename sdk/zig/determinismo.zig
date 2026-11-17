@@ -1761,7 +1761,7 @@ const sites = struct {
     fn path_of_own() ?Path {
         @disableInstrumentation();
         var path: Path = .{};
-        if (environment_get(table_variable, path.buffer[0 .. path.buffer.len - 1])) |given| {
+        if (environment_value(table_variable, path.buffer[0 .. path.buffer.len - 1])) |given| {
             path.buffer[given.len] = 0;
             path.size = given.len;
             return path;
@@ -1802,26 +1802,6 @@ const sites = struct {
                 return notes[description_start..][0..description_size];
             }
             at = description_start + std.mem.alignForward(usize, description_size, 4);
-        }
-        return null;
-    }
-
-    /// An environment variable's value (`name` with its "="), from /proc/self/environ: no libc.
-    fn environment_get(comptime name: []const u8, buffer: []u8) ?[]const u8 {
-        @disableInstrumentation();
-        const fd = linux.open("/proc/self/environ", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-        if (linux.errno(fd) != .SUCCESS) return null;
-        defer _ = linux.close(@intCast(fd));
-        var environ: [32 * 1024]u8 = undefined;
-        const size = linux.read(@intCast(fd), &environ, environ.len);
-        if (linux.errno(size) != .SUCCESS) return null;
-        var entries = std.mem.splitScalar(u8, environ[0..size], 0);
-        while (entries.next()) |entry| {
-            if (!std.mem.startsWith(u8, entry, name)) continue;
-            const value = entry[name.len..];
-            if (value.len == 0 or value.len > buffer.len) return null;
-            @memcpy(buffer[0..value.len], value);
-            return buffer[0..value.len];
         }
         return null;
     }
@@ -2202,19 +2182,14 @@ pub const coverage = struct {
             busy = true;
             defer busy = false;
             var name_buffer: [512]u8 = undefined;
-            // The line, before anything else, only when a set asks for it (a table's lookup).
-            var line: ?[]const u8 = null;
-            const looked = set.active();
-            if (looked) {
-                line = line_of(@returnAddress(), &name_buffer);
-                if (!set.holds(line)) {
-                    guard.* = 0; // Left out: never again.
-                    return;
-                }
+            // The line, before anything else (a table's lookup): the set decides by it.
+            const line = line_of(@returnAddress(), &name_buffer);
+            if (!set.holds(line)) {
+                guard.* = 0; // Left out: never again.
+                return;
             }
             guard.* = edge | reported;
             if (!shared.reported_before(guard)) {
-                if (!looked) line = line_of(@returnAddress(), &name_buffer);
                 const name = line orelse
                     std.fmt.bufPrint(&name_buffer, "edge {d}", .{edge}) catch unreachable;
                 event("coverage", .{ .name = name });
@@ -2226,10 +2201,39 @@ pub const coverage = struct {
     /// The node's coverage set, DETERMINISMO_COVERAGE (schema.Coverage): source file prefixes,
     /// those starting with "-" excluded. An edge it leaves out (by its source line, the first
     /// time it runs; "" when unknown) reports nothing and pauses nothing. From /proc/self/environ.
+    ///
+    /// Without a prefix that includes them, the Zig installation's library (std, compiler_rt)
+    /// and this SDK's own directory are left out: a Zig program is instrumented whole, and
+    /// their lines are not the program's code (C, Rust and Go instrument the program's own).
+    /// They were nine in ten of a program's coverage names, and a search guided by coverage
+    /// kept timelines for an allocator's new line as for the program's: the self-test's Zig
+    /// maze was solved in 3 of 6 seeds with them, in 5 of 6 with its own file alone (300
+    /// timelines a seed, 2026-11-17).
     const set = struct {
         var text_buffer: [4096]u8 = undefined;
         var text: ?[]const u8 = null;
         var read = false;
+        /// Where the library and the SDK are, as the program's table names their files (the
+        /// file of a function of each, less its own part): "" when the table does not say.
+        var theirs_read = false;
+        var library: []const u8 = "";
+        var sdk_directory: []const u8 = "";
+
+        fn theirs(path: []const u8) bool {
+            @disableInstrumentation();
+            if (!theirs_read) {
+                theirs_read = true;
+                const library_file = "std/os/linux.zig";
+                if (sites.place(@intFromPtr(&linux.getpid), .code_after)) |place| {
+                    if (std.mem.endsWith(u8, place.file, library_file)) library = place.file[0 .. place.file.len - library_file.len];
+                }
+                if (sites.place(@intFromPtr(&theirs), .code_after)) |place| {
+                    if (std.mem.lastIndexOfScalar(u8, place.file, '/')) |slash| sdk_directory = place.file[0 .. slash + 1];
+                }
+            }
+            if (library.len > 0 and std.mem.startsWith(u8, path, library)) return true;
+            return sdk_directory.len > 0 and std.mem.startsWith(u8, path, sdk_directory);
+        }
 
         fn active() bool {
             @disableInstrumentation();
@@ -2242,7 +2246,7 @@ pub const coverage = struct {
 
         fn holds(line: ?[]const u8) bool {
             @disableInstrumentation();
-            const entries = if (active()) text.? else return true;
+            const entries = if (active()) text.? else "";
             const name = line orelse "";
             const file = if (std.mem.startsWith(u8, name, "line ")) name["line ".len..] else name;
             const path = file[0 .. std.mem.lastIndexOfScalar(u8, file, ':') orelse file.len];
@@ -2257,7 +2261,8 @@ pub const coverage = struct {
                     if (std.mem.startsWith(u8, path, entry)) matched = true;
                 }
             }
-            return included or matched;
+            if (matched) return true; // Asked for by name: the library's or the SDK's too.
+            return included and !theirs(path);
         }
     };
 
@@ -2328,6 +2333,38 @@ pub const coverage = struct {
         return std.fmt.bufPrint(buffer, "line {s}:{d}", .{ place.file, place.line }) catch null;
     }
 };
+
+test "coverage set: the library's and the SDK's lines are left out unless a prefix includes them" {
+    const set = coverage.set;
+    defer {
+        set.read = false;
+        set.text = null;
+        set.theirs_read = false;
+        set.library = "";
+        set.sdk_directory = "";
+    }
+    set.read = true;
+    set.text = null;
+    set.theirs_read = true;
+    set.library = "/opt/zig/lib/";
+    set.sdk_directory = "/src/sdk/zig/";
+    try std.testing.expect(set.holds("line /src/app/main.zig:10"));
+    try std.testing.expect(!set.holds("line /opt/zig/lib/std/mem.zig:81"));
+    try std.testing.expect(!set.holds("line /opt/zig/lib/compiler_rt/memcpy.zig:3"));
+    try std.testing.expect(!set.holds("line /src/sdk/zig/determinismo.zig:802"));
+    try std.testing.expect(set.holds(null)); // No line (no table): an edge by its number.
+    // An exclusion of the program's own, the rest as before.
+    set.text = "-/src/app/generated";
+    try std.testing.expect(!set.holds("line /src/app/generated/x.zig:1"));
+    try std.testing.expect(set.holds("line /src/app/main.zig:10"));
+    try std.testing.expect(!set.holds("line /opt/zig/lib/std/mem.zig:81"));
+    // A prefix that includes: those alone, the library's among them when it names them.
+    set.text = "/opt/zig/lib/std/mem.zig,/src/app/main.zig";
+    try std.testing.expect(set.holds("line /opt/zig/lib/std/mem.zig:81"));
+    try std.testing.expect(set.holds("line /src/app/main.zig:10"));
+    try std.testing.expect(!set.holds("line /src/app/other.zig:10"));
+    try std.testing.expect(!set.holds("line /opt/zig/lib/std/heap.zig:1"));
+}
 
 fn device_get() Device {
     if (device == .unopened) {
