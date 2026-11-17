@@ -25,4 +25,9 @@ What it asks serve, twice (`POST /runs/<run>/quint`):
   and the first one's details as the argument its action would get: what a spec could take,
   printed by the script when the spec has no action of any of those names.
 - The same with `"passed"` (whether `quint test` passed) and `"states"` (the content of
-  `determinismo_trace.itf.json`): the answer has the verdict's `status` and `text`.
+  `determinismo_trace.itf.json`): the answer has the verdict's `status` and `text`, and the
+  same as data: `kind` ("behavior", "refused", "invariant", "unknown"), `event` (the one
+  refused, or after which the invariant was lost: its `index` among the trace's `of` events,
+  its `seq` and `vtime_ns` in the timeline, its `action` and `argument`) and `state` (the
+  spec's state there as plain JSON: a map an object, a set a list). `trace.sh --json` prints
+  it.

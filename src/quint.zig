@@ -163,7 +163,25 @@ pub fn answer(arena: std.mem.Allocator, io: std.Io, events_directory: []const u8
         var text: std.ArrayList(u8) = .empty;
         const states = if (asked.states) |states| states_in(arena, states) else null;
         const status = try verdict(arena, &trace, asked.invariant, passed, states, "(its output is where it ran)", &text);
-        try std.json.Stringify.value(.{ .status = status, .text = text.items }, .{}, out);
+        const outcome = outcome_of(&trace, passed, states);
+        const Event = struct { index: usize, of: usize, seq: u64, vtime_ns: u64, action: []const u8, argument: ?std.json.Value };
+        const event: ?Event = if (outcome.event) |index| .{
+            .index = index,
+            .of = trace.steps.len,
+            .seq = trace.steps[index - 1].seq,
+            .vtime_ns = trace.steps[index - 1].vtime_ns,
+            .action = trace.steps[index - 1].name,
+            .argument = trace.steps[index - 1].details,
+        } else null;
+        const state: ?std.json.Value = if (states) |known| if (known.last_value) |last| plain(arena, last) catch null else null else null;
+        try std.json.Stringify.value(.{
+            .status = status,
+            .text = text.items,
+            .kind = outcome.kind,
+            .events = trace.steps.len,
+            .event = event,
+            .state = state,
+        }, .{}, out);
     } else {
         const module = if (trace.steps.len == 0) "" else try trace_module(arena, asked.main, asked.file orelse asked.main, &trace, asked.invariant);
         try std.json.Stringify.value(.{
@@ -442,7 +460,75 @@ fn verdict(
     return 3;
 }
 
-const States = struct { count: usize, whole: usize, last: ?[]const u8 };
+const States = struct {
+    count: usize,
+    whole: usize,
+    last: ?[]const u8,
+    /// The last whole state as Quint's trace format has it (for `plain`).
+    last_value: ?std.json.Value = null,
+};
+
+/// The verdict as data, for a client that draws it (the text says the same).
+const Outcome = struct {
+    /// "behavior", "refused" (an event the spec does not take), "invariant" (lost after an
+    /// event, or in the first state: no event), "unknown" (Quint wrote no states).
+    kind: []const u8,
+    /// The event refused, or the one after which the invariant was lost: its place among the
+    /// trace's events, from 1.
+    event: ?usize = null,
+};
+
+fn outcome_of(trace: *const Trace, passed: bool, states_known: ?States) Outcome {
+    if (passed) return .{ .kind = "behavior" };
+    const states = states_known orelse return .{ .kind = "unknown" };
+    if (states.whole == 0) return .{ .kind = "refused" };
+    const taken = states.whole - 1;
+    if (states.whole == states.count or taken >= trace.steps.len) {
+        return .{ .kind = "invariant", .event = if (taken == 0) null else @min(taken, trace.steps.len) };
+    }
+    return .{ .kind = "refused", .event = taken + 1 };
+}
+
+/// A value of Quint's trace format as plain JSON: {"#bigint":"7"} a number (a string when it
+/// does not fit 64 bits), a map an object (its keys as text), a set or a tuple an array; a
+/// state's "#meta" left out.
+fn plain(arena: std.mem.Allocator, value: std.json.Value) ItfError!std.json.Value {
+    switch (value) {
+        .array => |items| return plain_items(arena, items.items),
+        .object => |fields| {
+            if (fields.get("#bigint")) |number| if (number == .string) {
+                const parsed = std.fmt.parseInt(i64, number.string, 10) catch return number;
+                return .{ .integer = parsed };
+            };
+            if (fields.get("#set")) |items| if (items == .array) return plain_items(arena, items.array.items);
+            if (fields.get("#tup")) |items| if (items == .array) return plain_items(arena, items.array.items);
+            var object: std.json.ObjectMap = .empty;
+            if (fields.get("#map")) |pairs| if (pairs == .array) {
+                for (pairs.array.items) |pair| {
+                    if (pair != .array or pair.array.items.len != 2) return error.UnsupportedValue;
+                    var key: std.ArrayList(u8) = .empty;
+                    const key_value = pair.array.items[0];
+                    if (key_value == .string) try key.appendSlice(arena, key_value.string) else try itf_write(arena, &key, key_value);
+                    try object.put(arena, key.items, try plain(arena, pair.array.items[1]));
+                }
+                return .{ .object = object };
+            };
+            var iterator = fields.iterator();
+            while (iterator.next()) |field| {
+                if (std.mem.eql(u8, field.key_ptr.*, "#meta")) continue;
+                try object.put(arena, field.key_ptr.*, try plain(arena, field.value_ptr.*));
+            }
+            return .{ .object = object };
+        },
+        else => return value,
+    }
+}
+
+fn plain_items(arena: std.mem.Allocator, items: []const std.json.Value) ItfError!std.json.Value {
+    var array: std.json.Array = .init(arena);
+    for (items) |item| try array.append(try plain(arena, item));
+    return .{ .array = array };
+}
 
 /// The run's states from its ITF file: how many, how many of them have variables (a state the
 /// run did not reach has its "#meta" alone), and the last of those as text.
@@ -468,7 +554,12 @@ fn states_in(arena: std.mem.Allocator, parsed: std.json.Value) ?States {
     }
     var last: std.ArrayList(u8) = .empty;
     if (whole > 0) itf_write(arena, &last, states[whole - 1]) catch return null;
-    return .{ .count = states.len, .whole = whole, .last = if (whole == 0) null else last.items };
+    return .{
+        .count = states.len,
+        .whole = whole,
+        .last = if (whole == 0) null else last.items,
+        .last_value = if (whole == 0) null else states[whole - 1],
+    };
 }
 
 /// A value of Quint's trace format (ITF) as Quint writes it: {"#bigint":"7"} is 7, {"#map":
@@ -608,6 +699,21 @@ test "the run's states say where it stopped" {
     try std.testing.expectEqual(3, states.count);
     try std.testing.expectEqual(2, states.whole);
     try std.testing.expectEqualStrings("{ x: 7 }", states.last.?);
+    // Two states whole of three: the second event was refused; all whole: the invariant.
+    const steps = [_]Step{
+        .{ .seq = 5, .vtime_ns = 1, .name = "a", .details = null },
+        .{ .seq = 9, .vtime_ns = 2, .name = "b", .details = null },
+    };
+    const trace: Trace = .{ .steps = &steps, .unnamed = 0 };
+    const refused = outcome_of(&trace, false, states);
+    try std.testing.expectEqualStrings("refused", refused.kind);
+    try std.testing.expectEqual(2, refused.event.?);
+    const lost = outcome_of(&trace, false, .{ .count = 2, .whole = 2, .last = null });
+    try std.testing.expectEqualStrings("invariant", lost.kind);
+    try std.testing.expectEqual(1, lost.event.?);
+    try std.testing.expectEqualStrings("behavior", outcome_of(&trace, true, null).kind);
+    const plain_state = try plain(arena, states.last_value.?);
+    try std.testing.expectEqual(7, plain_state.object.get("x").?.integer);
     try std.testing.expect(states_of(arena, "") == null);
     const value = try std.json.parseFromSliceLeaky(std.json.Value, arena,
         \\{"#meta":{"index":4},"balances":{"#map":[[{"#bigint":"0"},{"#bigint":"95"}],[{"#bigint":"1"},{"#bigint":"107"}]]},"reads":{"#map":[]},"seen":{"#set":["a"]},"pair":{"#tup":[true,[1]]}}

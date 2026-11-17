@@ -1,25 +1,29 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 # trace.sh <serve's URL> <run> <timeline> <spec.qnt> [--main <module>] [--invariant <name>]
-#          [--quint <command>]
+#          [--quint <command>] [--json]
 # A timeline of a run checked against a Quint spec kept on this machine (docs/QUINT.md), with
 # no determinismo here: serve gives the timeline's own events as a run of the spec's actions,
 # written beside the spec (determinismo_trace.qnt); Quint runs it here; serve says what its
 # result means. As `determinismo quint` where the run is: exit 0 the trace is a behavior of
 # the spec, 3 it is not (the first event the spec refuses, or the one after which the invariant
 # fails, with the spec's state there), 1 nothing could be checked.
+# --json: the verdict as serve gives it (its kind, the event and the spec's state there as
+# data, beside the text), on one line.
 # Needs curl, jq and Quint (`npm install -g @informalsystems/quint`).
 #   clients/quint/trace.sh http://127.0.0.1:7878 12 3 examples/bank/quint/bank.qnt --invariant total_conserved
 set -euo pipefail
-usage="usage: $0 <serve's URL> <run> <timeline> <spec.qnt> [--main <module>] [--invariant <name>] [--quint <command>]"
+usage="usage: $0 <serve's URL> <run> <timeline> <spec.qnt> [--main <module>] [--invariant <name>] [--quint <command>] [--json]"
 serve=${1:?$usage}; run=${2:?$usage}; timeline=${3:?$usage}; spec=${4:?$usage}
 shift 4
 file=$(basename "$spec" .qnt)
 main=$file
 invariant=
 quint=${QUINT:-quint}
+json=0
 while [ $# -gt 0 ]; do
   case $1 in
+    --json) json=1; shift; continue ;;
     --main) main=${2:?$usage} ;;
     --invariant) invariant=${2:?$usage} ;;
     --quint) quint=${2:?$usage} ;;
@@ -61,5 +65,5 @@ else
 fi
 verdict=$(jq -n --argjson request "$request" --argjson passed "$passed" --argjson states "$marks" \
   '$request + {passed: $passed, states: $states}' | ask)
-jq -r .text <<< "$verdict"
+if [ "$json" = 1 ]; then jq -c . <<< "$verdict"; else jq -r .text <<< "$verdict"; fi
 exit "$(jq -r .status <<< "$verdict")"
