@@ -1,0 +1,16 @@
+--- a/drivers/md/dm-delay.c
++++ b/drivers/md/dm-delay.c
+@@ -265,7 +265,12 @@
+ 	max_delay = max(max_delay, dc->flush.delay);
+ 
+ out:
+-	if (max_delay < 50) {
++	/*
++	 * determinismo: never the polling kthread. It runs flush_delayed_bios() in a loop for as
++	 * long as a bio is delayed: a guest whose disks have a delay of a millisecond or two
++	 * computes through every write instead of idling, and reads no clock doing it.
++	 */
++	if (false) {
+ 		/*
+ 		 * In case of small requested delays, use kthread instead of
+ 		 * timers and workqueue to achieve better latency.
