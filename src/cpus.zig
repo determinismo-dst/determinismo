@@ -423,10 +423,23 @@ pub fn memory_reserve() u64 {
     return host_reserve(total);
 }
 
-/// The reserve of memory `total` in size: 8 GB, or an eighth of less than 64 GB. A host's claims
-/// against its whole reserve admitted no VM on an 8 GB host (EC2's c8i.xlarge, 2026-11-07).
+/// The reserve of memory `total` in size: 8 GB, an eighth of less than 64 GB, or a twelfth of
+/// more than 96 GB. A host's claims against its whole reserve admitted no VM on an 8 GB host (EC2's
+/// c8i.xlarge, 2026-11-07); a 187 GB host thrashed at 12 GB available beside a 40-VM run, its
+/// holders' shared memory at 71 GB and the page cache its VMs' disks and the events' writes
+/// need squeezed (ssh dead four minutes, 2026-11-17): its reserve 15.6 GB, and its holders kept
+/// in memory only above twice that (holders.zig).
 fn host_reserve(total: u64) u64 {
-    return @min(memory_reserve_bytes, total / 8);
+    return @max(@min(memory_reserve_bytes, total / 8), total / 12);
+}
+
+test host_reserve {
+    const gib: u64 = 1 << 30;
+    try std.testing.expectEqual(1 * gib, host_reserve(8 * gib)); // An eighth of a small host.
+    try std.testing.expectEqual(8 * gib, host_reserve(64 * gib));
+    try std.testing.expectEqual(8 * gib, host_reserve(96 * gib)); // A twelfth: 8 GB again.
+    // A 187 GB host (srv4's): no less than what kept it from thrashing beside a 40-VM run.
+    try std.testing.expect(host_reserve(187 * gib) >= 15 * gib);
 }
 
 /// Memory a host's runs leave to its user's own sessions (a host with reserved cores: their
@@ -969,7 +982,8 @@ test "a small host keeps an eighth of its memory free" {
     const gib = 1 << 30;
     try std.testing.expect(fits(0, 2 * gib, 8 * gib, 0, host_reserve(8 * gib))); // A 2 GB VM on 8 GB.
     try std.testing.expect(!fits(6 * gib, 2 * gib, 8 * gib, 0, host_reserve(8 * gib))); // Not beside 6 GB.
-    try std.testing.expectEqual(@as(u64, memory_reserve_bytes), host_reserve(187 * gib)); // srv4's.
+    // srv4's: a twelfth since it thrashed at 12 GB available (2026-11-17).
+    try std.testing.expectEqual(@as(u64, 187 * gib / 12), host_reserve(187 * gib));
 }
 
 test "a VM's memory claim counts while its CPU is held" {
