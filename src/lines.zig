@@ -11,20 +11,39 @@
 //! A table: "DETLINES", the rows' count (u64), the rows sorted by address ({address: u64,
 //! line: u32, file: u32}, the file an offset in the strings), then the strings, each ending in a
 //! zero byte. Little-endian, as the guest. guest/runtime/voidstar.zig reads it.
+//!
+//! After the strings, the functions: rows sorted by address ({address: u64, name: u32, 0: u32},
+//! the name an offset in the strings, `name_none` where no function is: an address between two
+//! rows is in the earlier one's), then the table's last 24 bytes, {where the functions' rows
+//! start: u64, their count: u64, "DETFUNCS"}. The innermost function of an address, an inlined
+//! one before its caller, as the program's DWARF names it. The Zig SDK names an assertion's site
+//! from the table (sdk/zig/determinismo.zig: file, line and function of a return address): a
+//! program reads no debug information of its own (a driver is a process: each parsed its DWARF,
+//! 88% of a bank timeline's exact stops, 2026-11-17).
 const std = @import("std");
 const assert = std.debug.assert;
 
 pub const magic = "DETLINES";
+pub const functions_magic = "DETFUNCS";
 /// Images prepared by an earlier version of this are prepared again (prepare.zig).
-pub const format_version = 2;
+pub const format_version = 3;
 pub const tables_directory = "symbols/.determinismo";
 /// A larger table (a huge C++ server's) is not made: its edges stay numbers.
 pub const table_size_max = 1 << 30;
 
 pub const Row = extern struct { address: u64, line: u32, file: u32 };
+pub const FunctionRow = extern struct { address: u64, name: u32, reserved: u32 = 0 };
+pub const Trailer = extern struct { functions_at: u64, functions_count: u64, magic: [8]u8 };
+/// A function row's name where no function is.
+pub const name_none = std.math.maxInt(u32);
+/// A file with more debug information than this has no functions in its table (a huge C++
+/// server's: every DIE of it read to find them): its lines only.
+pub const functions_debug_info_size_max = 256 << 20;
 
 comptime {
     assert(@sizeOf(Row) == 16);
+    assert(@sizeOf(FunctionRow) == 16);
+    assert(@sizeOf(Trailer) == 24);
 }
 
 pub const Table = struct { name: []const u8, bytes: []const u8 };
@@ -76,14 +95,24 @@ pub fn of(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, path: []
         rows.items[kept] = row;
         kept += 1;
     }
-    const size = magic.len + 8 + kept * @sizeOf(Row) + strings.items.len;
+    var functions: std.ArrayList(FunctionRow) = .empty;
+    defer functions.deinit(gpa);
+    // A file whose functions cannot be read keeps its lines.
+    functions_read(gpa, arena, &loaded.dwarf.?, &functions, &strings, &offsets) catch functions.clearRetainingCapacity();
+    const rows_start = magic.len + 8;
+    const strings_start = rows_start + kept * @sizeOf(Row);
+    const functions_start = strings_start + strings.items.len;
+    const trailer_start = functions_start + functions.items.len * @sizeOf(FunctionRow);
+    const size = trailer_start + @sizeOf(Trailer);
     if (size > table_size_max) return null;
     const bytes = try arena.alloc(u8, size);
     @memcpy(bytes[0..magic.len], magic);
     std.mem.writeInt(u64, bytes[magic.len..][0..8], kept, .little);
-    const rows_start = magic.len + 8;
-    @memcpy(bytes[rows_start..][0 .. kept * @sizeOf(Row)], std.mem.sliceAsBytes(rows.items[0..kept]));
-    @memcpy(bytes[rows_start + kept * @sizeOf(Row) ..], strings.items);
+    @memcpy(bytes[rows_start..strings_start], std.mem.sliceAsBytes(rows.items[0..kept]));
+    @memcpy(bytes[strings_start..functions_start], strings.items);
+    @memcpy(bytes[functions_start..trailer_start], std.mem.sliceAsBytes(functions.items));
+    const trailer: Trailer = .{ .functions_at = functions_start, .functions_count = functions.items.len, .magic = functions_magic.* };
+    @memcpy(bytes[trailer_start..], std.mem.asBytes(&trailer));
     const name = if (build_id(loaded.mapped_file)) |id|
         try std.fmt.allocPrint(arena, "{x}", .{id})
     else
@@ -92,6 +121,150 @@ pub fn of(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, path: []
 }
 
 const Sections = struct { line: []const u8, line_str: []const u8, str: []const u8 };
+
+/// The functions of a file's DWARF as rows by address: at each address the innermost function
+/// there, as std.debug names an address (Dwarf.getSymbolName: the last of its list whose range
+/// holds it, an inlined function after its caller).
+fn functions_read(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    dwarf: *std.debug.Dwarf,
+    functions: *std.ArrayList(FunctionRow),
+    strings: *std.ArrayList(u8),
+    offsets: *std.StringHashMapUnmanaged(u32),
+) !void {
+    const info = dwarf.section(.debug_info) orelse return;
+    if (info.len > functions_debug_info_size_max) return;
+    try dwarf.open(gpa, .little);
+    const Edge = struct { address: u64, function: u32, starts: bool };
+    var edges: std.ArrayList(Edge) = .empty;
+    defer edges.deinit(gpa);
+    for (dwarf.func_list.items, 0..) |function, index| {
+        const range = function.pc_range orelse continue;
+        if (range.start == 0 or range.start >= range.end) continue; // Discarded code.
+        try edges.append(gpa, .{ .address = range.start, .function = @intCast(index), .starts = true });
+        try edges.append(gpa, .{ .address = range.end, .function = @intCast(index), .starts = false });
+    }
+    std.mem.sort(Edge, edges.items, {}, struct {
+        fn less(_: void, a: Edge, b: Edge) bool {
+            return a.address < b.address;
+        }
+    }.less);
+    // The functions an address is in, the last of the list on top: a heap of their numbers,
+    // one that ended left in it until it reaches the top.
+    const inside = try gpa.alloc(bool, dwarf.func_list.items.len);
+    defer gpa.free(inside);
+    @memset(inside, false);
+    var heap: std.ArrayList(u32) = .empty;
+    defer heap.deinit(gpa);
+    var named: u32 = name_none;
+    var at: usize = 0;
+    while (at < edges.items.len) {
+        const address = edges.items[at].address;
+        while (at < edges.items.len and edges.items[at].address == address) : (at += 1) {
+            const edge = edges.items[at];
+            inside[edge.function] = edge.starts;
+            if (edge.starts) try heap_push(gpa, &heap, edge.function);
+        }
+        while (heap.items.len > 0 and !inside[heap.items[0]]) heap_pop(&heap);
+        var name: u32 = name_none;
+        if (heap.items.len > 0) {
+            if (dwarf.func_list.items[heap.items[0]].name) |text| {
+                const known = try offsets.getOrPut(arena, text);
+                if (!known.found_existing) {
+                    known.value_ptr.* = @intCast(strings.items.len);
+                    try strings.appendSlice(gpa, text);
+                    try strings.append(gpa, 0);
+                }
+                name = known.value_ptr.*;
+            }
+        }
+        if (name == named and functions.items.len > 0) continue;
+        try functions.append(gpa, .{ .address = address, .name = name });
+        named = name;
+    }
+}
+
+fn heap_push(gpa: std.mem.Allocator, heap: *std.ArrayList(u32), value: u32) !void {
+    try heap.append(gpa, value);
+    var at = heap.items.len - 1;
+    while (at > 0) {
+        const parent = (at - 1) / 2;
+        if (heap.items[parent] >= heap.items[at]) break;
+        std.mem.swap(u32, &heap.items[parent], &heap.items[at]);
+        at = parent;
+    }
+}
+
+fn heap_pop(heap: *std.ArrayList(u32)) void {
+    assert(heap.items.len > 0);
+    heap.items[0] = heap.items[heap.items.len - 1];
+    heap.items.len -= 1;
+    var at: usize = 0;
+    while (true) {
+        var largest = at;
+        for ([_]usize{ 2 * at + 1, 2 * at + 2 }) |child| {
+            if (child < heap.items.len and heap.items[child] > heap.items[largest]) largest = child;
+        }
+        if (largest == at) break;
+        std.mem.swap(u32, &heap.items[largest], &heap.items[at]);
+        at = largest;
+    }
+}
+
+/// A table's parts, for a reader on the host (the SDK and the guest have their own, on a
+/// mapped file).
+pub const View = struct {
+    rows: []align(1) const Row,
+    strings: []const u8,
+    functions: []align(1) const FunctionRow,
+
+    pub fn of(bytes: []const u8) ?View {
+        const head = magic.len + 8;
+        if (bytes.len < head + @sizeOf(Trailer) or !std.mem.eql(u8, bytes[0..magic.len], magic)) return null;
+        const count = std.mem.readInt(u64, bytes[magic.len..][0..8], .little);
+        if (count > (bytes.len - head) / @sizeOf(Row)) return null;
+        const rows_end = head + count * @sizeOf(Row);
+        const trailer = std.mem.bytesToValue(Trailer, bytes[bytes.len - @sizeOf(Trailer) ..]);
+        if (!std.mem.eql(u8, &trailer.magic, functions_magic)) return null;
+        const functions_end = bytes.len - @sizeOf(Trailer);
+        if (trailer.functions_at < rows_end or trailer.functions_at > functions_end) return null;
+        if (trailer.functions_count != (functions_end - trailer.functions_at) / @sizeOf(FunctionRow)) return null;
+        return .{
+            .rows = std.mem.bytesAsSlice(Row, bytes[head..rows_end]),
+            .strings = bytes[rows_end..trailer.functions_at],
+            .functions = std.mem.bytesAsSlice(FunctionRow, bytes[trailer.functions_at..functions_end]),
+        };
+    }
+
+    /// The line an address is on (the last row at or before it), null past a sequence's end.
+    pub fn line(view: View, address: u64) ?struct { file: []const u8, line: u32 } {
+        var low: usize = 0;
+        var high: usize = view.rows.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (view.rows[middle].address <= address) low = middle + 1 else high = middle;
+        }
+        if (low == 0) return null;
+        const found = view.rows[low - 1];
+        if (found.line == 0 or found.file >= view.strings.len) return null;
+        return .{ .file = std.mem.sliceTo(view.strings[found.file..], 0), .line = found.line };
+    }
+
+    /// The function an address is in, null where none is.
+    pub fn function(view: View, address: u64) ?[]const u8 {
+        var low: usize = 0;
+        var high: usize = view.functions.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (view.functions[middle].address <= address) low = middle + 1 else high = middle;
+        }
+        if (low == 0) return null;
+        const found = view.functions[low - 1];
+        if (found.name == name_none or found.name >= view.strings.len) return null;
+        return std.mem.sliceTo(view.strings[found.name..], 0);
+    }
+};
 
 /// A unit of .debug_line: its header's facts and its files' paths.
 const Unit = struct {
@@ -487,6 +660,47 @@ test "the test program's own lines, by address" {
         try std.testing.expect(row.address > previous);
         previous = row.address;
     }
+}
+
+test "the test program's own functions: an address's line and function as std.debug names them" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+    const table = (try of(std.testing.allocator, arena, std.testing.io, "/proc/self/exe")).?;
+    const view = View.of(table.bytes).?;
+    try std.testing.expect(view.functions.len > 100);
+    var previous: u64 = 0;
+    for (view.functions) |row| {
+        try std.testing.expect(row.address > previous);
+        previous = row.address;
+    }
+    // Here, as the SDK asks: a return address, less one (the call), less where the program is
+    // loaded.
+    const here = return_address();
+    var offset: usize = 0;
+    // (An error set of its own: with libc linked, as here, std's needs one that is not empty.)
+    const Never = error{Never};
+    std.posix.dl_iterate_phdr(&offset, Never, struct {
+        fn first(info: *std.posix.dl_phdr_info, _: usize, found: *usize) Never!void {
+            if (found.* == 0) found.* = info.addr; // The program comes first.
+        }
+    }.first) catch {};
+    const address = here - offset - 1;
+    const place = view.line(address).?;
+    try std.testing.expect(std.mem.endsWith(u8, place.file, "lines.zig"));
+    // What std.debug says of the same address.
+    const info = try std.debug.getSelfDebugInfo();
+    var symbols: std.ArrayList(std.debug.Symbol) = .empty;
+    try info.getSymbols(std.testing.io, arena, arena, here - 1, false, &symbols);
+    try std.testing.expect(symbols.items.len > 0);
+    try std.testing.expectEqualStrings(symbols.items[0].name.?, view.function(address).?);
+    try std.testing.expectEqual(symbols.items[0].source_location.?.line, place.line);
+}
+
+/// An address in its caller: where the call returns to.
+noinline fn return_address() usize {
+    return @returnAddress();
 }
 
 test note_build_id {
