@@ -3976,8 +3976,13 @@ fn queue_fresh(arena: std.mem.Allocator, state: *TreeState, setup: *const Snapsh
 
 /// Generations of summaries a tree's batch has room for, beside every running timeline's: the
 /// next ones complete while a slow judgment's nodes are made, and timelines go on starting
-/// meanwhile (with room for one, a 9-minute judgment left 30 of 40 CPUs idle: run 1832).
-const batch_generations = 4;
+/// meanwhile (with room for one, a 9-minute judgment left 30 of 40 CPUs idle: run 1832). With
+/// four, a 40-worker run whose returns end in seconds filled them in the 161 to 184 s its
+/// judgments' replays from their parents' starts took, four times in three hours (24.7 to 70.8%
+/// of ten minutes idle, 2026-11-17). Room costs little resident memory: a summary's pages are
+/// touched as it fills (Summaries.note writes its behaviors' count), its behaviors' fixed array
+/// mostly not.
+const batch_generations = 16;
 
 /// The timelines a judgment takes: every whole generation completed by then, one judgment for
 /// them all, their returns and fresh timelines in proportion (tree.nodes, tree.roots of the
