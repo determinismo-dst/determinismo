@@ -64,6 +64,20 @@ exactly, and your setup is not redone on every run.
   `shards`, `timelines` or `junit` reuses the cached setup.
 - `vcpus`, `memory_mib`: the machine's size (4 and 2048 by default).
 
+## Coverage
+
+The tests' code is covered with nothing in your repository asking for it, so explorations keep
+the timelines that reach new code and serve can tell a job that ran from one that did not
+(it stops a run whose first timelines report no coverage):
+
+- **JVM** (24 or later): determinismo's agent, on `JAVA_TOOL_OPTIONS`.
+- **Python** (3.12 or later): each Python process the run command starts reports the lines of
+  its own code: every file but the interpreter's library and the installed packages (the
+  node's `DETERMINISMO_COVERAGE` narrows it). A `sitecustomize` of your own still runs.
+- Other languages: built with their instrumentation (docs/SDKS.md).
+
+An older Python or JVM runs uncovered and says so on standard error.
+
 ## Running it
 
 On the host (serve running there):

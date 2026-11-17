@@ -28,7 +28,7 @@ const runtime = [_][]const u8{
 const directories = [_][]const u8{
     "bin",                  "sbin",                     "etc",                  "proc",                      "sys",                      "dev",
     "run",                  "tmp",                      "det",                  "root",                      "opt",                      "opt/determinismo",
-    "opt/determinismo/bin", "opt/determinismo/modules", "opt/determinismo/lib", "opt/determinismo/coverage", "opt/determinismo/records",
+    "opt/determinismo/bin", "opt/determinismo/modules", "opt/determinismo/lib", "opt/determinismo/coverage", "opt/determinismo/records", "opt/determinismo/lib/python",
 };
 const applets_max = 1024;
 
@@ -107,6 +107,15 @@ fn entries_collect(arena: std.mem.Allocator, io: std.Io, inputs: Inputs) ![]Entr
             .path = try std.fmt.allocPrint(arena, "opt/determinismo/lib/{s}", .{name}),
             .mode = mode_file,
             .data = try cwd.readFileAlloc(io, try std.fs.path.join(arena, &.{ inputs.bin, name }), arena, .unlimited),
+        });
+    }
+    // Python's coverage for a command run covered (nodes.zig's python_coverage_path): the
+    // sitecustomize every Python process imports as it starts, and the SDK it calls.
+    for ([_][2][]const u8{ .{ "determinismo.py", "determinismo.py" }, .{ "determinismo-sitecustomize.py", "sitecustomize.py" } }) |names| {
+        try entries.append(arena, .{
+            .path = try std.fmt.allocPrint(arena, "opt/determinismo/lib/python/{s}", .{names[1]}),
+            .mode = mode_file,
+            .data = try cwd.readFileAlloc(io, try std.fs.path.join(arena, &.{ inputs.bin, names[0] }), arena, .unlimited),
         });
     }
     try entries.append(arena, .{

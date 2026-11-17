@@ -611,10 +611,15 @@ def _coverage_set(text):
             tuple(entry[1:] for entry in entries if entry.startswith("-")))
 
 
-def coverage_start(paths=None):
+_coverage_started = False
+
+
+def coverage_start(paths=None, exclude=None):
     """Code coverage for strategies (Python 3.12+): from now on, each line of code under `paths`
-    (prefixes of file names; None for every file but this SDK's) emits a "coverage" event the
-    first time this process runs it, as the C and Zig SDKs do for edges. Strategies such as
+    (prefixes of file names; None for every file but this SDK's), and under none of `exclude`
+    (prefixes too), emits a "coverage" event the first time this process runs it, as the C and
+    Zig SDKs do for edges. Started once a process: a second call changes nothing (a command
+    determinismo runs covered has it started already, det-nodes exec --coverage). Strategies such as
     det-strategy-mutate keep the timelines that reach new code. A line costs nothing once
     reported: sys.monitoring stops watching it, except where thread pausing pauses (inside
     determinismo, _pausing_stretches). Branches are points for thread pausing too (where a
@@ -622,11 +627,16 @@ def coverage_start(paths=None):
     (`if x == 0: x += 1`) have a point between them, as with edge instrumentation. The node's
     coverage set, DETERMINISMO_COVERAGE (file name prefixes, those starting with "-" excluded: the
     Zig SDK's schema.Coverage), narrows it further: a test program's profile scopes it."""
+    global _coverage_started
+    if _coverage_started:
+        return
+    _coverage_started = True
     monitoring = sys.monitoring
     tool = monitoring.COVERAGE_ID
     monitoring.use_tool_id(tool, "determinismo")
     prefixes = tuple(paths) if paths else None
     included, excluded = _coverage_set(os.environ.get("DETERMINISMO_COVERAGE", ""))
+    excluded += tuple(exclude or ())
     reported = set()
     local = threading.local()
 
@@ -778,7 +788,12 @@ def _catalog_source(filename):
     _scanned.add(filename)
     try:
         with open(filename, encoding="utf-8") as source:
-            tree = ast.parse(source.read(), filename)
+            text = source.read()
+        # A file that never names this SDK has none of its assertions: not parsed (every
+        # module a process imports comes through here, an interpreter's library included).
+        if "determinismo" not in text:
+            return
+        tree = ast.parse(text, filename)
     except (OSError, SyntaxError, ValueError):
         return
     modules = set()  # Names of this module: `import determinismo as det`.

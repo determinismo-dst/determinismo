@@ -45,6 +45,46 @@ const JavaOptions = struct {
     replaces: ?[]const u8,
 };
 
+/// Where a command run covered finds Python's coverage (initramfs.zig's): a sitecustomize, which
+/// every Python process imports as it starts, and the Python SDK it starts coverage with.
+const python_coverage_path = "/opt/determinismo/lib/python";
+
+/// PYTHONPATH with python_coverage_path before the node's own entries, for a command run covered
+/// (`det-nodes exec --coverage`: a CI job's tests): each Python process it starts reports the
+/// lines of its own code with no change to the repository, as its JVMs do. None when the node's
+/// coverage set is off (DETERMINISMO_COVERAGE=!).
+fn python_options(arena: std.mem.Allocator, knobs: []const []const u8, env: []const []const u8) !?JavaOptions {
+    const name = "PYTHONPATH=";
+    var own: ?[]const u8 = null;
+    for (env) |entry| {
+        if (std.mem.eql(u8, entry, "DETERMINISMO_COVERAGE=!")) return null;
+        if (std.mem.startsWith(u8, entry, name) and !knob_sets(knobs, entry)) own = entry;
+    }
+    for (knobs) |entry| if (std.mem.startsWith(u8, entry, name)) {
+        own = entry;
+    };
+    const value = if (own) |entry| entry[name.len..] else "";
+    const joined = if (value.len == 0)
+        try std.fmt.allocPrintSentinel(arena, name ++ python_coverage_path, .{}, 0)
+    else
+        try std.fmt.allocPrintSentinel(arena, name ++ python_coverage_path ++ ":{s}", .{value}, 0);
+    return .{ .entry = joined, .replaces = own };
+}
+
+test "a command run covered finds Python's coverage before the node's own PYTHONPATH" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const none = (try python_options(arena, &.{}, &.{ "PATH=/bin", "HOME=/root" })).?;
+    try std.testing.expectEqualStrings("PYTHONPATH=" ++ python_coverage_path, none.entry);
+    try std.testing.expect(none.replaces == null);
+    const env = [_][]const u8{ "PYTHONPATH=/app/src:/app/lib", "A=1" };
+    const own = (try python_options(arena, &.{}, &env)).?;
+    try std.testing.expectEqualStrings("PYTHONPATH=" ++ python_coverage_path ++ ":/app/src:/app/lib", own.entry);
+    try std.testing.expect(own.replaces.?.ptr == env[0].ptr);
+    try std.testing.expect(try python_options(arena, &.{}, &.{ "DETERMINISMO_COVERAGE=!", "A=1" }) == null);
+}
+
 /// The node's JAVA_TOOL_OPTIONS with the coverage agent after its own (a knob's first, as the
 /// environment takes it), or none when its coverage set is off (DETERMINISMO_COVERAGE=!).
 fn java_options(arena: std.mem.Allocator, knobs: []const []const u8, env: []const []const u8) !?JavaOptions {
@@ -85,6 +125,16 @@ test "every node's JVMs get the coverage agent after their own options, unless c
     try std.testing.expectEqualStrings("JAVA_TOOL_OPTIONS=-Xmx512m " ++ coverage_agent, knobbed.entry);
     try std.testing.expect(knobbed.replaces.?.ptr == knob[0].ptr);
     try std.testing.expect(try java_options(arena, &.{}, &.{ "DETERMINISMO_COVERAGE=!", "A=1" }) == null);
+}
+
+/// The coverage entry that stands for the node's `entry` (the same slice), if one does.
+fn covered_replacing(covered: []const ?JavaOptions, entry: []const u8) ?[:0]const u8 {
+    for (covered) |candidate| {
+        const with = candidate orelse continue;
+        const replaced = with.replaces orelse continue;
+        if (replaced.ptr == entry.ptr) return with.entry;
+    }
+    return null;
 }
 
 /// The quiet-period command (det-stop-faults), at the same path in the runner and every node,
@@ -351,8 +401,9 @@ const Child = struct {
 };
 
 /// A command run in a node: `coverage` gives its JVMs determinismo's coverage agent, as the
-/// node's start's have (`det-nodes exec --coverage`): a CI job's tests, whose code is the system
-/// under test; by default a driver's tools run without it (Launch.init).
+/// node's start's have, and its Python processes the SDK's coverage (`det-nodes exec
+/// --coverage`): a CI job's tests, whose code is the system under test; by default a driver's
+/// tools run without it (Launch.init).
 /// `quiet`: its output discarded (a readiness command's, run every second).
 pub const ExecOptions = struct { coverage: bool = false, quiet: bool = false };
 
@@ -3653,7 +3704,7 @@ const Launch = struct {
         }
         var env_kept: usize = 0;
         for (node.env) |entry| env_kept += @intFromBool(!knob_sets(knob_entries[0..knob_count], entry));
-        if (knob_count + env_kept + platform_environment.len + 3 >= environment_max) {
+        if (knob_count + env_kept + platform_environment.len + 4 >= environment_max) {
             return error.TooManyEnvironmentEntries;
         }
         // Every JVM the node's start runs with determinismo's coverage agent (java_options); not
@@ -3661,28 +3712,32 @@ const Launch = struct {
         // each one instrumented and slower, its admin client's code a behavior the explorer would
         // chase; trial run 1891), which keep the node's environment as it is.
         const java = if (kind != .exec) try java_options(arena, knob_entries[0..knob_count], node.env) else null;
+        // Its Python processes too, for a command run covered (python_options): not a node's
+        // start, whose Python programs start their own coverage with the paths they mean.
+        const python = if (kind == .exec_covered) try python_options(arena, knob_entries[0..knob_count], node.env) else null;
+        const covered = [_]?JavaOptions{ java, python };
         const argv = try arena.allocSentinel(?[*:0]const u8, node.command.len, null);
         for (node.command, argv) |argument, *slot| slot.* = try arena.dupeSentinel(u8, argument, 0);
         // Its own name too (DETERMINISMO_NODE): what det-faults crash-point names.
-        const java_added = java != null and java.?.replaces == null;
-        const envp_count = knob_count + env_kept + platform_environment.len + 1 + @intFromBool(kind == .start) +
-            @intFromBool(java_added);
+        var covered_added: usize = 0;
+        for (covered) |entry| covered_added += @intFromBool(entry != null and entry.?.replaces == null);
+        const envp_count = knob_count + env_kept + platform_environment.len + 1 + @intFromBool(kind == .start) + covered_added;
         const envp = try arena.allocSentinel(?[*:0]const u8, envp_count, null);
         var path_value: []const u8 = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
         var filled: usize = 0;
         for (knob_entries[0..knob_count]) |entry| {
-            const replaced = java != null and java.?.replaces != null and java.?.replaces.?.ptr == entry.ptr;
-            envp[filled] = if (replaced) java.?.entry.ptr else (try arena.dupeSentinel(u8, entry, 0)).ptr;
+            envp[filled] = if (covered_replacing(&covered, entry)) |with| with.ptr else (try arena.dupeSentinel(u8, entry, 0)).ptr;
             filled += 1;
         }
         for (node.env) |entry| {
             if (knob_sets(knob_entries[0..knob_count], entry)) continue;
-            const replaced = java != null and java.?.replaces != null and java.?.replaces.?.ptr == entry.ptr;
-            envp[filled] = if (replaced) java.?.entry.ptr else (try arena.dupeSentinel(u8, entry, 0)).ptr;
+            envp[filled] = if (covered_replacing(&covered, entry)) |with| with.ptr else (try arena.dupeSentinel(u8, entry, 0)).ptr;
             filled += 1;
         }
-        if (java_added) {
-            envp[filled] = java.?.entry.ptr;
+        for (covered) |entry| {
+            const added = entry orelse continue;
+            if (added.replaces != null) continue;
+            envp[filled] = added.entry.ptr;
             filled += 1;
         }
         for (envp[0..filled]) |entry| {

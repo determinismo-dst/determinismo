@@ -249,6 +249,16 @@ pub fn build(b: *std.Build) void {
     const coverage_jar_installed = b.addInstallFileWithDir(coverage_jar_file, .bin, "determinismo-coverage.jar");
     phases.guest.dependOn(&coverage_jar_installed.step);
     b.getInstallStep().dependOn(&coverage_jar_installed.step);
+    // Python's coverage for a command run covered (det-nodes exec --coverage): the SDK and the
+    // sitecustomize that starts it, in every node's /opt/determinismo/lib/python (initramfs.zig).
+    for ([_][2][]const u8{
+        .{ "sdk/python/determinismo.py", "determinismo.py" },
+        .{ "guest/runtime/python/sitecustomize.py", "determinismo-sitecustomize.py" },
+    }) |file| {
+        const installed = b.addInstallFileWithDir(b.path(file[0]), .bin, file[1]);
+        phases.guest.dependOn(&installed.step);
+        b.getInstallStep().dependOn(&installed.step);
+    }
 
     // libdeterminismo.so, the Zig SDK behind a C ABI (sdk/zig/ffi.zig), for test programs in any
     // language: no libc, so a JVM loads it. In every initramfs at /opt/determinismo/lib, and on

@@ -2,10 +2,9 @@
 
 The smallest repository `determinismo-ci` runs (docs/PRODUCTS.md): a Python node with pytest and
 three tests, one that passes, one flaky (it fails when a random byte is low), one that always
-fails. `tests/conftest.py` turns on the Python SDK's coverage for the tests' code (serve stops a
-run whose first timelines report no coverage). `ci.json` names the system (`compose.yaml`), the
-node, the setup, how the tests are listed and run, the shards and each shard's timelines, and
-the files the setup depends on.
+fails. `ci.json` names the system (`compose.yaml`), the node, the setup, how the tests are
+listed and run, the shards and each shard's timelines, and the files the setup depends on.
+The repository asks for no coverage: determinismo-ci runs the tests covered (docs/CI.md).
 
 ```
 cd examples/ci-demo && determinismo-ci --config ci.json --serve http://127.0.0.1:7878

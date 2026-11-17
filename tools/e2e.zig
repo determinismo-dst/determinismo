@@ -1780,6 +1780,26 @@ fn check_ci(context: *Context) !void {
     const listed = curl(context, &.{url ++ "/runs"}) catch "[]";
     const Listed = struct { id: u32 };
     const runs = std.json.parseFromSliceLeaky([]const Listed, arena, listed, .{ .ignore_unknown_fields = true }) catch &.{};
+    // The tests' code covered with nothing in the repository asking for it (det-nodes exec
+    // --coverage: Python's sitecustomize, nodes.zig): each job's run reports coverage (serve
+    // stops a run whose first timelines report none: the demo's job of 12 timelines ended
+    // "error" at 10), the tests' own lines and none of the interpreter's library.
+    var runs_covered: u32 = 0;
+    var tests_lines = false;
+    var library_lines = false;
+    for (runs) |listed_run| {
+        const covered_sql = "{\"sql\":\"SELECT count(*) AS covered FROM (SELECT 1 FROM events WHERE name = 'coverage' LIMIT 1)\"}";
+        const covered = curl(context, &.{ "-X", "POST", "-d", covered_sql, try std.fmt.allocPrint(arena, url ++ "/runs/{d}/sql", .{listed_run.id}) }) catch "[]";
+        runs_covered += @intFromBool(std.mem.indexOf(u8, covered, "\"covered\":1") != null);
+        const run_output = curl(context, &.{try std.fmt.allocPrint(arena, url ++ "/runs/{d}/output", .{listed_run.id})}) catch "";
+        tests_lines = tests_lines or std.mem.indexOf(u8, run_output, "\"name\":\"line /app/tests/test_demo.py:") != null;
+        library_lines = library_lines or std.mem.indexOf(u8, run_output, "\"name\":\"line /usr/local/lib/python") != null;
+    }
+    expect_all(context, &.{
+        .{ "each job's run reports coverage, the repository asking for none", runs.len > 0 and runs_covered == runs.len },
+        .{ "the tests' own lines", tests_lines },
+        .{ "and none of the interpreter's library or its packages", !library_lines },
+    }, "ci: {d} of {d} runs covered; the tests' lines {}; the library's {}", .{ runs_covered, runs.len, tests_lines, library_lines });
     for (runs) |listed_run| {
         const sql = "{\"sql\":\"SELECT count(DISTINCT timeline) AS timelines, count(DISTINCT timeline) FILTER (WHERE name = 'faults_start') AS started FROM timeline_events\"}";
         const answer = curl(context, &.{ "-X", "POST", "-d", sql, try std.fmt.allocPrint(arena, url ++ "/runs/{d}/sql", .{listed_run.id}) }) catch "[]";
