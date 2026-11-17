@@ -1630,7 +1630,21 @@ pub fn wipe(name: []const u8) !void {
     }
     _ = linux.unlink(paths.image);
     _ = linux.unlink(paths.crash_files);
+    var count_buffer: [16]u8 = undefined;
+    const count = try std.fmt.bufPrint(&count_buffer, "{d}", .{wipes_of(&paths) + 1});
+    try file_write(paths.wipes, count);
     sdk.event("node_wipe", .{ .node = name });
+}
+
+/// How many times the node was wiped. Its starts after one are told (DETERMINISMO_WIPES in a
+/// start's environment, absent before any): a start that finds its disk empty knows a first
+/// start from a disk lost, as the operator bringing a replica back does, where the two need
+/// different commands (TigerBeetle: `format` for a new replica; for one that lost its data
+/// file `recover`, a format there letting the cluster lose committed data).
+fn wipes_of(paths: *const Paths) u32 {
+    var buffer: [16]u8 = undefined;
+    const text = read_small(paths.wipes, &buffer) orelse return 0;
+    return std.fmt.parseInt(u32, std.mem.trim(u8, text, " \n"), 10) catch 0;
 }
 
 const directory_flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true };
@@ -3216,7 +3230,7 @@ fn file_size(path: [:0]const u8) u64 {
 }
 
 const Paths = struct {
-    buffers: [17][path_size_max]u8 = undefined,
+    buffers: [18][path_size_max]u8 = undefined,
     directory: [:0]const u8 = "",
     lower: [:0]const u8 = "",
     /// The writable layer's mount (upper and work are in it), its disk image and loop device
@@ -3241,6 +3255,8 @@ const Paths = struct {
     output_start: [:0]const u8 = "",
     /// Present while the node runs on its next release (schema.Resolved.upgrade).
     variant: [:0]const u8 = "",
+    /// How many times the node was wiped (a decimal number; absent: never), for its starts.
+    wipes: [:0]const u8 = "",
     cgroup: [:0]const u8 = "",
     cgroup_procs: [:0]const u8 = "",
     cgroup_kill: [:0]const u8 = "",
@@ -3269,6 +3285,7 @@ const Paths = struct {
         paths.output_start = try print_z(&b[13], state_root ++ "/{s}/output.start", .{name});
         paths.variant = try print_z(&b[15], state_root ++ "/{s}/variant-next", .{name});
         paths.stopping = try print_z(&b[16], state_root ++ "/{s}/pid-stopping", .{name});
+        paths.wipes = try print_z(&b[17], state_root ++ "/{s}/wipes", .{name});
         paths.cgroup = try print_z(&b[7], cgroup_root ++ "/{s}", .{name});
         const c = &paths.cgroup_buffers;
         paths.cgroup_procs = try print_z(&c[0], "{s}/cgroup.procs", .{paths.cgroup});
@@ -3705,7 +3722,7 @@ const Launch = struct {
         }
         var env_kept: usize = 0;
         for (node.env) |entry| env_kept += @intFromBool(!knob_sets(knob_entries[0..knob_count], entry));
-        if (knob_count + env_kept + platform_environment.len + 4 >= environment_max) {
+        if (knob_count + env_kept + platform_environment.len + 5 >= environment_max) {
             return error.TooManyEnvironmentEntries;
         }
         // Every JVM the node's start runs with determinismo's coverage agent (java_options); not
@@ -3722,7 +3739,9 @@ const Launch = struct {
         // Its own name too (DETERMINISMO_NODE): what det-faults crash-point names.
         var covered_added: usize = 0;
         for (covered) |entry| covered_added += @intFromBool(entry != null and entry.?.replaces == null);
-        const envp_count = knob_count + env_kept + platform_environment.len + 1 + @intFromBool(kind == .start) + covered_added;
+        const wipes = if (kind == .start) wipes_of(paths) else 0;
+        const envp_count = knob_count + env_kept + platform_environment.len + 1 + @intFromBool(wipes > 0) +
+            @intFromBool(kind == .start) + covered_added;
         const envp = try arena.allocSentinel(?[*:0]const u8, envp_count, null);
         var path_value: []const u8 = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
         var filled: usize = 0;
@@ -3747,6 +3766,10 @@ const Launch = struct {
         }
         for (platform_environment, envp[filled..][0..platform_environment.len]) |entry, *slot| slot.* = entry.ptr;
         envp[filled + platform_environment.len] = try std.fmt.allocPrintSentinel(arena, "DETERMINISMO_NODE={s}", .{node.name}, 0);
+        // A start after a wipe (wipes_of).
+        if (wipes > 0) {
+            envp[filled + platform_environment.len + 1] = try std.fmt.allocPrintSentinel(arena, "DETERMINISMO_WIPES={d}", .{wipes}, 0);
+        }
         // A number drawn for this start (start_draw_name): a start script's own choices, a
         // workaround a node applies at random (never for good), steered and replayed as any.
         if (kind == .start) {

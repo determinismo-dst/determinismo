@@ -1157,19 +1157,25 @@ fn writeback_window(context: *System.Context) !void {
 
 /// Whether the echo node's main process has DETERMINISMO_DRAW in its environment.
 fn start_drawn(buffer: []u8) bool {
-    const pid = pid_read("/run/det/nodes/echo/pid") catch return false;
+    const value = start_variable(buffer, "DETERMINISMO_DRAW=") orelse return false;
+    return value.len > 0;
+}
+
+/// The value the echo node's main process has for `key` ("NAME=") in its environment, or null.
+fn start_variable(buffer: []u8, key: []const u8) ?[]const u8 {
+    const pid = pid_read("/run/det/nodes/echo/pid") catch return null;
     var path_buffer: [64]u8 = undefined;
-    const path = std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}/environ", .{pid}, 0) catch return false;
+    const path = std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}/environ", .{pid}, 0) catch return null;
     const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    if (linux.errno(fd) != .SUCCESS) return false;
+    if (linux.errno(fd) != .SUCCESS) return null;
     defer _ = linux.close(@intCast(fd));
     const size = linux.read(@intCast(fd), buffer.ptr, buffer.len);
-    if (linux.errno(size) != .SUCCESS) return false;
+    if (linux.errno(size) != .SUCCESS) return null;
     var entries = std.mem.splitScalar(u8, buffer[0..size], 0);
     while (entries.next()) |entry| {
-        if (std.mem.startsWith(u8, entry, "DETERMINISMO_DRAW=")) return entry.len > "DETERMINISMO_DRAW=".len;
+        if (std.mem.startsWith(u8, entry, key)) return entry[key.len..];
     }
-    return false;
+    return null;
 }
 
 /// The flushes counted in a node's `writeback` file ("on <flushes>" or "off <flushes>").
@@ -1539,10 +1545,19 @@ fn crash_and_wipe(echo: *const sdk.Node) !void {
         .synced = synced,
         .unsynced = unsynced,
     });
+    var environment: [8192]u8 = undefined;
+    const wipes_before = start_variable(&environment, "DETERMINISMO_WIPES=") != null;
     try echo.wipe();
     try sdk.retry(100, 100, answers, .{echo.address});
     // The node wrote both again on its fresh start: the wipe lost what the crash kept.
     sdk.always(file_present(echo, "/data/unsynced"), "a wipe starts the node fresh", .{});
+    // And its start knows its disk was lost, not new (DETERMINISMO_WIPES; none before any).
+    const wipes = start_variable(&environment, "DETERMINISMO_WIPES=");
+    sdk.always(!wipes_before and wipes != null and std.mem.eql(u8, wipes.?, "1"), "a node's start " ++
+        "after a wipe is told how many times its disk was lost", .{
+        .before = wipes_before,
+        .after = wipes orelse "",
+    });
 }
 
 /// Disk faults asked for. Writes a disk drops are acknowledged, synced even, and gone after a

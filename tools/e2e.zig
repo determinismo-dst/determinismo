@@ -5573,6 +5573,8 @@ fn check_disk(context: *Context) !void {
             "after its faults",
         "PASS always                hit in    3/3 branches, failing in    0  a node whose disk " ++
             "recorded errors starts again after a crash",
+        "PASS always                hit in    3/3 branches, failing in    0  a node's start after " ++
+            "a wipe is told how many times its disk was lost",
     });
     const outage_passes = has_lines(report, &.{
         "PASS always                hit in    3/3 branches, failing in    0  an outage takes its " ++

@@ -254,7 +254,10 @@ classpath), `determinismo.session` drives sessions and runs:
 - Disk faults: a node that allows `crash` gets an ext4 disk of its own (4 GiB, the inodes mkfs
   gives a disk of that size, held in the guest's memory as it is written); a crash is a power
   loss (what it synced survives, the rest is lost; the journal keeps the filesystem consistent),
-  a `wipe` starts it fresh from its image. A node that fills its disk starts again as a machine
+  a `wipe` starts it fresh from its image, its starts from then on given `$DETERMINISMO_WIPES`
+  (how many times its disk was lost; unset before any), for a start script whose system brings
+  back a member that lost its disk with another command than a new one's (TigerBeetle's
+  `recover`, never `format`). A node that fills its disk starts again as a machine
   would, its programs meeting the full disk (a reserve outside its view keeps room for the
   start). `disk` makes its disk fail for a while (I/O errors,
   write errors, lost writes, corrupted reads, slowness); an exit then is expected, and a node
