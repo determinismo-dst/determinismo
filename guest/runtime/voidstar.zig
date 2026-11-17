@@ -26,6 +26,7 @@
 //! It runs inside the system's processes, whatever their libc: no libc, system calls only, and
 //! it never stops a program (an event that cannot be written is dropped).
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 
 /// No thread-local state may exist here: in a library others load, the compiler's local-exec
@@ -264,15 +265,19 @@ var guard_next = std.atomic.Value(u32).init(1);
 /// Whether the program's guards were numbered here, at a first call: a program without a C runtime
 /// (its own _start, as a Zig program's) runs no constructor, so trace-pc-guard's never calls
 /// the init. Linked in statically (lib/libvoidstar.o), the linker's symbols for the guards'
-/// section bound them; in a shared library the section is the library's own, which has none
-/// (it is not instrumented), and the program's constructor numbers its guards.
+/// section bound them; a program loading the shared library runs its constructors, which number
+/// its guards.
 var numbered_static = std.atomic.Value(bool).init(false);
 
 fn number_static() void {
     if (numbered_static.swap(true, .acq_rel)) return;
-    const start = @extern(?[*]u32, .{ .name = "__start___sancov_guards", .linkage = .weak }) orelse return;
-    const stop = @extern(?[*]u32, .{ .name = "__stop___sancov_guards", .linkage = .weak }) orelse return;
-    __sanitizer_cov_trace_pc_guard_init(start, stop);
+    // Only the object (lib/libvoidstar.o) refers to the section's bounds: a linker refuses the
+    // weak references undefined in an executable (the unit tests') or a library of its own.
+    if (comptime builtin.output_mode == .Obj) {
+        const start = @extern(?[*]u32, .{ .name = "__start___sancov_guards", .linkage = .weak }) orelse return;
+        const stop = @extern(?[*]u32, .{ .name = "__stop___sancov_guards", .linkage = .weak }) orelse return;
+        __sanitizer_cov_trace_pc_guard_init(start, stop);
+    }
 }
 
 export fn __sanitizer_cov_trace_pc_guard_init(start: [*]u32, stop: [*]u32) void {
