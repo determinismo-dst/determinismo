@@ -85,6 +85,9 @@ serve says what the result means. Same answers, same exit statuses (clients/quin
   `check`, `simulate` and `agent`; a check answers the verdict as data (its kind, the event,
   the spec's state there, the spec's numbers along the run), which clients/jank-viz draws.
 - For an agent where determinismo runs: the MCP server's `quint` tool (`determinismo mcp`).
+- From the run's page: a timeline's logs have "Trace for Quint". With no name it lists the
+  names the timeline's events have; with the start of a name (`bank_`) and the spec's module
+  it downloads determinismo_trace.qnt, to put beside the spec and run with `quint test`.
 
 ## Writing a spec from a trace
 

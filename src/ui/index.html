@@ -3779,7 +3779,11 @@ function logsBody() {
         <input id="port-port" type="number" min="1" max="65535" style="width:100px" placeholder="its port">
         <input id="port-listen" type="number" min="1024" max="65535" style="width:110px" value="7950" title="The port on serve's host your browser connects to">
         <button id="port-open">Open a port here</button><button id="port-end" hidden>End the session</button></div>
-      <div class="muted" id="port-status">From your browser into a node's port at this moment (a UI, an API): the session runs live and records every byte, so it replays exactly (<a href="/learn#boundary">ingress</a>).</div></div>`;
+      <div class="muted" id="port-status">From your browser into a node's port at this moment (a UI, an API): the session runs live and records every byte, so it replays exactly (<a href="/learn#boundary">ingress</a>).</div>
+      <div style="display:flex;gap:8px;margin-top:8px;align-items:center"><input id="quint-prefix" style="width:200px" placeholder="events named like… (bank_)" title="This timeline's own events whose name starts with this are the trace: one step an event, its name the spec's action, its details the argument">
+        <input id="quint-main" style="width:140px" placeholder="the spec's module" title="The Quint module the run imports (bank, for bank.qnt)">
+        <button id="quint-run">Trace for Quint</button></div>
+      <div class="muted" id="quint-status">This timeline's events as a run of a Quint spec's actions, to check with <span class="mono">quint test</span> beside the spec (docs/QUINT.md). With no name: the names its events have.</div></div>`;
 }
 function logsWire() {
   const apply = $("#logs-apply");
@@ -3845,6 +3849,39 @@ function logsWire() {
     link.download = path.split("/").pop() || "file";
     link.click();
     $("#extract-status").textContent = `${blob.size} bytes, as they were at this moment.`;
+  });
+  // This timeline's own events as a run of a Quint spec's actions (serve's POST /runs/<id>/quint):
+  // the names they have when none is asked for, else the module, downloaded.
+  $("#quint-run").addEventListener("click", async () => {
+    const prefix = $("#quint-prefix").value.trim();
+    const main = $("#quint-main").value.trim() || "spec";
+    const ask = async (actions) => {
+      const response = await fetch(`/runs/${state.runId}/quint`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ branch: state.logs.branch, actions, main }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      return response.json();
+    };
+    $("#quint-status").textContent = "Reading the timeline's events…";
+    try {
+      const kinds = (await ask([])).kinds || [];
+      const named = kinds.filter((kind) => prefix !== "" && kind.name.startsWith(prefix));
+      if (named.length === 0) {
+        $("#quint-status").textContent = kinds.length === 0
+          ? "This timeline has no event of the program's own."
+          : `${prefix === "" ? "Its events" : `None starts with "${prefix}". Its events`}: ${kinds.map((kind) => `${kind.name} (${kind.count})`).join(", ")}.`;
+        return;
+      }
+      const given = await ask(named.map((kind) => kind.name));
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(new Blob([given.module], { type: "text/plain" }));
+      link.download = given.file;
+      link.click();
+      $("#quint-status").textContent = `${given.events} events (${named.map((kind) => `${kind.name} ${kind.count}`).join(", ")}) in ${given.file}. Beside ${main}.qnt: ${given.command}`;
+    } catch (error) {
+      $("#quint-status").textContent = String(error.message || error);
+    }
   });
   // A port into a node at this moment: a live session with ingress (serve's POST /runs/<id>/session),
   // its listener on serve's host, at the address this page was reached by.
