@@ -23,7 +23,8 @@
 //!              are in the order Redis took the steps: without it a client that has its
 //!              reply says so only when it runs again, after others' steps (a write's event
 //!              after the event of a read that saw it). The bug is as it was: a transfer's
-//!              read and its write are two steps. The trace a spec is checked against
+//!              read and its write are two steps. No faults: a write whose reply a fault
+//!              took happened and was never said. The trace a spec is checked against
 //!              (`determinismo quint`, docs/QUINT.md; examples/bank/quint).
 const std = @import("std");
 const assert = std.debug.assert;
@@ -106,6 +107,10 @@ fn Bank(comptime account_count: u32, comptime steps: bool) type {
             s.parallel_driver("transfer", transfer_many);
             s.anytime("audit_live", audit_anytime);
             s.finally("audit_final", audit_finally);
+            // Its steps are a trace only when each one's answer came: a write whose reply a
+            // fault took is in Redis and was never said (a commit of 1 missing from a timeline,
+            // its audit refused by a spec 1.5 s later, 2026-11-17). No injector here.
+            if (steps) s.faults = false;
         }
 
         /// The same, its driver phase's length drawn (up to 20 s) instead of its starts (the

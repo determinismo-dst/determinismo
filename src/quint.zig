@@ -182,6 +182,7 @@ pub fn answer(arena: std.mem.Allocator, io: std.Io, events_directory: []const u8
             .event = event,
             .state = state,
             .series = if (asked.states) |raw| series_of(arena, raw) catch null else null,
+            .steps = if (states) |known| steps_of(arena, &trace, known) catch null else null,
         }, .{}, out);
     } else {
         const module = if (trace.steps.len == 0) "" else try trace_module(arena, asked.main, asked.file orelse asked.main, &trace, asked.invariant);
@@ -467,7 +468,35 @@ const States = struct {
     last: ?[]const u8,
     /// The last whole state as Quint's trace format has it (for `plain`).
     last_value: ?std.json.Value = null,
+    /// The whole states, as Quint's trace format has them: the spec's init, then one an event.
+    values: []const std.json.Value = &.{},
 };
+
+/// The run's last events before it stopped (or its end), each with the spec's state after it:
+/// how the timeline's events drive the spec, for a client that shows it. `steps_shown` at most.
+const steps_shown = 8;
+
+const Shown = struct { index: usize, seq: u64, vtime_ns: u64, action: []const u8, argument: ?std.json.Value, state: std.json.Value };
+
+fn steps_of(arena: std.mem.Allocator, trace: *const Trace, states: States) ItfError![]const Shown {
+    var shown: std.ArrayList(Shown) = .empty;
+    // State i is the spec after event i (state 0 its init).
+    const last = @min(states.values.len -| 1, trace.steps.len);
+    var index = last -| (steps_shown - 1);
+    if (index == 0) index = 1;
+    while (index <= last) : (index += 1) {
+        const step = trace.steps[index - 1];
+        try shown.append(arena, .{
+            .index = index,
+            .seq = step.seq,
+            .vtime_ns = step.vtime_ns,
+            .action = step.name,
+            .argument = step.details,
+            .state = try plain(arena, states.values[index]),
+        });
+    }
+    return shown.items;
+}
 
 /// The verdict as data, for a client that draws it (the text says the same).
 const Outcome = struct {
@@ -622,6 +651,7 @@ fn states_in(arena: std.mem.Allocator, parsed: std.json.Value) ?States {
         .whole = whole,
         .last = if (whole == 0) null else last.items,
         .last_value = if (whole == 0) null else states[whole - 1],
+        .values = states[0..whole],
     };
 }
 
@@ -777,6 +807,11 @@ test "the run's states say where it stopped" {
     try std.testing.expectEqualStrings("behavior", outcome_of(&trace, true, null).kind);
     const plain_state = try plain(arena, states.last_value.?);
     try std.testing.expectEqual(7, plain_state.object.get("x").?.integer);
+    const shown = try steps_of(arena, &trace, states);
+    try std.testing.expectEqual(1, shown.len); // Its init, then the one event it took.
+    try std.testing.expectEqual(1, shown[0].index);
+    try std.testing.expectEqualStrings("a", shown[0].action);
+    try std.testing.expectEqual(7, shown[0].state.object.get("x").?.integer);
     const drawn = try series_of(arena, try std.json.parseFromSliceLeaky(std.json.Value, arena,
         \\{"states":[{"#meta":{"index":0},"n":{"#bigint":"1"},"b":{"#map":[[{"#bigint":"0"},{"#bigint":"100"}],[{"#bigint":"1"},{"#bigint":"100"}]]},"r":{"#map":[]}},
         \\{"#meta":{"index":1},"n":{"#bigint":"2"},"b":{"#map":[[{"#bigint":"0"},{"#bigint":"93"}],[{"#bigint":"1"},{"#bigint":"107"}]]},"r":{"#map":[]}},

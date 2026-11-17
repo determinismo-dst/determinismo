@@ -74,6 +74,12 @@ read before the write it saw, and a spec that follows the events refuses it.
   steps. Its e2e check (`bank-steps`) runs each timeline's events against the bank they
   describe: none out of order with the lock, a third of them without it.
 
+A step can also happen and never be said: a write whose reply a fault took is in the server
+and not in the trace, and the spec refuses what follows from it (an audit that lists a balance
+no said commit explains). `bank_steps` runs without the fault injector for that. A system
+tested under faults needs such a step in its spec (a write that may have happened), or its
+steps said by the server that takes them.
+
 ## From another machine
 
 `clients/quint/trace.sh <serve's URL> <run> <timeline> <spec.qnt> [--invariant <name>]` does

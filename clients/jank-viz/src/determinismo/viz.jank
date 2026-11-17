@@ -877,7 +877,8 @@
       (= view :events) (+ (apply + (map (fn [event] (+ 26 (* 20 (count (:lines event))))) (:events c)))
                           (if (> (:count c) (count (:events c))) 20 0))
       (= view :numbers) 100
-      (= view :quint) (+ 34 (if (:event (:verdict c)) 24 0) (if (seq (:series (:verdict c))) 190 0))
+      (= view :quint) (+ 34 (if (:event (:verdict c)) 24 0) (if (seq (:series (:verdict c))) 190 0)
+                         (if (seq (:steps (:verdict c))) (+ 30 (* 20 (count (:steps (:verdict c))))) 0))
       (= view :quint-run) (+ 34 (* 22 (count (:states c))))
       (= view :plan) (+ 22 (* 20 (count (:rows c))) (if (:board c) 168 0) 26)
       (= view :run-plan) (+ (* 20 (count (:lines c))) 6 (* 44 (count (:labels c))))
@@ -1146,7 +1147,30 @@
               (text! (+ x plot-width 8) (+ sum-floor 32 (* 18 li)) color small
                      (str (subs (name k) (min (count (name k)) (inc (count group)))) "  " (last vs)))))
           (when (and event (= kind "invariant"))
-            (line! (at-x (dec n)) (- top 2) (at-x (dec n)) floor purple 2.0)))))))
+            (line! (at-x (dec n)) (- top 2) (at-x (dec n)) floor purple 2.0)))))
+    ;; The timeline's last events before the run stopped, each with the spec's state after it:
+    ;; the real event (its number and moment in the timeline), the action it is, what it left.
+    (when-let [steps (seq (:steps verdict))]
+      (let [top (+ y (if event 62 38) (if (seq (:series verdict)) 190 0))
+            sums (mapv (fn [step] (when-let [[_ values] (numbers-of (:state step))] (apply + values))) steps)
+            first-sum (first sums)
+            values-x (- (+ x width) 250)]
+        (text! x top muted small "event")
+        (text! (+ x 52) top muted small "at")
+        (text! (+ x 118) top muted small "the timeline's event, as the spec's action")
+        (text! values-x top muted small (str (or (first (numbers-of (:state (first steps)))) "state") " after it"))
+        (text! (- (+ x width) 60) top muted small "sum")
+        (doseq [[i step] (map-indexed vector steps)]
+          (let [sy (+ top 20 (* 20 i))
+                [_ values] (numbers-of (:state step))
+                sum (nth sums i)
+                lost (and sum first-sum (not= sum first-sum))]
+            (text! x sy muted mono (str (:index step)))
+            (text! (+ x 52) sy blue small (seconds (:vtime_ns step)))
+            (text! (+ x 118) sy (if lost red ink) mono
+                   (clip mono (- values-x x 130) (str (:action step) " " (said-of (:argument step)))))
+            (text! values-x sy (if lost red ink) mono (str/join "  " values))
+            (text! (- (+ x width) 60) sy (if lost red ink) mono (str sum))))))))
 
 (defn- draw-quint-run
   "What Quint's simulator found in the spec alone: its last states, a row a state, the first
