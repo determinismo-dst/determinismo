@@ -311,6 +311,11 @@ TLA+ trace validation: a system emits its abstract states (`event "tla"`), and
 of the spec; it reports the first state the spec cannot reach
 ([examples/clojure-bank/tla](examples/clojure-bank/tla)).
 
+Quint: `determinismo quint --spec bank.qnt --events <branch events>` runs a timeline's own
+events as the actions of a Quint spec (an event's name the action, its details the argument)
+and reports the first event the spec refuses, or with `--invariant` the event after which the
+spec's invariant fails ([docs/QUINT.md](docs/QUINT.md)).
+
 Targeted runs: `--changed <diff file | git range>` aims the exploration at a change's lines and
 says which of them ran, in how many timelines, and which never did. With
 `--changed-repository <directory | URL>` the range is the system's own: a commit

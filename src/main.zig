@@ -29,6 +29,7 @@ const mcp = @import("mcp.zig");
 const merge = @import("merge.zig");
 const script = @import("script.zig");
 const tla = @import("tla.zig");
+const quint = @import("quint.zig");
 const advisor_zig = @import("advisor.zig");
 const draws_zig = @import("draws.zig");
 const serve_call = @import("serve_call.zig");
@@ -248,6 +249,10 @@ const usage =
     \\                            testing it: invalid commands, scenarios with no driver)
     \\       determinismo script  <events.jsonl>       (a branch's shape, for --script)
     \\       determinismo tla     --spec <Spec.tla> --events <events.jsonl> [--tla2tools <jar>]
+    \\       determinismo quint   --spec <Spec.qnt> --events <events.jsonl[.zst] | directory>
+    \\                            [--branch <n>] [--main <module>] [--invariant <name>]
+    \\                            [--quint <command>]   (a timeline's own events, those named
+    \\                            like an action of the spec, as a run of it: docs/QUINT.md)
     \\       determinismo runs    list | show <id> | properties <id> [--details] |
     \\                            logs <id> <timeline> <seconds> | search <id> '<condition>' |
     \\                            export <id> <timeline> <seconds | failure> [--property <message>] [--html] |
@@ -819,6 +824,8 @@ fn command_tool(
         event_sets.run(arena, io, rest)
     else if (eql(u8, name, "tla"))
         tla.check(arena, io, rest)
+    else if (eql(u8, name, "quint"))
+        quint.check(arena, io, rest)
     else if (eql(u8, name, "runs"))
         runs_cli.run(arena, io, rest)
     else if (eql(u8, name, "bundle"))
@@ -8404,6 +8411,7 @@ test {
     _ = @import("merge.zig");
     _ = @import("script.zig");
     _ = @import("tla.zig");
+    _ = @import("quint.zig");
     _ = @import("core").guest_memory;
     _ = @import("query.zig");
     _ = @import("runs_cli.zig");

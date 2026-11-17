@@ -1,0 +1,84 @@
+# Quint
+
+`determinismo quint` checks a timeline against a [Quint](https://quint-lang.org) spec: the
+events the program emitted, in the order they happened, must be a run of the spec's actions.
+
+    determinismo quint --spec bank.qnt --events <a timeline's events> [--branch <n>]
+                       [--main <module>] [--invariant <name>] [--quint <command>]
+
+- `--events`: a timeline's events file (`branch-<n>.jsonl`, or `.jsonl.zst` once it ended), or
+  a directory of them with `--branch <n>` (a run's `events`, an `--events-dir`).
+- `--main`: the spec's module, when it is not named like its file.
+- `--quint`: Quint's command (`quint` by default). `npm install -g @informalsystems/quint`
+  installs it; `--quint "npx -y @informalsystems/quint"` runs it without installing.
+
+## What is checked
+
+- The trace is the program's own events (`sdk.event(name, details)`, any SDK) whose name is an
+  action of the spec. An event is one step: its name the action, its details the action's
+  argument, a record. An event without details calls the action without arguments.
+- Events under other names (the platform's faults, a program's other events) are left out and
+  counted. A spec that wants them defines an action of their name.
+- A timeline's events are totally ordered (one vCPU, virtual time): the trace is the history
+  as it happened, not one of its possible orders.
+- JSON to Quint: integers, booleans and strings as they are, arrays as lists, objects as
+  records. A `null` field is left out of its record. A float, or a field whose name is not an
+  identifier, is an error. A string's `"` and `\` become `'` (Quint's strings have no escapes).
+
+## What it writes, beside the spec
+
+- `determinismo_trace.qnt`: the trace as a module with one run, checked with `quint test`.
+
+      module determinismo_trace {
+        import bank.* from "./bank"
+
+        run determinismo_trace_run =
+          init
+            .then(bank_read({ client: 1, source: 0, target: 1, source_balance: 100, target_balance: 100 })) // event 10 at 1.000 s
+            .then(bank_commit({ client: 1, amount: 7 })) // event 13 at 1.300 s
+            .then(bank_audit({ total: 400 })) // event 16 at 1.600 s
+      }
+
+- `determinismo_trace.itf.json`: the spec's states along the run, in Quint's trace format
+  (ITF): the timeline in the spec's terms.
+
+## What it answers
+
+- Exit 0: every event was an enabled action in the state the events before it left.
+
+      [determinismo] the trace (5 events) is a behavior of the spec (1 events under names the spec has no action for; its states: determinismo_trace.itf.json)
+
+- Exit 3: the first event the spec refuses, with the spec's state before it.
+
+      [determinismo] the spec refuses event 5 of 5: bank_audit({ total: 400 }) (event 16 at 1.600 s): not enabled after the 4 before it
+      [determinismo] the spec's state there: { balances: Map(0 -> 95, 1 -> 107, 2 -> 105, 3 -> 100), reads: Map() }
+
+- With `--invariant <name>` the spec's invariant is asked in the first state and after every
+  event. Exit 3 names the event after which it fails: where a timeline's bug shows in the
+  spec's terms.
+
+      [determinismo] total_conserved does not hold after event 4 of 5 (bank_commit, event 15 at 1.500 s)
+
+- Exit 1: nothing could be checked (no event named like an action, Quint did not run).
+
+## Writing a spec from a trace
+
+A spec that matches a timeline is written the way a test is made to pass:
+
+1. Read the timeline's events and pick the ones that are the system's steps.
+2. Write an action for each event name, taking the event's details as its argument: its guard
+   says when the step can happen, its updates what it changes.
+3. Run `determinismo quint`. A refused event and the spec's state before it say what the spec
+   has wrong; change the spec and run it again until the trace passes.
+4. Ask the property the program asserts as an invariant (`--invariant`), and let Quint look for
+   it in the spec alone: `quint run bank.qnt --invariant total_conserved`.
+
+An agent does the same from outside: it needs the timeline's events, the spec's file and this
+command (docs/AGENTS.md).
+
+## Limits
+
+- 65,536 events a trace.
+- Events as actions, not states: Quint's simulator cannot be asked whether some step of a spec
+  leads to a given state (an action cannot constrain the state it leads to). A check of states
+  is `determinismo tla`, with TLC.
