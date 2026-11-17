@@ -2913,8 +2913,15 @@ fn stale_pid(context: *System.Context) !void {
 
 /// The echo node's limit in profile `climb`, and the most one driver start leaks: a timeline's
 /// share stays under the limit; the tree's returns to the leakiest moments add up past it.
+/// A timeline makes up to 63 driver starts (composer.zig's starts_draw): at most 126 MiB of its
+/// own. With 6 MiB a start, one of 58 starts reached the limit alone (174 MiB expected), the
+/// first kill of both arms in three seeds of four, and the kills after it were the returns
+/// near that failure in either arm: the check compared nothing of the objective (2026-11-17).
 const climb_limit_mib = 160;
-const climb_step_mib_max = 6;
+const climb_step_mib_max = 2;
+comptime {
+    std.debug.assert(63 * climb_step_mib_max < climb_limit_mib);
+}
 
 /// A leak that grows down the tree (e2e memory-climb, profile `climb`): each driver start has
 /// the echo node's server keep a drawn 0 to climb_step_mib_max MiB. A timeline alone stays under
