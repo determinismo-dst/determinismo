@@ -7566,20 +7566,32 @@ fn check_tla(context: *Context, jar: []const u8) !void {
 fn check_script(context: *Context) !void {
     const program = try std.fs.path.join(context.arena, &.{ context.bin, "bank-test" });
     const common = [_][]const u8{ "--program", program, "--scenario", "bank" };
-    const exploration = [_][]const u8{ "--seed", "7", "--branches", "8" };
-    const found = try explore(context, &(common ++ exploration));
-    var branches: [branches_max]Branch = undefined;
-    const count = parse_branches(found, &branches);
-    const failing = for (branches[0..count]) |branch| {
-        if (branch.failing) break branch;
-    } else return expect(context, false, "script: a failing branch to start from", .{});
-    const index = try std.fmt.allocPrint(context.arena, "{d}", .{failing.index});
+    // A failing timeline whose script has a fault: what the check is about (a script's faults
+    // and commands followed). Which timelines fail, and whether before their first fault, moves
+    // with every build of the program and of the guest: seed 7's four failing ones of eight all
+    // ended within 6 s, before any fault, once the composer asked one decision more
+    // (2026-11-17), and the check failed on its premise. The first one of a few seeds.
     const events_name = "script-events.jsonl";
     const events = try std.fs.path.join(context.arena, &.{ context.scratch, events_name });
-    _ = try explore(context, &(common ++ [_][]const u8{
-        "--seed", "7", "--branch", index, "--events", events,
-    }));
-    const extracted = try run_kept(context, &.{ context.determinismo, "script", events });
+    var seed: []const u8 = "";
+    var index: []const u8 = "";
+    var extracted: std.process.RunResult = undefined;
+    const found = seeds: for ([_][]const u8{ "7", "8", "9", "10" }) |candidate| {
+        const explored = try explore(context, &(common ++ [_][]const u8{ "--seed", candidate, "--branches", "8" }));
+        var branches: [branches_max]Branch = undefined;
+        const count = parse_branches(explored, &branches);
+        for (branches[0..count]) |branch| {
+            if (!branch.failing) continue;
+            seed = candidate;
+            index = try std.fmt.allocPrint(context.arena, "{d}", .{branch.index});
+            _ = try explore(context, &(common ++ [_][]const u8{
+                "--seed", seed, "--branch", index, "--events", events,
+            }));
+            extracted = try run_kept(context, &.{ context.determinismo, "script", events });
+            if ((try script_shape(context.arena, extracted.stdout)).fault_count > 0) break :seeds true;
+        }
+    } else false;
+    if (!found) return expect(context, false, "script: a failing timeline whose script has a fault, in seeds 7 to 10", .{});
     const script_path = try std.fs.path.join(context.arena, &.{ context.scratch, "script.json" });
     const script_file: std.Io.Dir.WriteFileOptions = .{
         .sub_path = script_path,
@@ -7599,7 +7611,7 @@ fn check_script(context: *Context) !void {
     // timelines either way (6 of 8 without, 5 with, once), and 8 cannot tell them apart.
     const own_events = try std.fs.path.join(context.arena, &.{ context.scratch, "script-own-events.jsonl" });
     _ = try explore(context, &(common ++ [_][]const u8{
-        "--seed", "7", "--branch", index, "--script", script_path, "--events", own_events,
+        "--seed", seed, "--branch", index, "--script", script_path, "--events", own_events,
     }));
     const followed = try run_kept(context, &.{ context.determinismo, "script", own_events });
     const original = try script_shape(context.arena, extracted.stdout);
