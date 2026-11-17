@@ -260,6 +260,13 @@ pub const Multiverse = struct {
     throttles: u64 = 0,
     /// Exact stops reached at an exit that replaced the MTF exit (kvm patch).
     late_steps: u64 = 0,
+    /// What exact stops cost: the counter overflows that began one's approach, the single-steps
+    /// from there to the target (those KVM handled in its exit fastpath among them), and the
+    /// timers delivered at a clock read instead (free).
+    overflows: u64 = 0,
+    mtf_steps: u64 = 0,
+    fast_steps: u64 = 0,
+    soft_exits: u64 = 0,
     /// The guests' clock reads (RDTSC exits), and those KVM answered in its exit fastpath.
     rdtsc_exits: u64 = 0,
     fast_rdtscs: u64 = 0,
@@ -368,6 +375,10 @@ pub const Multiverse = struct {
         multiverse.overshoots += state.overshoots;
         multiverse.throttles += state.throttles;
         multiverse.late_steps += state.late_steps;
+        multiverse.overflows += state.overflows;
+        multiverse.mtf_steps += state.mtf_steps;
+        multiverse.fast_steps += state.fast_steps;
+        multiverse.soft_exits += state.soft_exits;
         multiverse.rdtsc_exits += state.rdtsc_exits;
         multiverse.fast_rdtscs += state.fast_rdtscs;
         multiverse.xinuse_fixes += state.xinuse_fixes;
@@ -490,6 +501,10 @@ pub const Multiverse = struct {
         multiverse.overshoots += other.overshoots;
         multiverse.throttles += other.throttles;
         multiverse.late_steps += other.late_steps;
+        multiverse.overflows += other.overflows;
+        multiverse.mtf_steps += other.mtf_steps;
+        multiverse.fast_steps += other.fast_steps;
+        multiverse.soft_exits += other.soft_exits;
         multiverse.rdtsc_exits += other.rdtsc_exits;
         multiverse.fast_rdtscs += other.fast_rdtscs;
         multiverse.xinuse_fixes += other.xinuse_fixes;
@@ -647,6 +662,13 @@ pub const Multiverse = struct {
             multiverse.skid_max,    multiverse.overshoots,   multiverse.throttles,
             multiverse.late_steps,  multiverse.xinuse_fixes, multiverse.xinuse_unfixed,
             multiverse.rdtsc_exits, multiverse.fast_rdtscs,
+        });
+        print("[determinismo] stepping: {d} single-steps to exact stops ({d} in KVM's fastpath) " ++
+            "after {d} counter overflows, {d} a second of wall time; {d} timers delivered at a " ++
+            "clock read\n", .{
+            multiverse.mtf_steps,  multiverse.fast_steps,
+            multiverse.overflows,  multiverse.mtf_steps * std.time.ns_per_s / @max(multiverse.wall_ns, 1),
+            multiverse.soft_exits,
         });
         print("[determinismo] virtual time per wall time: {d:.2} (one core; {d:.3}s virtual " ++
             "in {d:.3}s)\n", .{
