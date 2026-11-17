@@ -5649,7 +5649,7 @@ fn check_disk(context: *Context) !void {
     // under 50 ms ("dm-delay-flush-worker") that loops for as long as a bio is delayed, and the
     // disk baseline is 0 to 2 ms on every durable disk. A guest computed through every delayed
     // write and read no clock doing it: three quarters of an etcd timeline's exact stops
-    // (guest/kernel/patches/0011). Each timeline at the moment its baseline is set: the delay
+    // (guest/kernel/patches/0013). Each timeline at the moment its baseline is set: the delay
     // it drew, and the kernel's threads of that name.
     var delayed: u32 = 0;
     var polling: u32 = 0;
