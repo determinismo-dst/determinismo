@@ -1048,6 +1048,7 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
                 .checks = if (prepared) |system| system.system.checks else &.{},
                 .program = program,
                 .scenario = scenario orelse "",
+                .lines = if (prepared) |system| system.program_lines else null,
             };
             options.end_checks = host_checks.end_checks();
         }

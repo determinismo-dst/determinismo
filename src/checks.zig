@@ -30,6 +30,9 @@ pub const Options = struct {
     /// The test program, run on the host (the same binary as in the guest).
     program: []const u8,
     scenario: []const u8,
+    /// The program's table of lines (prepare.zig's program_lines): its assertions' sites are
+    /// named from it (`DETERMINISMO_LINES`).
+    lines: ?[]const u8 = null,
     /// `<events directory>/branch-<n>`: a check that asserts anything false has its input kept
     /// there, `<keep>.check-<name>.jsonl` (an Elle history: Oxia's, Datahike's and Comdb2's
     /// failures each took a replay to the timeline's end to read theirs, 2026-11-06).
@@ -62,6 +65,8 @@ pub const Hook = struct {
     checks: []const schema.Check,
     program: []const u8,
     scenario: []const u8,
+    /// `Options.lines`.
+    lines: ?[]const u8 = null,
 
     pub fn end_checks(hook: *const Hook) VM.EndChecks {
         return .{ .context = hook, .run = run_hook };
@@ -69,7 +74,7 @@ pub const Hook = struct {
 
     fn run_hook(context: *const anyopaque, events: *Events, end: Events.Moment, keep: ?[]const u8) anyerror!void {
         const hook: *const Hook = @ptrCast(@alignCast(context));
-        try run(events, end, hook.checks, .{ .program = hook.program, .scenario = hook.scenario, .keep = keep });
+        try run(events, end, hook.checks, .{ .program = hook.program, .scenario = hook.scenario, .lines = hook.lines, .keep = keep });
     }
 };
 
@@ -202,6 +207,7 @@ fn check_run(options: Options, name: []const u8, input: []const u8, output: []u8
         null,
     };
     var library_buffer: [std.fs.max_path_bytes + 32]u8 = undefined;
+    var lines_buffer: [std.fs.max_path_bytes + 32]u8 = undefined;
     const environment = [_:null]?[*:0]const u8{
         "PATH=/usr/local/bin:/usr/bin:/bin",
         try library_variable(&library_buffer),
@@ -209,6 +215,11 @@ fn check_run(options: Options, name: []const u8, input: []const u8, output: []u8
         // reads (standard error). Without it every check's assertions were lost, Elle's verdicts
         // among them (hunt run 1036, etcd: "Elle checked a history" never reached).
         "DETERMINISMO_SDK_LOCAL_OUTPUT=/dev/stderr",
+        // Last: without one the list ends here.
+        if (options.lines) |table|
+            try std.fmt.bufPrintSentinel(&lines_buffer, "DETERMINISMO_LINES={s}", .{table}, 0)
+        else
+            null,
         null,
     };
     const pid = linux.fork();

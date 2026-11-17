@@ -60,6 +60,9 @@ pub const Prepared = struct {
     hash: u64,
     /// Its pin (`Options.pinned`).
     pin_path: []const u8,
+    /// The test program's table of lines (lines.zig), for the program run on this host (its
+    /// checks: `DETERMINISMO_LINES`); null without a program, or one with no debug information.
+    program_lines: ?[]const u8 = null,
 };
 
 /// A resolved system with its node disks: their paths, absolute or relative to the pin's
@@ -181,11 +184,15 @@ fn system_finish(
     var hasher = std.hash.Wyhash.init(0);
     hasher.update(system_json);
     hasher.update(program);
+    // A program's disk has its table of lines (below): one made without it is another disk.
+    if (options.program != null) hasher.update(std.fmt.comptimePrint("lines-{d}", .{source_lines.format_version}));
     if (script) |text| hasher.update(text);
     const hash = hasher.final();
+    const program_lines = if (options.program) |path| try program_lines_make(context, path, program) else null;
     disk_paths[0] = try system_disk(context, .{
         .system_json = system_json,
         .program = options.program,
+        .program_lines = program_lines,
         .script = script,
         .hash = hash,
     });
@@ -211,7 +218,59 @@ fn system_finish(
         .system_json = system_json,
         .hash = hash,
         .pin_path = pin_path,
+        .program_lines = if (program_lines) |lines| try path_join(context, &.{ lines.directory, lines.name }) else null,
     };
+}
+
+/// The test program's table of lines, where a program run on this host finds it.
+const ProgramLines = struct {
+    /// `<cache>/symbols/<the program's content and the format>`: the table alone in it.
+    directory: []const u8,
+    /// lines.zig's name for it: the program's build ID, or `name-<its file's name>`.
+    name: []const u8,
+};
+
+/// The program's table of lines and functions (lines.zig), made once a program in the cache:
+/// the Zig SDK names an assertion's site and an edge's line from it, in the guest (disk 0's
+/// /symbols, below) and on this host (its checks, given the file), and reads no debug
+/// information itself. Null
+/// for a program without debug information (another language's, a stripped one).
+fn program_lines_make(context: Context, path: []const u8, content: []const u8) !?ProgramLines {
+    const io = context.io;
+    const cwd = std.Io.Dir.cwd();
+    const directory = try path_join(context, &.{ context.cache, "symbols", try std.fmt.allocPrint(
+        context.arena,
+        "{x:0>16}-lines-{d}",
+        .{ std.hash.Wyhash.hash(0, content), source_lines.format_version },
+    ) });
+    // Made before: the one file in it.
+    if (cwd.openDir(io, directory, .{ .iterate = true })) |opened| {
+        var known = opened;
+        defer known.close(io);
+        var entries = known.iterate();
+        while (try entries.next(io)) |entry| {
+            if (entry.kind == .file) return .{ .directory = directory, .name = try context.arena.dupe(u8, entry.name) };
+        }
+        return null; // A program with no table: its empty directory says so.
+    } else |_| {}
+    var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer scratch.deinit();
+    const table = source_lines.of(std.heap.smp_allocator, scratch.allocator(), io, path) catch null;
+    // Whole or not at all: in a directory of this process's own, renamed into place.
+    const staging = try own_path(context, directory, "partial");
+    errdefer cwd.deleteTree(io, staging) catch {};
+    try cwd.createDirPath(io, staging);
+    if (table) |made| {
+        try cwd.writeFile(io, .{ .sub_path = try path_join(context, &.{ staging, made.name }), .data = made.bytes });
+        std.debug.print("[determinismo] source lines of {s}: {d} bytes\n", .{ path, made.bytes.len });
+    }
+    cwd.rename(staging, cwd, directory, io) catch |err| {
+        // Another prepare of the same program made it meanwhile: its own is the same.
+        cwd.deleteTree(io, staging) catch {};
+        if (!exists(context, directory)) return err;
+    };
+    const made = table orelse return null;
+    return .{ .directory = directory, .name = try context.arena.dupe(u8, made.name) };
 }
 
 /// `Options.pinned`: the pin's system and node disks, as they are.
@@ -1172,6 +1231,7 @@ fn binary_disk(
 const SystemFiles = struct {
     system_json: []const u8,
     program: ?[]const u8,
+    program_lines: ?ProgramLines = null,
     script: ?[]const u8,
     hash: u64,
 };
@@ -1190,6 +1250,14 @@ fn system_disk(context: Context, files: SystemFiles) ![]const u8 {
     try cwd.createDirPath(io, staging);
     if (program) |path| {
         try cwd.copyFile(path, cwd, try path_join(context, &.{ staging, "program" }), io, .{});
+    }
+    if (files.program_lines) |lines| {
+        // Its table of lines where the guest's /symbols leads (init.zig: a link to this disk's
+        // symbols), under the name the SDK asks for there: the file is "program" in the guest.
+        const tables = try path_join(context, &.{ staging, source_lines.tables_directory });
+        try cwd.createDirPath(io, tables);
+        const key = if (std.mem.startsWith(u8, lines.name, "name-")) "name-program" else lines.name;
+        try cwd.copyFile(try path_join(context, &.{ lines.directory, lines.name }), cwd, try path_join(context, &.{ tables, key }), io, .{});
     }
     try cwd.writeFile(io, .{
         .sub_path = try path_join(context, &.{ staging, "system.json" }),

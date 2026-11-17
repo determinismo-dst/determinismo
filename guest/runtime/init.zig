@@ -76,6 +76,9 @@ fn run(arena: std.mem.Allocator, cmdline: []const u8) u32 {
         return 1;
     }
     system_share();
+    // The test program's table of lines, where the SDK looks for a program's (lines.zig: an
+    // image has its own /symbols; the program's is on the system disk).
+    _ = linux.symlink("/det/symbols", "/symbols");
     if (nodes.system_load(arena)) |system| {
         const names = arena.alloc([]const u8, system.nodes.len) catch return 1;
         for (system.nodes, names) |node, *name| name.* = node.name;

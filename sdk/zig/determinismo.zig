@@ -1618,30 +1618,294 @@ fn emit_assertion(
     emit_raw(writer.buffered());
 }
 
-/// `,"location":{"file","line","function"}` for a return address, from the program's own debug
-/// info; nothing when there is none (a stripped program) or it does not fit.
+/// `,"location":{"file","line","function"}` for a return address, from the program's table of
+/// lines (`sites`); nothing when there is none or it does not fit.
 fn location_write(writer: *std.Io.Writer, address: usize) void {
-    const info = std.debug.getSelfDebugInfo() catch return;
-    var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var symbols: std.ArrayList(std.debug.Symbol) = .empty;
-    // The return address follows the call: one byte back is in it.
-    const io = std.Options.debug_io;
-    info.getSymbols(io, arena, arena, address -| 1, false, &symbols) catch return;
-    if (symbols.items.len == 0) return;
-    const symbol = symbols.items[0];
-    const source = symbol.source_location orelse return;
+    const place = sites.place(address) orelse return;
     var buffer: [512]u8 = undefined;
     var location: std.Io.Writer = .fixed(&buffer);
     location.writeAll(",\"location\":{\"file\":") catch return;
-    std.json.Stringify.value(source.file_name, .{}, &location) catch return;
-    location.print(",\"line\":{d},\"function\":", .{source.line}) catch return;
-    std.json.Stringify.value(symbol.name orelse "", .{}, &location) catch return;
+    std.json.Stringify.value(place.file, .{}, &location) catch return;
+    location.print(",\"line\":{d},\"function\":", .{place.line}) catch return;
+    std.json.Stringify.value(place.function, .{}, &location) catch return;
     location.writeAll("}") catch return;
     // Two bytes stay for the envelope's closing braces.
     if (writer.end + location.end + 2 > writer.buffer.len) return;
     writer.writeAll(location.buffered()) catch unreachable;
+}
+
+/// Where the program's code is in its source: its table of lines and functions, built on the
+/// host from its debug information (src/lines.zig: its format) and mapped here once a process,
+/// at the first site asked for. No debug information is read in the program: a workload's
+/// drivers are processes, and each one parsing its DWARF for its first assertion was 88% of a
+/// bank timeline's exact stops (2026-11-17). The table is the file $DETERMINISMO_LINES names (a
+/// program the explorer runs on its host: a check), else /symbols/.determinismo/<key> (an
+/// image's, a binary node's, the test program's through the guest's /symbols), the key the
+/// program's GNU build ID in hex or `name-<its file's name>` without one. Without a table a
+/// site has no location and an edge is a number. Raw system calls, no allocator and no lock a thread could hold across a fork.
+const sites = struct {
+    const Row = extern struct { address: u64, line: u32, file: u32 };
+    const FunctionRow = extern struct { address: u64, name: u32, reserved: u32 };
+    const Trailer = extern struct { functions_at: u64, functions_count: u64, magic: [8]u8 };
+    const lines_magic = "DETLINES";
+    const functions_magic = "DETFUNCS";
+    const name_none = std.math.maxInt(u32);
+    const directory = "/symbols/.determinismo";
+    const table_variable = "DETERMINISMO_LINES=";
+    /// A thread that finds another one reading the table waits this many yields for it, then
+    /// goes without (a fork can leave the reading state behind: never waited for forever).
+    const yields_max = 100;
+
+    const State = enum(u8) { unread, reading, read };
+    const Table = struct {
+        rows: []align(1) const Row = &.{},
+        strings: []const u8 = "",
+        functions: []align(1) const FunctionRow = &.{},
+        /// Where the program is in memory, less where it says it is (0 unless PIE).
+        bias: usize = 0,
+    };
+    const Place = struct { file: []const u8, line: u32, function: []const u8 };
+
+    var state: std.atomic.Value(State) = .init(.unread);
+    var table: Table = .{};
+
+    /// The line and function of a return address (the call is just before it); null without a
+    /// table, or a line there.
+    fn place(return_address: usize) ?Place {
+        @disableInstrumentation();
+        if (!ready()) return null;
+        return place_in(&table, return_address);
+    }
+
+    fn place_in(known: *const Table, return_address: usize) ?Place {
+        @disableInstrumentation();
+        if (known.rows.len == 0 or return_address <= known.bias) return null;
+        const address: u64 = return_address - known.bias - 1;
+        var low: usize = 0;
+        var high: usize = known.rows.len;
+        while (low < high) { // The last row at or before the address.
+            const middle = low + (high - low) / 2;
+            if (known.rows[middle].address <= address) low = middle + 1 else high = middle;
+        }
+        if (low == 0) return null;
+        const row = known.rows[low - 1];
+        if (row.line == 0 or row.file >= known.strings.len) return null; // Past a sequence's end.
+        low = 0;
+        high = known.functions.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (known.functions[middle].address <= address) low = middle + 1 else high = middle;
+        }
+        var function: []const u8 = "";
+        if (low > 0) {
+            const name = known.functions[low - 1].name;
+            if (name != name_none and name < known.strings.len) function = std.mem.sliceTo(known.strings[name..], 0);
+        }
+        return .{ .file = std.mem.sliceTo(known.strings[row.file..], 0), .line = row.line, .function = function };
+    }
+
+    fn ready() bool {
+        @disableInstrumentation();
+        var yields: u32 = 0;
+        while (true) {
+            switch (state.load(.acquire)) {
+                .read => return true,
+                .reading => {
+                    if (yields == yields_max) return false;
+                    yields += 1;
+                    _ = linux.sched_yield();
+                },
+                .unread => if (state.cmpxchgStrong(.unread, .reading, .acquire, .monotonic) == null) {
+                    if (path_of_own()) |path| table = load(path.slice(), bias_of_own()) orelse .{};
+                    state.store(.read, .release);
+                    return true;
+                },
+            }
+        }
+    }
+
+    const Path = struct {
+        buffer: [1024]u8 = undefined,
+        size: usize = 0,
+
+        fn slice(path: *const Path) [:0]const u8 {
+            return path.buffer[0..path.size :0];
+        }
+    };
+
+    /// This program's headers in memory (the kernel's auxiliary vector), or none.
+    fn headers_of_own() []const std.elf.ElfN.Phdr {
+        @disableInstrumentation();
+        const getauxval = if (builtin.link_libc) std.c.getauxval else linux.getauxval;
+        if (getauxval(std.elf.AT.PHENT) != @sizeOf(std.elf.ElfN.Phdr)) return &.{};
+        const at = getauxval(std.elf.AT.PHDR);
+        if (at == 0) return &.{};
+        return @as([*]const std.elf.ElfN.Phdr, @ptrFromInt(at))[0..getauxval(std.elf.AT.PHNUM)];
+    }
+
+    fn bias_of_own() usize {
+        @disableInstrumentation();
+        const headers = headers_of_own();
+        for (headers) |header| {
+            if (header.type == .PHDR) return @intFromPtr(headers.ptr) - header.vaddr;
+        }
+        return 0;
+    }
+
+    /// Where this program's table would be.
+    fn path_of_own() ?Path {
+        @disableInstrumentation();
+        var path: Path = .{};
+        if (environment_get(table_variable, path.buffer[0 .. path.buffer.len - 1])) |given| {
+            path.buffer[given.len] = 0;
+            path.size = given.len;
+            return path;
+        }
+        var key_buffer: [200]u8 = undefined;
+        var key: []const u8 = "";
+        const bias = bias_of_own();
+        for (headers_of_own()) |header| {
+            if (header.type != .NOTE) continue;
+            const notes = @as([*]const u8, @ptrFromInt(bias +% header.vaddr))[0..header.filesz];
+            const id = note_build_id(notes) orelse continue;
+            key = std.fmt.bufPrint(&key_buffer, "{x}", .{id}) catch "";
+            break;
+        }
+        if (key.len == 0) {
+            var exe_buffer: [512]u8 = undefined;
+            const size = linux.readlink("/proc/self/exe", &exe_buffer, exe_buffer.len);
+            if (linux.errno(size) != .SUCCESS or size == 0) return null;
+            key = std.fmt.bufPrint(&key_buffer, "name-{s}", .{std.fs.path.basename(exe_buffer[0..size])}) catch return null;
+        }
+        const written = std.fmt.bufPrintSentinel(&path.buffer, directory ++ "/{s}", .{key}, 0) catch return null;
+        path.size = written.len;
+        return path;
+    }
+
+    /// NT_GNU_BUILD_ID's bytes among notes (src/lines.zig's note_build_id).
+    fn note_build_id(notes: []const u8) ?[]const u8 {
+        @disableInstrumentation();
+        var at: usize = 0;
+        while (at + 12 <= notes.len) {
+            const name_size = std.mem.readInt(u32, notes[at..][0..4], .little);
+            const description_size = std.mem.readInt(u32, notes[at + 4 ..][0..4], .little);
+            const kind = std.mem.readInt(u32, notes[at + 8 ..][0..4], .little);
+            const name_start = at + 12;
+            const description_start = name_start + std.mem.alignForward(usize, name_size, 4);
+            if (description_start + description_size > notes.len) return null;
+            if (kind == std.elf.NT_GNU_BUILD_ID and std.mem.eql(u8, notes[name_start..][0..name_size], "GNU\x00")) {
+                return notes[description_start..][0..description_size];
+            }
+            at = description_start + std.mem.alignForward(usize, description_size, 4);
+        }
+        return null;
+    }
+
+    /// An environment variable's value (`name` with its "="), from /proc/self/environ: no libc.
+    fn environment_get(comptime name: []const u8, buffer: []u8) ?[]const u8 {
+        @disableInstrumentation();
+        const fd = linux.open("/proc/self/environ", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(fd) != .SUCCESS) return null;
+        defer _ = linux.close(@intCast(fd));
+        var environ: [32 * 1024]u8 = undefined;
+        const size = linux.read(@intCast(fd), &environ, environ.len);
+        if (linux.errno(size) != .SUCCESS) return null;
+        var entries = std.mem.splitScalar(u8, environ[0..size], 0);
+        while (entries.next()) |entry| {
+            if (!std.mem.startsWith(u8, entry, name)) continue;
+            const value = entry[name.len..];
+            if (value.len == 0 or value.len > buffer.len) return null;
+            @memcpy(buffer[0..value.len], value);
+            return buffer[0..value.len];
+        }
+        return null;
+    }
+
+    /// The table at `path`, mapped; null when there is none or it is not one.
+    fn load(path: [:0]const u8, bias: usize) ?Table {
+        @disableInstrumentation();
+        const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(fd) != .SUCCESS) return null;
+        defer _ = linux.close(@intCast(fd));
+        const end = linux.lseek(@intCast(fd), 0, linux.SEEK.END);
+        if (linux.errno(end) != .SUCCESS) return null;
+        const size: usize = end;
+        const head = lines_magic.len + 8;
+        if (size < head + @sizeOf(Trailer)) return null;
+        const address = linux.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, @intCast(fd), 0);
+        if (linux.errno(address) != .SUCCESS) return null;
+        const bytes = @as([*]const u8, @ptrFromInt(address))[0..size];
+        if (!std.mem.eql(u8, bytes[0..lines_magic.len], lines_magic)) return null;
+        const count = std.mem.readInt(u64, bytes[lines_magic.len..][0..8], .little);
+        if (count > (size - head) / @sizeOf(Row)) return null;
+        const rows_end = head + count * @sizeOf(Row);
+        const functions_end = size - @sizeOf(Trailer);
+        const trailer = std.mem.bytesToValue(Trailer, bytes[functions_end..]);
+        if (!std.mem.eql(u8, &trailer.magic, functions_magic)) return null;
+        if (trailer.functions_at < rows_end or trailer.functions_at > functions_end) return null;
+        if (trailer.functions_count != (functions_end - trailer.functions_at) / @sizeOf(FunctionRow)) return null;
+        return .{
+            .rows = std.mem.bytesAsSlice(Row, bytes[head..rows_end]),
+            .strings = bytes[rows_end..trailer.functions_at],
+            .functions = std.mem.bytesAsSlice(FunctionRow, bytes[trailer.functions_at..functions_end]),
+            .bias = bias,
+        };
+    }
+};
+
+test "sites: a return address's line and function from a table, none past its code or without one" {
+    // A table as src/lines.zig writes it: two lines of a.zig in `first`, a gap, one of b.zig in
+    // `second`.
+    const strings = "a.zig\x00b.zig\x00first\x00second\x00";
+    const rows = [_]sites.Row{
+        .{ .address = 0x1000, .line = 10, .file = 0 },
+        .{ .address = 0x1010, .line = 11, .file = 0 },
+        .{ .address = 0x1020, .line = 0, .file = 0 }, // A sequence's end.
+        .{ .address = 0x2000, .line = 7, .file = 6 },
+    };
+    const functions = [_]sites.FunctionRow{
+        .{ .address = 0x1000, .name = 12, .reserved = 0 },
+        .{ .address = 0x1020, .name = sites.name_none, .reserved = 0 },
+        .{ .address = 0x2000, .name = 18, .reserved = 0 },
+    };
+    var bytes: [8 + 8 + rows.len * 16 + strings.len + functions.len * 16 + 24]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&bytes);
+    try writer.writeAll(sites.lines_magic);
+    try writer.writeInt(u64, rows.len, .little);
+    try writer.writeAll(std.mem.sliceAsBytes(&rows));
+    try writer.writeAll(strings);
+    const functions_at = writer.end;
+    try writer.writeAll(std.mem.sliceAsBytes(&functions));
+    const trailer: sites.Trailer = .{ .functions_at = functions_at, .functions_count = functions.len, .magic = sites.functions_magic.* };
+    try writer.writeAll(std.mem.asBytes(&trailer));
+    try std.testing.expectEqual(bytes.len, writer.end);
+
+    var path_buffer: [128]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "/tmp/det-sites-test-{d}", .{linux.getpid()}, 0);
+    const fd = linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o600);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(fd));
+    defer _ = linux.unlink(path);
+    try std.testing.expectEqual(bytes.len, linux.write(@intCast(fd), &bytes, bytes.len));
+    _ = linux.close(@intCast(fd));
+
+    // A program loaded 0x400000 above where it says it is.
+    const known = sites.load(path, 0x400000).?;
+    const first = sites.place_in(&known, 0x400000 + 0x1011).?; // A call ending at 0x1010: line 11.
+    try std.testing.expectEqualStrings("a.zig", first.file);
+    try std.testing.expectEqual(11, first.line);
+    try std.testing.expectEqualStrings("first", first.function);
+    const earlier = sites.place_in(&known, 0x400000 + 0x1010).?; // The call before 0x1010: line 10.
+    try std.testing.expectEqual(10, earlier.line);
+    const second = sites.place_in(&known, 0x400000 + 0x2005).?;
+    try std.testing.expectEqualStrings("b.zig", second.file);
+    try std.testing.expectEqualStrings("second", second.function);
+    try std.testing.expectEqual(@as(?sites.Place, null), sites.place_in(&known, 0x400000 + 0x1800)); // Between the two.
+    try std.testing.expectEqual(@as(?sites.Place, null), sites.place_in(&known, 0x400000 + 0x800)); // Before the first.
+    try std.testing.expectEqual(@as(?sites.Place, null), sites.place_in(&known, 0x1000)); // Below the program.
+    // No table, or a file that is not one: no place.
+    try std.testing.expectEqual(@as(?sites.Table, null), sites.load("/tmp/det-sites-test-none", 0));
+    try std.testing.expectEqual(@as(?sites.Table, null), sites.load("/proc/self/environ", 0));
+    try std.testing.expectEqual(@as(?sites.Place, null), sites.place_in(&.{}, 0x400000 + 0x1011));
 }
 
 fn json_write(writer: *std.Io.Writer, value: anytype) void {
@@ -1931,7 +2195,7 @@ pub const coverage = struct {
             busy = true;
             defer busy = false;
             var name_buffer: [512]u8 = undefined;
-            // The line, before anything else, only when a set asks for it (a DWARF lookup).
+            // The line, before anything else, only when a set asks for it (a table's lookup).
             var line: ?[]const u8 = null;
             const looked = set.active();
             if (looked) {
@@ -2049,68 +2313,12 @@ pub const coverage = struct {
         }
     };
 
-    /// The program's own line table, read once, apart from std.debug's: its SelfInfo is shared
-    /// (a lock, an arena), and an edge inside the stack unwinding a SafeAllocator does at each
-    /// allocation would wait for the lock that unwinding holds (det-maze-zig hung). Its own
-    /// file, Io, allocators and DWARF: nothing the program may be in the middle of.
-    const Lines = struct {
-        arena: std.heap.ArenaAllocator,
-        text: std.heap.ArenaAllocator,
-        elf: std.debug.ElfFile,
-        /// Where the executable is in memory, less where it says it is (0 unless PIE).
-        load_offset: usize,
-    };
-    var lines: ?Lines = null;
-    var lines_failed = false;
-
     /// "line <file>:<n>" for a code address (a return address: the call is just before it), or
-    /// null without debug information there.
+    /// null without a line there (no table of the program's: `sites`).
     fn line_of(address: usize, buffer: []u8) ?[]const u8 {
         @disableInstrumentation();
-        const known = lines_get() orelse return null;
-        defer _ = known.text.reset(.retain_capacity);
-        const dwarf: *std.debug.Dwarf = if (known.elf.dwarf) |*opened| opened else return null;
-        const vaddr = address -% known.load_offset -% 1;
-        const unit = dwarf.findCompileUnit(builtin.cpu.arch.endian(), vaddr) catch return null;
-        const location = dwarf.getLineNumberInfo(
-            known.arena.allocator(),
-            known.text.allocator(),
-            builtin.cpu.arch.endian(),
-            unit,
-            vaddr,
-        ) catch return null;
-        if (location.line == 0) return null;
-        return std.fmt.bufPrint(buffer, "line {s}:{d}", .{ location.file_name, location.line }) catch null;
-    }
-
-    fn lines_get() ?*Lines {
-        @disableInstrumentation();
-        if (lines) |*known| return known;
-        if (lines_failed) return null;
-        lines_failed = true; // Until it is read: once only, whatever happens.
-        var threaded: std.Io.Threaded = .init_single_threaded;
-        const io = threaded.io();
-        var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
-        const file = std.Io.Dir.cwd().openFile(io, "/proc/self/exe", .{}) catch return null;
-        defer file.close(io);
-        var elf = std.debug.ElfFile.load(arena.allocator(), io, file, null, &.none) catch return null;
-        if (elf.dwarf) |*dwarf| {
-            dwarf.open(arena.allocator(), builtin.cpu.arch.endian()) catch return null;
-        } else return null;
-        var offset: ?usize = null;
-        std.posix.dl_iterate_phdr(&offset, error{}, struct {
-            fn first(info: *std.posix.dl_phdr_info, _: usize, found: *?usize) error{}!void {
-                if (found.* == null) found.* = info.addr; // The program comes first.
-            }
-        }.first) catch {};
-        lines = .{
-            .arena = arena,
-            .text = .init(std.heap.page_allocator),
-            .elf = elf,
-            .load_offset = offset orelse 0,
-        };
-        lines_failed = false;
-        return &lines.?;
+        const place = sites.place(address) orelse return null;
+        return std.fmt.bufPrint(buffer, "line {s}:{d}", .{ place.file, place.line }) catch null;
     }
 };
 

@@ -157,7 +157,8 @@ pub const Profile = struct {
 /// under an `include` prefix (every name when there is none) and under no `exclude` prefix. The
 /// names are each SDK's own: Java classes (`org.apache.kafka.raft`), Go packages
 /// (`go.etcd.io/raft/v3`), Python files, and for C, C++, Rust and Zig source files (known when the
-/// binary is in the image's /symbols, or its own DWARF for Zig). The node's processes get it as
+/// binary is in the image's /symbols, or is the node's binary or the test program: their table
+/// of lines is made when the system is prepared). The node's processes get it as
 /// DETERMINISMO_COVERAGE (`include,...,-exclude,...`), which a Compose project sets itself; it
 /// narrows what the build instrumented, at no rebuild (an excluded block still calls the SDK,
 /// which returns at once: to take a part's cost out entirely, leave it out of the build).
