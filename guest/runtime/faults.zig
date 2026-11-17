@@ -64,7 +64,21 @@ const sdk = @import("determinismo");
 const schema = sdk.schema;
 const nodes = @import("nodes.zig");
 
-const faults_max = 256;
+/// A node's own fault kinds (24 today, the five pod kinds and its clog among them) and its custom
+/// programs: what a node may list of its own.
+const node_faults_max = 32;
+/// The table holds every fault a system of schema.nodes_max nodes lists (faults_collect): each
+/// node's own, three for its link with the runner and with each later node (a partition, a
+/// degradation each way), the groups (their partition, swizzle, outages), the clock skip and the
+/// restore. It was 256, which ten nodes fill: a system past that had its later nodes' faults,
+/// the groups and the restore dropped without a word (an imported project of 20 services: only
+/// its first six were ever stopped). A node listing more custom programs than node_faults_max
+/// leaves room for is said and fails `listed_property`.
+const faults_max = schema.nodes_max * node_faults_max +
+    3 * (schema.nodes_max + schema.nodes_max * (schema.nodes_max - 1) / 2) + 16;
+const listed_property = "the fault injector lists every fault the system allows";
+/// The faults faults_collect had no room for, of its last call.
+var faults_dropped: u32 = 0;
 const injections_max = 10_000;
 const delay_ns_min = 10 * std.time.ns_per_ms;
 const delay_ns_max = 300 * std.time.ns_per_ms;
@@ -309,6 +323,10 @@ pub fn main(init: std.process.Init) !void {
     const scenario = if (asked.scenario) |name| system.scenario(name) orelse return error.UnknownScenario else &default_scenario;
     var faults: [faults_max]Fault = undefined;
     var count = faults_collect(&system, scenario, &faults);
+    if (faults_dropped > 0) {
+        std.debug.print("[det-faults] {d} faults past the table's {d} are never injected\n", .{ faults_dropped, faults_max });
+    }
+    sdk.assert_computed(.always, faults_dropped == 0, listed_property, .{ .listed = count, .dropped = faults_dropped });
     if (asked.only) |kinds| count = faults_keep(&faults, count, kinds);
     if (count == 0) return; // Nothing allowed: nothing to inject.
     const action = linux.Sigaction{
@@ -1249,6 +1267,7 @@ fn faults_collect(
     faults: *[faults_max]Fault,
 ) u32 {
     var count: u32 = 0;
+    faults_dropped = 0;
     for (system.nodes, 0..) |node, index| {
         const allowed = node.faults;
         if (allowed.pause) faults_add(faults, &count, .{ .kind = .pause, .node = node.name });
@@ -1365,7 +1384,10 @@ fn links_add(
 }
 
 fn faults_add(faults: *[faults_max]Fault, count: *u32, fault: Fault) void {
-    if (count.* == faults_max) return;
+    if (count.* == faults_max) {
+        faults_dropped += 1;
+        return;
+    }
     faults[count.*] = fault;
     count.* += 1;
 }
@@ -4557,6 +4579,61 @@ test "outages take only the nodes that allow them" {
         restarts += @intFromBool(fault.kind == .restart);
     }
     try std.testing.expectEqual(@as(u32, 3), restarts);
+}
+
+test "every fault of a system of schema.nodes_max nodes is listed: its last node's, its groups', its restore" {
+    var names: [schema.nodes_max][3]u8 = undefined;
+    var resolved: [schema.nodes_max]schema.Resolved = undefined;
+    for (&resolved, 0..) |*node, index| {
+        node.* = .{
+            .name = std.fmt.bufPrint(&names[index], "n{d:0>2}", .{index}) catch unreachable,
+            .address = "10.0.0.2",
+            .disk = "vdb",
+            .digest = "",
+            .command = &.{"x"},
+            .env = &.{},
+            // Every kind a node can allow, and two custom programs.
+            .faults = .{
+                .restart = true,
+                .crash = true,
+                .wipe = true,
+                .stop = true,
+                .disk = true,
+                .clock_skew = true,
+                .process_kill = true,
+                .signals = true,
+                .syscall_errors = true,
+                .file_errors = true,
+                .pods = true,
+                .custom = &.{ "a", "b" },
+            },
+        };
+    }
+    const scenario = schema.Scenario{ .name = "s", .commands = &.{}, .clock_skip = true };
+    const system = schema.System{ .profile = "p", .nodes = &resolved, .scenarios = &.{scenario} };
+    var faults: [faults_max]Fault = undefined;
+    const count = faults_collect(&system, &scenario, &faults);
+    const last = resolved[schema.nodes_max - 1].name;
+    var last_stops: u32 = 0;
+    var stops: u32 = 0;
+    var partitions: u32 = 0;
+    var kinds: std.EnumSet(Kind) = .empty;
+    for (faults[0..count]) |fault| {
+        kinds.insert(fault.kind);
+        stops += @intFromBool(fault.kind == .stop);
+        last_stops += @intFromBool(fault.kind == .stop and std.mem.eql(u8, fault.node, last));
+        partitions += @intFromBool(fault.kind == .partition);
+    }
+    // A table of 256 was full after the first ten nodes: the rest were never stopped, and the
+    // groups and the restore, listed last, were not there at all.
+    try std.testing.expectEqual(@as(u32, 0), faults_dropped);
+    try std.testing.expectEqual(@as(u32, schema.nodes_max), stops);
+    try std.testing.expectEqual(@as(u32, 1), last_stops);
+    // A link with the runner each, and one between every two nodes.
+    try std.testing.expectEqual(@as(u32, schema.nodes_max + schema.nodes_max * (schema.nodes_max - 1) / 2), partitions);
+    for ([_]Kind{ .partition_groups, .swizzle, .outage, .clock_skip, .restore, .clog, .custom, .pod_partition }) |kind| {
+        try std.testing.expect(kinds.contains(kind));
+    }
 }
 
 test faults_collect {
