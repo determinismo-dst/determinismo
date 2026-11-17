@@ -856,7 +856,7 @@ function renderPage() {
   const isOpen = (id) => state.open.has(id);
   const titleHtml = `
     <div style="display:flex;align-items:baseline;gap:14px">
-      <h2>Run ${run.id} ${(run.ci || (state.runs || []).find((listed) => listed.id === run.id)?.ci) ? "· " + runLabel(run) : info.scenario ? "· " + escape(info.scenario) : ""}</h2>${stateBadge(run.state)}
+      <h2>Run ${run.id} ${(run.ci || (state.runs || []).find((listed) => listed.id === run.id)?.ci) ? "· " + runLabel(run) : info.scenario && info.scenario !== "none" ? "· " + escape(info.scenario) : ""}</h2>${stateBadge(run.state)}
     </div>`;
   const metaHtml = `
     <div class="muted" style="margin-top:4px">${escape(info.program || info.compose || info.kubernetes || "")}

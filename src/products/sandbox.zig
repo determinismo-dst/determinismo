@@ -377,9 +377,12 @@ fn list(context: Context) ![]const u8 {
     var directory = try std.Io.Dir.cwd().openDir(context.io, context.data, .{ .iterate = true });
     defer directory.close(context.io);
     var entries = directory.iterate();
+    var ids: std.ArrayList(u32) = .empty;
+    while (try entries.next(context.io)) |entry| try ids.append(arena, std.fmt.parseInt(u32, entry.name, 10) catch continue);
+    // In their order (a directory lists them in its own: 3, 1, 2).
+    std.mem.sort(u32, ids.items, {}, std.sort.asc(u32));
     var first = true;
-    while (try entries.next(context.io)) |entry| {
-        const id = std.fmt.parseInt(u32, entry.name, 10) catch continue;
+    for (ids.items) |id| {
         const state = state_read(context, id) catch continue;
         if (state.deleted) continue; // Its record stays; the sandbox is gone.
         if (!first) try out.append(arena, ',');
