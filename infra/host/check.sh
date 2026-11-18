@@ -133,6 +133,10 @@ case " $CHECKS " in *" ui "*)
     cp tests/ui/package-lock.json tests/ui/node_modules/.lock-installed
   fi ;;
 esac
+# Babashka for the checks that evaluate Clojure (serve's notebook cells, the REPL's client): the
+# host's own (tools.sh). Without it they said SKIP on every host (2026-11-18: each serve check).
+bb=~/opt/bb/bb
+[ -x "$bb" ] || bb=
 failed=0
 # The checks' runs of 3 days ago and before: each check leaves its runs (39 GB of them,
 # 2026-11-06), never read again once its verdict was printed.
@@ -142,7 +146,7 @@ for check in $CHECKS; do
   status=0
   # Its runs in a store of its own.
   run env DETERMINISMO_DATA=.zig-cache/e2e-runs \
-    zig-out/bin/e2e --guest "$guest" --only "$check" > "check-$check.log" 2>&1 || status=$?
+    zig-out/bin/e2e --guest "$guest" --only "$check" ${bb:+--bb "$bb"} > "check-$check.log" 2>&1 || status=$?
   echo "== $check: exit $status in $(( $(date +%s) - start )) s"
   grep -aE "^(FAIL|SKIP)|^  failed:|all checks passed" "check-$check.log" | head -20 || true
   [ $status -eq 0 ] || failed=1

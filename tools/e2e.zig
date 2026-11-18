@@ -263,7 +263,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "ingress-checkpoint", check_ingress_checkpoint }, .{ "ingress-crash", check_ingress_crash },
         .{ "draws", check_draws },                           .{ "exit-stack", check_exit_stack },
         .{ "plan-calls", check_plan_calls },                 .{ "services", check_services },
-        .{ "sites", check_sites },
+        .{ "sites", check_sites },                           .{ "client", check_client },
     };
     // A check's whole name runs it alone (check.sh's `ui` ran guidance and quiet too).
     var exact = std.mem.eql(u8, only, "tla");
@@ -1104,6 +1104,105 @@ fn little_u64_after(text: []const u8, prefix: []const u8, from: usize) ?u64 {
     var bytes: [8]u8 = undefined;
     _ = std.fmt.hexToBytes(&bytes, text[at..][0..16]) catch return null;
     return std.mem.readInt(u64, &bytes, .little);
+}
+
+/// The REPL's client (clients/clojure, under babashka) against a serve: a session at a moment
+/// of a selftest run, its registers, a variable and a structure's field by their names (their
+/// types from DWARF, the field 16 bytes in), the field's writes after two of the guest's
+/// connections (half a connection each), a function's call with its argument (the connection's
+/// descriptor), and `across`: a look at the condition's first match in the run's two timelines
+/// (the session's own, a third, left out). Judged in the script, said as `ok <name>` or
+/// `bad <name> <values>` a line. Every name is looked up before the connection it is to see:
+/// det-nodes symbol runs the guest on while it reads the module's DWARF, and a connection
+/// started first was served before the watch or the breakpoint was there.
+fn check_client(context: *Context) !void {
+    const bb = context.bb orelse {
+        std.debug.print("SKIP client: no babashka (-Dbb or $DETERMINISMO_BB)\n", .{});
+        return;
+    };
+    const arena = context.arena;
+    const address = "127.0.0.1:7887";
+    const url = "http://" ++ address;
+    const data = try std.fs.path.join(arena, &.{ context.scratch, "serve-client" });
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{ context.determinismo, "serve", "--listen", address, "--data", data });
+    try argv.appendSlice(arena, context.machine);
+    var server = try std.process.spawn(context.io, .{ .argv = argv.items, .stdout = .ignore, .stderr = .ignore });
+    defer server.kill(context.io);
+    for (0..50) |_| {
+        const runs: []const u8 = curl(context, &.{url ++ "/runs"}) catch "";
+        if (runs.len > 0) break;
+        sleep_ms(100);
+    }
+    const program = try std.fs.path.join(arena, &.{ context.bin, "det-selftest" });
+    const asked = try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(.{
+        .program = program,
+        .scenario = "steady",
+        .seed = 1,
+        .branches = 2,
+        .branching = "flat",
+        .timeline = "10s",
+    }, .{})});
+    _ = try curl(context, &.{ "-X", "POST", "-d", asked, url ++ "/runs" });
+    var run: []const u8 = "";
+    for (0..1200) |_| {
+        run = curl(context, &.{url ++ "/runs/1"}) catch "";
+        if (std.mem.indexOf(u8, run, "\"state\":\"running\"") == null and run.len > 0) break;
+        sleep_ms(500);
+    }
+    const script = try std.fs.path.join(arena, &.{ context.scratch, "client.clj" });
+    try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = script, .data = try std.fmt.allocPrint(arena,
+        \\(require '[determinismo.api :as api] '[determinismo.debug :as d])
+        \\(defn number [x] (if (string? x) (Long/parseLong (subs x 2) 16) x))
+        \\(defn echo-of [s] (first (filter (fn [n] (= "echo" (:name n))) (d/nodes s))))
+        \\(defn connect [s n]
+        \\  (d/step s (str "det:background sh -c 'for i in $(seq " n "); do echo ping | nc -w 1 "
+        \\                 (:address (echo-of s)) " 7000; done'")))
+        \\(defn said [name ok & values] (println (if ok "ok" "bad") name (pr-str values)))
+        \\(binding [api/*url* "{s}"]
+        \\  (let [condition "event=node_sample details.node=echo"
+        \\        s (d/open 1 {{:branch 0 :until condition}})
+        \\        regs (d/regs s)
+        \\        accepted (d/symbol s :echo :selftest_accepted)
+        \\        stats (d/symbol s "echo" "selftest_stats")
+        \\        ratio (d/symbol s 'echo 'selftest_stats {{:field ".ratio"}})
+        \\        _ (connect s 2)
+        \\        ratios (mapv :value (d/watch-values s ratio {{:limit 2 :ms 3000}}))
+        \\        serve-fn (d/symbol s :echo :selftest_serve)
+        \\        _ (connect s 1)
+        \\        served (d/calls s serve-fn {{:limit 1 :ms 3000}})
+        \\        _ (d/close s)
+        \\        across (d/across 1 condition
+        \\                         (fn [t] (let [found (d/symbol t :echo :selftest_accepted)]
+        \\                                   (connect t 1)
+        \\                                   (mapv :value (d/watch-values t found {{:limit 1 :ms 3000}}))))
+        \\                         {{:branches [0 1]}})
+        \\        fd (first (:args (first served)))]
+        \\    (said "regs" (some? (:rip regs)) (:rip regs))
+        \\    (said "accepted-u64" (= ["unsigned" 8] [(:kind (:type accepted)) (:size (:type accepted))]) (:type accepted))
+        \\    (said "ratio-f64" (= ["float" 8] [(:kind (:type ratio)) (:size (:type ratio))]) (:type ratio))
+        \\    (said "ratio-16-in" (= 16 (- (number (:address ratio)) (number (:address stats)))) (:address stats) (:address ratio))
+        \\    (said "ratios-half-a-connection" (and (= 2 (count ratios)) (every? double? ratios) (== 0.5 (- (second ratios) (first ratios)))) ratios)
+        \\    (said "call-descriptor" (and (some? fd) (< 2 fd 1024)) (:args (first served)))
+        \\    (said "across-both" (and (= [0 1] (mapv :branch across))
+        \\                             (every? (fn [r] (and (= 1 (count (:result r))) (pos? (first (:result r))))) across))
+        \\          (mapv (juxt :branch :timeline :result) across))))
+        \\
+    , .{url}) });
+    const ran = try run_kept(context, &.{ bb, "--classpath", "clients/clojure/src", script });
+    const out = try std.mem.concat(arena, u8, &.{ ran.stdout, ran.stderr });
+    const names = [_][]const u8{ "regs", "accepted-u64", "ratio-f64", "ratio-16-in", "ratios-half-a-connection", "call-descriptor", "across-both" };
+    var good: [names.len]bool = undefined;
+    for (names, 0..) |name, index| good[index] = std.mem.indexOf(u8, out, try std.fmt.allocPrint(arena, "ok {s} ", .{name})) != null;
+    expect_all(context, &.{
+        .{ "a session's registers", good[0] },
+        .{ "a variable by its name, typed from DWARF (unsigned, 8)", good[1] },
+        .{ "a structure's field by its path, typed (float, 8)", good[2] },
+        .{ "the field 16 bytes into the structure", good[3] },
+        .{ "its writes after two connections, half a connection apart", good[4] },
+        .{ "a function's call, its argument the connection's descriptor", good[5] },
+        .{ "across: the same look in both timelines", good[6] },
+    }, "client: the REPL's session, symbols, values, calls and across, from babashka ({s})", .{out[0..@min(out.len, 1200)]});
 }
 
 fn check_tapes(context: *Context) !void {
