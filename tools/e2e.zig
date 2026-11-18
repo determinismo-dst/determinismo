@@ -1110,7 +1110,7 @@ fn little_u64_after(text: []const u8, prefix: []const u8, from: usize) ?u64 {
 /// of a selftest run, its registers, a variable and a structure's field by their names (their
 /// types from DWARF, the field 16 bytes in), the field's writes after two of the guest's
 /// connections (half a connection each), a function's call with its argument (the connection's
-/// descriptor), and `across`: a look at the condition's first match in the run's two timelines
+/// descriptor, also by its parameter's name and type from DWARF), and `across`: a look at the condition's first match in the run's two timelines
 /// (the session's own, a third, left out). Judged in the script, said as `ok <name>` or
 /// `bad <name> <values>` a line. Every name is looked up before the connection it is to see:
 /// det-nodes symbol runs the guest on while it reads the module's DWARF, and a connection
@@ -1184,6 +1184,7 @@ fn check_client(context: *Context) !void {
         \\    (said "ratio-16-in" (= 16 (- (number (:address ratio)) (number (:address stats)))) (:address stats) (:address ratio))
         \\    (said "ratios-half-a-connection" (and (= 2 (count ratios)) (every? double? ratios) (== 0.5 (- (second ratios) (first ratios)))) ratios)
         \\    (said "call-descriptor" (and (some? fd) (< 2 fd 1024)) (:args (first served)))
+        \\    (said "call-params" (= [{{:name "client" :type "i32" :value fd}}] (:params (first served))) (:params serve-fn) (:params (first served)))
         \\    (said "across-both" (and (= [0 1] (mapv :branch across))
         \\                             (every? (fn [r] (and (= 1 (count (:result r))) (pos? (first (:result r))))) across))
         \\          (mapv (juxt :branch :timeline :result) across))))
@@ -1191,7 +1192,7 @@ fn check_client(context: *Context) !void {
     , .{url}) });
     const ran = try run_kept(context, &.{ bb, "--classpath", "clients/clojure/src", script });
     const out = try std.mem.concat(arena, u8, &.{ ran.stdout, ran.stderr });
-    const names = [_][]const u8{ "regs", "accepted-u64", "ratio-f64", "ratio-16-in", "ratios-half-a-connection", "call-descriptor", "across-both" };
+    const names = [_][]const u8{ "regs", "accepted-u64", "ratio-f64", "ratio-16-in", "ratios-half-a-connection", "call-descriptor", "call-params", "across-both" };
     var good: [names.len]bool = undefined;
     for (names, 0..) |name, index| good[index] = std.mem.indexOf(u8, out, try std.fmt.allocPrint(arena, "ok {s} ", .{name})) != null;
     expect_all(context, &.{
@@ -1201,7 +1202,8 @@ fn check_client(context: *Context) !void {
         .{ "the field 16 bytes into the structure", good[3] },
         .{ "its writes after two connections, half a connection apart", good[4] },
         .{ "a function's call, its argument the connection's descriptor", good[5] },
-        .{ "across: the same look in both timelines", good[6] },
+        .{ "the call's parameter by its DWARF name and type (client, i32)", good[6] },
+        .{ "across: the same look in both timelines", good[7] },
     }, "client: the REPL's session, symbols, values, calls and across, from babashka ({s})", .{out[0..@min(out.len, 1200)]});
 }
 

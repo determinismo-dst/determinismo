@@ -84,10 +84,12 @@ of the node's processes that defines it (its program's symbols, then its librari
 process first touched it), its `type` from the module's DWARF (`kind`: signed, unsigned,
 float, boolean, pointer, aggregate; `size`, `name`; null without DWARF), with `--field` a field
 of it by its path (`stats.accepted`, `table[2].key`: structures, unions and arrays followed,
-pointers not) and a `probe`, a page of the process's own (its stack's top) by which
+pointers not), a function's `params` from its DWARF definition (`name`, `kind`, `size`,
+`type`, in order) and a `probe`, a page of the process's own (its stack's top) by which
 a stop in any address space is told the process's or not. The REPL's `symbol`, `watch-values`
 (a variable's writes) and `calls` (a function's calls, its arguments the calling convention's
-registers at its entry) take it from there, keeping to the process's address space from its
+registers at its entry, by their parameters' names and types when the module has DWARF: a
+float's not read yet) take it from there, keeping to the process's address space from its
 first stop there. `across` does one look in many timelines: a session in each of a run's
 timelines an event query keeps (the first eight, or those named), opened at the condition's
 first match, the look done there and the session closed, one session at a time. Looking moves nothing: these steps leave the vCPU where it is, the next one queued runs there,

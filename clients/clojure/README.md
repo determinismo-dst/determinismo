@@ -69,7 +69,8 @@ the recorded history.
     (dbg/watch-values s (dbg/symbol s :db-1 :stats {:field "latency.p99"}))
                                                       ; a field by its path, read as its type
     (dbg/calls s (dbg/symbol s "db-1" "handle_request") {:limit 5})
-                                                      ; a function's calls, :args at each
+                                                      ; a function's calls, :args at each and
+                                                      ; :params by name ({:name "fd" :value 5})
     (dbg/across 13 "event=request_start" #(dbg/calls % (dbg/symbol % :db-1 :handle_request) {:limit 3})
                                                       ; the same look in each timeline the query keeps
     (dbg/step-branches s 1000)                        ; the registers 1000 branches on

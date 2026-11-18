@@ -48,6 +48,9 @@ pub const Found = struct {
     type: ?Type = null,
     /// The field asked for (`stats.accepted`): `address` and `size` are its own.
     field: ?[]const u8 = null,
+    /// A function's parameters from the module's DWARF, in order; null for a variable or
+    /// without DWARF that defines the function.
+    params: ?[]const dwarf_types.Parameter = null,
     /// A page of the process's own (its main stack's top, always there and never shared): its
     /// address and physical address, so that a stop in any address space can be told the
     /// process's (the address translated there lands on that page) or not. A function's
@@ -103,6 +106,14 @@ pub fn find(arena: std.mem.Allocator, pid: linux.pid_t, name: []const u8, field:
             error.NoSuchField, error.NotAnAggregate, error.NotAnArray, error.IndexOutOfRange, error.BadPath => |asked| if (field != null) return asked else null,
         } else null;
         if (field != null and typed == null) return error.NoType;
+        const function = symbol.kind_raw == stt_func or symbol.kind_raw == stt_gnu_ifunc;
+        const params: ?[]const dwarf_types.Parameter = if (sections != null and function and field == null)
+            dwarf_types.parameters(arena, sections.?, name) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => null,
+            }
+        else
+            null;
         const address = symbol.value +% bias +% if (field != null) typed.?.offset else 0;
         return .{
             .pid = pid,
@@ -111,6 +122,7 @@ pub fn find(arena: std.mem.Allocator, pid: linux.pid_t, name: []const u8, field:
             .size = if (field != null) typed.?.size else symbol.size,
             .type = if (typed) |t| .{ .kind = t.kind, .size = t.size, .name = t.name } else null,
             .field = field,
+            .params = params,
             .kind = switch (symbol.kind_raw) {
                 stt_object => .object,
                 stt_func, stt_gnu_ifunc => .function,
@@ -310,7 +322,7 @@ fn pread_all(fd: linux.fd_t, buffer: []u8, offset: u64) bool {
 }
 
 /// A JSON line for `det-nodes symbol`: {"pid","module","address","size","kind","physical",
-/// "probe":{"address","physical"}}.
+/// "type","field","params":[{"name","kind","size","type"}],"probe":{"address","physical"}}.
 pub fn print(writer: *std.Io.Writer, found: Found) !void {
     try writer.print("{{\"pid\":{d},\"module\":", .{found.pid});
     try std.json.Stringify.value(found.module, .{}, writer);
@@ -324,6 +336,19 @@ pub fn print(writer: *std.Io.Writer, found: Found) !void {
     } else try writer.writeAll("null");
     try writer.writeAll(",\"field\":");
     if (found.field) |path| try std.json.Stringify.value(path, .{}, writer) else try writer.writeAll("null");
+    try writer.writeAll(",\"params\":");
+    if (found.params) |params| {
+        try writer.writeAll("[");
+        for (params, 0..) |param, index| {
+            if (index > 0) try writer.writeAll(",");
+            try writer.writeAll("{\"name\":");
+            try std.json.Stringify.value(param.name, .{}, writer);
+            try writer.print(",\"kind\":\"{s}\",\"size\":{d},\"type\":", .{ @tagName(param.kind), param.size });
+            try std.json.Stringify.value(param.type_name, .{}, writer);
+            try writer.writeAll("}");
+        }
+        try writer.writeAll("]");
+    } else try writer.writeAll("null");
     try writer.writeAll(",\"probe\":");
     if (found.probe) |probe| {
         try writer.print("{{\"address\":\"0x{x}\",\"physical\":\"0x{x}\"}}", .{ probe.address, probe.physical });
@@ -332,6 +357,29 @@ pub fn print(writer: *std.Io.Writer, found: Found) !void {
 }
 
 export var det_symbol_test_value: u64 = 0x5eed;
+
+export fn det_symbol_test_function(client: i32, ratio: f64) callconv(.c) i64 {
+    return client + @as(i64, @intFromFloat(ratio));
+}
+
+test "a function of this process, its parameters by the module's DWARF" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    std.mem.doNotOptimizeAway(&det_symbol_test_function);
+    const found = (try find(arena, linux.getpid(), "det_symbol_test_function", null)).?;
+    try std.testing.expectEqual(Kind.function, found.kind);
+    try std.testing.expectEqual(@intFromPtr(&det_symbol_test_function), found.address);
+    const params = found.params.?;
+    try std.testing.expectEqual(@as(usize, 2), params.len);
+    try std.testing.expectEqualStrings("client", params[0].name);
+    try std.testing.expectEqual(dwarf_types.Kind.signed, params[0].kind);
+    try std.testing.expectEqualStrings("ratio", params[1].name);
+    try std.testing.expectEqual(dwarf_types.Kind.float, params[1].kind);
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try print(&out.writer, found);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"params\":[{\"name\":\"client\",\"kind\":\"signed\",\"size\":4,\"type\":\"i32\"}") != null);
+}
 
 test "a variable of this process, found by its name where the process sees it" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);

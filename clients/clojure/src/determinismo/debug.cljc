@@ -314,7 +314,8 @@ std::string determinismo_debug_hex(std::string const &decimal) {
   moment (`det-nodes symbol`): {:pid :module :address :size :kind :physical :type :probe},
   the address in that process, :physical its page's guest physical address now (nil until
   the process first touched it), :type its type from the module's DWARF ({:kind :size :name};
-  nil without DWARF), :probe a page of the process's own ({:address :physical}: its stack's
+  nil without DWARF), a function's :params ([{:name :kind :size :type}], in order, from DWARF),
+  :probe a page of the process's own ({:address :physical}: its stack's
   top) that tells its address space from any other at a stop. Options: :field, a path into
   it (\"stats.accepted\", \"table[2].key\": that field's address, size and type); :pid, the
   process (else the first of the node's that defines the name). The node and the name are
@@ -342,6 +343,39 @@ std::string determinismo_debug_hex(std::string const &decimal) {
           (or (= kind "unsigned") (= kind "boolean") (= kind "pointer")) (get {1 :u8 2 :u16 4 :u32 8 :u64} size)
           (= kind "float") (get {4 :f32 8 :f64} size)
           :else nil)))
+
+(def ^:private integer-registers
+  "Where x86-64's calling convention puts a function's integer and pointer arguments, in order."
+  [:rdi :rsi :rdx :rcx :r8 :r9])
+
+(defn- register-bytes
+  "A register's value (\"0x...\") as its 8 bytes in memory order (little-endian)."
+  [said]
+  (let [text (str said)
+        digits (if (str/starts-with? text "0x") (subs text 2) text)
+        padded (str (apply str (repeat (- 16 (count digits)) "0")) digits)]
+    (vec (reverse (map (fn [pair] (unhex (str "0x" (apply str pair)))) (partition 2 padded))))))
+
+(defn- parameter-values
+  "A call's parameters (a `symbol`'s :params, from DWARF) by x86-64's calling convention, at the
+  function's entry: an integer, a pointer or a boolean in the next of rdi rsi rdx rcx r8 r9,
+  read as its type; a float in a vector register (not read: nil); from an aggregate passed by
+  value on, where each is not known (nil). -> [{:name :type :value} ...]"
+  [params registers]
+  (loop [params params next-register 0 placed true out []]
+    (if (empty? params)
+      out
+      (let [param (first params)
+            kind (:kind param)
+            integer (contains? #{"signed" "unsigned" "boolean" "pointer"} kind)
+            type (value-type param)
+            register (when (and placed integer type (< next-register (count integer-registers)))
+                       (get registers (nth integer-registers next-register)))
+            value (when register (value-of (subvec (register-bytes register) 0 (:size param)) type))]
+        (recur (rest params)
+               (if integer (inc next-register) next-register)
+               (and placed (or integer (= kind "float")))
+               (conj out {:name (:name param) :type (:type param) :value value}))))))
 
 (defn watch-values
   "A variable's writes from the session's moment on: a write watchpoint on its `size` bytes at
@@ -406,7 +440,9 @@ std::string determinismo_debug_hex(std::string const &decimal) {
   integer's or a pointer's; a float's are in vector registers, not read), kept when :keep?
   holds for :args. Until :limit kept (100), :max-stops calls (10,000), or :ms of virtual time
   with no call (60 s); the breakpoint is off after. Each kept call is an exact moment, the
-  function's first instruction not run yet. -> [{:args :vtime_ns :branches :rip :cr3} ...]"
+  function's first instruction not run yet. With the module's DWARF (the symbol's :params),
+  :params says them by name, each read as its type ([{:name \"client\" :type \"i32\" :value 5}];
+  a float's value nil). -> [{:args :params :vtime_ns :branches :rip :cr3} ...]"
   ([session found] (calls session found {}))
   ([session found options]
    (let [address (:address found)
@@ -430,8 +466,9 @@ std::string determinismo_debug_hex(std::string const &decimal) {
                           (when learned (break session address learned))
                           (if-not ours
                             (recur kept (inc stops) space)
-                            (let [arguments (mapv (fn [k] (register registers k)) [:rdi :rsi :rdx :rcx :r8 :r9])
-                                  found-call (assoc (select-keys stop [:vtime_ns :branches :rip :cr3]) :args arguments)]
+                            (let [arguments (mapv (fn [k] (register registers k)) integer-registers)
+                                  found-call (cond-> (assoc (select-keys stop [:vtime_ns :branches :rip :cr3]) :args arguments)
+                                               (:params found) (assoc :params (parameter-values (:params found) registers)))]
                               (recur (if (keep? arguments) (conj kept found-call) kept) (inc stops) space))))))))]
        (break session nil)
        (tap/tell :calls {:session session :address (hex address) :kept kept} kept)))))

@@ -6,6 +6,8 @@
 //! variable (by its name or its linkage name), then its type followed: typedefs and qualifiers,
 //! structures, classes and unions by their members, arrays by an index. A pointer is a value
 //! here, never followed (that would read the process's memory). Sections read whole, bounded.
+//! A function's parameters too (`det-nodes symbol` of a function: `calls` says its arguments by
+//! name and type): its defining entry's formal parameters, in order.
 const std = @import("std");
 const assert = std.debug.assert;
 const DW = std.dwarf;
@@ -61,6 +63,52 @@ pub fn resolve(arena: std.mem.Allocator, sections: Sections, variable: []const u
         place.name = typed.name;
     }
     return place;
+}
+
+pub const Parameter = struct {
+    /// Empty when the module does not name it.
+    name: []const u8,
+    size: u64,
+    kind: Kind,
+    /// Its type's name.
+    type_name: []const u8,
+};
+
+/// The parameters of the function `function` (its name or linkage name), in order, from its
+/// defining entry (one with code; an inlined-only or declared-only one is not it), names and
+/// types through the entry it completes or instantiates; null when the module's DWARF has no
+/// definition of it.
+pub fn parameters(arena: std.mem.Allocator, sections: Sections, function: []const u8) Error!?[]const Parameter {
+    var types: Types = .{ .arena = arena, .sections = sections };
+    try types.units_scan();
+    const found = (try types.function_find(function)) orelse return null;
+    const unit = try types.unit_of(found.offset);
+    var listed: std.ArrayList(Parameter) = .empty;
+    if (!found.children) return listed.items;
+    var at = found.next;
+    var depth: u32 = 0;
+    while (at < unit.end) {
+        const die = try types.die_at(unit, at);
+        at = die.next;
+        if (die.tag == 0) {
+            if (depth == 0) break; // The function's children ended.
+            depth -= 1;
+            continue;
+        }
+        if (depth == 0 and die.tag == DW.TAG.formal_parameter) {
+            var name = die.name;
+            var type_offset = die.type;
+            if (die.specification) |origin| {
+                const original = try types.die_at(try types.unit_of(origin), origin);
+                name = name orelse original.name;
+                type_offset = type_offset orelse original.type;
+            }
+            const typed: Field = if (type_offset) |offset| try types.type_of(offset) else .{ .offset = 0, .size = 0, .kind = .other, .name = "" };
+            try listed.append(arena, .{ .name = name orelse "", .size = typed.size, .kind = typed.kind, .type_name = typed.name });
+        }
+        if (die.children) depth += 1;
+    }
+    return listed.items;
 }
 
 /// A path's steps: `.name` a member, `[n]` an index; the first member needs no dot.
@@ -142,6 +190,9 @@ const Die = struct {
     count: ?u64 = null,
     upper_bound: ?u64 = null,
     declaration: bool = false,
+    /// It has code (low_pc or ranges): a function's definition, not only its declaration or
+    /// its abstract (inlined) instance.
+    code: bool = false,
     str_offsets_base: ?u64 = null,
 };
 
@@ -248,6 +299,7 @@ const Types = struct {
                 DW.AT.count => die.count = number_of(value),
                 DW.AT.upper_bound => die.upper_bound = number_of(value),
                 DW.AT.declaration => die.declaration = true,
+                DW.AT.low_pc, DW.AT.ranges => die.code = true,
                 DW.AT.str_offsets_base => die.str_offsets_base = number_of(value),
                 else => {},
             }
@@ -342,6 +394,35 @@ const Types = struct {
                 const matches = (named != null and std.mem.eql(u8, named.?, name)) or
                     (linkage != null and std.mem.eql(u8, linkage.?, name));
                 if (matches) if (type_offset) |found| return found;
+            }
+        }
+        return null;
+    }
+
+    /// The defining entry of the function named `name` (its name or linkage name, its own or
+    /// that of the entry it completes or instantiates): the first with code.
+    fn function_find(types: *Types, name: []const u8) Error!?Die {
+        for (types.units.items) |*unit| {
+            var at = unit.dies;
+            while (at < unit.end) {
+                const die = try types.die_at(unit, at);
+                at = die.next;
+                if (die.tag != DW.TAG.subprogram or !die.code) continue;
+                var named = die.name;
+                var linkage = die.linkage_name;
+                // A definition's or an instance's names are on its declaration or abstract
+                // entry, and that one's may be on its own declaration.
+                var origin = die.specification;
+                for (0..4) |_| {
+                    const offset = origin orelse break;
+                    const original = try types.die_at(try types.unit_of(offset), offset);
+                    named = named orelse original.name;
+                    linkage = linkage orelse original.linkage_name;
+                    origin = original.specification;
+                }
+                const matches = (named != null and std.mem.eql(u8, named.?, name)) or
+                    (linkage != null and std.mem.eql(u8, linkage.?, name));
+                if (matches) return die;
             }
         }
         return null;
@@ -597,6 +678,32 @@ test "a variable's fields by their paths, from this test binary's DWARF" {
     try std.testing.expectError(error.IndexOutOfRange, resolve(arena, sections, "det_types_test", "table[3]"));
     try std.testing.expectError(error.NotAnArray, resolve(arena, sections, "det_types_test", "ratio[0]"));
     try std.testing.expectEqual(@as(?Field, null), try resolve(arena, sections, "det_no_such_variable", ""));
+}
+
+// A test function whose parameters this file reads back from the test binary's own DWARF.
+export fn det_types_test_function(client: i32, ratio: f64, stats: *const TestStats, flag: bool) callconv(.c) u64 {
+    return @as(u64, @intCast(@max(client, 0))) + @as(u64, @intFromFloat(@max(ratio, 0))) + stats.accepted + @intFromBool(flag);
+}
+
+test "a function's parameters, from this test binary's DWARF" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    std.mem.doNotOptimizeAway(&det_types_test_function);
+    const sections = (try sections_of_self(arena)) orelse return error.SkipZigTest;
+    const listed = (try parameters(arena, sections, "det_types_test_function")).?;
+    try std.testing.expectEqual(@as(usize, 4), listed.len);
+    try std.testing.expectEqualStrings("client", listed[0].name);
+    try std.testing.expectEqual(Kind.signed, listed[0].kind);
+    try std.testing.expectEqual(@as(u64, 4), listed[0].size);
+    try std.testing.expectEqualStrings("ratio", listed[1].name);
+    try std.testing.expectEqual(Kind.float, listed[1].kind);
+    try std.testing.expectEqual(@as(u64, 8), listed[1].size);
+    try std.testing.expectEqualStrings("stats", listed[2].name);
+    try std.testing.expectEqual(Kind.pointer, listed[2].kind);
+    try std.testing.expectEqualStrings("flag", listed[3].name);
+    try std.testing.expectEqual(Kind.boolean, listed[3].kind);
+    try std.testing.expectEqual(@as(?[]const Parameter, null), try parameters(arena, sections, "det_no_such_function"));
 }
 
 /// This test binary's debug sections (the test reads its own DWARF), or null without them.
