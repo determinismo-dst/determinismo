@@ -21,6 +21,8 @@ const Context = struct {
     scratch: []const u8,
     /// Babashka, for notebooks ($DETERMINISMO_BB); without it their evaluation is skipped.
     bb: ?[]const u8 = null,
+    /// jank, for the REPL's client as the viz runs it ($DETERMINISMO_JANK).
+    jank: ?[]const u8 = null,
     failures: u32 = 0,
     /// Every exploration's whole output is kept (`<scratch>/outputs/<n>.log`): a failing check
     /// names the ones it judged (those since the check before it), to read rather than rerun.
@@ -115,6 +117,7 @@ pub fn main(init: std.process.Init) !void {
     var cache: []const u8 = try std.fs.path.join(arena, &.{ home, "cache" });
     var only: []const u8 = "";
     var bb: ?[]const u8 = init.environ_map.get("DETERMINISMO_BB");
+    var jank: ?[]const u8 = init.environ_map.get("DETERMINISMO_JANK");
     var index: usize = 1;
     while (index + 1 < arguments.len) : (index += 2) {
         const flag = arguments[index];
@@ -127,6 +130,8 @@ pub fn main(init: std.process.Init) !void {
             only = value;
         } else if (std.mem.eql(u8, flag, "--bb")) {
             bb = value;
+        } else if (std.mem.eql(u8, flag, "--jank")) {
+            jank = value;
         } else return error.Usage;
     }
     // Its own: suites run at once (a full one and a single check) do not share files. On disk,
@@ -151,6 +156,7 @@ pub fn main(init: std.process.Init) !void {
         .arena = arena,
         .io = init.io,
         .bb = bb,
+        .jank = jank,
         .determinismo = try std.fs.path.join(arena, &.{ bin, "determinismo" }),
         .machine = &.{
             "--kernel",     kernel,
@@ -1154,7 +1160,8 @@ fn check_client(context: *Context) !void {
     const script = try std.fs.path.join(arena, &.{ context.scratch, "client.clj" });
     try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = script, .data = try std.fmt.allocPrint(arena,
         \\(require '[determinismo.api :as api] '[determinismo.debug :as d])
-        \\(defn number [x] (if (string? x) (Long/parseLong (subs x 2) 16) x))
+        \\(def unhex (deref (resolve 'determinismo.debug/unhex)))
+        \\(defn number [x] (if (string? x) (unhex x) x))
         \\(defn echo-of [s] (first (filter (fn [n] (= "echo" (:name n))) (d/nodes s))))
         \\(defn connect [s n]
         \\  (d/step s (str "det:background sh -c 'for i in $(seq " n "); do echo ping | nc -w 1 "
@@ -1183,7 +1190,7 @@ fn check_client(context: *Context) !void {
         \\    (said "accepted-u64" (= ["unsigned" 8] [(:kind (:type accepted)) (:size (:type accepted))]) (:type accepted))
         \\    (said "ratio-f64" (= ["float" 8] [(:kind (:type ratio)) (:size (:type ratio))]) (:type ratio))
         \\    (said "ratio-16-in" (= 16 (- (number (:address ratio)) (number (:address stats)))) (:address stats) (:address ratio))
-        \\    (said "ratios-half-a-connection" (and (= 2 (count ratios)) (every? double? ratios) (== 0.5 (- (second ratios) (first ratios)))) ratios)
+        \\    (said "ratios-half-a-connection" (and (= 2 (count ratios)) (every? float? ratios) (== 0.5 (- (second ratios) (first ratios)))) ratios)
         \\    (said "call-descriptor" (and (some? fd) (< 2 fd 1024)) (:args (first served)))
         \\    (said "call-params" (= [{{:name "client" :type "i32" :value fd}}] (:params (first served))) (:params serve-fn) (:params (first served)))
         \\    (said "across-both" (and (= [0 1] (mapv :branch across))
@@ -1191,21 +1198,31 @@ fn check_client(context: *Context) !void {
         \\          (mapv (juxt :branch :timeline :result) across))))
         \\
     , .{url}) });
-    const ran = try run_kept(context, &.{ bb, "--classpath", "clients/clojure/src", script });
-    const out = try std.mem.concat(arena, u8, &.{ ran.stdout, ran.stderr });
-    const names = [_][]const u8{ "regs", "accepted-u64", "ratio-f64", "ratio-16-in", "ratios-half-a-connection", "call-descriptor", "call-params", "across-both" };
-    var good: [names.len]bool = undefined;
-    for (names, 0..) |name, index| good[index] = std.mem.indexOf(u8, out, try std.fmt.allocPrint(arena, "ok {s} ", .{name})) != null;
-    expect_all(context, &.{
-        .{ "a session's registers", good[0] },
-        .{ "a variable by its name, typed from DWARF (unsigned, 8)", good[1] },
-        .{ "a structure's field by its path, typed (float, 8)", good[2] },
-        .{ "the field 16 bytes into the structure", good[3] },
-        .{ "its writes after two connections, half a connection apart", good[4] },
-        .{ "a function's call, its argument the connection's descriptor", good[5] },
-        .{ "the call's parameter by its DWARF name and type (client, i32)", good[6] },
-        .{ "across: the same look in both timelines", good[7] },
-    }, "client: the REPL's session, symbols, values, calls and across, from babashka ({s})", .{out[0..@min(out.len, 1200)]});
+    // The same script under babashka and under jank (the viz's runtime, where the client's own
+    // limits are: a catch's nil, 32-bit products), each judged on its own.
+    const Runner = struct { name: []const u8, argv: []const []const u8 };
+    var runners: std.ArrayList(Runner) = .empty;
+    try runners.append(arena, .{ .name = "babashka", .argv = &.{ bb, "--classpath", "clients/clojure/src", script } });
+    if (context.jank) |jank| {
+        try runners.append(arena, .{ .name = "jank", .argv = try arena.dupe([]const u8, &.{ jank, "--module-path", "clients/clojure/src", "run", script }) });
+    } else std.debug.print("SKIP client: under jank (no jank: $DETERMINISMO_JANK or --jank)\n", .{});
+    for (runners.items) |runner| {
+        const ran = try run_kept(context, runner.argv);
+        const out = try std.mem.concat(arena, u8, &.{ ran.stdout, ran.stderr });
+        const names = [_][]const u8{ "regs", "accepted-u64", "ratio-f64", "ratio-16-in", "ratios-half-a-connection", "call-descriptor", "call-params", "across-both" };
+        var good: [names.len]bool = undefined;
+        for (names, 0..) |name, index| good[index] = std.mem.indexOf(u8, out, try std.fmt.allocPrint(arena, "ok {s} ", .{name})) != null;
+        expect_all(context, &.{
+            .{ "a session's registers", good[0] },
+            .{ "a variable by its name, typed from DWARF (unsigned, 8)", good[1] },
+            .{ "a structure's field by its path, typed (float, 8)", good[2] },
+            .{ "the field 16 bytes into the structure", good[3] },
+            .{ "its writes after two connections, half a connection apart", good[4] },
+            .{ "a function's call, its argument the connection's descriptor", good[5] },
+            .{ "the call's parameter by its DWARF name and type (client, i32)", good[6] },
+            .{ "across: the same look in both timelines", good[7] },
+        }, "client: the REPL's session, symbols, values, calls and across, from {s} ({s})", .{ runner.name, out[0..@min(out.len, 1200)] });
+    }
 }
 
 fn check_tapes(context: *Context) !void {
