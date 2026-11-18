@@ -2721,6 +2721,9 @@ fn check_kubernetes(context: *Context) !void {
     const driven = std.mem.indexOf(u8, report, "test command completed: parallel_driver_increment") != null;
     const read = std.mem.indexOf(u8, report, "test command completed: eventually_counter_readable") != null;
     const passing = std.mem.indexOf(u8, report, "4 branches, 0 with failing properties") != null;
+    // The greps below read the timelines' own files plain (an ended timeline's are compressed:
+    // they found no pod fault, and no pod's output, in any).
+    try events_plain(context, explored);
     // Faults on single pods (Faults.pods), each naming its pod.
     const pod_faults = try run_kept(context, &.{ "sh", "-c", try std.fmt.allocPrint(arena, "grep -rhoE '\"kind\":\"pod_[a-z]+\"' {s} | sort | uniq -c | tr -s ' \\n' ' '", .{explored}) });
     // The pods' own output, named after them (det-podlogs): Redis says it is ready.
