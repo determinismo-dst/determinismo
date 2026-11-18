@@ -446,9 +446,14 @@ pub fn main(init: std.process.Init) !void {
         }
         if (linux.errno(client) != .SUCCESS) continue;
         defer _ = linux.close(@intCast(client));
+        selftest_accepted += 1;
         serve(@intCast(client));
     }
 }
+
+/// The connections this server accepted: a variable with a known course, watched by its name
+/// from a session (e2e debugging: det-nodes symbol, det:watch). Exported, so kept whole.
+export var selftest_accepted: u64 = 0;
 
 fn on_urgent(_: linux.SIG) callconv(.c) void {}
 

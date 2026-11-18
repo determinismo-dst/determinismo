@@ -17,6 +17,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const nodes = @import("nodes.zig");
+const symbol = @import("symbol.zig");
 const sdk = @import("determinismo");
 const schema = sdk.schema;
 
@@ -27,6 +28,7 @@ const usage =
     \\       det-nodes upgrade <node> next|base
     \\       det-nodes exec [--coverage] <node> <command>...
     \\       det-nodes list
+    \\       det-nodes symbol <node> <name> [pid]
     \\       det-nodes writeback
     \\       det-nodes samples
     \\
@@ -73,6 +75,31 @@ pub fn main(init: std.process.Init) !void {
         const next = eql(u8, arguments[3], "next");
         if (!next and !eql(u8, arguments[3], "base")) return usage_exit();
         return nodes.upgrade(arena, &system, node, next);
+    }
+    if (eql(u8, command, "symbol")) {
+        // `symbol <node> <name> [pid]`: where a variable (or function) of the node's processes
+        // is (symbol.zig), a JSON line; the first of its processes that defines the name, or
+        // the one given.
+        if (arguments.len != 4 and arguments.len != 5) return usage_exit();
+        const node = system.node(arguments[2]) orelse return error.UnknownNode;
+        var found_pids: [1024]std.os.linux.pid_t = undefined;
+        const pids = if (arguments.len == 5) found_pids[0..1] else found_pids[0..try nodes.processes(node.name, &found_pids)];
+        if (arguments.len == 5) found_pids[0] = try std.fmt.parseInt(std.os.linux.pid_t, arguments[4], 10);
+        for (pids) |pid| {
+            const found = try symbol.find(arena, pid, arguments[3]) orelse continue;
+            var out: std.Io.Writer.Allocating = .init(arena);
+            try symbol.print(&out.writer, found);
+            const text = out.written();
+            var written: usize = 0;
+            while (written < text.len) {
+                const result = std.os.linux.write(1, text[written..].ptr, text.len - written);
+                if (std.os.linux.errno(result) != .SUCCESS) return error.Write;
+                written += result;
+            }
+            return;
+        }
+        std.debug.print("det-nodes: no process of {s} defines {s}\n", .{ node.name, arguments[3] });
+        std.process.exit(1);
     }
     if (arguments.len != 3) return usage_exit();
     const name = arguments[2];

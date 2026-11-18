@@ -14,6 +14,7 @@
 ;;   (dbg/break s 0xffffffff81b96960) (dbg/continue s)  ; stopped on the kernel's schedule
 ;;   (dbg/watch-values s 0xffffffff824079c0 8 {:limit 3}) ; jiffies' next three writes, each a moment
 ;;   (dbg/watch-values s address 8 {:cr3 cr3 :type :f64 :keep? #(< 35.0 % 40.3)})
+;;   (dbg/watch-values s (dbg/symbol s "db-1" "counter") {:keep? #(> % 100)}) ; by its name
 ;;   (dbg/step-branches s 1000) (dbg/sh s "det-nodes list")
 ;;   (dbg/checkpoint s "loaded")                        ; the machine saved here
 ;;   (dbg/close s)
@@ -22,6 +23,7 @@
 ;; A run replays with the explorer that recorded it: these answer in runs recorded since they
 ;; exist (2026-11-13); an older run's guest takes them for shell commands.
 (ns determinismo.debug
+  (:refer-clojure :exclude [symbol])
   (:require [clojure.string :as str]
             [determinismo.api :as api]
             [determinismo.http :as http]
@@ -36,7 +38,7 @@
 
 (def ^:private timelines (atom {}))
 
-(declare plan-session open-session)
+(declare plan-session open-session sh)
 
 (defn open
   "A session held at a moment of `run`'s timeline: its id. The moment: :until, a condition on
@@ -301,6 +303,21 @@ std::string determinismo_debug_hex(std::string const &decimal) {
                        (/ (+ (mod b6 16) low) 16.0) 1023 2047))
       (throw (ex-info (str "determinismo: no such value type " type) {:type type})))))
 
+(defn symbol
+  "Where a variable (or function) of a node's processes is, by its name, at the session's
+  moment (`det-nodes symbol`): {:pid :module :address :size :kind :physical}, the address in
+  that process, :physical its page's guest physical address now (nil until the process first
+  touched it). `pid` picks the process; else the first of the node's that defines the name.
+  `watch-values` takes it whole."
+  ([session node name] (symbol session node name nil))
+  ([session node name pid]
+   (let [said (sh session (str "det-nodes symbol " node " " name (when pid (str " " pid))))
+         line (some (fn [l] (when (str/starts-with? l "{") l)) (str/split-lines (or said "")))]
+     (when-not line
+       (throw (ex-info (str "determinismo: " node " has no " name ": " said) {:node node :name name :said said})))
+     (let [found (json/read-json line)]
+       (tap/tell :symbol {:session session :node node :name name :found found} found)))))
+
 (defn watch-values
   "A variable's writes from the session's moment on: a write watchpoint on its `size` bytes at
   `address` (a guest virtual address), then `continue` to each write, its value read as
@@ -309,24 +326,46 @@ std::string determinismo_debug_hex(std::string const &decimal) {
   with no write (60 s); the watch is off after. :cr3 keeps one address space's writes (a
   process's: regs' or a stop's :cr3), else any. Each kept write is an exact moment of the
   timeline (its :vtime_ns and :branches, the guest just past the writing instruction at :rip),
-  where a session can be opened. -> [{:value :vtime_ns :branches :rip :cr3} ...]"
-  ([session address size] (watch-values session address size {}))
+  where a session can be opened. -> [{:value :vtime_ns :branches :rip :cr3} ...]
+
+  Or a `symbol`'s answer in place of address and size: its process's writes alone. A write
+  counts when its address space maps the variable's page (:physical; the first write's when
+  the page was not there yet), and from the first that does the watch keeps to that address
+  space (its :cr3)."
+  ([session address-or-symbol] (watch-values session address-or-symbol nil {}))
+  ([session address size-or-options]
+   (if (map? address)
+     (watch-values session address nil size-or-options)
+     (watch-values session address size-or-options {})))
   ([session address size options]
-   (let [type (or (:type options) (get {1 :i8 2 :i16 4 :i32 8 :i64} size))
+   (let [named (when (map? address) address)
+         address (if named (:address named) address)
+         size (if named (:size named) size)
+         physical (when named (some-> (:physical named) unhex))
+         type (or (:type options) (get {1 :i8 2 :i16 4 :i32 8 :i64} size))
          keep? (or (:keep? options) (fn [_] true))
          limit (or (:limit options) 100)
          most (or (:max-stops options) 10000)]
      (watch session address size (:cr3 options))
-     (let [kept (loop [kept [] stops 0]
+     (let [kept (loop [kept [] stops 0 space (:cr3 options)]
                   (if (or (>= (count kept) limit) (>= stops most))
                     kept
                     (let [stop (continue session (:ms options))]
                       (if-not (and stop (:watch stop) (:hex stop))
                         kept
-                        (let [bytes (mapv (fn [pair] (unhex (str "0x" (apply str pair)))) (partition 2 (:hex stop)))
-                              value (value-of bytes type)
-                              found (assoc (select-keys stop [:vtime_ns :branches :rip :cr3]) :value value)]
-                          (recur (if (keep? value) (conj kept found) kept) (inc stops)))))))]
+                        (let [ours (or (not named) space
+                                       (nil? physical)
+                                       (= physical (translate session (:cr3 stop) address)))
+                              learned (when (and named ours (nil? space)) (:cr3 stop))
+                              space (or space learned)]
+                          ;; The process's address space found: its writes alone from here.
+                          (when learned (watch session address size learned))
+                          (if-not ours
+                            (recur kept (inc stops) space)
+                            (let [bytes (mapv (fn [pair] (unhex (str "0x" (apply str pair)))) (partition 2 (:hex stop)))
+                                  value (value-of bytes type)
+                                  found (assoc (select-keys stop [:vtime_ns :branches :rip :cr3]) :value value)]
+                              (recur (if (keep? value) (conj kept found) kept) (inc stops) space))))))))]
        (watch session nil)
        (tap/tell :watch-values {:session session :address (hex address) :size size :type type :kept kept} kept)))))
 

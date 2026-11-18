@@ -982,6 +982,7 @@ fn check_debugging(context: *Context) !void {
         .{ "the history to 5 s is the plain replay's", parse_branches(watched_steps, &watched_branch_to) == 1 and
             std.mem.eql(u8, watched_branch_to[0].events_hash, unstopped_branch[0].events_hash) },
     }, "debugging: a watched variable's writes stop with their values and change nothing (jiffies {d}, {d})", .{ values[0], values[1] });
+    try check_debugging_symbol(context);
     const forks = try std.fs.path.join(context.arena, &.{ context.scratch, "debugging-forks" });
     const forked = try explore(context, &.{
         "--program",   program, "--scenario",    "bank", "--seed",          "11",   "--timeline",  "30s",
@@ -999,6 +1000,68 @@ fn check_debugging(context: *Context) !void {
         .{ "its tape replays it, the poke again", parse_branches(again, &again_branch) == 1 and one and
             std.mem.eql(u8, again_branch[0].events_hash, fork_branch[0].events_hash) and std.mem.indexOf(u8, again, poked) != null },
     }, "debugging: a fork with a poke goes on from it and replays from its tape", .{});
+}
+
+/// A node's variable by its name (det-nodes symbol): the selftest echo node's count of the
+/// connections it accepted (selftest_accepted), found in its process at 3 s, read at its
+/// physical address, watched at its virtual one while a guest command connects (steady's own
+/// drivers connect once in its 10 s): the write the watch stops at is that connection's.
+fn check_debugging_symbol(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "det-selftest" });
+    const tapes = try std.fs.path.join(arena, &.{ context.scratch, "debugging-symbol" });
+    const common = [_][]const u8{ "--program", program, "--scenario", "steady", "--seed", "1", "--timeline", "10s" };
+    _ = try explore(context, &(common ++ [_][]const u8{ "--branching", "flat", "--branches", "1", "--tape-dir", tapes }));
+    const tape = try std.fs.path.join(arena, &.{ tapes, "branch-0.jsonl" });
+    const named = try explore(context, &(common ++ [_][]const u8{ "--tape", tape, "--at-vtime-ms", "3000", "--exec", "det-nodes symbol echo selftest_accepted; det-nodes list" }));
+    // Its JSON line inside the exec_output event's text, quotes escaped there.
+    const address = hex_after(named, "address\\\":\\\"0x");
+    const physical = hex_after(named, "physical\\\":\\\"0x");
+    const object = std.mem.indexOf(u8, named, "kind\\\":\\\"object") != null;
+    const echo_prefix = "\\\"name\\\":\\\"echo\\\"";
+    const address_key = "address\\\":\\\"";
+    const echo_at = std.mem.indexOf(u8, named, echo_prefix);
+    const ip_at = if (echo_at) |at| if (std.mem.indexOfPos(u8, named, at, address_key)) |key| key + address_key.len else null else null;
+    const ip_end = if (ip_at) |at| std.mem.indexOfScalarPos(u8, named, at, '\\') else null;
+    if (address == null or physical == null or ip_end == null) {
+        const shown = if (std.mem.indexOf(u8, named, "exec_output")) |i| named[i..@min(named.len, i + 300)] else named[named.len -| 300..];
+        expect(context, false, "debugging: det-nodes symbol named the echo node's selftest_accepted ({s})", .{shown});
+        return;
+    }
+    const script = try std.fs.path.join(arena, &.{ context.scratch, "debugging-symbol.txt" });
+    const ip = named[ip_at.?..ip_end.?];
+    try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = script, .data = try std.fmt.allocPrint(arena, "det:mem 0x{x} 8\ndet:watch 0x{x} 8\ndet:background echo ping | nc -w 1 {s} 7000\ndet:continue 3000\ndet:mem 0x{x} 8\ndet:watch off\n", .{ physical.?, address.?, ip, physical.? }) });
+    const watched = try explore(context, &(common ++ [_][]const u8{ "--tape", tape, "--at-vtime-ms", "3000", "--exec-script", script }));
+    const read_prefix = try std.fmt.allocPrint(arena, "\"address\":\"0x{x}\",\"size\":8,\"hex\":\"", .{physical.?});
+    const before = little_u64_after(watched, read_prefix, 0);
+    const hit_prefix = try std.fmt.allocPrint(arena, "\"watch\":\"0x{x}\",\"size\":8,\"hex\":\"", .{address.?});
+    const hit = little_u64_after(watched, hit_prefix, 0);
+    const after_at = if (std.mem.indexOf(u8, watched, read_prefix)) |first| first + read_prefix.len else 0;
+    const after = little_u64_after(watched, read_prefix, after_at);
+    expect_all(context, &.{
+        .{ "det-nodes symbol said where it is: an object, its address and its page", object },
+        .{ "its value read at its physical address", before != null },
+        .{ "det:watch at its address stopped at the next connection's write, one more", before != null and hit != null and hit.? == before.? + 1 },
+        .{ "read again there, the value the stop said", hit != null and after != null and after.? == hit.? },
+    }, "debugging: a node's variable by its name (selftest_accepted at 0x{x}, page 0x{x}: {?d}, then {?d})", .{ address.?, physical.?, before, hit });
+}
+
+/// The hexadecimal number right after `prefix` in `text`, or null.
+fn hex_after(text: []const u8, prefix: []const u8) ?u64 {
+    const at = (std.mem.indexOf(u8, text, prefix) orelse return null) + prefix.len;
+    var end = at;
+    while (end < text.len and std.ascii.isHex(text[end])) end += 1;
+    return std.fmt.parseInt(u64, text[at..end], 16) catch null;
+}
+
+/// The 8 bytes of hex (memory order) right after `prefix` (its first at or past `from`), as a
+/// little-endian number, or null.
+fn little_u64_after(text: []const u8, prefix: []const u8, from: usize) ?u64 {
+    const at = (std.mem.indexOfPos(u8, text, from, prefix) orelse return null) + prefix.len;
+    if (at + 16 > text.len) return null;
+    var bytes: [8]u8 = undefined;
+    _ = std.fmt.hexToBytes(&bytes, text[at..][0..16]) catch return null;
+    return std.mem.readInt(u64, &bytes, .little);
 }
 
 fn check_tapes(context: *Context) !void {
