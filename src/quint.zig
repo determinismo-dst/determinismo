@@ -624,7 +624,53 @@ const States = struct {
 /// how the timeline's events drive the spec, for a client that shows it. `steps_shown` at most.
 const steps_shown = 8;
 
-const Shown = struct { index: usize, seq: u64, vtime_ns: u64, action: []const u8, argument: ?std.json.Value, state: std.json.Value };
+const Shown = struct {
+    index: usize,
+    seq: u64,
+    vtime_ns: u64,
+    action: []const u8,
+    argument: ?std.json.Value,
+    state: std.json.Value,
+    /// What the event changed in the spec's state: each place that differs from the state
+    /// before it, `changes_shown` at most (`changes` says how many there were).
+    changed: []const Change,
+    changes: usize,
+};
+
+/// A place of the spec's state (`nodes.raft-node-0.mark`) an event changed, and its values
+/// before and after (null where there was none).
+const Change = struct { path: []const u8, before: ?std.json.Value, after: ?std.json.Value };
+const changes_shown = 8;
+
+/// The places where `after` differs from `before`: records by field, anything else whole.
+fn changes_of(arena: std.mem.Allocator, found: *std.ArrayList(Change), count: *usize, path: []const u8, before: ?std.json.Value, after: ?std.json.Value) ItfError!void {
+    // A variant ({tag, value}) is one value, not a record of two fields.
+    const records = before != null and after != null and before.? == .object and after.? == .object and
+        before.?.object.get("tag") == null and after.?.object.get("tag") == null;
+    if (records) {
+        var fields = after.?.object.iterator();
+        while (fields.next()) |field| {
+            const inner = if (path.len == 0) field.key_ptr.* else try std.fmt.allocPrint(arena, "{s}.{s}", .{ path, field.key_ptr.* });
+            try changes_of(arena, found, count, inner, before.?.object.get(field.key_ptr.*), field.value_ptr.*);
+        }
+        var gone = before.?.object.iterator();
+        while (gone.next()) |field| {
+            if (after.?.object.get(field.key_ptr.*) != null) continue;
+            const inner = if (path.len == 0) field.key_ptr.* else try std.fmt.allocPrint(arena, "{s}.{s}", .{ path, field.key_ptr.* });
+            try changes_of(arena, found, count, inner, field.value_ptr.*, null);
+        }
+        return;
+    }
+    const same = same: {
+        if (before == null or after == null) break :same before == null and after == null;
+        const one = std.json.Stringify.valueAlloc(arena, before.?, .{}) catch return error.OutOfMemory;
+        const other = std.json.Stringify.valueAlloc(arena, after.?, .{}) catch return error.OutOfMemory;
+        break :same std.mem.eql(u8, one, other);
+    };
+    if (same) return;
+    count.* += 1;
+    if (found.items.len < changes_shown) try found.append(arena, .{ .path = path, .before = before, .after = after });
+}
 
 fn steps_of(arena: std.mem.Allocator, trace: *const Trace, states: States) ItfError![]const Shown {
     var shown: std.ArrayList(Shown) = .empty;
@@ -634,13 +680,19 @@ fn steps_of(arena: std.mem.Allocator, trace: *const Trace, states: States) ItfEr
     if (index == 0) index = 1;
     while (index <= last) : (index += 1) {
         const step = trace.steps[index - 1];
+        const state = try plain(arena, states.values[index]);
+        var changed: std.ArrayList(Change) = .empty;
+        var changes: usize = 0;
+        try changes_of(arena, &changed, &changes, "", try plain(arena, states.values[index - 1]), state);
         try shown.append(arena, .{
             .index = index,
             .seq = step.seq,
             .vtime_ns = step.vtime_ns,
             .action = step.name,
             .argument = step.details,
-            .state = try plain(arena, states.values[index]),
+            .state = state,
+            .changed = changed.items,
+            .changes = changes,
         });
     }
     return shown.items;
@@ -996,6 +1048,10 @@ test "the run's states say where it stopped" {
     try std.testing.expectEqual(1, shown[0].index);
     try std.testing.expectEqualStrings("a", shown[0].action);
     try std.testing.expectEqual(7, shown[0].state.object.get("x").?.integer);
+    // What the event changed: x alone, from the init's value.
+    try std.testing.expectEqual(1, shown[0].changes);
+    try std.testing.expectEqualStrings("x", shown[0].changed[0].path);
+    try std.testing.expectEqual(7, shown[0].changed[0].after.?.integer);
     const drawn = try series_of(arena, try std.json.parseFromSliceLeaky(std.json.Value, arena,
         \\{"states":[{"#meta":{"index":0},"n":{"#bigint":"1"},"b":{"#map":[[{"#bigint":"0"},{"#bigint":"100"}],[{"#bigint":"1"},{"#bigint":"100"}]]},"r":{"#map":[]}},
         \\{"#meta":{"index":1},"n":{"#bigint":"2"},"b":{"#map":[[{"#bigint":"0"},{"#bigint":"93"}],[{"#bigint":"1"},{"#bigint":"107"}]]},"r":{"#map":[]}},

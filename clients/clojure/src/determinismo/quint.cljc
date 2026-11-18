@@ -251,3 +251,19 @@ std::string determinismo_quint_close() {
                                     (reset! said line)
                                     (tap/tell :quint-agent {:directory directory :line line} nil)))]
     {:status status :steps @steps :said @said}))
+
+(defn agent-told
+  "A run of `agent` that was kept, told again: the lines it told (`file` in `directory`, one a
+  line, as `agent` tells them and a kit's own script keeps them), at a pace one can read. For a
+  run too long to make again where it is shown (a real system's: forty minutes). {:steps (how
+  many lines) :said (the last: its turns and seconds)}."
+  [directory file]
+  (let [steps (atom 0)
+        said (atom nil)
+        command (str "while IFS= read -r line; do printf '%s\\n' \"$line\"; sleep 0.05; done < '"
+                     directory "/" file "'")]
+    (each-line command (fn [line]
+                         (swap! steps inc)
+                         (reset! said line)
+                         (tap/tell :quint-agent {:directory directory :line line} nil)))
+    {:steps @steps :said @said}))

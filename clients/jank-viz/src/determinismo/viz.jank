@@ -862,6 +862,21 @@
                        (map first (filter (fn [[_ v]] (string? v)) registers)))]
     (mapv (fn [k] [k (get registers k)]) (concat known others))))
 
+(def ^:private changes-steps-max 5)
+(def ^:private changes-max 4)
+
+(defn- changes-steps
+  "The steps a card of changes shows: the last ones."
+  [steps]
+  (vec (take-last changes-steps-max steps)))
+
+(defn- changes-height
+  "A step's height in a card of changes: its line and one a change shown (one more saying how
+  many are not)."
+  [step]
+  (let [shown (min changes-max (count (:changed step)))]
+    (+ 22 (* 17 (+ shown (if (> (:changes step 0) shown) 1 0))))))
+
 (defn- body-height [c]
   (let [view (:view c)]
     (cond
@@ -878,7 +893,11 @@
                           (if (> (:count c) (count (:events c))) 20 0))
       (= view :numbers) 100
       (= view :quint) (+ 34 (if (:event (:verdict c)) 24 0) (if (seq (:series (:verdict c))) 190 0)
-                         (if (seq (:steps (:verdict c))) (+ 30 (* 20 (count (:steps (:verdict c))))) 0))
+                         (let [steps (:steps (:verdict c))]
+                           (cond (empty? steps) 0
+                                 (seq (:series (:verdict c))) (+ 30 (* 20 (count steps)))
+                                 :else (+ 30 (apply + (map changes-height (changes-steps steps)))
+                                          (if (:event (:verdict c)) 24 0)))))
       (= view :quint-run) (+ 34 (* 22 (count (:states c))))
       (= view :plan) (+ 22 (* 20 (count (:rows c))) (if (:board c) 168 0) 26)
       (= view :run-plan) (+ (* 20 (count (:lines c))) 6 (* 44 (count (:labels c))))
@@ -1096,6 +1115,23 @@
         group (when (seq series) (first (str/split (name (first (first series))) #"\.")))]
     [group (vec (filter (fn [[k _]] (= group (first (str/split (name k) #"\.")))) series))]))
 
+(defn- state-said
+  "A value of a spec's state as a card says it: a variant by its tag (`Transferring(118)`),
+  a long list by its end, anything else its text."
+  [value]
+  (cond
+    (nil? value) "none"
+    (and (map? value) (contains? value :tag))
+    (let [inner (:value value)]
+      (if (or (nil? inner) (and (coll? inner) (empty? inner)))
+        (str (:tag value))
+        (str (:tag value) "(" (state-said inner) ")")))
+    (and (sequential? value) (> (count value) 6))
+    (str "[... " (str/join " " (map state-said (take-last 4 value))) "] (" (count value) ")")
+    (sequential? value) (str "[" (str/join " " (map state-said value)) "]")
+    (map? value) (str "{" (str/join ", " (map (fn [[k v]] (str (name k) " " (state-said v))) value)) "}")
+    :else (str value)))
+
 (defn- draw-quint
   "A timeline against a Quint spec: the verdict, the event it stopped at, and the spec's
   numbers along the run (a line a number, their sum above them, the event marked)."
@@ -1156,7 +1192,46 @@
             (line! (at-x (dec n)) (- top 2) (at-x (dec n)) floor purple 2.0)))))
     ;; The timeline's last events before the run stopped, each with the spec's state after it:
     ;; the real event (its number and moment in the timeline), the action it is, what it left.
-    (when-let [steps (seq (:steps verdict))]
+    ;; A state with no flat group of numbers (records by node, tags): the last events, each with
+    ;; what it changed in the spec's state, the place and its value before and after.
+    (when (and (seq (:steps verdict)) (empty? (:series verdict)))
+      (let [steps (changes-steps (:steps verdict))
+            top (+ y (if event 62 38))
+            last-index (:index (last steps))]
+        (text! x top muted small "event")
+        (text! (+ x 52) top muted small "at")
+        (text! (+ x 118) top muted small "the timeline's event, as the spec's action, and what it changed in the spec's state")
+        (loop [steps steps
+               sy (+ top 22)]
+          (when-let [step (first steps)]
+            (let [breaking (and (= kind "invariant") (= (:index step) last-index))
+                  shown (take changes-max (:changed step))
+                  more (- (:changes step 0) (count shown))]
+              (text! x sy muted mono (str (:index step)))
+              (text! (+ x 52) sy blue small (seconds (:vtime_ns step)))
+              (text! (+ x 118) sy (if breaking red ink) mono
+                     (clip mono (- width 130) (str (:action step) " " (said-of (:argument step)))))
+              (doseq [[i change] (map-indexed vector shown)]
+                (text! (+ x 136) (+ sy 20 (* 17 i)) (if breaking red muted) mono
+                       (clip mono (- width 150)
+                             (str (:path change) "  " (state-said (:before change)) " -> " (state-said (:after change))))))
+              (when (pos? more)
+                (text! (+ x 136) (+ sy 20 (* 17 (count shown))) muted small (str "and " more " more")))
+              (recur (rest steps) (+ sy (changes-height step))))))
+        ;; Where it stopped: the record the last event changed (a node's), as the spec has it
+        ;; there, its plain fields.
+        (when event
+          (when-let [place (:path (first (:changed (last steps))))]
+            (let [parts (butlast (str/split place #"\."))
+                  record (reduce (fn [value part] (when (map? value) (get value (keyword part)))) (:state verdict) parts)
+                  plain (when (map? record)
+                          (filter (fn [[_ v]] (or (number? v) (string? v) (boolean? v) (and (map? v) (contains? v :tag)))) record))]
+              (when (seq plain)
+                (text! x (+ top 22 (apply + (map changes-height steps)) 4) purple mono
+                       (clip mono (- width 20)
+                             (str (str/join "." parts) ":  "
+                                  (str/join "  " (map (fn [[k v]] (str (name k) " " (state-said v))) plain)))))))))))
+    (when-let [steps (and (seq (:series verdict)) (seq (:steps verdict)))]
       (let [top (+ y (if event 62 38) (if (seq (:series verdict)) 190 0))
             sums (mapv (fn [step] (when-let [[_ values] (numbers-of (:state step))] (apply + values))) steps)
             ;; The sum the spec began with (the plot's), or the first one listed.
@@ -1180,9 +1255,20 @@
             (text! values-x sy (if lost red ink) mono (str/join "  " values))
             (text! (- (+ x width) 60) sy (if lost red ink) mono (str sum))))))))
 
+(defn- state-changes
+  "The places where a state differs from the one before it (records by field, a variant or
+  anything else whole): [[place before after] ...]."
+  [path before after]
+  (if (and (map? before) (map? after) (not (contains? after :tag)) (not (contains? before :tag)))
+    (mapcat (fn [k]
+              (state-changes (if (seq path) (str path "." (name k)) (name k)) (get before k) (get after k)))
+            (distinct (concat (keys after) (keys before))))
+    (when (not= before after) [[path before after]])))
+
 (defn- draw-quint-run
   "What Quint's simulator found in the spec alone: its last states, a row a state, the first
-  numbers of each with their sum (red where it is not the first state's)."
+  numbers of each with their sum (red where it is not the first state's); a state with no
+  such numbers by what it changed from the one before."
   [c x y width]
   (let [states (:states c)
         from (- (:count c) (count states))
@@ -1192,13 +1278,23 @@
              (str (:invariant c) " can be lost: in " (dec (:count c)) " steps of the spec")
              (str "no state without " (:invariant c) " found" (when (:step c) (str " with " (:step c))))))
     (doseq [[i state] (map-indexed vector states)]
-      (when-let [[variable values] (numbers-of state)]
-        (let [sy (+ y 36 (* 22 i))
-              sum (apply + values)]
-          (text! x sy muted small (str "state " (+ from i)))
-          (text! (+ x 70) sy ink mono (clip mono (- width 190) (str variable " " (str/join "  " values))))
-          (text! (- (+ x width) 100) sy (if (and first-sum (not= sum first-sum) (= i (dec (count states)))) red ink) mono
-                 (str "sum " sum)))))))
+      (let [sy (+ y 36 (* 22 i))]
+        (if-let [[variable values] (numbers-of state)]
+          (let [sum (apply + values)]
+            (text! x sy muted small (str "state " (+ from i)))
+            (text! (+ x 70) sy ink mono (clip mono (- width 190) (str variable " " (str/join "  " values))))
+            (text! (- (+ x width) 100) sy (if (and first-sum (not= sum first-sum) (= i (dec (count states)))) red ink) mono
+                   (str "sum " sum)))
+          (let [changes (when (pos? i) (state-changes "" (nth states (dec i)) state))
+                last-one (and (:violation c) (= i (dec (count states))))]
+            (text! x sy muted small (str "state " (+ from i)))
+            (text! (+ x 70) sy (if last-one red ink) mono
+                   (clip mono (- width 90)
+                         (if (pos? i)
+                           (str/join ";  " (map (fn [[place before after]]
+                                                  (str place " " (state-said before) " -> " (state-said after)))
+                                                changes))
+                           "the spec's first state")))))))))
 
 (defn- draw-card
   "One card at (x, y): its code, where it was, its body. Returns its height."
