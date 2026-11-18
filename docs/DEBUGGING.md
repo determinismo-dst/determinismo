@@ -61,15 +61,23 @@ vCPU stopped:
                                               returns; one more at most), stopped there
     det:break <virtual address> [cr3] | off   a hardware execute breakpoint (one), in that
                                               address space or any
-    det:continue [ms]                         on until the breakpoint (or ms of virtual time,
-                                              60 s by default), stopped before its instruction
+    det:watch <virtual address> <bytes> [cr3] | off
+                                              a hardware write watchpoint (one; 1, 2, 4 or 8
+                                              bytes, aligned to their size), in that address
+                                              space or any
+    det:continue [ms]                         on until the breakpoint or a watched write (or ms
+                                              of virtual time, 60 s by default), stopped before
+                                              the breakpoint's instruction, after the write
     det:translate <cr3 | current> <virtual>   a virtual address's physical one, through the page
                                               tables of that address space (det:regs' cr3, a
                                               watch hit's), or the running one's
 
 Stops change nothing either: a replay to 5 s that stopped at a breakpoint twice and stepped has
 the plain replay's events hash (timers fire where they would; the breakpoint's exits are the
-VMM's, the instruction passed once with RF). Looking moves nothing: these steps leave the vCPU where it is, the next one queued runs there,
+VMM's, the instruction passed once with RF). A watched write's stop says the bytes written, in
+memory order, with its moment (`"watch"`, `"size"`, `"hex"` beside `vtime_ns`, `branches`, `rip`
+and `cr3`): `det:continue` again goes to the next one, so a variable's values over a stretch of a
+timeline are the stops' lines, each a moment a session can be opened at. Looking moves nothing: these steps leave the vCPU where it is, the next one queued runs there,
 and a session (not live) waits for the next request with the machine stopped, so every look
 between requests sees one state; the guest moves only with a guest command (or a step that runs
 it). A bad one answers `[determinismo] debug: {"step":..., "error":...}` and the session goes on.

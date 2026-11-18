@@ -99,9 +99,11 @@ over_limit: bool,
 moment_tsc: ?u64,
 /// det:step's branch count to reach: its clock target re-armed while short of it.
 step_until_branches: ?u64 = null,
-/// det:break's hardware breakpoint (a guest virtual address, in one address space or any), and
-/// whether det:continue runs on to it.
+/// det:break's hardware breakpoint (DR0: an instruction) and det:watch's (DR1: a write of 1, 2,
+/// 4 or 8 bytes), each a guest virtual address in one address space or any, and whether
+/// det:continue runs on to them.
 breakpoint: ?struct { address: u64, cr3: ?u64 } = null,
+watchpoint: ?struct { address: u64, size: u8, cr3: ?u64 } = null,
 continuing: bool = false,
 moment_command: ?[]const u8,
 moment_reached: bool,
@@ -1940,29 +1942,40 @@ fn moment_command_one(vm: *VM) !bool {
         try vm.step_arm_branches(n);
         return false;
     }
-    if (std.mem.startsWith(u8, step, step_break)) {
-        // "<virtual address> [cr3]" or "off": a hardware execute breakpoint (DR0), the next
-        // det:continue stopping there, before the instruction.
-        var words = std.mem.tokenizeScalar(u8, step[step_break.len..], ' ');
+    if (std.mem.startsWith(u8, step, step_break) or std.mem.startsWith(u8, step, step_watch)) {
+        // det:break "<virtual address> [cr3]" or "off": a hardware execute breakpoint (DR0), the
+        // next det:continue stopping there, before the instruction. det:watch "<virtual address>
+        // <bytes> [cr3]" or "off": a hardware write watchpoint (DR1; 1, 2, 4 or 8 bytes, aligned
+        // to their size, as the CPU matches them), det:continue stopping after a write there.
+        const watch = std.mem.startsWith(u8, step, step_watch);
+        const arguments = if (watch) step[step_watch.len..] else step[step_break.len..];
+        var words = std.mem.tokenizeScalar(u8, arguments, ' ');
         const first = words.next() orelse return error.BadStep;
         if (std.mem.eql(u8, first, "off")) {
-            vm.breakpoint = null;
+            if (watch) vm.watchpoint = null else vm.breakpoint = null;
         } else {
             const address = std.fmt.parseInt(u64, first, 0) catch return error.BadStep;
+            const size: u8 = if (watch) std.fmt.parseInt(u8, words.next() orelse return error.BadStep, 0) catch return error.BadStep else 1;
+            if (watch and (watch_length(size) == null or address % size != 0)) return error.BadStep;
             const cr3 = if (words.next()) |text| std.fmt.parseInt(u64, text, 0) catch return error.BadStep else null;
-            vm.breakpoint = .{ .address = address, .cr3 = cr3 };
+            if (watch) {
+                vm.watchpoint = .{ .address = address, .size = size, .cr3 = cr3 };
+            } else {
+                vm.breakpoint = .{ .address = address, .cr3 = cr3 };
+            }
         }
         try vm.debug_breakpoint_apply();
-        std.debug.print("[determinismo] break: {{\"armed\":{}}}\n", .{vm.breakpoint != null});
+        std.debug.print("[determinismo] break: {{\"armed\":{},\"watching\":{}}}\n", .{ vm.breakpoint != null, vm.watchpoint != null });
         if (vm.moment_commands_rest.len > 0) return true;
         try vm.step_arm(0, null);
         return false;
     }
     if (std.mem.startsWith(u8, step, step_continue)) {
-        // "[ms]": on until the breakpoint (or ms of virtual time, 60 s by default), stopped there.
+        // "[ms]": on until the breakpoint or a watched write (or ms of virtual time, 60 s by
+        // default), stopped there.
         const text = std.mem.trim(u8, step[step_continue.len..], " ");
         const ms = if (text.len == 0) 60_000 else std.fmt.parseInt(u64, text, 0) catch return error.BadStep;
-        if (vm.breakpoint == null) return error.NoBreakpoint;
+        if (vm.breakpoint == null and vm.watchpoint == null) return error.NoBreakpoint;
         vm.continuing = true;
         try vm.step_arm(ms, null);
         return false;
@@ -2189,40 +2202,93 @@ const step_poke = "det:poke ";
 const step_translate = "det:translate ";
 const step_branches = "det:step ";
 const step_break = "det:break ";
+const step_watch = "det:watch ";
 const step_continue = "det:continue";
 /// `det:checkpoint [name]`: the machine saved where a session can come back to (session_checkpoint).
 const step_checkpoint = "det:checkpoint";
 /// A checkpoint's name, at most (it is queried: details.name=...).
 const checkpoint_name_max = 128;
 
-/// det:break's breakpoint given to KVM (KVM_SET_GUEST_DEBUG: DR0, execute, one byte), or none.
+/// DR7's LEN field for a watched write of `size` bytes (the CPU's encoding), or null.
+fn watch_length(size: u8) ?u64 {
+    return switch (size) {
+        1 => 0b00,
+        2 => 0b01,
+        8 => 0b10,
+        4 => 0b11,
+        else => null,
+    };
+}
+
+test watch_length {
+    try std.testing.expectEqual(@as(?u64, 0b11), watch_length(4));
+    try std.testing.expectEqual(@as(?u64, 0b10), watch_length(8));
+    try std.testing.expectEqual(@as(?u64, null), watch_length(3));
+}
+
+/// det:break's and det:watch's breakpoints given to KVM (KVM_SET_GUEST_DEBUG: DR0 an execute
+/// breakpoint of one byte, DR1 a write of the watched size), or none.
 fn debug_breakpoint_apply(vm: *VM) !void {
     var debug: kvm.GuestDebug = .{ .control = 0 };
-    if (vm.breakpoint) |breakpoint| {
+    if (vm.breakpoint != null or vm.watchpoint != null) {
         debug.control = kvm.guestdbg_enable | kvm.guestdbg_use_hw_bp;
+    }
+    if (vm.breakpoint) |breakpoint| {
         debug.debugreg[0] = breakpoint.address;
-        debug.debugreg[7] = 0x1; // L0: DR0, an execute breakpoint (RW0 = LEN0 = 0).
+        debug.debugreg[7] |= 0x1; // L0: DR0, an execute breakpoint (RW0 = LEN0 = 0).
+    }
+    if (vm.watchpoint) |watchpoint| {
+        debug.debugreg[1] = watchpoint.address;
+        // L1 (bit 2); RW1 (bits 20-21) 01, data writes; LEN1 (bits 22-23) the size's.
+        debug.debugreg[7] |= (1 << 2) | (0b01 << 20) | (watch_length(watchpoint.size).? << 22);
     }
     _ = try kvm.ioctl(vm.vcpu_fd, kvm.SET_GUEST_DEBUG, @intFromPtr(&debug));
 }
 
-/// A breakpoint hit (KVM_EXIT_DEBUG): the instruction not run yet. RF set, so that it runs
-/// once resumed without hitting again. True when it is the stop det:continue asked for.
+/// A breakpoint's hit (KVM_EXIT_DEBUG, DR6 saying which). An instruction's (DR0): not run yet,
+/// RF set so that it runs once resumed without hitting again. A watched write's (DR1): a trap,
+/// the writing instruction done, the bytes written read at the stop. True when it is the stop
+/// det:continue asked for; any other hit is passed, the guest none the wiser.
 fn debug_breakpoint_hit(vm: *VM) !bool {
+    const dr6 = vm.run.exit.debug.dr6;
     var regs: kvm.Regs = undefined;
     _ = try kvm.ioctl(vm.vcpu_fd, kvm.GET_REGS, @intFromPtr(&regs));
     var sregs: kvm.Sregs = undefined;
     _ = try kvm.ioctl(vm.vcpu_fd, kvm.GET_SREGS, @intFromPtr(&sregs));
-    regs.rflags |= 1 << 16; // RF: the breakpoint passes this instruction once.
-    _ = try kvm.ioctl(vm.vcpu_fd, kvm.SET_REGS, @intFromPtr(&regs));
-    const breakpoint = vm.breakpoint orelse return false;
     const address_mask: u64 = 0x000f_ffff_ffff_f000;
-    if (breakpoint.cr3) |cr3| if (cr3 & address_mask != sregs.cr3 & address_mask) return false;
-    if (!vm.continuing or vm.moment_reached) return false;
-    const now = try vm.moment();
-    std.debug.print("[determinismo] break: {{\"vtime_ns\":{d},\"branches\":{d},\"rip\":\"0x{x}\",\"cr3\":\"0x{x}\"}}\n", .{
-        now.vtime_ns, now.branches, regs.rip, sregs.cr3,
-    });
+    if (dr6 & 0b01 != 0) {
+        regs.rflags |= 1 << 16; // RF: the breakpoint passes this instruction once.
+        _ = try kvm.ioctl(vm.vcpu_fd, kvm.SET_REGS, @intFromPtr(&regs));
+        const breakpoint = vm.breakpoint orelse return false;
+        if (breakpoint.cr3) |cr3| if (cr3 & address_mask != sregs.cr3 & address_mask) return false;
+        if (!vm.continuing or vm.moment_reached) return false;
+        const now = try vm.moment();
+        std.debug.print("[determinismo] break: {{\"vtime_ns\":{d},\"branches\":{d},\"rip\":\"0x{x}\",\"cr3\":\"0x{x}\"}}\n", .{
+            now.vtime_ns, now.branches, regs.rip, sregs.cr3,
+        });
+    } else if (dr6 & 0b10 != 0) {
+        const watchpoint = vm.watchpoint orelse return false;
+        if (watchpoint.cr3) |cr3| if (cr3 & address_mask != sregs.cr3 & address_mask) return false;
+        if (!vm.continuing or vm.moment_reached) return false;
+        const now = try vm.moment();
+        const guest = GuestMemory{ .bytes = vm.memory };
+        const bytes: ?[]const u8 = if (translate_space(guest, sregs.cr3, watchpoint.address)) |physical|
+            guest.range(physical, watchpoint.size)
+        else
+            null;
+        // The value as the guest's bytes (little-endian: hex in memory order, as det:mem's).
+        if (bytes) |written| {
+            std.debug.print("[determinismo] break: {{\"vtime_ns\":{d},\"branches\":{d},\"rip\":\"0x{x}\",\"cr3\":\"0x{x}\"," ++
+                "\"watch\":\"0x{x}\",\"size\":{d},\"hex\":\"{x}\"}}\n", .{
+                now.vtime_ns, now.branches, regs.rip, sregs.cr3, watchpoint.address, watchpoint.size, written,
+            });
+        } else {
+            std.debug.print("[determinismo] break: {{\"vtime_ns\":{d},\"branches\":{d},\"rip\":\"0x{x}\",\"cr3\":\"0x{x}\"," ++
+                "\"watch\":\"0x{x}\",\"size\":{d},\"hex\":null}}\n", .{
+                now.vtime_ns, now.branches, regs.rip, sregs.cr3, watchpoint.address, watchpoint.size,
+            });
+        }
+    } else return false;
     vm.continuing = false;
     if (vm.target_branches != 0) try vm.target_set(0);
     return true;

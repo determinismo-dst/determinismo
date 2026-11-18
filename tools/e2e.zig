@@ -953,6 +953,35 @@ fn check_debugging(context: *Context) !void {
         .{ "the history to 5 s is the plain replay's", parse_branches(stopped, &stopped_branch) == 1 and parse_branches(unstopped, &unstopped_branch) == 1 and
             std.mem.eql(u8, stopped_branch[0].events_hash, unstopped_branch[0].events_hash) },
     }, "debugging: a breakpoint and a step stop where asked and change nothing", .{});
+    // A watched write: jiffies (the kernel's, any address space) twice, each stop after the
+    // tick's write with the value written, det:mem reading the same, the history to 5 s the
+    // plain replay's.
+    const watches = try std.fs.path.join(context.arena, &.{ context.scratch, "debugging-watches.txt" });
+    try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = watches, .data = try std.fmt.allocPrint(context.arena, "det:watch 0x{x} 8\ndet:continue 1000\ndet:continue 1000\ndet:mem 0x{x} 8\ndet:watch off\ndet:at 5000000000\ntrue\n", .{ virtual, physical }) });
+    const watched_steps = try explore(context, &.{ "--program", program, "--scenario", "bank", "--timeline", "30s", "--tape", tape, "--at-vtime-ms", "3000", "--exec-script", watches });
+    const hit_prefix = try std.fmt.allocPrint(context.arena, "\"watch\":\"0x{x}\",\"size\":8,\"hex\":\"", .{virtual});
+    var values: [2]u64 = .{ 0, 0 };
+    var hexes: [2][]const u8 = .{ "", "" };
+    var hits: usize = 0;
+    var from: usize = 0;
+    while (hits < values.len) : (hits += 1) {
+        const at_hit = std.mem.indexOfPos(u8, watched_steps, from, hit_prefix) orelse break;
+        const hex = watched_steps[at_hit + hit_prefix.len ..][0..@min(16, watched_steps.len - at_hit - hit_prefix.len)];
+        var bytes: [8]u8 = undefined;
+        _ = std.fmt.hexToBytes(&bytes, hex) catch break;
+        values[hits] = std.mem.readInt(u64, &bytes, .little);
+        hexes[hits] = hex;
+        from = at_hit + hit_prefix.len;
+    }
+    const read_back = if (hits == 2) try std.fmt.allocPrint(context.arena, "\"address\":\"0x{x}\",\"size\":8,\"hex\":\"{s}\"", .{ physical, hexes[1] }) else "";
+    var watched_branch_to: [1]Branch = undefined;
+    expect_all(context, &.{
+        .{ "det:continue stopped at two writes of jiffies, each with its value", hits == 2 },
+        .{ "the second value is past the first", hits == 2 and values[1] > values[0] },
+        .{ "det:mem read the second value there", hits == 2 and std.mem.indexOf(u8, watched_steps, read_back) != null },
+        .{ "the history to 5 s is the plain replay's", parse_branches(watched_steps, &watched_branch_to) == 1 and
+            std.mem.eql(u8, watched_branch_to[0].events_hash, unstopped_branch[0].events_hash) },
+    }, "debugging: a watched variable's writes stop with their values and change nothing (jiffies {d}, {d})", .{ values[0], values[1] });
     const forks = try std.fs.path.join(context.arena, &.{ context.scratch, "debugging-forks" });
     const forked = try explore(context, &.{
         "--program",   program, "--scenario",    "bank", "--seed",          "11",   "--timeline",  "30s",
