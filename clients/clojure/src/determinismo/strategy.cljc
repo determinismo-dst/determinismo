@@ -8,6 +8,7 @@
 ;;   (strategy/use-strategy! :middle)        ; the next generation's returns are its
 ;;   (swap! strategy/strategies assoc :mine {:returns (fn [generation candidates n] ...)})
 ;;   @strategy/generations                   ; what each generation offered and what was chosen
+;;   (strategy/use-strategy-for! "redis-server" :mine) ; that process's decisions and events: :mine's
 ;;
 ;; A strategy's functions, each optional (missing: the explorer's own answer):
 ;;   :returns (fn [generation candidates count]) -> [{:branch :vtime_ns :reason [:branches]}] or
@@ -125,6 +126,36 @@ std::string determinismo_close(std::string const &fd_text) {
 
 (defn- strategy [] (get @strategies @current))
 
+;; Per service: which strategy answers the decisions and events of a source (the asking
+;; process's name, as requests say it), as [matcher name] pairs, the first match answering; the
+;; run-wide one (`use-strategy!`) answers the rest, and always a generation's returns.
+(defonce by-source (atom []))
+
+(defn use-strategy-for!
+  "The strategy that answers the decisions and events whose source (the asking process's name)
+  is `source`, a string, or a regex found in it, from each connection's next timeline (its
+  hello says what it decides); `name` nil: the run-wide one again."
+  [source name]
+  (when (and name (not (contains? @strategies name)))
+    (throw (ex-info (str "determinismo: no strategy " name) {:name name :known (keys @strategies)})))
+  (let [kept (vec (remove (fn [[matcher _]] (= (str matcher) (str source))) @by-source))]
+    (reset! by-source (if name (conj kept [source name]) kept))
+    name))
+
+(defn- matches? [matcher source]
+  (if (string? matcher) (= matcher source) (boolean (re-find matcher (str source)))))
+
+(defn- strategy-for
+  "The strategy answering a decision or an event from `source`."
+  [source]
+  (or (some (fn [[matcher name]] (when (matches? matcher source) (get @strategies name))) @by-source)
+      (strategy)))
+
+(defn- every-strategy
+  "The run-wide strategy and every per-source one: what a hello says for all of them."
+  []
+  (cons (strategy) (keep (fn [[_ name]] (get @strategies name)) @by-source)))
+
 (defn answer
   "A request's reply (docs/PLUGINS.md's messages), `{}` for the default."
   [request state]
@@ -133,21 +164,25 @@ std::string determinismo_close(std::string const &fd_text) {
         chosen (strategy)]
     (cond
       (= method "hello")
-      {:name (str #?(:jank "jank/" :default "clojure/") (name @current)) :decides (boolean (:decide chosen))
-       :wants (or (:wants chosen) ["behaviors"])}
+      (let [all (every-strategy)]
+        {:name (str #?(:jank "jank/" :default "clojure/") (name @current)
+                    (when (seq @by-source) (str " +" (count @by-source) " per source")))
+         :decides (boolean (some :decide all))
+         :wants (vec (distinct (mapcat (fn [one] (or (:wants one) ["behaviors"])) all)))})
       (= method "branch")
       (do (reset! state {})
           (when-let [f (:branch chosen)] (f state request))
           {})
       (= method "event")
-      (let [f (:event chosen)]
+      (let [f (:event (strategy-for (:source request)))]
         (if (and f (= end-timeline (f state request))) {:end true} {}))
       (= method "events")
-      (let [f (:event chosen)
-            ended (when f (some (fn [e] (= end-timeline (f state (assoc e :method "event")))) (:events request)))]
+      (let [ended (some (fn [e] (let [f (:event (strategy-for (:source e)))]
+                                  (and f (= end-timeline (f state (assoc e :method "event"))))))
+                        (:events request))]
         (if ended {:end true} {}))
       (= method "random")
-      (or (when-let [f (:decide chosen)] (f state request)) {})
+      (or (when-let [f (:decide (strategy-for (:source request)))] (f state request)) {})
       (= method "branch_end")
       (do (swap! ends assoc (:index request) (select-keys request [:outcome :events :failing]))
           (when-let [f (:end chosen)] (f state request))

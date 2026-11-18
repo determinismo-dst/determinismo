@@ -5219,8 +5219,9 @@ fn check_shape(context: *Context) !void {
 /// under jank: `:middle` chosen in its registry, a tree exploration of the bank asks it where to
 /// return, over TCP (48 timelines: the pipeline's first two generations of 16 start from the
 /// setup snapshot), and the timelines of its first judged generation start from its moments (each
-/// the middle of a timeline's span, their reason "middle of timeline <n>"); the deepest of them
-/// replays alone from its tape, without the strategy.
+/// the middle of a timeline's span, their reason "middle of timeline <n>"), while the composer's
+/// named draws are answered by a strategy of their own (`use-strategy-for!`: zeros); the deepest
+/// timeline replays alone from its tape, without the strategy.
 fn check_repl_strategy(context: *Context) !void {
     const bb = context.bb orelse {
         std.debug.print("SKIP repl-strategy: no babashka (-Dbb or $DETERMINISMO_BB)\n", .{});
@@ -5240,12 +5241,19 @@ fn check_repl_strategy(context: *Context) !void {
         try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = script, .data = try std.fmt.allocPrint(arena,
             \\(require '[determinismo.strategy :as strategy] '[determinismo.http :as http])
             \\(strategy/use-strategy! :middle)
-            \\;; A moment past 2^31 ns from two below it (jank 0.1's + wraps at 32 bits there): served
-            \\;; only when it is right.
+            \\;; Per service: the composer's named draws all zeros, every other process's left as drawn.
+            \\(swap! strategy/strategies assoc :zeros
+            \\       {{:decide (fn [_ request] {{:hex (apply str (repeat (* 2 (:size request)) "0")) :reason "zeros"}})}})
+            \\(strategy/use-strategy-for! #"^det-composer$" :zeros)
+            \\;; Served only when right: a moment past 2^31 ns from two below it (jank 0.1's + wraps at
+            \\;; 32 bits there), and decisions by their source.
             \\(let [answer (strategy/answer {{:method "returns" :generation 0 :count 1
             \\                               :candidates [{{:branch 1 :start_ns 1200000000 :end_ns 3200000000 :novel 1}}]}}
-            \\                              (atom {{}}))]
-            \\  (when (= 2200000000 (:vtime_ns (first (:returns answer))))
+            \\                              (atom {{}}))
+            \\      pull (fn [source] (strategy/answer {{:method "random" :size 2 :source source}} (atom {{}})))]
+            \\  (when (and (= 2200000000 (:vtime_ns (first (:returns answer))))
+            \\             (= {{:hex "0000" :reason "zeros"}} (pull "det-composer"))
+            \\             (= {{}} (pull "bank-test")))
             \\    (strategy/serve! {d})))
             \\(http/sleep-ms 1800000)
             \\
@@ -5258,7 +5266,7 @@ fn check_repl_strategy(context: *Context) !void {
             if (tcp_listening(host.port)) break true;
             sleep_ms(100);
         } else false;
-        expect(context, listening, "repl strategy ({s}): it listens on {d} (its middle of a span past 2^31 ns right)", .{ host.name, host.port });
+        expect(context, listening, "repl strategy ({s}): it listens on {d} (its middle of a span past 2^31 ns right, decisions by source)", .{ host.name, host.port });
         if (!listening) continue;
         const tapes = try std.fmt.allocPrint(arena, "{s}/strategy-{s}-tapes", .{ context.scratch, host.name });
         const record = try std.fmt.allocPrint(arena, "{s}/strategy-{s}.jsonl", .{ context.scratch, host.name });
@@ -5273,12 +5281,16 @@ fn check_repl_strategy(context: *Context) !void {
         const count = parse_branches(report, &branches);
         const middle = try record_whys_with(context, record, "middle of timeline ");
         const deep = try deepest_replays(context, program, record, tapes, branches[0..count], &.{});
+        // The composer's draws answered zeros: on the tapes as overrides.
+        const zeroed = try run_kept(context, &.{ "grep", "-rlF", "\"hex\":\"0000", tapes });
+        const zeroed_tapes = count_lines(zeroed.stdout, "branch-");
         expect_all(context, &.{
+            .{ "the composer's decisions answered by its own strategy (zeros, on the tapes)", zeroed_tapes > 0 },
             .{ "48 timelines explored", count == 48 },
             .{ "timelines from the strategy's moments", middle > 0 },
             .{ "the deepest replays alone from its tape, without the strategy", deep.depth >= 1 and deep.replays },
-        }, "repl strategy ({s}): {d} timelines, {d} from its moments; #{?d}, {d} deep, replays alone: {}", .{
-            host.name, count, middle, deep.index, deep.depth, deep.replays,
+        }, "repl strategy ({s}): {d} timelines, {d} from its moments, {d} tapes with the composer's zeros; #{?d}, {d} deep, replays alone: {}", .{
+            host.name, count, middle, zeroed_tapes, deep.index, deep.depth, deep.replays,
         });
     }
 }
