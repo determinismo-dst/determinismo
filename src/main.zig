@@ -16,6 +16,7 @@ const report = @import("report.zig");
 const Strategy = @import("strategy.zig");
 const tape = @import("core").tape;
 const guest_memory = @import("core").guest_memory;
+const regex = @import("regex");
 const fd_pass = @import("fd_pass.zig");
 const holders = @import("holders.zig");
 const event_files = @import("event_files.zig");
@@ -139,6 +140,9 @@ const usage =
     \\                            [--fault-weights <kind=weight,...>]   (half the timelines keep
     \\                            these kinds at these weights, 1 to 64: the kinds a causality
     \\                            analysis found inside a failure's jump, made common)
+    \\                            [--fault-exclusions <regex>]   (Antithesis's fault_exclusions:
+    \\                            nodes, and pods on Kubernetes, whose names match it, Rust's
+    \\                            regex syntax, anywhere in the name, get no faults)
     \\                            [--pipeline <n>]   (a tree's generations of timelines planned
     \\                            from the setup snapshot before its first returns, 1 to 4, and
     \\                            queued ahead after: default 2 up to 16 workers, else 3)
@@ -423,6 +427,10 @@ const Arguments = struct {
     /// Fault kinds made common in half the timelines (`--fault-weights partition=64,pause=32`),
     /// for det-faults' swarm (`det.fault_weights=` on the guest's command line).
     fault_weights: ?[]const u8 = null,
+    /// Antithesis's `fault_exclusions` (`--fault-exclusions '^(client|monitor)$'`): a regular
+    /// expression over node names, and pod names on Kubernetes; a match gets no faults
+    /// (det-faults' `excluded`, `det.fault_exclusions=` on the guest's command line in hex).
+    fault_exclusions: ?[]const u8 = null,
     /// Commands the composer's swarm keeps in every timeline (`--keep compact,member`:
     /// `det.keep=` on the guest's command line): a trial of a new driver runs it, where the swarm
     /// left etcd's compaction driver out of both timelines of trial run 1521.
@@ -1285,6 +1293,7 @@ fn run_request_write(
         .return_offsets = arguments.return_offsets_text,
         // In the guest's command line: replays need them.
         .fault_weights = arguments.fault_weights,
+        .fault_exclusions = arguments.fault_exclusions,
         .keep = arguments.keep,
         .pipeline = arguments.pipeline,
         .jobs = arguments.jobs,
@@ -1636,13 +1645,34 @@ fn objective_extends(arguments: *const Arguments) bool {
     return arguments.command == .explore and arguments.objective_extend;
 }
 
+test "fault exclusions: a pattern det-faults would not take is a usage error; one it takes is on the guest's command line" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectError(error.Usage, parse_arguments(arena, &.{ "determinismo", "explore", "--fault-exclusions", "a{2}" }));
+    try std.testing.expectError(error.Usage, parse_arguments(arena, &.{ "determinismo", "explore", "--fault-exclusions", "(a" }));
+    // ParadeDB's: spaces and characters a command-line word could not carry go as hex.
+    const pattern = "coredns|stressgres|cloudnative-pg|logical-replication-publisher";
+    const arguments = try parse_arguments(arena, &.{ "determinismo", "explore", "--kernel", "vmlinuz", "--fault-exclusions", pattern });
+    try std.testing.expectEqualStrings(pattern, arguments.fault_exclusions.?);
+    const line = try cmdline_build(arena, "console=ttyS0", &arguments, null);
+    const key = "det.fault_exclusions=";
+    const at = std.mem.indexOf(u8, line, key) orelse return error.TestUnexpectedResult;
+    var words = std.mem.tokenizeScalar(u8, line[at + key.len ..], ' ');
+    var decoded: [regex.pattern_size_max]u8 = undefined;
+    try std.testing.expectEqualStrings(pattern, try std.fmt.hexToBytes(&decoded, words.next().?));
+    // None asked: no word.
+    const plain = try parse_arguments(arena, &.{ "determinismo", "explore", "--kernel", "vmlinuz" });
+    try std.testing.expect(std.mem.indexOf(u8, try cmdline_build(arena, "console=ttyS0", &plain, null), key) == null);
+}
+
 fn cmdline_build(
     arena: std.mem.Allocator,
     base: []const u8,
     arguments: *const Arguments,
     scenario: ?[]const u8,
 ) ![]const u8 {
-    var parts: [16][]const u8 = undefined; // The base and each word below: 12, room to spare.
+    var parts: [16][]const u8 = undefined; // The base and each word below: 13, room to spare.
     var count: u32 = 0;
     parts[count] = base;
     count += 1;
@@ -1684,6 +1714,10 @@ fn cmdline_build(
     }
     if (arguments.fault_weights) |weights| { // det-faults': kinds made common in half the timelines.
         parts[count] = try std.fmt.allocPrint(arena, "det.fault_weights={s}", .{weights});
+        count += 1;
+    }
+    if (arguments.fault_exclusions) |pattern| { // det-faults': names that get no faults.
+        parts[count] = try std.fmt.allocPrint(arena, "det.fault_exclusions={x}", .{pattern});
         count += 1;
     }
     if (arguments.keep) |names| { // det-composer's: commands kept in every timeline.
@@ -8130,6 +8164,14 @@ fn parse_option(
         // Kinds and weights, no spaces (a guest command-line word): checked by det-faults.
         if (value.len == 0 or std.mem.indexOfAny(u8, value, " \t\n") != null) return error.Usage;
         arguments.fault_weights = value;
+    } else if (eql(u8, flag, "--fault-exclusions")) {
+        // Compiled here as det-faults compiles it: a pattern it would not take is a usage error
+        // now, not a run whose faults reach what it meant to spare.
+        _ = regex.Regex.compile(value) catch |err| {
+            std.debug.print("--fault-exclusions: {s}: {s}\n", .{ value, @errorName(err) });
+            return error.Usage;
+        };
+        arguments.fault_exclusions = value;
     } else if (eql(u8, flag, "--min-drive")) {
         arguments.min_drive_ms = try duration_parse(value) / std.time.ns_per_ms;
         arguments.min_drive_text = value;

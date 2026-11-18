@@ -1590,6 +1590,8 @@ pub const RunRequest = struct {
     /// Fault kinds made common in half the timelines, "kind=weight,..." (explore's
     /// --fault-weights: a causality analysis's kinds, for a run that finds its bug more often).
     fault_weights: ?[]const u8 = null,
+    /// Antithesis's fault_exclusions: explore's --fault-exclusions.
+    fault_exclusions: ?[]const u8 = null,
     /// Named decisions fixed in every timeline, "name=value,..." (explore's --decide): a what if
     /// of the run with that choice.
     decide: ?[]const u8 = null,
@@ -3795,6 +3797,7 @@ fn session_futures_start(session: *Session, snapshot: []const u8) !void {
         .min_drive = original.min_drive,
         .drivers_cpu_weight = original.drivers_cpu_weight,
         .fault_weights = original.fault_weights,
+        .fault_exclusions = original.fault_exclusions,
         .decide = original.decide,
         .keep = original.keep,
         .trace_errno = original.trace_errno,
@@ -5172,6 +5175,7 @@ pub fn system_arguments(
     if (asked.min_drive) |length| try argv.appendSlice(arena, &.{ "--min-drive", length });
     if (asked.drivers_cpu_weight) |weight| try argv.appendSlice(arena, &.{ "--drivers-cpu-weight", weight });
     if (asked.fault_weights) |weights| try argv.appendSlice(arena, &.{ "--fault-weights", weights });
+    if (asked.fault_exclusions) |pattern| try argv.appendSlice(arena, &.{ "--fault-exclusions", pattern });
     if (asked.decide) |fixed| try argv.appendSlice(arena, &.{ "--decide", fixed });
     if (asked.keep) |names| try argv.appendSlice(arena, &.{ "--keep", names });
     if (asked.drive_max) |length| try argv.appendSlice(arena, &.{ "--drive-max", length });

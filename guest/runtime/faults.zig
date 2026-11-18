@@ -63,6 +63,7 @@ const linux = std.os.linux;
 const sdk = @import("determinismo");
 const schema = sdk.schema;
 const nodes = @import("nodes.zig");
+const regex = @import("regex.zig");
 
 /// A node's own fault kinds (24 today, the five pod kinds and its clog among them) and its custom
 /// programs: what a node may list of its own.
@@ -548,6 +549,40 @@ fn swarm_select(faults: *[faults_max]Fault, count: u32) u32 {
     while (listed.next()) |kind| names.print("{s}{s}:{d}", .{ if (names.end == 0) "" else " ", @tagName(kind), kind_weights.get(kind) }) catch break;
     sdk.event("fault_swarm", .{ .kinds = names.buffered(), .faults = front, .of = count, .kept_eighths = eighths });
     return front;
+}
+
+/// Antithesis's `fault_exclusions` (explore's --fault-exclusions: `det.fault_exclusions=` on
+/// the guest's command line, hex): a regular expression (regex.zig, Rust's syntax) over node
+/// names, and pod names on Kubernetes. A match gets no fault of its own and is in no partition,
+/// isolation or outage; faults of the whole machine (clock skips) reach it as any. Read once,
+/// at the first question; a pattern the explorer let through that does not compile here
+/// excludes nothing, said as an event.
+var exclusions: ?regex.Regex = null;
+var exclusions_read = false;
+
+fn excluded(name: []const u8) bool {
+    if (!exclusions_read) {
+        exclusions_read = true;
+        exclusions = exclusions_load();
+    }
+    const pattern = &(exclusions orelse return false);
+    return pattern.is_match(name);
+}
+
+fn exclusions_load() ?regex.Regex {
+    var hex_buffer: [2 * regex.pattern_size_max]u8 = undefined;
+    const hex = cmdline_word("det.fault_exclusions=", &hex_buffer) orelse return null;
+    var pattern_buffer: [regex.pattern_size_max]u8 = undefined;
+    const pattern = std.fmt.hexToBytes(&pattern_buffer, hex) catch {
+        sdk.event("fault_exclusions_invalid", .{ .reason = "hex" });
+        return null;
+    };
+    const compiled = regex.Regex.compile(pattern) catch |err| {
+        sdk.event("fault_exclusions_invalid", .{ .reason = @errorName(err) });
+        return null;
+    };
+    sdk.event("fault_exclusions", .{ .pattern = pattern });
+    return compiled;
 }
 
 /// The value of `key<value>` among the kernel's command line's words, copied into `buffer`.
@@ -1269,6 +1304,7 @@ fn faults_collect(
     var count: u32 = 0;
     faults_dropped = 0;
     for (system.nodes, 0..) |node, index| {
+        if (excluded(node.name)) continue; // Its links' faults too: they act on its network.
         const allowed = node.faults;
         if (allowed.pause) faults_add(faults, &count, .{ .kind = .pause, .node = node.name });
         if (allowed.isolate) faults_add(faults, &count, .{ .kind = .isolate, .node = node.name });
@@ -1318,11 +1354,13 @@ fn faults_collect(
     var isolatable: [endpoints_max]bool = @splat(false);
     var isolatable_count: u32 = 0;
     for (system.nodes, 1..) |node, index| {
-        endpoints[index] = node.faults.partition;
-        partitionable += @intFromBool(node.faults.partition);
-        if (node.faults.isolate) faults_add(faults, &count, .{ .kind = .clog, .node = node.name });
-        isolatable[index] = node.faults.isolate;
-        isolatable_count += @intFromBool(node.faults.isolate);
+        // An excluded node stays with the runner's group, reaching every node and reached.
+        const kept = !excluded(node.name);
+        endpoints[index] = node.faults.partition and kept;
+        partitionable += @intFromBool(endpoints[index]);
+        if (node.faults.isolate and kept) faults_add(faults, &count, .{ .kind = .clog, .node = node.name });
+        isolatable[index] = node.faults.isolate and kept;
+        isolatable_count += @intFromBool(isolatable[index]);
     }
     if (partitionable >= 3) {
         faults_add(faults, &count, .{ .kind = .partition_groups, .endpoints = endpoints });
@@ -1335,9 +1373,10 @@ fn faults_collect(
     for (system.nodes, 1..) |node, index| {
         // Outages take the nodes that allow them (Faults.outage): a node left out still
         // restarts and crashes, one at a time.
-        crashable[index] = node.faults.crash and node.faults.outage;
+        const kept = !excluded(node.name);
+        crashable[index] = node.faults.crash and node.faults.outage and kept;
         crashable_count += @intFromBool(crashable[index]);
-        restartable[index] = node.faults.restart and node.faults.outage;
+        restartable[index] = node.faults.restart and node.faults.outage and kept;
         restartable_count += @intFromBool(restartable[index]);
     }
     if (crashable_count >= 2) faults_add(faults, &count, .{ .kind = .outage, .endpoints = crashable });
@@ -2244,7 +2283,10 @@ fn pod_pick(node: []const u8, index: u32, pod: *Pod, spare_drivers: bool) !linux
         @memcpy(pod.path_buffer[0..picked.len], picked);
         pod.path_size = picked.len;
         pod.name_size = 0;
-        if (try pod_process(pod)) |pid| return pid;
+        if (try pod_process(pod)) |pid| {
+            if (excluded(pod.name())) continue;
+            return pid;
+        }
     }
     return error.NoPods;
 }

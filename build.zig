@@ -87,6 +87,8 @@ pub fn build(b: *std.Build) void {
     });
     sdk_pack_run.addPrefixedFileArg("lib/libvoidstar.o=", voidstar_object.getEmittedBin());
     const sdk_tar_module = b.createModule(.{ .root_source_file = sdk_tar });
+    // The guest's fault exclusions' regular expressions, checked by the explorer as it takes them.
+    const regex_module = b.createModule(.{ .root_source_file = b.path("guest/runtime/regex.zig") });
     const exe = b.addExecutable(.{
         .name = "determinismo",
         .root_module = b.createModule(.{
@@ -98,6 +100,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "build_options", .module = build_options_module },
                 .{ .name = "core", .module = core },
                 .{ .name = "sdk_tar", .module = sdk_tar_module },
+                .{ .name = "regex", .module = regex_module },
             },
         }),
     });
@@ -116,6 +119,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "build_options", .module = build_options_module },
                 .{ .name = "core", .module = core },
                 .{ .name = "sdk_tar", .module = sdk_tar_module },
+                .{ .name = "regex", .module = regex_module },
             },
         }),
     });
@@ -573,6 +577,7 @@ pub fn build(b: *std.Build) void {
         "guest/runtime/nodes.zig",
         "guest/runtime/netlink.zig",
         "guest/runtime/faults.zig",
+        "guest/runtime/regex.zig",
         "guest/runtime/composer.zig",
         "guest/runtime/errno_trace.zig",
         "guest/runtime/persist_trace.zig",
@@ -614,6 +619,7 @@ pub fn build(b: *std.Build) void {
         if (std.mem.eql(u8, root, "src/main.zig")) {
             unit_tests.root_module.addImport("build_options", build_options_module);
             unit_tests.root_module.addImport("sdk_tar", sdk_tar_module);
+            unit_tests.root_module.addImport("regex", regex_module);
             duckdb_link(b, unit_tests.root_module, duckdb);
             zstd_link(b, unit_tests.root_module);
             // Its tests compiled by `check` too, not linked (no DuckDB): a Mac checks them.
@@ -628,6 +634,7 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "core", .module = core },
                     .{ .name = "protocol", .module = protocol },
                     .{ .name = "sdk_tar", .module = sdk_tar_module },
+                    .{ .name = "regex", .module = regex_module },
                 },
             }) });
             check_tests.root_module.link_libc = true;
