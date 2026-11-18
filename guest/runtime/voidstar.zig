@@ -40,17 +40,27 @@ const symbols_directory = "/symbols/";
 const modules_max = 64;
 const edges_max = 1 << 24;
 
+/// The device's descriptor, -1 until looked for, `device_absent` once it was not there: a
+/// process outside determinismo (a build's own build scripts compiled with the instrumentation,
+/// local testing) looks once, where it looked at every instrumented edge's pass (ParadeDB's
+/// build scripts: minutes of failed opens). Nodes and containers have it from their start.
 var device = std.atomic.Value(i32).init(-1);
+const device_absent: i32 = -2;
 
 fn device_fd() ?linux.fd_t {
     const known = device.load(.acquire);
     if (known >= 0) return known;
+    if (known == device_absent) return null;
     const result = linux.open(device_path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
-    if (linux.errno(result) != .SUCCESS) return null;
+    if (linux.errno(result) != .SUCCESS) {
+        // Not there (ENOENT, EACCES: none of determinismo's): for good. Interrupted: next time.
+        if (linux.errno(result) != .INTR) _ = device.cmpxchgStrong(-1, device_absent, .acq_rel, .acquire);
+        return null;
+    }
     const fd: i32 = @intCast(result);
     if (device.cmpxchgStrong(-1, fd, .acq_rel, .acquire)) |other| {
-        _ = linux.close(fd); // Another thread opened it first.
-        return other;
+        _ = linux.close(fd); // Another thread opened it first, or found it absent.
+        return if (other >= 0) other else null;
     }
     return fd;
 }
@@ -712,6 +722,16 @@ const Maps = struct {
         };
     }
 };
+
+test "outside determinismo (no device) the device is looked for once, not at every edge" {
+    // A program built with Antithesis's instrumentation runs outside it too (a build's own build
+    // scripts, compiled with the same flags, ParadeDB's: 25 minutes of failed opens; Antithesis's
+    // docs: it must "run successfully ... in local testing").
+    if (linux.errno(linux.access(device_path, linux.F_OK)) == .SUCCESS) return error.SkipZigTest;
+    try std.testing.expect(device_fd() == null);
+    try std.testing.expect(device.load(.acquire) == device_absent);
+    try std.testing.expect(device_fd() == null);
+}
 
 test "Maps.parse" {
     const mapping = Maps.parse("7f0000001000-7f0000003000 r-xp 00001000 08:01 1234   /usr/lib/x.so").?;
