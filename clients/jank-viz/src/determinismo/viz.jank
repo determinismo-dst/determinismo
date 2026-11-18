@@ -228,6 +228,8 @@
           (http/sleep-ms 100)
           (recur))))))
 
+(def ^:private found-marks-max 400)
+
 (defn- heard
   "What the client did: the map's state after it, and its part of the evaluation's card."
   [kind data]
@@ -295,9 +297,12 @@
         (swap! state (fn [s]
                        (assoc s
                               :looked (if (some? (:branch (:request data))) (conj (:looked s) (:branch (:request data))) (:looked s))
+                              ;; The first found events only: a query that finds thousands
+                              ;; marks no more than a map can show (each ring is many vertices,
+                              ;; and a frame of ImGui holds 65,536: 2026-11-18, an agent's query).
                               :marks (vec (concat (remove (fn [mark] (= :found (:kind mark))) (:marks s))
                                                     (map (fn [event] {:timeline (:branch event) :at-ns (:vtime_ns event) :kind :found})
-                                                         (:events data)))))))
+                                                         (take found-marks-max (:events data))))))))
         (swap! told conj [kind data]))
 
     ;; Its flag at once: the session's events reach serve's store when it ends.
@@ -735,10 +740,16 @@
 
 (defn- draw-marks
   "A timeline's marks on its row at `ty`: faults, crashes, its first failure, what a query
-  found, the moments looked at."
+  found, the moments looked at. Marks of a kind that fall on the same pixel are drawn once (a
+  long timeline's thousands of faults: one rectangle a pixel, not one a fault)."
   [s index ty at-x from to large]
+  (let [drawn (atom #{})]
   (doseq [mark (:marks s)]
-    (when (and (= index (:timeline mark)) (>= (:at-ns mark) from) (<= (:at-ns mark) to))
+    (when (and (= index (:timeline mark)) (>= (:at-ns mark) from) (<= (:at-ns mark) to)
+               (let [place [(:kind mark) (int (at-x (:at-ns mark)))]]
+                 (when-not (contains? @drawn place)
+                   (swap! drawn conj place)
+                   true)))
       (let [mx (at-x (:at-ns mark))
             kind (:kind mark)]
         (cond
@@ -755,7 +766,7 @@
           ;; A session's checkpoint: a flag where a session can come back to.
           (= kind :checkpoint) (when large
                                  (line! mx (- ty 8) mx (+ ty 6) green 2.0)
-                                 (rect! mx (- ty 8) (+ mx 7) (- ty 3) green 1.0 0.0))))))
+                                 (rect! mx (- ty 8) (+ mx 7) (- ty 3) green 1.0 0.0)))))))
   (when large
     (doseq [visit (:visits s)]
       (when (and (= index (:timeline visit)) (:at-ns visit))
