@@ -3763,6 +3763,7 @@ fn explore_tree(
             const split = cpus.memory_split();
             activity.sample(starts[0..running_count], indices[0..running_count], nodes, @intCast(state.queue.items.len - state.queue_head), cpus.memory_available(), if (holding) registry.count else 0, split.anonymous, split.shared);
         }
+        claims_look(&state, branches.pool, running[0..running_count], jobs);
         const late = past_deadline(branches);
         // A run that starts no timeline any more (drained, or past its budget) returns to none of
         // its holders: their memory and disk go now, to the next hunt beside its last timelines,
@@ -3854,7 +3855,7 @@ fn explore_tree(
             else
                 false;
             if (branches.arguments.config_bandit) mine.bandit = &state.bandit;
-            running[running_count] = try timeline_start(context, vm, options, mine, &batch);
+            running[running_count] = try timeline_start(context, vm, options, mine, &batch, &state);
             running_count += 1;
             continue;
         };
@@ -4232,7 +4233,57 @@ fn deciding_strategy(exploration: *const Exploration) bool {
 
 /// A timeline running in a process of its own (explore_tree): where its results come back, and
 /// where it started.
-const Running = struct { pid: linux.pid_t, results: linux.fd_t, place: Planned, index: u32, start_ns: u64, slot: u16 };
+/// How often the explorer looks at the host's memory for its run's claims (claims_look).
+const claims_look_ns = 5 * std.time.ns_per_s;
+
+/// The run's claims, from the host's memory beside its VMs (cpus.ClaimLearning), every
+/// claims_look_ns: what its VMs came to hold is what the next ones claim, and what those running
+/// count as (the run's turn file: every process of the run reads it at its take). Memory short
+/// after it said less than its guests' size: the claims are the guests' again, for good, and its
+/// youngest VM ends, one a look while memory stays short (the least work lost; it runs again
+/// once memory allows: its take waits as any). Nothing heavy on this path: a read of meminfo, a
+/// write of 8 bytes, a signal.
+fn claims_look(state: *TreeState, pool: ?*cpus.Pool, running: []Running, jobs: u32) void {
+    const claims_pool = pool orelse return;
+    const now = monotonic_ns();
+    if (now -| state.claims_looked_ns < claims_look_ns) return;
+    state.claims_looked_ns = now;
+    if (state.claims.short(cpus.memory_available(), cpus.memory_reserve())) {
+        claims_pool.claim_soft_set(0);
+        var youngest: ?*Running = null;
+        for (running) |*entry| {
+            if (entry.short) continue; // Ended already, not reaped yet.
+            if (youngest == null or entry.start_ns > youngest.?.start_ns) youngest = entry;
+        }
+        if (youngest) |entry| {
+            entry.short = true;
+            _ = linux.kill(entry.pid, .KILL);
+            std.debug.print("[determinismo] memory is short ({d} MiB available) after the run claimed " ++
+                "less than its guests' size: its claims are the guests' again, and timeline {d}, its " ++
+                "youngest, ends and runs again\n", .{ cpus.memory_available() >> 20, entry.place.index });
+        }
+        return;
+    }
+    state.claims.sample(cpus.host_in_use(), claims_pool.run_held(), @intCast(running.len), jobs, state.ended);
+    const said = state.claims.softened;
+    const claim = state.claims.claim(cpus.claim_bytes);
+    claims_pool.claim_soft_set(claim);
+    if (claim != 0 and !said) std.debug.print("[determinismo] the run's VMs claim {d} MiB each from " ++
+        "now, not their guest's {d}: half again what the host had in use for each ({d} timelines " ++
+        "ended)\n", .{ claim >> 20, cpus.claim_bytes >> 20, state.ended });
+}
+
+const Running = struct {
+    pid: linux.pid_t,
+    results: linux.fd_t,
+    place: Planned,
+    index: u32,
+    start_ns: u64,
+    slot: u16,
+    /// Ended by the explorer, memory short under its run's learned claim (claims_look): it
+    /// runs again, and is none of the kills a host is given up for.
+    short: bool = false,
+};
 
 /// A tree's timelines planned from moments returned to, and those started, so far (status.json's
 /// `returns_planned`, `returned`): the hunt queue ends a first pass once its first returns run
@@ -4365,6 +4416,7 @@ fn timeline_start(
     options: *VM.Options,
     branches: Branches,
     batch: *Batch,
+    state: *const TreeState,
 ) !Running {
     assert(branches.plan.?.len == 1);
     var pipe: [2]linux.fd_t = undefined;
@@ -4382,6 +4434,7 @@ fn timeline_start(
         child_dies_with(explorer);
         oom_before_the_host();
         _ = linux.close(pipe[0]);
+        nodes_close_but(state, branches.plan.?[0].snapshot);
         options.progress = &vtimes[slot]; // Its VM made from these (VM.init).
         var one = Summaries{ .items = batch.scratch }; // Its own copy: sent back whole.
         var mine = branches;
@@ -4399,6 +4452,19 @@ fn timeline_start(
         .start_ns = monotonic_ns(),
         .slot = slot,
     };
+}
+
+/// In a timeline's process just forked: the memory of the tree's other nodes closed (the
+/// setup's stays: every timeline's path starts there). A node the tree lets go is then gone
+/// with the tree's own file, where every child forked while it existed kept it open until
+/// that child ended (run 2067, 27 minutes in: 37 nodes let go still alive in the children,
+/// 28.3 GiB nothing claimed, beside the tree's own 32).
+fn nodes_close_but(state: *const TreeState, mine: *const Snapshot) void {
+    var iterator = state.users.keyIterator();
+    while (iterator.next()) |snapshot| {
+        if (snapshot.* == mine or snapshot.* == state.setup) continue;
+        if (snapshot.*.memory_fd >= 0) _ = linux.close(snapshot.*.memory_fd);
+    }
 }
 
 /// How often a tree run says what it is doing while no timeline finishes.
@@ -4539,18 +4605,23 @@ fn timeline_reaped(
     finished: Finished,
 ) !void {
     const place = running[finished.at].place;
+    const short = running[finished.at].short;
     timeline_slots.unset(running[finished.at].slot);
     running[finished.at] = running[running_count.* - 1];
     running_count.* -= 1;
     if (finished.killed) {
-        // Not served: its start snapshot's count already has it.
-        state.kills += 1;
-        if (state.kills > kills_max) return error.WorkerFailed;
-        std.debug.print("[determinismo] timeline {d} was killed (SIGKILL: the host's OOM " ++
-            "killer?) before it finished: it runs again ({d} so far)\n", .{ place.index, state.kills });
+        // Not served: its start snapshot's count already has it. One the explorer ended for
+        // memory (claims_look) said so there, and is not the host's doing.
+        if (!short) {
+            state.kills += 1;
+            if (state.kills > kills_max) return error.WorkerFailed;
+            std.debug.print("[determinismo] timeline {d} was killed (SIGKILL: the host's OOM " ++
+                "killer?) before it finished: it runs again ({d} so far)\n", .{ place.index, state.kills });
+        }
         try queue_plan(arena, state, place);
         return;
     }
+    state.ended += 1;
     try batch.plan.append(arena, place);
     // Its holders, in the registry from now (judged or not: a late run releases them). Not one
     // summary a reap: an unstarted timeline brings none, one past the summaries' room is dropped
@@ -4913,6 +4984,11 @@ const TreeState = struct {
     nodes_skipped: u32 = 0,
     /// The memory of the snapshots it holds (nodes_claim_refresh).
     nodes_bytes: u64 = 0,
+    /// Timelines that ran to their end, and what the run learned its VMs come to hold from the
+    /// host's memory beside them (claims_look).
+    ended: u64 = 0,
+    claims: cpus.ClaimLearning = .{},
+    claims_looked_ns: u64 = 0,
 
     /// Why a behavior comes first, when it does (each preference as asked).
     fn preferred(state: *const TreeState, behavior: *const Events.Behavior) Preferred {

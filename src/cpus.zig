@@ -59,6 +59,18 @@ pub var run_key: ?linux.pid_t = null;
 /// takes: set once at its start, forks inherit it. 0: none claimed.
 pub var claim_bytes: u64 = 0;
 
+/// A CPU's lock file's content while a deterministic VM holds it: the VM's claim (its guest's
+/// size) and its run. A build before the run was written leaves its claim alone: read whole.
+const CpuClaim = extern struct { bytes: u64 = 0, run: u64 = 0 };
+
+/// Where a run's turn file keeps what the run learned its VMs come to hold (Pool.claim_soft),
+/// after its TurnMemory.
+const claim_soft_offset = @sizeOf(TurnMemory);
+
+fn run_of_this_process() u64 {
+    return @intCast(run_key orelse linux.getpid());
+}
+
 /// How many fast machines one CPU holds, unless told (serve's `--machines-per-cpu`, given to each
 /// machine it starts): a fast VM (`run` with several vCPUs: a sandbox, a CI job's setup) is
 /// never deterministic, so several share a CPU among themselves (Pool.take_shared), most of
@@ -263,7 +275,7 @@ pub const Pool = struct {
             // (holders go below the reserve, holders.zig: they make room before a VM waits).
             const available = memory_available(); // 0: unknown, never a reason to wait.
             const below = available != 0 and available < memory_reserve() / 2 + sessions_reserve_bytes();
-            if (below or !pool.claim_fits(claim_bytes)) {
+            if (below or !pool.claim_fits(pool.claim_now())) {
                 if (memory_since == null) {
                     memory_since = monotonic_ns();
                     // The run's processes queued behind this one wait for it too.
@@ -329,8 +341,8 @@ pub const Pool = struct {
                 const locked = linux.flock(pool.fds[slot], std.posix.LOCK.EX | std.posix.LOCK.NB);
                 if (linux.errno(locked) != .SUCCESS) continue;
                 // The claim, where the others read it while this process holds the CPU.
-                const claim = std.mem.toBytes(claim_bytes);
-                _ = linux.pwrite(pool.fds[slot], &claim, claim.len, 0);
+                const claim: CpuClaim = .{ .bytes = claim_bytes, .run = run_of_this_process() };
+                _ = linux.pwrite(pool.fds[slot], std.mem.asBytes(&claim), @sizeOf(CpuClaim), 0);
                 pin(pool.cpus[slot]);
                 return .{
                     .slot = slot,
@@ -472,6 +484,10 @@ pub const Pool = struct {
         // check's VM waiting while the hunt ran (srv3, 2026-10-29).
         const total = meminfo("MemTotal:");
         if (total == 0) return true; // Unknown: never a reason to wait.
+        // A VM of this run's counts as what the run learned its VMs hold, where that is less
+        // than its guest's size (claim_soft); any other run's as its guest's size.
+        const soft = pool.claim_soft();
+        const mine = run_of_this_process();
         var claimed: u64 = 0;
         for (pool.host_fds[0..pool.host_count]) |fd| {
             const probe = linux.flock(fd, std.posix.LOCK.SH | std.posix.LOCK.NB);
@@ -479,14 +495,56 @@ pub const Pool = struct {
                 _ = linux.flock(fd, std.posix.LOCK.UN);
                 continue; // Free.
             }
-            var claim: [8]u8 = @splat(0);
-            if (linux.pread(fd, &claim, claim.len, 0) == claim.len) claimed += std.mem.bytesToValue(u64, &claim);
+            var claim: CpuClaim = .{};
+            const got = linux.pread(fd, std.mem.asBytes(&claim), @sizeOf(CpuClaim), 0);
+            if (linux.errno(got) != .SUCCESS or got < @sizeOf(u64)) continue;
+            const softened = soft != 0 and got == @sizeOf(CpuClaim) and claim.run == mine;
+            claimed += if (softened) @min(claim.bytes, soft) else claim.bytes;
         }
         claimed += nodes_claimed(pool.directory_buffer[0..pool.directory_size]);
         claimed += machines_scan(pool.directory_buffer[0..pool.directory_size], null);
         if (!fits(claimed, bytes, total, 0, host_reserve(total) + sessions_reserve_bytes())) return false;
         const available = if (pool.available_counts) memory_available() else 0;
         return fits(0, bytes, std.math.maxInt(u64) / 2, available, reserve_bytes());
+    }
+
+    /// How many CPUs of the host this run's VMs hold now (their files name the run): the VMs
+    /// admitted, where its workers also count those still waiting for a CPU or for memory.
+    pub fn run_held(pool: *Pool) u32 {
+        const mine = run_of_this_process();
+        var held: u32 = 0;
+        for (pool.host_fds[0..pool.host_count]) |fd| {
+            const probe = linux.flock(fd, std.posix.LOCK.SH | std.posix.LOCK.NB);
+            if (linux.errno(probe) == .SUCCESS) {
+                _ = linux.flock(fd, std.posix.LOCK.UN);
+                continue; // Free.
+            }
+            var claim: CpuClaim = .{};
+            const got = linux.pread(fd, std.mem.asBytes(&claim), @sizeOf(CpuClaim), 0);
+            held += @intFromBool(linux.errno(got) == .SUCCESS and got == @sizeOf(CpuClaim) and claim.run == mine);
+        }
+        return held;
+    }
+
+    /// What the run's explorer learned each of its VMs comes to hold at most (claim_soft_set),
+    /// 0 while it has not: the run's claims count as this where it is less than their guest's
+    /// size. Read at each look: the explorer raises it as its VMs grow, and takes it back.
+    fn claim_soft(pool: *const Pool) u64 {
+        var bytes: [8]u8 = @splat(0);
+        if (linux.pread(pool.turn_fd, &bytes, bytes.len, claim_soft_offset) != bytes.len) return 0;
+        return std.mem.bytesToValue(u64, &bytes);
+    }
+
+    /// The run's explorer says what its VMs come to hold (0: their guest's size again).
+    pub fn claim_soft_set(pool: *const Pool, bytes: u64) void {
+        const value = std.mem.toBytes(bytes);
+        _ = linux.pwrite(pool.turn_fd, &value, value.len, claim_soft_offset);
+    }
+
+    /// What a VM of this process claims: its guest's size, or less once its run learned so.
+    fn claim_now(pool: *const Pool) u64 {
+        const soft = pool.claim_soft();
+        return if (soft == 0) claim_bytes else @min(claim_bytes, soft);
     }
 
     /// Whether a priority process waits for the CPU of `slot` (it holds its `priority-<cpu>`
@@ -506,6 +564,10 @@ pub const Pool = struct {
             _ = linux.unlink(@ptrCast(held.machine_path[0..held.machine_path_size :0]));
             _ = linux.close(held.machine_fd);
         }
+        // Its run goes from the CPU's file with it: a build that writes a claim alone, taking
+        // the CPU next, is of no run the file names.
+        const none: u64 = 0;
+        _ = linux.pwrite(pool.fds[held.slot], std.mem.asBytes(&none), @sizeOf(u64), @offsetOf(CpuClaim, "run"));
         _ = linux.flock(pool.fds[held.slot], std.posix.LOCK.UN);
         unpin(); // Not pinned to a CPU it no longer holds (nor are what it forks or runs next).
     }
@@ -877,6 +939,12 @@ pub fn memory_available() u64 {
     const host = meminfo("MemAvailable:");
     const limited = cgroup_memory() orelse return host;
     return if (host == 0) limited.available else @min(host, limited.available);
+}
+
+/// The host's memory in use (MemTotal less MemAvailable, whatever this process's cgroup: the
+/// claims are host-wide), 0 if unknown.
+pub fn host_in_use() u64 {
+    return meminfo("MemTotal:") -| meminfo("MemAvailable:");
 }
 
 /// The memory this process may use (MemTotal, or its cgroup's limit), 0 if unknown.
@@ -1262,6 +1330,142 @@ test "a VM's memory claim counts while its CPU is held" {
     try std.testing.expect(other.claim_fits(1 << 20));
     holder.give(held);
     try std.testing.expect(other.claim_fits(total / 2)); // Given back: its claim no longer counts.
+}
+
+/// What a run learns its VMs come to hold, from the host's memory while they run. A claim is a
+/// guest's size, what a VM may come to hold: a run whose VMs stay far under it kept its last
+/// worker waiting for memory the host had (run 2067: 40 workers of 4 GiB guests, 39 CPUs held
+/// in every look, 169.3 GiB claimed of the 171.9 that may be, 110 GB available; 6.5% of the
+/// workers' time), and larger guests more (8 GiB: 40,472 s of a run 2060).
+pub const ClaimLearning = struct {
+    /// The most the host had in use for each of the run's VMs running, over its looks.
+    held_max: u64 = 0,
+    /// The run said a claim under its guests' size.
+    softened: bool = false,
+    /// Memory ran short after that: its claims are its guests' size for good.
+    hard: bool = false,
+
+    /// A look at the host: `in_use` of its memory beside `admitted` VMs of the run (those
+    /// holding a CPU: Pool.run_held), `workers` of its `jobs` having a timeline (running, or
+    /// waiting for its CPU or memory), `ended` timelines so far. Counted once as many
+    /// timelines ended as the run has workers (its VMs seen whole, not young) and while every
+    /// worker has a timeline: the VMs admitted are then as many as memory lets in, where a
+    /// run short of work (a judgment's nodes awaited, its end) has the host's other memory on
+    /// a few heads, and what it held at most never comes down again.
+    pub fn sample(learning: *ClaimLearning, in_use: u64, admitted: u32, workers: u32, jobs: u32, ended: u64) void {
+        if (ended < jobs or admitted == 0 or workers < jobs) return;
+        learning.held_max = @max(learning.held_max, in_use / admitted);
+    }
+
+    /// The claim to say for a VM of `guest` bytes: half again what one held at most; 0 (its
+    /// guest's size) while nothing is learned, where that is no less, and once memory ran
+    /// short. All of the host's memory in use is counted on the run's VMs (its nodes, its
+    /// holders, serve, the host's own): the claim errs high, and a run whose holders fill
+    /// memory learns its guests' size.
+    pub fn claim(learning: *ClaimLearning, guest: u64) u64 {
+        if (learning.hard or learning.held_max == 0) return 0;
+        const learned = learning.held_max + learning.held_max / 2;
+        if (learned >= guest) return 0;
+        learning.softened = true;
+        return learned;
+    }
+
+    /// Whether memory is short on a run that claimed less than its guests' size: `available`
+    /// under half the `reserve`. Its claims are its guests' size from then on; while this says
+    /// yes its explorer ends its youngest VM, one a look (it runs again once memory allows).
+    pub fn short(learning: *ClaimLearning, available: u64, reserve: u64) bool {
+        if (!learning.softened) return false;
+        if (available == 0 or available >= reserve / 2) return false;
+        learning.hard = true;
+        return true;
+    }
+};
+
+test "a run learns what its VMs hold once enough ended, and claims half again" {
+    const gib: u64 = 1 << 30;
+    var learning: ClaimLearning = .{};
+    try std.testing.expectEqual(@as(u64, 0), learning.claim(4 * gib)); // Nothing learned.
+    learning.sample(40 * gib, 40, 40, 40, 39); // Fewer timelines ended than workers: young VMs.
+    try std.testing.expectEqual(@as(u64, 0), learning.claim(4 * gib));
+    learning.sample(78 * gib, 20, 20, 40, 400); // Half its workers without a timeline: not counted.
+    try std.testing.expectEqual(@as(u64, 0), learning.claim(4 * gib));
+    // Run 2067's: 39 admitted of 40 workers with a timeline, 2 GiB a VM with the host's all.
+    learning.sample(78 * gib, 39, 40, 40, 400);
+    try std.testing.expectEqual(3 * gib, learning.claim(4 * gib));
+    learning.sample(60 * gib, 40, 40, 40, 500); // Less later: what it held at most stays.
+    try std.testing.expectEqual(3 * gib, learning.claim(4 * gib));
+    try std.testing.expectEqual(@as(u64, 0), learning.claim(3 * gib)); // No less than the guest.
+    // Holders filling memory (run 2061's: 173 GB in use beside 40 VMs): the guest's size.
+    learning.sample(173 * gib, 40, 40, 40, 900);
+    try std.testing.expectEqual(@as(u64, 0), learning.claim(4 * gib));
+    // Guests that fill their memory (8 GiB ones holding 6: 20 admitted of 40 workers, the others
+    // waiting for memory): by the VMs admitted, not the workers, and so their guest's size.
+    var large: ClaimLearning = .{};
+    large.sample(150 * gib, 20, 40, 40, 400);
+    try std.testing.expectEqual(@as(u64, 0), large.claim(8 * gib));
+}
+
+test "memory short under a learned claim: the guest's size for good; never said, never short" {
+    const gib: u64 = 1 << 30;
+    var hard: ClaimLearning = .{};
+    hard.sample(160 * gib, 40, 40, 40, 400); // 4 GiB a VM: half again is past the guest.
+    try std.testing.expectEqual(@as(u64, 0), hard.claim(4 * gib));
+    try std.testing.expect(!hard.short(2 * gib, 16 * gib)); // Its claims were its guests': not its doing.
+    var learning: ClaimLearning = .{};
+    learning.sample(78 * gib, 39, 40, 40, 400);
+    try std.testing.expectEqual(3 * gib, learning.claim(4 * gib));
+    try std.testing.expect(!learning.short(9 * gib, 16 * gib)); // Half the reserve is there.
+    try std.testing.expect(!learning.short(0, 16 * gib)); // Unknown: never a reason.
+    try std.testing.expect(learning.short(7 * gib, 16 * gib));
+    try std.testing.expectEqual(@as(u64, 0), learning.claim(4 * gib));
+    try std.testing.expect(learning.short(7 * gib, 16 * gib)); // Still short: yes again.
+    try std.testing.expect(!learning.short(40 * gib, 16 * gib));
+    try std.testing.expectEqual(@as(u64, 0), learning.claim(4 * gib)); // For good.
+}
+
+test "a run's VMs count as what the run learned they hold, another run's as its guest" {
+    var holder: Pool = undefined;
+    try holder.open();
+    defer holder.close();
+    var other: Pool = undefined;
+    try other.open();
+    defer other.close();
+    holder.available_counts = false; // The claims' accounting alone.
+    other.available_counts = false;
+    const total = meminfo("MemTotal:");
+    if (total == 0) return error.SkipZigTest;
+    const saved = claim_bytes;
+    defer claim_bytes = saved;
+    claim_bytes = total / 2;
+    defer holder.claim_soft_set(0);
+    try std.testing.expectEqual(@as(u32, 0), other.run_held());
+    const held = holder.take(); // A VM of half the host, of this run.
+    try std.testing.expectEqual(@as(u32, 1), other.run_held());
+    try std.testing.expect(!other.claim_fits(total / 2));
+    try std.testing.expectEqual(total / 2, other.claim_now());
+    // The run learned its VMs hold an eighth of the host: the VM running counts as that, and
+    // the next one asks for that.
+    holder.claim_soft_set(total / 8);
+    try std.testing.expectEqual(total / 8, other.claim_now());
+    try std.testing.expect(other.claim_fits(total / 2));
+    // A VM of another run on that CPU: its guest's size, whatever this run learned.
+    const elsewhere: u64 = run_of_this_process() + 1;
+    _ = linux.pwrite(holder.fds[held.slot], std.mem.asBytes(&elsewhere), @sizeOf(u64), @offsetOf(CpuClaim, "run"));
+    try std.testing.expect(!other.claim_fits(total / 2));
+    try std.testing.expectEqual(@as(u32, 0), other.run_held());
+    // Its own again, and the run's claim taken back (memory ran short): the guest's size.
+    const mine: u64 = run_of_this_process();
+    _ = linux.pwrite(holder.fds[held.slot], std.mem.asBytes(&mine), @sizeOf(u64), @offsetOf(CpuClaim, "run"));
+    try std.testing.expect(other.claim_fits(total / 2));
+    holder.claim_soft_set(0);
+    try std.testing.expect(!other.claim_fits(total / 2));
+    try std.testing.expectEqual(total / 2, other.claim_now());
+    // Given back, the CPU's file names no run.
+    holder.give(held);
+    var claim: CpuClaim = .{};
+    _ = linux.pread(holder.fds[held.slot], std.mem.asBytes(&claim), @sizeOf(CpuClaim), 0);
+    try std.testing.expectEqual(total / 2, claim.bytes);
+    try std.testing.expectEqual(@as(u64, 0), claim.run);
 }
 
 test "a CPU is held by one process at a time, and given back" {
