@@ -19,6 +19,38 @@ const batch_size_max = 256 * 1024;
 const batch_prefix = "{\"method\":\"events\",\"events\":[";
 const batch_suffix = "]}";
 /// A plan's limits (`wants_plans`): decisions it weighs, segments a decision's values make.
+/// A plugin on this host takes its calls through a shared mapping instead of its socket when its
+/// hello says `"ring": true` (a TCP plugin at 127.0.0.1): the request written into the mapping, a
+/// word flipped with a futex wake, the reply read back from it; the explorer spins a little before
+/// it sleeps, the round trip a few microseconds instead of a socket's tens. The socket stays open,
+/// carrying nothing: its end is the plugin's. docs/PLUGINS.md's `ring`.
+pub const Ring = extern struct {
+    magic: [8]u8,
+    /// `ring_idle`, `ring_request` (posted by the explorer), `ring_reply` (posted by the plugin).
+    state: std.atomic.Value(u32),
+    request_size: u32,
+    reply_size: u32,
+    reserved: [44]u8,
+};
+const ring_magic = "DETRING1";
+const ring_idle = 0;
+const ring_request = 1;
+const ring_reply = 2;
+const ring_request_at = @sizeOf(Ring);
+/// A memfd's pages are taken as they are written: the room costs what requests use.
+const ring_request_size_max = 16 << 20;
+const ring_reply_at = ring_request_at + ring_request_size_max;
+const ring_size = ring_reply_at + line_size_max;
+/// Spins before the futex: a plugin answering at once (compiled code) is waited for without a
+/// sleep, one that takes longer (a JSON decoder) costs this much CPU a call at most.
+const ring_spins = 4096;
+/// How long a futex sleep lasts before the plugin's socket is looked at (its end ends the wait).
+const ring_wait_ns = 100 * std.time.ns_per_ms;
+comptime {
+    assert(@sizeOf(Ring) == 64);
+    assert(ring_size % std.heap.page_size_min == 0);
+}
+
 pub const plan_labels_max = 16;
 pub const plan_segments_max = 16;
 const plan_name_size_max = 64;
@@ -89,6 +121,10 @@ plan: [plan_labels_max]Planned = undefined,
 plan_count: u8 = 0,
 /// When the last batch went (virtual time): a plan older than `plan_refresh_ns` is refreshed.
 flushed_ns: u64 = 0,
+/// Whether the plugin's TCP connection is to this host (127.0.0.1): a ring can be offered.
+loopback: bool = false,
+/// The shared mapping the calls go through, once the plugin took it (`Ring` at its start).
+ring: ?[]align(std.heap.page_size_min) u8 = null,
 
 const Strategy = @This();
 
@@ -152,6 +188,8 @@ pub fn start(
     strategy.from_plugin = responses[0];
     strategy.response_start = 0;
     strategy.response_end = 0;
+    strategy.loopback = false;
+    strategy.ring = null;
 }
 
 fn connect(strategy: *Strategy, address_text: []const u8) !void {
@@ -187,6 +225,8 @@ fn connect(strategy: *Strategy, address_text: []const u8) !void {
     strategy.from_plugin = @intCast(linux.dup(fd)); // Closed separately, as pipes would be.
     strategy.response_start = 0;
     strategy.response_end = 0;
+    strategy.loopback = address[0] == 127;
+    strategy.ring = null;
 }
 
 fn program_find(
@@ -213,11 +253,13 @@ fn program_find(
 /// the end of its input when its owner stops it, and the owner would wait forever (a Tetris
 /// tree with a returns-only strategy, srv3 2026-10-29: every timeline stuck at its end).
 pub fn forget(strategy: *Strategy) void {
+    strategy.ring_unmap();
     _ = linux.close(strategy.to_plugin);
     _ = linux.close(strategy.from_plugin);
 }
 
 pub fn stop(strategy: *Strategy) void {
+    strategy.ring_unmap();
     _ = linux.close(strategy.to_plugin); // The plugin sees end of input and exits.
     _ = linux.close(strategy.from_plugin);
     if (strategy.pid == 0) return; // Remote: its connection closed.
@@ -264,9 +306,56 @@ pub fn hello(strategy: *Strategy, exploration_seed: u64, run_url: ?[]const u8) !
     };
     // A plan comes with a batch's reply: plans need batches.
     if (strategy.wants_plans) strategy.wants_batched = true;
+    const ring_asked = if (reply.get("ring")) |ring| ring == .bool and ring.bool else false;
     std.debug.print("[determinismo] strategy: {s}\n", .{name.string});
     strategy.name_size = @intCast(@min(name.string.len, name_size_max));
     @memcpy(strategy.name_buffer[0..strategy.name_size], name.string[0..strategy.name_size]);
+    if (ring_asked and strategy.pid == 0 and strategy.loopback) try strategy.ring_open();
+}
+
+/// The shared mapping offered to a plugin that asked for it: a memfd it opens through this
+/// process's /proc entry, the layout in the request. Taken when it answers `"ring": true`; the
+/// socket carries the calls otherwise.
+fn ring_open(strategy: *Strategy) !void {
+    assert(strategy.ring == null);
+    const created = linux.memfd_create("determinismo-ring", linux.MFD.CLOEXEC);
+    try check(created);
+    const fd: linux.fd_t = @intCast(created);
+    defer _ = linux.close(fd); // The mapping stays; the plugin has opened its own by its answer.
+    try check(linux.ftruncate(fd, ring_size));
+    const mapped = linux.mmap(null, ring_size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
+    try check(mapped);
+    const memory: []align(std.heap.page_size_min) u8 = @as([*]align(std.heap.page_size_min) u8, @ptrFromInt(mapped))[0..ring_size];
+    const ring: *Ring = @ptrCast(memory.ptr);
+    ring.* = .{
+        .magic = ring_magic.*,
+        .state = .init(ring_idle),
+        .request_size = 0,
+        .reply_size = 0,
+        .reserved = @splat(0),
+    };
+    var writer: std.Io.Writer = .fixed(&strategy.request);
+    try writer.print("{{\"method\":\"ring\",\"path\":\"/proc/{d}/fd/{d}\",\"size\":{d}," ++
+        "\"request_at\":{d},\"reply_at\":{d},\"reply_max\":{d}}}", .{
+        linux.getpid(), fd, ring_size, ring_request_at, ring_reply_at, line_size_max,
+    });
+    const reply = strategy.call(writer.buffered()) catch |err| {
+        _ = linux.munmap(memory.ptr, memory.len);
+        return err;
+    };
+    const taken = if (reply.get("ring")) |value| value == .bool and value.bool else false;
+    if (!taken) {
+        _ = linux.munmap(memory.ptr, memory.len);
+        return;
+    }
+    strategy.ring = memory;
+    std.debug.print("[determinismo] strategy: its calls through a shared mapping\n", .{});
+}
+
+fn ring_unmap(strategy: *Strategy) void {
+    const memory = strategy.ring orelse return;
+    _ = linux.munmap(memory.ptr, memory.len);
+    strategy.ring = null;
 }
 
 pub fn hello_name(strategy: *const Strategy) []const u8 {
@@ -723,6 +812,8 @@ test "hello readies a plugin's struct from undefined memory, as TCP's connect le
     strategy.from_plugin = from[0];
     strategy.response_start = 0;
     strategy.response_end = 0;
+    strategy.loopback = false;
+    strategy.ring = null;
     try write_all(from[1], "{\"name\":\"t\",\"wants\":[\"assertions\",\"batched\"]}\n{}\n");
     try strategy.hello(1, null);
     const moment: Events.Moment = .{ .vtime_ns = 5, .branches = 9 };
@@ -859,15 +950,58 @@ fn call(strategy: *Strategy, request: []const u8) !std.json.ObjectMap {
 /// `call` for a request of any size (the reply still fits the fixed buffers).
 fn call_long(strategy: *Strategy, request: []const u8) !std.json.ObjectMap {
     assert(request.len > 0);
-    try write_all(strategy.to_plugin, request);
-    try write_all(strategy.to_plugin, "\n");
-    const line = try strategy.read_line();
+    const line = if (strategy.ring) |memory| try strategy.ring_call(memory, request) else line: {
+        try write_all(strategy.to_plugin, request);
+        try write_all(strategy.to_plugin, "\n");
+        break :line try strategy.read_line();
+    };
     var fba = std.heap.FixedBufferAllocator.init(&strategy.parse_buffer);
     const value = std.json.parseFromSliceLeaky(std.json.Value, fba.allocator(), line, .{}) catch {
         return error.BadPluginReply;
     };
     if (value != .object) return error.BadPluginReply;
     return value.object;
+}
+
+/// One call through the shared mapping: the reply copied out of it (it is the next call's room).
+fn ring_call(strategy: *Strategy, memory: []u8, request: []const u8) ![]const u8 {
+    if (request.len > ring_request_size_max) return error.PluginRequestTooLarge;
+    const ring: *Ring = @ptrCast(@alignCast(memory.ptr));
+    assert(ring.state.load(.acquire) == ring_idle);
+    @memcpy(memory[ring_request_at..][0..request.len], request);
+    ring.request_size = @intCast(request.len);
+    ring.state.store(ring_request, .release);
+    _ = linux.futex_3arg(&ring.state.raw, .{ .cmd = .WAKE, .private = false }, 1);
+    var spins: u32 = 0;
+    while (ring.state.load(.acquire) != ring_reply) {
+        if (spins < ring_spins) {
+            spins += 1;
+            std.atomic.spinLoopHint();
+            continue;
+        }
+        const timeout: linux.timespec = .{ .sec = 0, .nsec = ring_wait_ns };
+        _ = linux.futex_4arg(&ring.state.raw, .{ .cmd = .WAIT, .private = false }, ring_request, &timeout);
+        if (ring.state.load(.acquire) != ring_reply and strategy.plugin_gone()) return error.PluginExited;
+    }
+    const size = ring.reply_size;
+    if (size > line_size_max) return error.PluginLineTooLong;
+    @memcpy(strategy.response[0..size], memory[ring_reply_at..][0..size]);
+    ring.state.store(ring_idle, .release);
+    strategy.response_start = 0;
+    strategy.response_end = 0;
+    return std.mem.trimEnd(u8, strategy.response[0..size], "\n");
+}
+
+/// Whether a ring plugin's socket has ended (closed, or an error on it): the plugin is gone.
+fn plugin_gone(strategy: *Strategy) bool {
+    var polled = [_]linux.pollfd{.{
+        .fd = strategy.from_plugin,
+        .events = linux.POLL.IN | linux.POLL.RDHUP,
+        .revents = 0,
+    }};
+    const ready = linux.poll(&polled, polled.len, 0);
+    if (linux.errno(ready) != .SUCCESS or ready == 0) return false;
+    return polled[0].revents & (linux.POLL.HUP | linux.POLL.RDHUP | linux.POLL.ERR) != 0;
 }
 
 fn read_line(strategy: *Strategy) ![]const u8 {
@@ -905,4 +1039,100 @@ fn write_all(fd: linux.fd_t, bytes: []const u8) !void {
 
 fn check(result: usize) !void {
     if (linux.errno(result) != .SUCCESS) return error.SyscallFailed;
+}
+
+/// The plugin side of a ring for the test: hello over the socket, the mapping taken, then each
+/// request answered in it with its size, until the explorer's socket ends.
+fn ring_test_plugin(listener: linux.fd_t) void {
+    const connection_or_error = linux.accept(listener, null, null);
+    if (linux.errno(connection_or_error) != .SUCCESS) linux.exit_group(10);
+    const connection: linux.fd_t = @intCast(connection_or_error);
+    var buffer: [4096]u8 = undefined;
+    var have: usize = 0;
+    // Two lines over the socket: the hello, then the ring's offer.
+    var lines: [2][]const u8 = undefined;
+    for (&lines) |*line| {
+        while (std.mem.indexOfScalar(u8, buffer[0..have], '\n') == null) {
+            const got = linux.read(connection, buffer[have..].ptr, buffer.len - have);
+            if (linux.errno(got) != .SUCCESS or got == 0) linux.exit_group(11);
+            have += got;
+        }
+        const end = std.mem.indexOfScalar(u8, buffer[0..have], '\n').?;
+        line.* = buffer[0..end];
+        if (line == &lines[0]) {
+            write_all(connection, "{\"name\":\"ring-test\",\"decides\":false,\"ring\":true}\n") catch linux.exit_group(12);
+            std.mem.copyForwards(u8, buffer[0 .. have - end - 1], buffer[end + 1 .. have]);
+            have -= end + 1;
+        }
+    }
+    var path_buffer: [64]u8 = undefined;
+    const key = "\"path\":\"";
+    const at = (std.mem.indexOf(u8, lines[1], key) orelse linux.exit_group(13)) + key.len;
+    const path_end = std.mem.indexOfScalarPos(u8, lines[1], at, '"') orelse linux.exit_group(14);
+    const path = std.fmt.bufPrintSentinel(&path_buffer, "{s}", .{lines[1][at..path_end]}, 0) catch linux.exit_group(15);
+    const opened = linux.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    if (linux.errno(opened) != .SUCCESS) linux.exit_group(16);
+    const mapped = linux.mmap(null, ring_size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, @intCast(opened), 0);
+    if (linux.errno(mapped) != .SUCCESS) linux.exit_group(17);
+    _ = linux.close(@intCast(opened));
+    const memory: [*]u8 = @ptrFromInt(mapped);
+    const ring: *Ring = @ptrCast(@alignCast(memory));
+    if (!std.mem.eql(u8, &ring.magic, ring_magic)) linux.exit_group(18);
+    write_all(connection, "{\"ring\":true}\n") catch linux.exit_group(19);
+    while (true) {
+        const seen = ring.state.load(.acquire);
+        if (seen != ring_request) {
+            const timeout: linux.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+            _ = linux.futex_4arg(&ring.state.raw, .{ .cmd = .WAIT, .private = false }, seen, &timeout);
+            var polled = [_]linux.pollfd{.{ .fd = connection, .events = linux.POLL.IN | linux.POLL.RDHUP, .revents = 0 }};
+            if (linux.poll(&polled, 1, 0) == 1 and polled[0].revents & (linux.POLL.HUP | linux.POLL.RDHUP) != 0) linux.exit_group(0);
+            continue;
+        }
+        var reply_buffer: [64]u8 = undefined;
+        const reply = std.fmt.bufPrint(&reply_buffer, "{{\"size\":{d}}}", .{ring.request_size}) catch linux.exit_group(20);
+        @memcpy(memory[ring_reply_at..][0..reply.len], reply);
+        ring.reply_size = @intCast(reply.len);
+        ring.state.store(ring_reply, .release);
+        _ = linux.futex_3arg(&ring.state.raw, .{ .cmd = .WAKE, .private = false }, 1);
+    }
+}
+
+test "a plugin on this host that asks for a ring takes its calls through the shared mapping" {
+    const listener_or_error = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    try check(listener_or_error);
+    const listener: linux.fd_t = @intCast(listener_or_error);
+    defer _ = linux.close(listener);
+    var address = linux.sockaddr.in{ .port = 0, .addr = @bitCast([4]u8{ 127, 0, 0, 1 }) };
+    var address_size: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    try check(linux.bind(listener, @ptrCast(&address), address_size));
+    try check(linux.listen(listener, 1));
+    try check(linux.getsockname(listener, @ptrCast(&address), &address_size));
+    const pid = linux.fork();
+    try check(pid);
+    if (pid == 0) ring_test_plugin(listener);
+    const allocator = std.testing.allocator;
+    const strategy = try allocator.create(Strategy);
+    defer allocator.destroy(strategy);
+    @memset(std.mem.asBytes(strategy), 0xaa); // connect sets its fields one by one.
+    var text: [32]u8 = undefined;
+    try strategy.connect(try std.fmt.bufPrint(&text, "127.0.0.1:{d}", .{std.mem.bigToNative(u16, address.port)}));
+    try strategy.hello(1, null);
+    try std.testing.expect(strategy.ring != null);
+    try std.testing.expectEqualStrings("ring-test", strategy.hello_name());
+    // Each call through the mapping: one of a few bytes, one past a socket's line.
+    for ([_]usize{ 13, 300 * 1024 }) |size| {
+        const request = try allocator.alloc(u8, size);
+        defer allocator.free(request);
+        @memset(request, ' ');
+        request[0] = '{';
+        request[size - 1] = '}';
+        const reply = try strategy.call_json(request);
+        try std.testing.expectEqual(@as(i64, @intCast(size)), reply.get("size").?.integer);
+    }
+    strategy.stop(); // The plugin's wait ends with the socket.
+    try std.testing.expect(strategy.ring == null);
+    var status: i32 = 0;
+    _ = linux.waitpid(@intCast(pid), &status, 0);
+    const exited: u32 = @bitCast(status);
+    try std.testing.expect(linux.W.IFEXITED(exited) and linux.W.EXITSTATUS(exited) == 0);
 }
