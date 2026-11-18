@@ -5,12 +5,15 @@
 ;; and stops change nothing of the recorded history.
 ;;
 ;;   (require '[determinismo.debug :as dbg])
-;;   (binding [dbg/*url* "http://127.0.0.1:7878"] ...)    ; $DETERMINISMO_URL, else this
+;;   (binding [api/*url* "http://127.0.0.1:7878"] ...)    ; $DETERMINISMO_URL, else this: one
+;;                                                      ; address for every namespace and the viz
 ;;   (def s (dbg/open 13 {:branch 0 :until "event=composer_start"}))
 ;;   (dbg/regs s)                                       ; {:rip "0x..." :cr3 "0x..." ...}
 ;;   (dbg/translate s :current 0xffffffff824079c0)      ; 0x24079c0 (jiffies)
 ;;   (dbg/mem s 0x24079c0 8) (dbg/poke s 0x24079c0 [0 0 0 0])
 ;;   (dbg/break s 0xffffffff81b96960) (dbg/continue s)  ; stopped on the kernel's schedule
+;;   (dbg/watch-values s 0xffffffff824079c0 8 {:limit 3}) ; jiffies' next three writes, each a moment
+;;   (dbg/watch-values s address 8 {:cr3 cr3 :type :f64 :keep? #(< 35.0 % 40.3)})
 ;;   (dbg/step-branches s 1000) (dbg/sh s "det-nodes list")
 ;;   (dbg/checkpoint s "loaded")                        ; the machine saved here
 ;;   (dbg/close s)
@@ -20,14 +23,13 @@
 ;; exist (2026-11-13); an older run's guest takes them for shell commands.
 (ns determinismo.debug
   (:require [clojure.string :as str]
+            [determinismo.api :as api]
             [determinismo.http :as http]
             [determinismo.json :as json]
             [determinismo.tap :as tap]))
 
-(def ^:dynamic *url* http/url) ; $DETERMINISMO_URL, else http://127.0.0.1:7878
-
 (defn- call [path body]
-  (let [[status text] (http/request :post (str *url* path) (json/write-json body))]
+  (let [[status text] (http/request :post (str api/*url* path) (json/write-json body))]
     (when (>= status 400)
       (throw (ex-info (str "determinismo: " status " " text) {:status status :body text})))
     (json/read-json text)))
@@ -240,13 +242,93 @@ std::string determinismo_debug_hex(std::string const &decimal) {
   ([session address cr3]
    (answer (step* session (str "det:break " (if address (str (hex address) (when cr3 (str " " (hex cr3)))) "off"))) "break")))
 
+(defn watch
+  "A hardware write watchpoint on `size` bytes (1, 2, 4 or 8, aligned to their size) at a guest
+  virtual address (in address space `cr3`, or any); `continue` then stops after each write
+  there, with the bytes written. (watch session nil): off."
+  ([session address] (watch session address nil nil))
+  ([session address size] (watch session address size nil))
+  ([session address size cr3]
+   (answer (step* session (str "det:watch " (if address (str (hex address) " " size (when cr3 (str " " (hex cr3)))) "off"))) "break")))
+
 (defn continue
-  "On until the breakpoint (or `ms` of virtual time, 60 s by default): where it stopped,
-  {:rip :cr3 :vtime_ns :branches}, or nil when the time ran out first."
+  "On until the breakpoint or a watched write (or `ms` of virtual time, 60 s by default): where
+  it stopped, {:rip :cr3 :vtime_ns :branches}, a write's with :watch :size and :hex (the bytes
+  written, memory order), or nil when the time ran out first."
   ([session] (continue session nil))
   ([session ms]
    (let [stopped (answer (step* session (str "det:continue" (when ms (str " " ms)))) "break")]
      (tap/tell :stop {:session session :at stopped} stopped))))
+
+(defn- power-of-two
+  "2.0 to the `e` (an integer, negative or not): exact for a float's exponents."
+  [e]
+  (loop [e e v 1.0]
+    (cond (pos? e) (recur (dec e) (* v 2.0))
+          (neg? e) (recur (inc e) (/ v 2.0))
+          :else v)))
+
+(defn- float-of
+  "An IEEE 754 float from its sign, biased exponent (`top` all ones) and fraction (the
+  mantissa over 2 to its width, in [0, 1))."
+  [negative exponent fraction bias top]
+  (let [magnitude (cond (= exponent top) (if (zero? fraction) ##Inf ##NaN)
+                        (zero? exponent) (* fraction (power-of-two (- 1 bias)))
+                        :else (* (+ 1.0 fraction) (power-of-two (- exponent bias))))]
+    (if negative (- magnitude) magnitude)))
+
+(defn value-of
+  "Bytes (0-255 each, memory order: x86's little-endian) as a `type`'s number: :u8 :u16 :u32
+  :u64, :i8 :i16 :i32 :i64 (two's complement), :f32 :f64 (IEEE 754). Built from the bytes
+  themselves: integers summed as big integers, a float's mantissa as a double (exact: 53 bits).
+  On jank a product of two integers that each fit 32 bits is taken in 32 ((* 46137344 256) is
+  -1073741824, 2026-11-18), and a big integer's quotient goes through a double."
+  [bytes type]
+  (let [bytes (vec bytes)
+        unsigned (reduce (fn [n b] (+ (* n 256) b)) 0N (reverse bytes))
+        fit (fn [n] (if (and (<= n 9223372036854775807) (>= n -9223372036854775808)) (long n) n))
+        span (reduce * 1N (repeat (* 8 (count bytes)) 2))]
+    (case type
+      (:u8 :u16 :u32 :u64) (fit unsigned)
+      (:i8 :i16 :i32 :i64) (fit (if (>= (peek bytes) 128) (- unsigned span) unsigned))
+      :f32 (let [[b0 b1 b2 b3] bytes
+                 low (reduce (fn [f b] (/ (+ f b) 256.0)) 0.0 [b0 b1])]
+             (float-of (>= b3 128) (+ (* (mod b3 128) 2) (quot b2 128))
+                       (/ (+ (mod b2 128) low) 128.0) 127 255))
+      :f64 (let [[b0 b1 b2 b3 b4 b5 b6 b7] bytes
+                 low (reduce (fn [f b] (/ (+ f b) 256.0)) 0.0 [b0 b1 b2 b3 b4 b5])]
+             (float-of (>= b7 128) (+ (* (mod b7 128) 16) (quot b6 16))
+                       (/ (+ (mod b6 16) low) 16.0) 1023 2047))
+      (throw (ex-info (str "determinismo: no such value type " type) {:type type})))))
+
+(defn watch-values
+  "A variable's writes from the session's moment on: a write watchpoint on its `size` bytes at
+  `address` (a guest virtual address), then `continue` to each write, its value read as
+  :type (:i8 ... :i64 by size unless given; :u8 ... :u64, :f32, :f64) and kept when :keep?
+  holds for it. Until :limit kept (100), :max-stops writes (10,000), or :ms of virtual time
+  with no write (60 s); the watch is off after. :cr3 keeps one address space's writes (a
+  process's: regs' or a stop's :cr3), else any. Each kept write is an exact moment of the
+  timeline (its :vtime_ns and :branches, the guest just past the writing instruction at :rip),
+  where a session can be opened. -> [{:value :vtime_ns :branches :rip :cr3} ...]"
+  ([session address size] (watch-values session address size {}))
+  ([session address size options]
+   (let [type (or (:type options) (get {1 :i8 2 :i16 4 :i32 8 :i64} size))
+         keep? (or (:keep? options) (fn [_] true))
+         limit (or (:limit options) 100)
+         most (or (:max-stops options) 10000)]
+     (watch session address size (:cr3 options))
+     (let [kept (loop [kept [] stops 0]
+                  (if (or (>= (count kept) limit) (>= stops most))
+                    kept
+                    (let [stop (continue session (:ms options))]
+                      (if-not (and stop (:watch stop) (:hex stop))
+                        kept
+                        (let [bytes (mapv (fn [pair] (unhex (str "0x" (apply str pair)))) (partition 2 (:hex stop)))
+                              value (value-of bytes type)
+                              found (assoc (select-keys stop [:vtime_ns :branches :rip :cr3]) :value value)]
+                          (recur (if (keep? value) (conj kept found) kept) (inc stops)))))))]
+       (watch session nil)
+       (tap/tell :watch-values {:session session :address (hex address) :size size :type type :kept kept} kept)))))
 
 (defn step-branches
   "On `n` taken branches (jumps, calls, returns), stopped there: the registers then."
@@ -290,7 +372,7 @@ std::string determinismo_debug_hex(std::string const &decimal) {
   "The last `event` (an event's name) the session's timeline said so far, as its events file has
   it ({:seq :vtime_ns :event}), or nil: what a window following a session draws from."
   [session event]
-  (let [[status text] (http/request :get (str *url* "/sessions/" session "/latest?event=" event) nil)]
+  (let [[status text] (http/request :get (str api/*url* "/sessions/" session "/latest?event=" event) nil)]
     (cond (= status 204) nil
           (>= status 400) (throw (ex-info (str "determinismo: " status " " text) {:status status :body text}))
           :else (json/read-json text))))

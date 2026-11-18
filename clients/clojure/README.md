@@ -53,8 +53,8 @@ serve's held at a moment; the machine stays stopped between calls, and stops cha
 the recorded history.
 
 ```clojure
-(require '[determinismo.debug :as dbg])
-(binding [dbg/*url* "http://127.0.0.1:7878"]          ; else $DETERMINISMO_URL
+(require '[determinismo.api :as api] '[determinismo.debug :as dbg])
+(binding [api/*url* "http://127.0.0.1:7878"]          ; else $DETERMINISMO_URL (every namespace's)
   (let [s (dbg/open 13 {:branch 0 :at-vtime-ms 3000})]
     (dbg/regs s)                                      ; {:rip "0x..." :cr3 "0x..." ...}
     (dbg/translate s :current "0xffffffff824079c0")   ; 37779904 (jiffies)
@@ -62,6 +62,8 @@ the recorded history.
     (dbg/poke s 37779904 [0 0 0 0])
     (dbg/break s "0xffffffff81b96960")                ; the kernel's schedule
     (dbg/continue s)                                  ; {:rip "0xffffffff81b96960" ...}
+    (dbg/watch-values s "0xffffffff824079c0" 8 {:limit 3 :keep? even?})
+                                                      ; jiffies' next even values, each a moment
     (dbg/step-branches s 1000)                        ; the registers 1000 branches on
     (dbg/sh s "det-nodes list")                       ; a guest command's output
     (dbg/node-sh s "db-1" "ls /data")                 ; a command inside a node, as it sees itself
