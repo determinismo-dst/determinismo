@@ -38,12 +38,16 @@ pub const entrypoint = [_][]const u8{ "/bin/sh", start_path };
 /// template directory's config-v3.toml.d/*.toml), merged over K3s's own.
 pub const containerd_dropin_path = "/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.d/determinismo.toml";
 const base_spec_path = tools_directory ++ "/base-spec.json";
+/// K3s's containerd root: its images and containers' layers.
+const containerd_root = "/var/lib/rancher/k3s/agent/containerd";
 const exec_path = tools_directory ++ "/exec";
 pub const manifests_directory = tools_directory ++ "/manifests";
 pub const command = [_][]const u8{
-    "server",                                     "--snapshotter=native",
-    "--disable=traefik,servicelb,metrics-server", "--disable-cloud-controller",
-    "--disable-helm-controller",                  "--write-kubeconfig-mode=644",
+    "server",
+    "--disable=traefik,servicelb,metrics-server",
+    "--disable-cloud-controller",
+    "--disable-helm-controller",
+    "--write-kubeconfig-mode=644",
 };
 pub const kubeconfig = "KUBECONFIG=/etc/rancher/k3s/k3s.yaml";
 pub const api_port = 6443;
@@ -134,6 +138,14 @@ pub const start_script =
     \\# container K3s makes gets libvoidstar, its device, the coverage bitmaps and the SDK's
     \\# output, as Antithesis gives every container, then K3s itself.
     \\set -e
+    \\# containerd's images and containers on a tmpfs of their own, where its overlayfs snapshotter
+    \\# works (not on the node's root, an overlay itself): native, which copies every layer whole,
+    \\# filled the node with ParadeDB's images (kubelet's DiskPressure evicted CloudNativePG's
+    \\# operator). As large as the guest's memory: what is there is what the images hold.
+    \\mkdir -p
+++ " " ++ containerd_root ++ "\n" ++
+    \\mount -t tmpfs -o size=100% tmpfs
+++ " " ++ containerd_root ++ "\n" ++
     \\mkdir -p
 ++ " " ++ std.fs.path.dirname(containerd_dropin_path).? ++ "\n" ++
     \\cp
@@ -179,9 +191,16 @@ pub const ready_script =
     \\  sleep 1
     \\done
     \\attempts=0
-    \\until kubectl apply --recursive --filename $manifests; do
+    \\# Created, as kapp creates what is new: no last-applied copy (kubectl apply's annotation of it
+    \\# is limited to 256 KiB, and CloudNativePG's poolers CRD is larger: "metadata.annotations: Too
+    \\# long", the operator never ready, its webhook refusing the Cluster), and the null fields a
+    \\# Helm render leaves pruned (server-side apply refused ParadeDB's Cluster for its empty
+    \\# `externalClusters:`). Again until every object is there: a custom resource after its CRD,
+    \\# one an operator's webhook admits after the operator.
+    \\until kubectl get --recursive --filename $manifests > /dev/null 2>&1; do
     \\  attempts=$((attempts + 1))
     \\  [ $attempts -le 60 ] || { echo "the manifests never applied"; exit 1; }
+    \\  kubectl create --recursive --filename $manifests 2>&1 | grep -v AlreadyExists
     \\  sleep 2
     \\done
     \\listed='{{range .items}}{{.metadata.namespace}} {{.metadata.name}}{{"\n"}}{{end}}'
@@ -296,6 +315,8 @@ test wrapper {
 }
 
 test start_script {
+    try std.testing.expect(std.mem.indexOf(u8, start_script, "\nmount -t tmpfs -o size=100% tmpfs " ++ containerd_root ++ "\n") != null);
+    for (command) |argument| try std.testing.expect(!std.mem.startsWith(u8, argument, "--snapshotter"));
     try std.testing.expect(std.mem.indexOf(u8, start_script, "\nctr oci spec | /opt/determinismo/bin/det-kubespec > " ++
         tools_directory ++ "/base-spec.json\nexec k3s \"$@\"\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, containerd_dropin, "runtimes.runc]\n  base_runtime_spec = \"" ++ base_spec_path ++ "\"\n") != null);
@@ -305,5 +326,7 @@ test start_script {
 
 test ready_script {
     try std.testing.expect(std.mem.indexOf(u8, ready_script, "\nmanifests=" ++ manifests_directory ++ "\ntimeout=600s\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ready_script, "--filename $manifests; do\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ready_script, "until kubectl get --recursive --filename $manifests > /dev/null 2>&1; do\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ready_script, "kubectl create --recursive --filename $manifests 2>&1 | grep -v AlreadyExists\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ready_script, "\nuntil kubectl apply") == null);
 }
