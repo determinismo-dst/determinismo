@@ -99,7 +99,7 @@ std::string determinismo_close(std::string const &fd_text) {
   (vec (for [candidate (take n (sort-by (fn [c] (- (or (:novel c) 0))) candidates))]
          {:branch (:branch candidate)
           :vtime_ns (+ (:start_ns candidate) (quot (- (:end_ns candidate) (:start_ns candidate)) 2))
-          :reason "middle"})))
+          :reason (str "middle of timeline " (:branch candidate))})))
 
 (defonce strategies
   (atom {:explorer {}
