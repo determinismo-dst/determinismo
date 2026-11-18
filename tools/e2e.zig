@@ -28,7 +28,7 @@ const Context = struct {
     output_count: u32 = 0,
     /// bank's first timeline of seed 3 that loses money (bank_violating_branch), once found.
     bank_violating: ?[]const u8 = null,
-    bank_cold_violating: ?[]const u8 = null,
+    bank_cold_violating: ?[]const []const u8 = null,
 };
 
 /// The first of bank's seed 3 timelines that violates "total balance is conserved", found once
@@ -72,24 +72,33 @@ fn bank_violating_branch(context: *Context) ![]const u8 {
 /// failure was decided at its colliding transfers, so causality analysis finds a jump. In
 /// `bank`, 10 accounts collide so often that a timeline fails from almost any moment (7 futures
 /// in 8 from its first second, the guest kernel of 2026-10-29): no moment decides it.
-fn bank_cold_violating_branch(context: *Context) ![]const u8 {
+/// bank_cold's timelines of seed 3 (the first 32) that lose money, by index.
+fn bank_cold_violating_branches(context: *Context) ![]const []const u8 {
     if (context.bank_cold_violating) |known| return known;
     const program = try std.fs.path.join(context.arena, &.{ context.bin, "bank-test" });
     const report = try explore(context, &.{
         "--program",  program, "--scenario", "bank_cold", "--seed", "3",
         "--branches", "32",
     });
+    var indexes: std.ArrayList(u32) = .empty;
     var lines = std.mem.tokenizeScalar(u8, report, '\n');
     while (lines.next()) |line| {
         if (!std.mem.startsWith(u8, line, "[branch ")) continue;
         if (std.mem.indexOf(u8, line, "FAIL \"total balance is conserved\"") == null) continue;
         const end = std.mem.indexOfScalar(u8, line, ']') orelse continue;
-        const index = std.mem.trim(u8, line["[branch ".len..end], " ");
-        context.bank_cold_violating = try context.arena.dupe(u8, index);
-        return context.bank_cold_violating.?;
+        const index = std.fmt.parseInt(u32, std.mem.trim(u8, line["[branch ".len..end], " "), 10) catch continue;
+        try indexes.append(context.arena, index);
     }
-    expect(context, false, "bank_cold: one of seed 3's first 32 timelines loses money", .{});
-    return error.NoViolatingBranch;
+    if (indexes.items.len == 0) {
+        expect(context, false, "bank_cold: one of seed 3's first 32 timelines loses money", .{});
+        return error.NoViolatingBranch;
+    }
+    // By index: the report lists timelines as they end, in the order the workers finish them.
+    std.mem.sort(u32, indexes.items, {}, std.sort.asc(u32));
+    const texts = try context.arena.alloc([]const u8, indexes.items.len);
+    for (indexes.items, texts) |index, *text| text.* = try std.fmt.allocPrint(context.arena, "{d}", .{index});
+    context.bank_cold_violating = texts;
+    return texts;
 }
 
 /// One branch line of a report: `[branch N] seed=... events_hash=H failing=F ...`.
@@ -3603,22 +3612,32 @@ fn check_until_and_causality(context: *Context) !void {
         .{ "the command ran at the violation", std.mem.indexOf(u8, outputs[0], "exec_output") != null },
         .{ "the same output twice", std.mem.eql(u8, outputs[0], outputs[1]) },
     }, "until: branch {s} stops at its first violation, the same twice", .{branch});
-    // Causality on a timeline whose failure some moment decided (bank_cold's).
-    const cold_branch = try bank_cold_violating_branch(context);
+    // Causality on a timeline whose failure some moment decided (bank_cold's): the first of seed
+    // 3's violating timelines whose analysis finds a jump. Not every one has one: a timeline's
+    // draws at its start can settle it (every future from its first moment failing), and which
+    // timelines do moves with anything that moves their moments (the first violating one did on
+    // 2026-11-18, with the SDK's change: timelines 0 and 1 certain from the snapshot on, 2 not).
+    const cold_branches = try bank_cold_violating_branches(context);
     const cold_system = [_][]const u8{ "--program", program, "--scenario", "bank_cold", "--seed", "3" };
-    var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(arena, &.{ context.determinismo, "causality" });
-    try argv.appendSlice(arena, context.machine);
-    try argv.appendSlice(arena, &cold_system);
-    try argv.appendSlice(arena, &.{
-        "--branch",  cold_branch, "--property", "total balance is conserved", "--points", "4",
-        "--futures", "8",         "--json",
-    });
-    // Its explanation too: futures inside the jump with a command at their moment (a system's
-    // logs turned up there; here, any command), each one's events kept.
-    const explain_dir = try std.fmt.allocPrint(arena, "{s}/explain", .{context.scratch});
-    try argv.appendSlice(arena, &.{ "--explain-exec", "true", "--explain-dir", explain_dir });
-    const result = try run_kept(context, argv.items);
+    var cold_branch: []const u8 = cold_branches[0];
+    var result: std.process.RunResult = undefined;
+    for (cold_branches) |candidate| {
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(arena, &.{ context.determinismo, "causality" });
+        try argv.appendSlice(arena, context.machine);
+        try argv.appendSlice(arena, &cold_system);
+        try argv.appendSlice(arena, &.{
+            "--branch",  candidate, "--property", "total balance is conserved", "--points", "4",
+            "--futures", "8",       "--json",
+        });
+        // Its explanation too: futures inside the jump with a command at their moment (a
+        // system's logs turned up there; here, any command), each one's events kept.
+        const explain_dir = try std.fmt.allocPrint(arena, "{s}/explain-{s}", .{ context.scratch, candidate });
+        try argv.appendSlice(arena, &.{ "--explain-exec", "true", "--explain-dir", explain_dir });
+        cold_branch = candidate;
+        result = try run_kept(context, argv.items);
+        if (std.mem.indexOf(u8, result.stdout, "{\"decided\":[{") != null) break;
+    }
     // Refinement adds moments inside jumps.
     const curve = try causality_curve(arena, result.stdout);
     // Each round counts the faults its futures went through, with and without failing.
@@ -3630,8 +3649,8 @@ fn check_until_and_causality(context: *Context) !void {
         .{ "the futures' faults counted (a faults line each round)", effects },
         .{ "where it was decided: each jump with its faults and code first run (a decided line)", std.mem.indexOf(u8, result.stdout, "{\"decided\":[{") != null },
         .{ "explained: futures inside the jump, each with its events", explained_ok(context, result.stdout) },
-    }, "causality: {d} moments (4, and refinements inside jumps), certain at the failure " ++
-        "({d:.2}), each within its 90% interval, where it was decided", .{ curve.moments, curve.latest.probability });
+    }, "causality: timeline {s} of {d} violating, {d} moments (4, and refinements inside jumps), certain at the " ++
+        "failure ({d:.2}), each within its 90% interval, where it was decided", .{ cold_branch, cold_branches.len, curve.moments, curve.latest.probability });
     // The bug as an event condition (a verdict) instead of a property: the same analysis.
     var verdict_argv: std.ArrayList([]const u8) = .empty;
     try verdict_argv.appendSlice(arena, &.{ context.determinismo, "causality" });
