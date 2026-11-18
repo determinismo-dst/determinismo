@@ -2184,12 +2184,13 @@ pub const coverage = struct {
             var name_buffer: [512]u8 = undefined;
             // The line, before anything else (a table's lookup): the set decides by it.
             const line = line_of(@returnAddress(), &name_buffer);
-            if (!set.holds(line)) {
+            const verdict = set.verdict(line);
+            if (verdict == .out) {
                 guard.* = 0; // Left out: never again.
                 return;
             }
             guard.* = edge | reported;
-            if (!shared.reported_before(guard)) {
+            if (verdict == .reported and !shared.reported_before(guard)) {
                 const name = line orelse
                     std.fmt.bufPrint(&name_buffer, "edge {d}", .{edge}) catch unreachable;
                 event("coverage", .{ .name = name });
@@ -2203,8 +2204,10 @@ pub const coverage = struct {
     /// time it runs; "" when unknown) reports nothing and pauses nothing. From /proc/self/environ.
     ///
     /// Without a prefix that includes them, the Zig installation's library (std, compiler_rt)
-    /// and this SDK's own directory are left out: a Zig program is instrumented whole, and
+    /// and this SDK's own directory are not reported: a Zig program is instrumented whole, and
     /// their lines are not the program's code (C, Rust and Go instrument the program's own).
+    /// Their edges stay points for thread pausing (a pause inside std between two of the
+    /// program's steps is an interleaving as any other).
     /// They were nine in ten of a program's coverage names, and a search guided by coverage
     /// kept timelines for an allocator's new line as for the program's: the self-test's Zig
     /// maze was solved in 3 of 6 seeds with them, in 5 of 6 with its own file alone (300
@@ -2244,7 +2247,11 @@ pub const coverage = struct {
             return text != null;
         }
 
-        fn holds(line: ?[]const u8) bool {
+        /// An edge by its line: left out by the set (nothing reported, no pause), reported, or
+        /// the library's or the SDK's that no prefix names (a pausing point, not reported).
+        const Verdict = enum { out, reported, pausing_only };
+
+        fn verdict(line: ?[]const u8) Verdict {
             @disableInstrumentation();
             const entries = if (active()) text.? else "";
             const name = line orelse "";
@@ -2255,14 +2262,15 @@ pub const coverage = struct {
             var iterator = std.mem.splitScalar(u8, entries, ',');
             while (iterator.next()) |entry| {
                 if (entry.len > 1 and entry[0] == '-') {
-                    if (std.mem.startsWith(u8, path, entry[1..])) return false;
+                    if (std.mem.startsWith(u8, path, entry[1..])) return .out;
                 } else if (entry.len > 0 and entry[0] != '-') {
                     included = false;
                     if (std.mem.startsWith(u8, path, entry)) matched = true;
                 }
             }
-            if (matched) return true; // Asked for by name: the library's or the SDK's too.
-            return included and !theirs(path);
+            if (matched) return .reported; // Asked for by name: the library's or the SDK's too.
+            if (!included) return .out;
+            return if (theirs(path)) .pausing_only else .reported;
         }
     };
 
@@ -2348,22 +2356,24 @@ test "coverage set: the library's and the SDK's lines are left out unless a pref
     set.theirs_read = true;
     set.library = "/opt/zig/lib/";
     set.sdk_directory = "/src/sdk/zig/";
-    try std.testing.expect(set.holds("line /src/app/main.zig:10"));
-    try std.testing.expect(!set.holds("line /opt/zig/lib/std/mem.zig:81"));
-    try std.testing.expect(!set.holds("line /opt/zig/lib/compiler_rt/memcpy.zig:3"));
-    try std.testing.expect(!set.holds("line /src/sdk/zig/determinismo.zig:802"));
-    try std.testing.expect(set.holds(null)); // No line (no table): an edge by its number.
+    const expectEqual = std.testing.expectEqual;
+    const Verdict = set.Verdict;
+    try expectEqual(Verdict.reported, set.verdict("line /src/app/main.zig:10"));
+    try expectEqual(Verdict.pausing_only, set.verdict("line /opt/zig/lib/std/mem.zig:81"));
+    try expectEqual(Verdict.pausing_only, set.verdict("line /opt/zig/lib/compiler_rt/memcpy.zig:3"));
+    try expectEqual(Verdict.pausing_only, set.verdict("line /src/sdk/zig/determinismo.zig:802"));
+    try expectEqual(Verdict.reported, set.verdict(null)); // No line (no table): an edge by its number.
     // An exclusion of the program's own, the rest as before.
     set.text = "-/src/app/generated";
-    try std.testing.expect(!set.holds("line /src/app/generated/x.zig:1"));
-    try std.testing.expect(set.holds("line /src/app/main.zig:10"));
-    try std.testing.expect(!set.holds("line /opt/zig/lib/std/mem.zig:81"));
+    try expectEqual(Verdict.out, set.verdict("line /src/app/generated/x.zig:1"));
+    try expectEqual(Verdict.reported, set.verdict("line /src/app/main.zig:10"));
+    try expectEqual(Verdict.pausing_only, set.verdict("line /opt/zig/lib/std/mem.zig:81"));
     // A prefix that includes: those alone, the library's among them when it names them.
     set.text = "/opt/zig/lib/std/mem.zig,/src/app/main.zig";
-    try std.testing.expect(set.holds("line /opt/zig/lib/std/mem.zig:81"));
-    try std.testing.expect(set.holds("line /src/app/main.zig:10"));
-    try std.testing.expect(!set.holds("line /src/app/other.zig:10"));
-    try std.testing.expect(!set.holds("line /opt/zig/lib/std/heap.zig:1"));
+    try expectEqual(Verdict.reported, set.verdict("line /opt/zig/lib/std/mem.zig:81"));
+    try expectEqual(Verdict.reported, set.verdict("line /src/app/main.zig:10"));
+    try expectEqual(Verdict.out, set.verdict("line /src/app/other.zig:10"));
+    try expectEqual(Verdict.out, set.verdict("line /opt/zig/lib/std/heap.zig:1"));
 }
 
 fn device_get() Device {
