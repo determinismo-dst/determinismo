@@ -67,6 +67,12 @@
   (let [ms (long (/ ns 1000000.0))]
     (str (quot ms 1000) "." (subs (str (+ 1000 (mod ms 1000))) 1) " s")))
 
+(defn- micro-seconds
+  "Nanoseconds as seconds, six decimals: writes or calls a fraction of a millisecond apart."
+  [ns]
+  (let [us (long (/ ns 1000.0))]
+    (str (quot us 1000000) "." (subs (str (+ 1000000 (mod us 1000000))) 1) " s")))
+
 (def ^:private hex-digits "0123456789abcdef")
 
 (defn- hex2 [byte]
@@ -571,6 +577,8 @@
         quint (last-told :quint-check happened)
         quint-kinds (last-told :quint-kinds happened)
         simulated (last-told :quint-simulate happened)
+        watched (last-told :watch-values happened)
+        called (last-told :calls happened)
         value (if (var? value) (deref value) value)
         now (:session s)
         context (cond session (str "timeline #" (:from session) (when (:at-ns session) (str " at " (seconds (:at-ns session)))))
@@ -581,6 +589,14 @@
         view
         (cond
        error {:view :error :said error}
+       ;; Before the looks they make on the way (translate, regs): the values, the calls.
+       watched {:view :series :label (str (:address watched) " " (name (:type watched)))
+                :points (mapv (fn [k] {:at-ns (* 1.0 (:vtime_ns k)) :value (:value k)}) (:kept watched))}
+       called {:view :table :count (count (:kept called))
+               :rows (mapv (fn [k] {:at (micro-seconds (* 1.0 (:vtime_ns k)))
+                                    :rdi (str (nth (:args k) 0)) :rsi (str (nth (:args k) 1))
+                                    :rdx (str (nth (:args k) 2))})
+                           (take 8 (:kept called)))}
        quint {:view :quint :verdict (:verdict quint) :invariant (:invariant quint)}
        simulated {:view :quint-run :violation (:violation simulated) :invariant (:invariant simulated)
                   :step (:step simulated) :states (vec (take-last 6 (:states simulated)))
@@ -903,6 +919,7 @@
       (= view :events) (+ (apply + (map (fn [event] (+ 26 (* 20 (count (:lines event))))) (:events c)))
                           (if (> (:count c) (count (:events c))) 20 0))
       (= view :numbers) 100
+      (= view :series) (if (empty? (:points c)) 20 (+ 150 (* 20 (min 4 (count (:points c))))))
       (= view :quint) (+ 34 (if (:event (:verdict c)) 24 0) (if (seq (:series (:verdict c))) 190 0)
                          (let [steps (:steps (:verdict c))]
                            (cond (empty? steps) 0
@@ -1063,6 +1080,50 @@
     (text! sx (+ y 22) (if differs red ink) big (str total))
     (when differs
       (text! sx (+ y 48) muted small (str "was " total-was)))))
+
+(defn- draw-series
+  "A variable's values over virtual time (watch-values): a dot a kept write, joined in steps
+  (a value holds until the next write), the first and last moments under it and the lowest and
+  highest values beside it, then the first writes listed."
+  [c x y width]
+  (let [points (:points c)
+        n (count points)]
+    (if (zero? n)
+      (text! x y muted small (str "no write kept · " (:label c)))
+      (let [plot-height 84.0
+            plot-width (- width 120.0)
+            top (+ y 22)
+            floor (+ top plot-height)
+            ;; Doubles throughout (jank's integer products wrap at 32 bits); NaN and the
+            ;; infinities are listed, not plotted.
+            number (fn [p] (double (:value p)))
+            finite? (fn [v] (and (= v v) (< v ##Inf) (> v ##-Inf)))
+            shown (filterv (fn [p] (finite? (number p))) points)
+            times (map :at-ns shown)
+            values (map number shown)
+            t0 (if (seq times) (apply min times) 0.0)
+            t1 (if (seq times) (apply max times) 0.0)
+            v0 (if (seq values) (apply min values) 0.0)
+            v1 (if (seq values) (apply max values) 0.0)
+            at-x (fn [t] (+ x (if (= t0 t1) (/ plot-width 2.0) (* plot-width (/ (- t t0) (- t1 t0))))))
+            at-y (fn [v] (- floor (if (= v0 v1) (/ plot-height 2.0) (* plot-height (/ (- v v0) (- v1 v0))))))]
+        (text! x y muted small (str n (if (= n 1) " write kept · " " writes kept · ") (:label c)))
+        (line! x floor (+ x plot-width) floor rule 1.0)
+        (doseq [[a b] (partition 2 1 shown)]
+          (let [xa (at-x (:at-ns a)) xb (at-x (:at-ns b)) ya (at-y (number a)) yb (at-y (number b))]
+            (line! xa ya xb ya blue 1.5)
+            (line! xb ya xb yb blue 1.5)))
+        (doseq [p shown]
+          (circle! (at-x (:at-ns p)) (at-y (number p)) 3.5 orange 1.0))
+        (when (seq shown)
+          (text! (+ x plot-width 10) (- top 6) ink small (str (:value (last (sort-by number shown)))))
+          (text! (+ x plot-width 10) (- floor 12) ink small (str (:value (first (sort-by number shown)))))
+          (text! x (+ floor 4) muted small (micro-seconds t0))
+          (when (not= t0 t1)
+            (text! (- (+ x plot-width) (text-width small (micro-seconds t1))) (+ floor 4) muted small (micro-seconds t1))))
+        (doseq [[i p] (map-indexed vector (take 4 points))]
+          (text! x (+ floor 26 (* 20 i)) ink mono
+                 (clip mono width (str (micro-seconds (:at-ns p)) "  " (:value p)))))))))
 
 (defn- draw-draws
   "A row a label: its name, then each value's bar (a split's two: failing in red over the others
@@ -1339,6 +1400,7 @@
       (= view :draw-split) (draw-draws c bx by inner true)
       (= view :draw-sets) (draw-draws c bx by inner false)
       (= view :numbers) (draw-numbers c bx by inner)
+      (= view :series) (draw-series c bx by inner)
       (= view :quint) (draw-quint c bx by inner)
       (= view :quint-run) (draw-quint-run c bx by inner)
       (= view :translate) (do (text! bx by ink big (str (:virtual c)))
