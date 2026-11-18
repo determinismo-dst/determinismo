@@ -1217,6 +1217,7 @@ fn check_client(context: *Context) !void {
         \\        s (d/open 1 {{:branch 0 :until condition}})
         \\        regs (d/regs s)
         \\        accepted (d/symbol s :echo :selftest_accepted)
+        \\        accepted-at (d/symbol-at 1 {{:branch 0 :until condition}} :echo :selftest_accepted)
         \\        stats (d/symbol s "echo" "selftest_stats")
         \\        ratio (d/symbol s 'echo 'selftest_stats {{:field ".ratio"}})
         \\        _ (connect s 2)
@@ -1256,6 +1257,8 @@ fn check_client(context: *Context) !void {
         \\                         {{:branches [0 1]}})
         \\        fd (first (:args (first served)))]
         \\    (said "regs" (some? (:rip regs)) (:rip regs))
+        \\    (said "symbol-at" (and (some? (:address accepted)) (= (select-keys accepted [:pid :address :type]) (select-keys accepted-at [:pid :address :type])))
+        \\          (select-keys accepted-at [:pid :address]))
         \\    (said "accepted-u64" (= ["unsigned" 8] [(:kind (:type accepted)) (:size (:type accepted))]) (:type accepted))
         \\    (said "ratio-f64" (= ["float" 8] [(:kind (:type ratio)) (:size (:type ratio))]) (:type ratio))
         \\    (said "ratio-16-in" (= 16 (- (number (:address ratio)) (number (:address stats)))) (:address stats) (:address ratio))
@@ -1287,21 +1290,22 @@ fn check_client(context: *Context) !void {
     for (runners.items) |runner| {
         const ran = try run_kept(context, runner.argv);
         const out = try std.mem.concat(arena, u8, &.{ ran.stdout, ran.stderr });
-        const names = [_][]const u8{ "regs", "accepted-u64", "ratio-f64", "ratio-16-in", "ratios-half-a-connection", "call-descriptor", "call-params", "call-float", "frames", "moment-when", "across-both" };
+        const names = [_][]const u8{ "regs", "symbol-at", "accepted-u64", "ratio-f64", "ratio-16-in", "ratios-half-a-connection", "call-descriptor", "call-params", "call-float", "frames", "moment-when", "across-both" };
         var good: [names.len]bool = undefined;
         for (names, 0..) |name, index| good[index] = std.mem.indexOf(u8, out, try std.fmt.allocPrint(arena, "ok {s} ", .{name})) != null;
         expect_all(context, &.{
             .{ "a session's registers", good[0] },
-            .{ "a variable by its name, typed from DWARF (unsigned, 8)", good[1] },
-            .{ "a structure's field by its path, typed (float, 8)", good[2] },
-            .{ "the field 16 bytes into the structure", good[3] },
-            .{ "its writes after two connections, half a connection apart", good[4] },
-            .{ "a function's call, its argument the connection's descriptor", good[5] },
-            .{ "the call's parameter by its DWARF name and type (client, i32)", good[6] },
-            .{ "a float argument from its vector register, the integer after it from rdi", good[7] },
-            .{ "a stop's frames, named as a crash's stack is (det-nodes where), its frame pointers' chain among them, the node's own code too", good[8] },
-            .{ "moment-when: jiffies' +500 ticks from 2 s, not yet one branch before the moment found, held at it", good[9] },
-            .{ "across: the same look in both timelines", good[10] },
+            .{ "symbol-at: the lookup in a session of its own, the same process, address and type", good[1] },
+            .{ "a variable by its name, typed from DWARF (unsigned, 8)", good[2] },
+            .{ "a structure's field by its path, typed (float, 8)", good[3] },
+            .{ "the field 16 bytes into the structure", good[4] },
+            .{ "its writes after two connections, half a connection apart", good[5] },
+            .{ "a function's call, its argument the connection's descriptor", good[6] },
+            .{ "the call's parameter by its DWARF name and type (client, i32)", good[7] },
+            .{ "a float argument from its vector register, the integer after it from rdi", good[8] },
+            .{ "a stop's frames, named as a crash's stack is (det-nodes where), its frame pointers' chain among them, the node's own code too", good[9] },
+            .{ "moment-when: jiffies' +500 ticks from 2 s, not yet one branch before the moment found, held at it", good[10] },
+            .{ "across: the same look in both timelines", good[11] },
         }, "client: the REPL's session, symbols, values, calls and across, from {s} ({s})", .{ runner.name, out[0..@min(out.len, 1200)] });
     }
 }

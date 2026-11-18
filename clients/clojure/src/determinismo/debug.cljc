@@ -430,6 +430,18 @@ std::string determinismo_debug_hex(std::string const &decimal) {
           {:stops (vec (concat (when first-stop [first-stop]) hits))
            :dropped (or (:dropped said) 0)})))))
 
+(defn symbol-at
+  "`symbol` looked up in a session of its own at a moment (`at`, as `open` takes it:
+  {:branch :at-vtime-ms} or {:branch :until}), closed after: det-nodes symbol runs the guest on
+  while it reads the module's DWARF, so a session that is to see the timeline as recorded takes
+  the result from here (the address, the type, a function's params: the process's for its
+  life) and runs no guest command itself. :physical and :probe are the lookup's, after its guest
+  ran. -> as `symbol`"
+  ([run at node wanted] (symbol-at run at node wanted {}))
+  ([run at node wanted options]
+   (let [s (open run at)]
+     (try (symbol s node wanted options) (finally (close s))))))
+
 (defn watch-values
   "A variable's writes from the session's moment on: a write watchpoint on its `size` bytes at
   `address` (a guest virtual address), each write's value read as :type (:i8 ... :i64 by size
