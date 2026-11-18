@@ -68,6 +68,11 @@ vCPU stopped:
     det:continue [ms]                         on until the breakpoint or a watched write (or ms
                                               of virtual time, 60 s by default), stopped before
                                               the breakpoint's instruction, after the write
+    det:collect [ms]                          on for ms of virtual time (10 s by default), each
+                                              hit of the breakpoint or the watch said as it
+                                              passes ("hit": a write's bytes, a call's argument
+                                              registers), 10,000 at most (the rest counted),
+                                              stopped at the window's end: many hits, one request
     det:translate <cr3 | current> <virtual>   a virtual address's physical one, through the page
                                               tables of that address space (det:regs' cr3, a
                                               watch hit's), or the running one's

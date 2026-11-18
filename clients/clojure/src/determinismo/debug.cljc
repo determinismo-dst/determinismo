@@ -38,7 +38,7 @@
 
 (def ^:private timelines (atom {}))
 
-(declare plan-session open-session sh process-stop?)
+(declare plan-session open-session sh process-stop? continue)
 
 (defn open
   "A session held at a moment of `run`'s timeline: its id. The moment: :until, a condition on
@@ -377,19 +377,63 @@ std::string determinismo_debug_hex(std::string const &decimal) {
                (and placed (or integer (= kind "float")))
                (conj out {:name (:name param) :type (:type param) :value value}))))))
 
+;; A top-level name: jank cannot capture a local bound to a string literal in a closure.
+(def ^:private hit-prefix "[determinismo] hit: ")
+
+(defn- collected
+  "The hits a det:collect said as they passed ({:vtime_ns :branches :rip :cr3} and a write's
+  :watch :size :hex, a call's :rdi ... :r9), and its count ({:hits :dropped})."
+  [output]
+  {:hits (vec (keep (fn [line] (when (str/starts-with? line hit-prefix) (json/read-json (subs line (count hit-prefix)))))
+                    (str/split-lines (or output ""))))
+   :said (answer output "collect")})
+
+(defn- first-in-process
+  "On to the first stop in the process `probe` names (det:continue, the others passed, at most
+  `most` of them): [its address space (cr3), the stop], or [nil nil] when none came within
+  `ms` of virtual time."
+  [session probe ms most]
+  (loop [passed 0]
+    (let [stop (continue session ms)]
+      (cond (or (nil? stop) (>= passed most)) [nil nil]
+            (process-stop? session probe nil stop) [(:cr3 stop) stop]
+            :else (recur (inc passed))))))
+
+(defn- window
+  "The hits from the session's moment on, in one request a window: armed with `arm!` (called
+  with an address space or nil), a stop in the probe's process first when there is a probe
+  and no address space given (one det:continue a stop until its address space is known, then
+  armed to it), then det:collect over :ms of virtual time (10 s). -> {:stops [...] :dropped n}"
+  [session probe arm! options]
+  (let [ms (or (:ms options) 10000)
+        given (:cr3 options)]
+    (arm! given)
+    (let [[space first-stop] (if (and probe (nil? given))
+                               (first-in-process session probe ms (or (:max-stops options) 10000))
+                               [given nil])
+          searched (and probe (nil? given))]
+      (when (and searched space) (arm! space))
+      (if (and searched (nil? space))
+        {:stops [] :dropped 0}
+        (let [{:keys [hits said]} (collected (step* session (str "det:collect " ms)))]
+          {:stops (vec (concat (when first-stop [first-stop]) hits))
+           :dropped (or (:dropped said) 0)})))))
+
 (defn watch-values
   "A variable's writes from the session's moment on: a write watchpoint on its `size` bytes at
-  `address` (a guest virtual address), then `continue` to each write, its value read as
-  :type (:i8 ... :i64 by size unless given; :u8 ... :u64, :f32, :f64) and kept when :keep?
-  holds for it. Until :limit kept (100), :max-stops writes (10,000), or :ms of virtual time
-  with no write (60 s); the watch is off after. :cr3 keeps one address space's writes (a
+  `address` (a guest virtual address), each write's value read as :type (:i8 ... :i64 by size
+  unless given; :u8 ... :u64, :f32, :f64) and kept when :keep? holds for it, the first :limit
+  (100) of them. The writes of :ms of virtual time (10 s), said as they pass in one request (a
+  window: det:collect, 10,000 at most, the rest counted in the tap's :dropped); the watch is
+  off after, the session at the window's end. :cr3 keeps one address space's writes (a
   process's: regs' or a stop's :cr3), else any. Each kept write is an exact moment of the
   timeline (its :vtime_ns and :branches, the guest just past the writing instruction at :rip),
   where a session can be opened. -> [{:value :vtime_ns :branches :rip :cr3} ...]
 
-  Or a `symbol`'s answer in place of address and size: its process's writes alone. A write
-  counts when it is in the process's address space (its :probe page translates there), and
-  from the first that does the watch keeps to that address space (its :cr3)."
+  Or a `symbol`'s answer in place of address and size: its process's writes alone, each read
+  as the symbol's DWARF type (its :type) unless :type is given. The first
+  write in the process's address space (its :probe page translates there) is stopped at, the
+  others passed, and the window keeps to that address space (its :cr3)."
   ([session address-or-symbol] (watch-values session address-or-symbol nil {}))
   ([session address size-or-options]
    (if (map? address)
@@ -399,31 +443,22 @@ std::string determinismo_debug_hex(std::string const &decimal) {
    (let [named (when (map? address) address)
          address (if named (:address named) address)
          size (if named (:size named) size)
-         probe (:probe named)
          type (or (:type options) (value-type (:type named)) (get {1 :i8 2 :i16 4 :i32 8 :i64} size))
          keep? (or (:keep? options) (fn [_] true))
          limit (or (:limit options) 100)
-         most (or (:max-stops options) 10000)]
-     (watch session address size (:cr3 options))
-     (let [kept (loop [kept [] stops 0 space (:cr3 options)]
-                  (if (or (>= (count kept) limit) (>= stops most))
-                    kept
-                    (let [stop (continue session (:ms options))]
-                      (if-not (and stop (:watch stop) (:hex stop))
-                        kept
-                        (let [ours (process-stop? session probe space stop)
-                              learned (when (and named ours (nil? space)) (:cr3 stop))
-                              space (or space learned)]
-                          ;; The process's address space found: its writes alone from here.
-                          (when learned (watch session address size learned))
-                          (if-not ours
-                            (recur kept (inc stops) space)
-                            (let [bytes (mapv (fn [pair] (unhex (str "0x" (apply str pair)))) (partition 2 (:hex stop)))
-                                  value (value-of bytes type)
-                                  found (assoc (select-keys stop [:vtime_ns :branches :rip :cr3]) :value value)]
-                              (recur (if (keep? value) (conj kept found) kept) (inc stops) space))))))))]
-       (watch session nil)
-       (tap/tell :watch-values {:session session :address (hex address) :size size :type type :kept kept} kept)))))
+         {:keys [stops dropped]} (window session (:probe named) (fn [space] (watch session address size space)) options)
+         kept (->> stops
+                   (filter :hex)
+                   (map (fn [stop]
+                          (let [bytes (mapv (fn [pair] (unhex (str "0x" (apply str pair)))) (partition 2 (:hex stop)))]
+                            (assoc (select-keys stop [:vtime_ns :branches :rip :cr3]) :value (value-of bytes type)))))
+                   (filter (fn [write] (keep? (:value write))))
+                   (take limit)
+                   vec)]
+     (watch session nil)
+     (tap/tell :watch-values {:session session :address (hex address) :size size :type type :kept kept
+                              :dropped dropped}
+               kept))))
 
 (defn- process-stop?
   "Whether a stop is in the process `probe` names (its page translates to the probe's physical
@@ -435,43 +470,32 @@ std::string determinismo_debug_hex(std::string const &decimal) {
 
 (defn calls
   "A function's calls from the session's moment on: a breakpoint at a `symbol`'s function
-  (its entry, in its process's address space), then `continue` to each call, its arguments the
-  registers of x86-64's calling convention ({:args [rdi rsi rdx rcx r8 r9]}, as numbers: an
-  integer's or a pointer's; a float's are in vector registers, not read), kept when :keep?
-  holds for :args. Until :limit kept (100), :max-stops calls (10,000), or :ms of virtual time
-  with no call (60 s); the breakpoint is off after. Each kept call is an exact moment, the
+  (its entry, in its process's address space), each call's arguments the registers of
+  x86-64's calling convention ({:args [rdi rsi rdx rcx r8 r9]}, as numbers: an integer's or a
+  pointer's; a float's are in vector registers, not read), kept when :keep? holds for :args,
+  the first :limit (100) of them. The calls of :ms of virtual time (10 s), said as they pass in
+  one request (a window, as watch-values'), the first in the process stopped at to learn its
+  address space; the breakpoint is off after. Each kept call is an exact moment, the
   function's first instruction not run yet. With the module's DWARF (the symbol's :params),
   :params says them by name, each read as its type ([{:name \"client\" :type \"i32\" :value 5}];
   a float's value nil). -> [{:args :params :vtime_ns :branches :rip :cr3} ...]"
   ([session found] (calls session found {}))
   ([session found options]
    (let [address (:address found)
-         probe (:probe found)
          keep? (or (:keep? options) (fn [_] true))
          limit (or (:limit options) 100)
-         most (or (:max-stops options) 10000)
-         register (fn [registers k] (unhex (get registers k)))]
-     (break session address (:cr3 options))
-     (let [kept (loop [kept [] stops 0 space (:cr3 options)]
-                  (if (or (>= (count kept) limit) (>= stops most))
-                    kept
-                    (let [stop (continue session (:ms options))]
-                      (if-not (and stop (:rip stop))
-                        kept
-                        (let [ours (process-stop? session probe space stop)
-                              learned (when (and probe ours (nil? space)) (:cr3 stop))
-                              space (or space learned)
-                              ;; Read where it stopped: arming a breakpoint lets the guest on.
-                              registers (when ours (regs session))]
-                          (when learned (break session address learned))
-                          (if-not ours
-                            (recur kept (inc stops) space)
-                            (let [arguments (mapv (fn [k] (register registers k)) integer-registers)
-                                  found-call (cond-> (assoc (select-keys stop [:vtime_ns :branches :rip :cr3]) :args arguments)
-                                               (:params found) (assoc :params (parameter-values (:params found) registers)))]
-                              (recur (if (keep? arguments) (conj kept found-call) kept) (inc stops) space))))))))]
-       (break session nil)
-       (tap/tell :calls {:session session :address (hex address) :kept kept} kept)))))
+         {:keys [stops dropped]} (window session (:probe found) (fn [space] (break session address space)) options)
+         kept (->> stops
+                   (filter :rdi)
+                   (map (fn [stop]
+                          (cond-> (assoc (select-keys stop [:vtime_ns :branches :rip :cr3])
+                                         :args (mapv (fn [k] (unhex (get stop k))) integer-registers))
+                            (:params found) (assoc :params (parameter-values (:params found) stop)))))
+                   (filter (fn [call] (keep? (:args call))))
+                   (take limit)
+                   vec)]
+     (break session nil)
+     (tap/tell :calls {:session session :address (hex address) :kept kept :dropped dropped} kept))))
 
 (defn across
   "`f` at a moment of each timeline of `run` an event query keeps: the timelines where

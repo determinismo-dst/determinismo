@@ -990,6 +990,40 @@ fn check_debugging(context: *Context) !void {
         .{ "the history to 5 s is the plain replay's", parse_branches(watched_steps, &watched_branch_to) == 1 and
             std.mem.eql(u8, watched_branch_to[0].events_hash, unstopped_branch[0].events_hash) },
     }, "debugging: a watched variable's writes stop with their values and change nothing (jiffies {d}, {d})", .{ values[0], values[1] });
+    // A window of hits without stops (det:collect): jiffies' writes for 20 ms, then the
+    // scheduler's calls for 5 ms with their argument registers, each said as it passed, the
+    // history to 5 s the plain replay's.
+    const collects = try std.fs.path.join(context.arena, &.{ context.scratch, "debugging-collects.txt" });
+    try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = collects, .data = try std.fmt.allocPrint(context.arena, "det:watch 0x{x} 8\ndet:collect 20\ndet:watch off\ndet:break 0x{x}\ndet:collect 5\ndet:break off\ndet:at 5000000000\ntrue\n", .{ virtual, schedule }) });
+    const collected = try explore(context, &.{ "--program", program, "--scenario", "bank", "--timeline", "30s", "--tape", tape, "--at-vtime-ms", "3000", "--exec-script", collects });
+    const write_prefix = try std.fmt.allocPrint(context.arena, "\"watch\":\"0x{x}\",\"size\":8,\"hex\":\"", .{virtual});
+    var writes: u32 = 0;
+    var increasing = true;
+    var last_value: u64 = 0;
+    var at_write: usize = 0;
+    while (std.mem.indexOfPos(u8, collected, at_write, write_prefix)) |found| {
+        const start_of_line = std.mem.lastIndexOfScalar(u8, collected[0..found], '\n') orelse 0;
+        at_write = found + write_prefix.len;
+        if (std.mem.indexOf(u8, collected[start_of_line..found], "[determinismo] hit: {") == null) continue;
+        if (at_write + 16 > collected.len) break;
+        var bytes: [8]u8 = undefined;
+        _ = std.fmt.hexToBytes(&bytes, collected[at_write..][0..16]) catch break;
+        const value = std.mem.readInt(u64, &bytes, .little);
+        if (writes > 0 and value <= last_value) increasing = false;
+        last_value = value;
+        writes += 1;
+    }
+    const said_writes = try std.fmt.allocPrint(context.arena, "[determinismo] collect: {{\"hits\":{d},\"dropped\":0}}", .{writes});
+    const call_hit = try std.fmt.allocPrint(context.arena, "\"rip\":\"0x{x}\",\"cr3\":", .{schedule});
+    const calls = std.mem.count(u8, collected, call_hit);
+    var collected_branch: [1]Branch = undefined;
+    expect_all(context, &.{
+        .{ "jiffies' writes said as they passed, one more each", writes >= 10 and increasing },
+        .{ "the window's count is theirs, none dropped", std.mem.indexOf(u8, collected, said_writes) != null },
+        .{ "the scheduler's calls said with their argument registers", calls > 0 and std.mem.indexOf(u8, collected, "\",\"rdi\":\"0x") != null },
+        .{ "the history to 5 s is the plain replay's", parse_branches(collected, &collected_branch) == 1 and
+            std.mem.eql(u8, collected_branch[0].events_hash, unstopped_branch[0].events_hash) },
+    }, "debugging: windows of hits without stops (det:collect: {d} writes in 20 ms, {d} calls in 5 ms)", .{ writes, calls });
     try check_debugging_symbol(context);
     const forks = try std.fs.path.join(context.arena, &.{ context.scratch, "debugging-forks" });
     const forked = try explore(context, &.{

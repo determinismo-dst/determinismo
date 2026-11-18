@@ -105,6 +105,9 @@ step_until_branches: ?u64 = null,
 breakpoint: ?struct { address: u64, cr3: ?u64 } = null,
 watchpoint: ?struct { address: u64, size: u8, cr3: ?u64 } = null,
 continuing: bool = false,
+/// det:collect's window: every hit of the breakpoints said as it passes (no stop), counted, at
+/// most collect_hits_max of them; null outside one.
+collect: ?struct { hits: u32 = 0, dropped: u32 = 0 } = null,
 moment_command: ?[]const u8,
 moment_reached: bool,
 /// Keep running after the command at the moment finished (instead of ending the run there).
@@ -1773,6 +1776,10 @@ fn moment_arrive(vm: *VM) !?Outcome {
     assert(!vm.moment_reached);
     vm.moment_reached = true;
     vm.continuing = false; // A det:continue's breakpoint, or its time out: either way, here.
+    if (vm.collect) |collect| {
+        std.debug.print("[determinismo] collect: {{\"hits\":{d},\"dropped\":{d}}}\n", .{ collect.hits, collect.dropped });
+        vm.collect = null;
+    }
     vm.target_kind = .timer;
     const moment_now = try vm.moment();
     try vm.trace("moment", moment_now.vtime_ns);
@@ -1997,6 +2004,17 @@ fn moment_command_one(vm: *VM) !bool {
         const ms = if (text.len == 0) 60_000 else std.fmt.parseInt(u64, text, 0) catch return error.BadStep;
         if (vm.breakpoint == null and vm.watchpoint == null) return error.NoBreakpoint;
         vm.continuing = true;
+        try vm.step_arm(ms, null);
+        return false;
+    }
+    if (std.mem.startsWith(u8, step, step_collect)) {
+        // "[ms]": on for ms of virtual time (10 s by default), each hit of the breakpoint or the
+        // watched write said as it passes, the guest stopping only at the window's end: many
+        // hits for one request (a session's det:continue is one a hit).
+        const text = std.mem.trim(u8, step[step_collect.len..], " ");
+        const ms = if (text.len == 0) 10_000 else std.fmt.parseInt(u64, text, 0) catch return error.BadStep;
+        if (vm.breakpoint == null and vm.watchpoint == null) return error.NoBreakpoint;
+        vm.collect = .{};
         try vm.step_arm(ms, null);
         return false;
     }
@@ -2241,6 +2259,10 @@ const step_watch = "det:watch ";
 const step_continue = "det:continue";
 /// The moment, nothing done (an interactive session's first step when none is asked).
 pub const step_here = "det:here";
+const step_collect = "det:collect";
+/// The hits one det:collect says at most; the rest are counted (its window too long for what
+/// it watches).
+const collect_hits_max = 10_000;
 /// `det:checkpoint [name]`: the machine saved where a session can come back to (session_checkpoint).
 const step_checkpoint = "det:checkpoint";
 /// A checkpoint's name, at most (it is queried: details.name=...).
@@ -2283,9 +2305,11 @@ fn debug_breakpoint_apply(vm: *VM) !void {
 }
 
 /// A breakpoint's hit (KVM_EXIT_DEBUG, DR6 saying which). An instruction's (DR0): not run yet,
-/// RF set so that it runs once resumed without hitting again. A watched write's (DR1): a trap,
-/// the writing instruction done, the bytes written read at the stop. True when it is the stop
-/// det:continue asked for; any other hit is passed, the guest none the wiser.
+/// RF set so that it runs once resumed without hitting again; its line has the calling
+/// convention's argument registers. A watched write's (DR1): a trap, the writing instruction
+/// done, the bytes written read at the hit. True when it is the stop det:continue asked for; in
+/// a det:collect window it is said ("hit") and passed; any other hit is passed, the guest none
+/// the wiser.
 fn debug_breakpoint_hit(vm: *VM) !bool {
     const dr6 = vm.run.exit.debug.dr6;
     var regs: kvm.Regs = undefined;
@@ -2293,39 +2317,51 @@ fn debug_breakpoint_hit(vm: *VM) !bool {
     var sregs: kvm.Sregs = undefined;
     _ = try kvm.ioctl(vm.vcpu_fd, kvm.GET_SREGS, @intFromPtr(&sregs));
     const address_mask: u64 = 0x000f_ffff_ffff_f000;
-    if (dr6 & 0b01 != 0) {
+    const execute = dr6 & 0b01 != 0;
+    if (!execute and dr6 & 0b10 == 0) return false;
+    if (execute) {
         regs.rflags |= 1 << 16; // RF: the breakpoint passes this instruction once.
         _ = try kvm.ioctl(vm.vcpu_fd, kvm.SET_REGS, @intFromPtr(&regs));
-        const breakpoint = vm.breakpoint orelse return false;
-        if (breakpoint.cr3) |cr3| if (cr3 & address_mask != sregs.cr3 & address_mask) return false;
-        if (!vm.continuing or vm.moment_reached) return false;
-        const now = try vm.moment();
-        std.debug.print("[determinismo] break: {{\"vtime_ns\":{d},\"branches\":{d},\"rip\":\"0x{x}\",\"cr3\":\"0x{x}\"}}\n", .{
-            now.vtime_ns, now.branches, regs.rip, sregs.cr3,
-        });
-    } else if (dr6 & 0b10 != 0) {
-        const watchpoint = vm.watchpoint orelse return false;
-        if (watchpoint.cr3) |cr3| if (cr3 & address_mask != sregs.cr3 & address_mask) return false;
-        if (!vm.continuing or vm.moment_reached) return false;
-        const now = try vm.moment();
+    }
+    const space: ?u64 = if (execute)
+        (vm.breakpoint orelse return false).cr3
+    else
+        (vm.watchpoint orelse return false).cr3;
+    if (space) |cr3| if (cr3 & address_mask != sregs.cr3 & address_mask) return false;
+    if (vm.moment_reached) return false;
+    const stopping = vm.continuing;
+    if (!stopping) {
+        const collect = if (vm.collect) |*collect| collect else return false;
+        if (collect.hits == collect_hits_max) {
+            collect.dropped += 1;
+            return false;
+        }
+        collect.hits += 1;
+    }
+    const now = try vm.moment();
+    var buffer: [512]u8 = undefined;
+    var line: std.Io.Writer = .fixed(&buffer);
+    line.print("[determinismo] {s}: {{\"vtime_ns\":{d},\"branches\":{d},\"rip\":\"0x{x}\",\"cr3\":\"0x{x}\"", .{
+        if (stopping) "break" else "hit", now.vtime_ns, now.branches, regs.rip, sregs.cr3,
+    }) catch unreachable;
+    if (execute) {
+        line.print(",\"rdi\":\"0x{x}\",\"rsi\":\"0x{x}\",\"rdx\":\"0x{x}\",\"rcx\":\"0x{x}\",\"r8\":\"0x{x}\",\"r9\":\"0x{x}\"", .{
+            regs.rdi, regs.rsi, regs.rdx, regs.rcx, regs.r8, regs.r9,
+        }) catch unreachable;
+    } else {
+        const watchpoint = vm.watchpoint.?;
         const guest = GuestMemory{ .bytes = vm.memory };
         const bytes: ?[]const u8 = if (translate_space(guest, sregs.cr3, watchpoint.address)) |physical|
             guest.range(physical, watchpoint.size)
         else
             null;
         // The value as the guest's bytes (little-endian: hex in memory order, as det:mem's).
-        if (bytes) |written| {
-            std.debug.print("[determinismo] break: {{\"vtime_ns\":{d},\"branches\":{d},\"rip\":\"0x{x}\",\"cr3\":\"0x{x}\"," ++
-                "\"watch\":\"0x{x}\",\"size\":{d},\"hex\":\"{x}\"}}\n", .{
-                now.vtime_ns, now.branches, regs.rip, sregs.cr3, watchpoint.address, watchpoint.size, written,
-            });
-        } else {
-            std.debug.print("[determinismo] break: {{\"vtime_ns\":{d},\"branches\":{d},\"rip\":\"0x{x}\",\"cr3\":\"0x{x}\"," ++
-                "\"watch\":\"0x{x}\",\"size\":{d},\"hex\":null}}\n", .{
-                now.vtime_ns, now.branches, regs.rip, sregs.cr3, watchpoint.address, watchpoint.size,
-            });
-        }
-    } else return false;
+        line.print(",\"watch\":\"0x{x}\",\"size\":{d},\"hex\":", .{ watchpoint.address, watchpoint.size }) catch unreachable;
+        if (bytes) |written| line.print("\"{x}\"", .{written}) catch unreachable else line.writeAll("null") catch unreachable;
+    }
+    line.writeAll("}\n") catch unreachable;
+    std.debug.print("{s}", .{line.buffered()});
+    if (!stopping) return false;
     vm.continuing = false;
     if (vm.target_branches != 0) try vm.target_set(0);
     return true;
