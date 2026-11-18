@@ -4293,7 +4293,7 @@ fn claims_look(state: *TreeState, pool: ?*cpus.Pool, running: []Running, jobs: u
         return;
     }
     const held_before = state.claims.held_max;
-    state.claims.sample(cpus.host_in_use(), claims_pool.run_held(), @intCast(running.len), jobs, state.ended);
+    state.claims.sample(cpus.host_in_use(), claims_pool.nodes_held(), claims_pool.run_held(), @intCast(running.len), jobs, state.ended);
     const claim = state.claims.claim(cpus.claim_bytes);
     claims_pool.claim_soft_set(claim);
     // Said at its first look that counts, and whenever its VMs' claim goes below their guest's
