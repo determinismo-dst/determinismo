@@ -50,7 +50,8 @@ client (`clj-nrepl-eval`). `(require '[determinismo.help :refer [help]])` then `
 every call there is, with its arguments and documentation: runs and their events
 (determinismo.api), a session held at a moment of a timeline, with the machine's registers,
 memory and breakpoints and commands inside its nodes (determinismo.debug), a node's file at a
-moment, new timelines from a moment, causality, shrinking and explaining, and Quint
+moment, a file put into a node at a moment with the timeline going on (a fix tried on the
+system itself), new timelines from a moment, causality, shrinking and explaining, and Quint
 (determinismo.quint). A session stays at its moment between calls, so questions about one moment
 cost one replay. The window draws each evaluation, for whoever watches.
 

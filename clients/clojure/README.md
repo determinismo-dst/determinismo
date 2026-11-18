@@ -16,7 +16,8 @@ at an nREPL alike):
 `determinismo.api`: runs (start, stop, resume, wait), their timelines, properties, findings,
 failures, triage report, what their nodes logged, learned ranges, activity, events (query, SQL),
 replays, a node's file at a moment, the lines a timeline's events left out, new timelines from a
-moment, and the analyses of a failing timeline (causality, shrinking, explaining).
+moment, a file put into a node at a moment (a patched binary, a config) with the timeline going
+on from there, and the analyses of a failing timeline (causality, shrinking, explaining).
 
 ```clojure
 (require '[determinismo.api :as api])
@@ -29,6 +30,9 @@ moment, and the analyses of a failing timeline (causality, shrinking, explaining
 (api/extract-to 13 {:branch 4 :at_vtime_ms 9000 :node "db-1" :path "/data/db.bin"} "db.bin")
 (api/recover 13 {:branch 4 :vtime_ns 9000000000})     ; lines its events left out near there
 (api/fork 13 4 9000 16)                               ; 16 new timelines from timeline 4 at 9 s
+(api/inject 13 {:branch 4 :at_vtime_ms 9000 :node "db-1" :path "/usr/bin/db" :from "db-patched"
+                :mode "755" :exec "det-nodes kill db-1; det-nodes start db-1"
+                :continue true})                      ; a fix tried there, the timeline going on
 (api/shrink-start 13 {:branch 4 :property "..."})     ; the fewest faults the failure needs
 (api/logged 13)                                       ; what the nodes logged, by template
 ```

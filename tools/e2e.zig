@@ -3136,6 +3136,35 @@ fn check_serve(context: *Context) !void {
         .{ "the replay printed an events hash", hash.len == 16 },
         .{ "the record has that hash", hash.len == 16 and std.mem.indexOf(u8, record, hash) != null },
     }, "serve: a run replays after a deploy replaced its initramfs (events hash {s})", .{hash});
+    // A file put into a node at a moment of a replay (its `inject`), then a command there sees
+    // it byte for byte: what a person or an agent tries a change with (a patched binary).
+    var patch: [3000]u8 = undefined;
+    for (&patch, 0..) |*byte, index| byte.* = @truncate(index *% 2654435761 >> 9);
+    const encoder = std.base64.standard.Encoder;
+    const content = try arena.alloc(u8, encoder.calcSize(patch.len));
+    _ = encoder.encode(content, &patch);
+    var patch_digest: [std.crypto.hash.Md5.digest_length]u8 = undefined;
+    std.crypto.hash.Md5.hash(&patch, &patch_digest, .{});
+    // Between the setup's snapshot (a moment before it is refused) and the timeline's end.
+    // The timeline's own line ("[branch    0] seed=... <outcome> vtime=<s>s ..."), not the
+    // snapshot's.
+    const branch_line = replayed[std.mem.indexOf(u8, replayed, "[branch") orelse 0 ..];
+    const ended_ms: u64 = @intFromFloat((number_after(branch_line, " vtime=") orelse 2.0) * 1000.0);
+    const snapshot_ms = snapshot_vtime_ms(replayed) orelse 0;
+    const middle_ms = snapshot_ms + (ended_ms -| snapshot_ms) / 2;
+    const inject_body = try std.fmt.allocPrint(arena, "{{\"branch\":0,\"at_vtime_ms\":{d},\"inject\":{{\"node\":\"redis\"," ++
+        "\"path\":\"/tmp/patch.bin\",\"content\":\"{s}\",\"mode\":\"755\"}},\"exec\":\"md5sum " ++
+        "/proc/$(cat /run/det/nodes/redis/pid)/root/tmp/patch.bin; stat -c %a /proc/$(cat /run/det/nodes/redis/pid)/root/tmp/patch.bin\"}}", .{ middle_ms, content });
+    const injected = try curl(context, &.{ "-X", "POST", "-d", inject_body, url ++ "/runs/1/replay" });
+    const patch_hex = std.fmt.bytesToHex(patch_digest, .lower);
+    expect_all(context, &.{
+        .{ "the file went in", std.mem.indexOf(u8, injected, "[injected]") != null },
+        .{ "a command there sees its bytes", std.mem.indexOf(u8, injected, &patch_hex) != null },
+        .{ "with its mode", std.mem.indexOf(u8, injected, "755\\n") != null },
+    }, "serve: a replay puts a file into a node at a moment ({d} bytes at {d} ms), the same there", .{ patch.len, middle_ms });
+    if (std.mem.indexOf(u8, injected, &patch_hex) == null) std.debug.print("{s}\n", .{lines_with(arena, injected, &.{
+        "exec_", "injected", "error", "refused", "snapshot", "[branch",
+    }) catch ""});
     // Its timeline in a bundle (bundle.zig), for another host: the bundle names nothing of the
     // store's or the cache's, and it replays inside it, the store's artifacts away, to the
     // record's events.

@@ -373,6 +373,19 @@
                        :output (str "extracted " (:node request-map) ":" (:path request-map) " to " path)}
               written)))
 
+(defn inject
+  "A file put into a node at a moment of a timeline, then the replay goes on as asked: {:branch
+  :at_vtime_ms (or :until :rewind_ms) :node :path :from (a local file) | :text (the file's
+  content) :mode (octal, \"644\") :exec (a command after it) | :steps [...] :continue (on to the
+  timeline's end: a new future with the change) :fresh_seed}. The replay's output: \"[injected]\"
+  once the file is there, then what followed. A patched binary is put in place of the node's
+  and the node restarted by :exec, as a person tries a fix."
+  [id request-map]
+  (let [content (if (:from request-map) (http/file-base64 (:from request-map)) (http/text-base64 (or (:text request-map) "")))
+        file (cond-> {:node (:node request-map) :path (:path request-map) :content content}
+               (:mode request-map) (assoc :mode (:mode request-map)))]
+    (replay id (assoc (dissoc request-map :node :path :from :text :mode) :inject file))))
+
 (defn recover
   "The output lines a timeline's events left out near a moment (Antithesis's \"Recover filtered
   logs\"): {:branch :vtime_ns :window_ms}. Oldest first."

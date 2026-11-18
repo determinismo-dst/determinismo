@@ -33,7 +33,8 @@
 //!   GET  /runs/<id>/automations  JSON lines {property, timeline, vtime_ns, exec, output}: the
 //!                             request's and profile's automations (schema.Automation) run at
 //!                             each failing property's first counterexample once the run ended
-//!   POST /runs/<id>/replay   {branch, at_vtime_ms? | until? rewind_ms?, exec? | steps? |
+//!   POST /runs/<id>/replay   {branch, at_vtime_ms? | until? rewind_ms?, inject? {node, path,
+//!                             content (base64), mode?}, exec? | steps? |
 //!                             session?} -> its output (session: that session's script replayed);
 //!                             at a moment, on from the newest snapshot of the timeline before it,
 //!                             one saved just before it when that is far (replay_snapshots.zig)
@@ -2219,11 +2220,17 @@ pub const ReplayRequest = struct {
     /// debugging: bash commands run or run in the background, branch.wait, branch.wait_until):
     /// each step's end is a moment, printed ("at moment"), the next step from it.
     steps: []const Step = &.{},
+    /// A file put into a node at the moment, before the command or the steps (extract.zig's
+    /// inject): a patched binary, a config, as `determinismo inject` puts one.
+    inject: ?Inject = null,
     /// After the steps (or the command): on to the timeline's end.
     @"continue": bool = false,
     /// A fresh future from the moment (explore's --fresh-seed): the branch's own randomness, as
     /// Antithesis's branches diverge from their timeline; without it, the timeline's.
     fresh_seed: ?u64 = null,
+
+    /// `content`: the file's bytes in base64 (standard, padded); `mode`: octal.
+    pub const Inject = struct { node: []const u8, path: []const u8, content: []const u8, mode: []const u8 = "644" };
 
     pub const Step = struct {
         /// A command, in the runner, or in `node` (as docker exec runs it); in the background
@@ -2318,22 +2325,35 @@ fn run_replay(server: *Server, run: *const Run, body: []const u8, out: *std.Io.W
     defer if (saving) replay_snapshots_done(server, run.id);
     if (asked.exec) |command| {
         if (command.len > VM.step_size_max) return error.BadRequest;
-        if (moment) try argv.appendSlice(server.arena, &.{ "--exec", command });
+        // With a file to put in first, the command follows it in the script (below).
+        if (moment and asked.inject == null) try argv.appendSlice(server.arena, &.{ "--exec", command });
     }
     var script_path: ?[]const u8 = null;
-    if (asked.steps.len > 0) {
-        if (!moment or asked.exec != null) return error.BadRequest;
+    if (asked.steps.len > 0 or asked.inject != null) {
+        if (!moment or (asked.exec != null and asked.steps.len > 0)) return error.BadRequest;
+        var script: std.ArrayList(u8) = .empty;
+        if (asked.inject) |file| {
+            const decoder = std.base64.standard.Decoder;
+            const size = decoder.calcSizeForSlice(file.content) catch return error.BadRequest;
+            const bytes = try server.arena.alloc(u8, size);
+            decoder.decode(bytes, file.content) catch return error.BadRequest;
+            const target = try print(server, "{s}:{s}", .{ file.node, file.path });
+            try script.appendSlice(server.arena, extract.inject_lines(server.arena, bytes, target, file.mode, null) catch return error.BadRequest);
+        }
+        if (asked.exec) |command| try script.print(server.arena, "{s}\n", .{command});
+        try script.appendSlice(server.arena, try steps_script(server.arena, asked.steps));
         var unique: u64 = 0;
         std.Io.random(server.io, std.mem.asBytes(&unique));
         const path = try std.fmt.allocPrint(server.arena, "{s}/steps-{x:0>16}.txt", .{ try run_directory(server, run.id), unique });
-        try std.Io.Dir.cwd().writeFile(server.io, .{ .sub_path = path, .data = try steps_script(server.arena, asked.steps) });
+        try std.Io.Dir.cwd().writeFile(server.io, .{ .sub_path = path, .data = script.items });
         try argv.appendSlice(server.arena, &.{ "--exec-script", path });
         script_path = path;
     }
     defer if (script_path) |path| std.Io.Dir.cwd().deleteFile(server.io, path) catch {};
-    if (asked.@"continue" and (asked.exec != null or asked.steps.len > 0)) try argv.append(server.arena, "--continue");
+    const acts = asked.exec != null or asked.steps.len > 0 or asked.inject != null;
+    if (asked.@"continue" and acts) try argv.append(server.arena, "--continue");
     if (asked.fresh_seed) |seed| {
-        if (asked.exec == null and asked.steps.len == 0) return error.BadRequest;
+        if (!acts) return error.BadRequest;
         try argv.appendSlice(server.arena, &.{ "--fresh-seed", try print(server, "{d}", .{seed}) });
     }
     const result = try replay_run(server, argv.items);

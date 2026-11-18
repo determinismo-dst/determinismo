@@ -58,6 +58,37 @@ long determinismo_download(std::string const &url, std::string const &body, std:
   return out.empty() ? 0 : std::stol(out);
 }
 
+// bytes -> base64 (standard, padded).
+std::string determinismo_base64(std::string const &bytes) {
+  static char const table[] = \"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/\";
+  std::string out;
+  size_t i = 0;
+  for (; i + 2 < bytes.size(); i += 3) {
+    unsigned n = ((unsigned char)bytes[i] << 16) | ((unsigned char)bytes[i + 1] << 8) | (unsigned char)bytes[i + 2];
+    out += table[n >> 18]; out += table[(n >> 12) & 63]; out += table[(n >> 6) & 63]; out += table[n & 63];
+  }
+  if (i + 1 == bytes.size()) {
+    unsigned n = (unsigned char)bytes[i] << 16;
+    out += table[n >> 18]; out += table[(n >> 12) & 63]; out += \"==\";
+  } else if (i + 2 == bytes.size()) {
+    unsigned n = ((unsigned char)bytes[i] << 16) | ((unsigned char)bytes[i + 1] << 8);
+    out += table[n >> 18]; out += table[(n >> 12) & 63]; out += table[(n >> 6) & 63]; out += '=';
+  }
+  return out;
+}
+
+// A local file's bytes in base64; \"\" when it cannot be read.
+std::string determinismo_file_base64(std::string const &path) {
+  FILE *file = fopen(path.c_str(), \"rb\");
+  if (!file) return std::string();
+  std::string bytes;
+  std::array<char, 65536> buffer;
+  size_t n;
+  while ((n = fread(buffer.data(), 1, buffer.size(), file)) > 0) bytes.append(buffer.data(), n);
+  fclose(file);
+  return determinismo_base64(bytes);
+}
+
 void determinismo_sleep_ms(long ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
 
 std::string determinismo_getenv(std::string const &name) {
@@ -103,6 +134,21 @@ std::string determinismo_getenv(std::string const &name) {
      [(long (cpp/determinismo_download (cpp/cast cpp/std.string url) (cpp/cast cpp/std.string body)
                                        (cpp/cast cpp/std.string path)))
       path]))
+
+(defn file-base64
+  "A local file's bytes in base64 (standard, padded)."
+  [path]
+  #?(:clj (.encodeToString (java.util.Base64/getEncoder)
+                           (java.nio.file.Files/readAllBytes (.toPath (java.io.File. ^String path))))
+     :jank (let [encoded (str (cpp/determinismo_file_base64 (cpp/cast cpp/std.string path)))]
+             (when (= "" encoded) (throw (ex-info (str "cannot read " path) {:path path})))
+             encoded)))
+
+(defn text-base64
+  "A string's bytes (UTF-8) in base64 (standard, padded)."
+  [text]
+  #?(:clj (.encodeToString (java.util.Base64/getEncoder) (.getBytes ^String text "UTF-8"))
+     :jank (str (cpp/determinismo_base64 (cpp/cast cpp/std.string text)))))
 
 (defn sleep-ms [ms]
   #?(:clj (Thread/sleep (long ms))

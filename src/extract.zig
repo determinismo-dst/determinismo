@@ -84,12 +84,12 @@ pub fn inject_run(
         if (index == arguments.len) return error.Usage;
         if (slot) |target| target.* = arguments[index] else mode = arguments[index];
     }
-    for (mode) |digit| if (digit < '0' or digit > '7') return error.Usage;
-    if (mode.len == 0 or mode.len > 4) return error.Usage;
-    const target = try target_parse(file orelse return error.Usage);
     const source = from orelse return error.Usage;
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, source, arena, .unlimited);
-    const script = try inject_script(arena, bytes, target, mode, then);
+    const script = inject_lines(arena, bytes, file orelse return error.Usage, mode, then) catch |err| switch (err) {
+        error.BadMode => return error.Usage,
+        else => return err,
+    };
     var path_buffer: [64]u8 = undefined;
     const script_path = try std.fmt.bufPrint(&path_buffer, "/tmp/determinismo-inject-{d}", .{
         std.os.linux.getpid(),
@@ -139,6 +139,22 @@ fn target_shell(arena: std.mem.Allocator, target: Target) ![]const u8 {
     }
     const format = "'/proc/'$(cat /run/det/nodes/{s}/pid)'/root{s}'";
     return std.fmt.allocPrint(arena, format, .{ target.node, target.path });
+}
+
+/// The commands that put `bytes` into a node's file at a moment (`file`: `<node>:<absolute
+/// path>`, as `--file` says it), its mode octal, then `then`: lines of an explore --exec-script,
+/// the inject's own ("[injected]" said once the file is there). serve's replays put them before
+/// their own steps (POST /runs/<id>/replay {inject}).
+pub fn inject_lines(
+    arena: std.mem.Allocator,
+    bytes: []const u8,
+    file: []const u8,
+    mode: []const u8,
+    then: ?[]const u8,
+) ![]const u8 {
+    for (mode) |digit| if (digit < '0' or digit > '7') return error.BadMode;
+    if (mode.len == 0 or mode.len > 4) return error.BadMode;
+    return inject_script(arena, bytes, try target_parse(file), mode, then);
 }
 
 /// The moment's commands, one per line: staging, the chunks, the decode, then `then`.
