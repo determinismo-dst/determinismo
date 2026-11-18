@@ -5870,7 +5870,10 @@ fn check_pausing(context: *Context) !void {
         const property_failing = failing_in(report, language.property) orelse 0;
         // The SDK's draws: a named decision at each stretch's first look, announced (not logged
         // since 41334b0) and counted by name in each timeline's `decisions_announced`.
-        const counted = try run_kept(context, &.{ "sh", "-c", try std.fmt.allocPrint(arena, "grep -rho '\"thread pausing\":[0-9]*' {s} | cut -d: -f2 | paste -sd+ - | bc 2>/dev/null || echo 0", .{events}) });
+        // In the timelines' own files, plain: an ended timeline's is compressed, and the grep
+        // over the directory counted 0 draws in every language since it was (2026-11-17).
+        try events_plain(context, events);
+        const counted = try run_kept(context, &.{ "sh", "-c", try std.fmt.allocPrint(arena, "grep -ho '\"thread pausing\":[0-9]*' {s}/branch-*.jsonl | cut -d: -f2 | paste -sd+ - | bc 2>/dev/null || echo 0", .{events}) });
         const draws = std.fmt.parseInt(u64, std.mem.trim(u8, counted.stdout, " \n"), 10) catch 0;
         expect_all(context, &.{
             .{ "every timeline explored", count == timelines },
@@ -7385,15 +7388,17 @@ fn check_voidstar(context: *Context) !void {
         const edge = std.mem.indexOf(u8, text, "edge none.sym.tsv:1") != null;
         events_found = events_found and event and edge;
     }
-    // notify_coverage answers False: the edge is reported once, never asked about again.
+    // notify_coverage answers True: the edge is reported once, and asked about at every pass,
+    // where thread pausing pauses (voidstar.zig; False was its answer before pausing rode on it).
     const answered = std.mem.indexOf(u8, outputs[0], "voidstar ") != null and
-        std.mem.indexOf(u8, outputs[0], "False") != null;
+        std.mem.indexOf(u8, outputs[0], "True") != null;
     const same = std.mem.eql(u8, outputs[0], outputs[1]);
     // Thread-local state would be the host program's (static-pie: local-exec): none at all.
     const library = try std.fs.path.join(arena, &.{ context.bin, "libvoidstar.so" });
     const tls_free = !(try elf_has_tls(context, library));
     const ulimits = std.mem.indexOf(u8, outputs[0], "nofile 20000 40000") != null;
-    // At most stdin, stdout, stderr, two pipes, the log and the device: 7 files each.
+    // At most stdin, stdout, stderr, two pipes, the log, the device and the listener of the
+    // node's exits (exits.zig's seccomp notification): 8 files each.
     var forwarders: u32 = 0;
     var forwarders_lean = true;
     var forwarder_lines = std.mem.tokenizeScalar(u8, outputs[0], '\n');
@@ -7402,14 +7407,14 @@ fn check_voidstar(context: *Context) !void {
         var words = std.mem.tokenizeScalar(u8, line[at + "forwarder ".len ..], ' ');
         const files = std.fmt.parseInt(u32, words.next() orelse "", 10) catch 1000;
         forwarders += 1;
-        forwarders_lean = forwarders_lean and files <= 7;
+        forwarders_lean = forwarders_lean and files <= 8;
     }
     forwarders_lean = forwarders_lean and forwarders >= 2;
     const passes = answered and events_found and same and tls_free and ulimits and forwarders_lean;
     expect_all(context, &.{
-        .{ "notify_coverage answered (False)", answered },
+        .{ "notify_coverage answered (True)", answered },
         .{ "the command ran with the node's Compose ulimits (nofile 20000 40000)", ulimits },
-        .{ "every node's output forwarder holds 7 files at most (none inherited)", forwarders_lean },
+        .{ "every node's output forwarder holds 8 files at most (none inherited)", forwarders_lean },
         .{ "its events and edges reach the timeline", events_found },
         .{ "the same twice", same },
         .{ "libvoidstar.so has no thread-local storage", tls_free },
