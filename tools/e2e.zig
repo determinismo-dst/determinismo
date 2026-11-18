@@ -4907,9 +4907,10 @@ fn check_tree(context: *Context) !void {
     const held = holders_made(one) and holders_made(many);
     // Each the node a replay makes, in what the guest can see (--verify-holders remade them).
     const verified = holders_verified(one);
-    // The explorer looks at the host's memory beside its VMs for its run's claims, and says
-    // its first look that counts (its VMs claim their guest's size, or less): without a pool
-    // of its own it never looked, and nothing said so (2026-11-18).
+    // The explorer looks at the host's memory beside its VMs for its run's claims, and says so
+    // at its first look: without a pool of its own it never looked, and nothing said so
+    // (2026-11-18). Not its first look that counts (every worker running a timeline at a look
+    // 5 s apart): a one-worker tree is idle most of its time, and that line came or not.
     const claims_looked = std.mem.indexOf(u8, one, "the run's VMs claim") != null or
         std.mem.indexOf(u8, many, "the run's VMs claim") != null;
     expect_all(context, &.{
