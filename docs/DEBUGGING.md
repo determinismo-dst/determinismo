@@ -100,8 +100,9 @@ first stop there. `det-nodes where <node> <address>... [--return]` names each ad
 stack names its frames (its source line, its Go function and line, its ELF function with Rust's
 and C++'s paths demangled, else its module and offset), with the ELF function beside a line;
 the REPL's `frames` reads a process's
-stack at a stop inside it (a breakpoint's, a watch's) and names the words that are return
-addresses, innermost first, and `moment-when`
+stack at a stop inside it (a breakpoint's, a watch's) and unwinds it there: the stop's own
+instruction, then each caller by its frame's rule (`det-nodes cfi`: the module's .eh_frame, as
+Rust and C++ release code needs, else the frame pointers'), each named; and `moment-when`
 bisects a timeline to the first moment a look holds (a fresh session each look, to the
 millisecond, then to the taken branch with det:step): where a value changed, for instance, then
 `frames` there for who changed it. `across` does one look in many timelines: a session in each of a run's

@@ -77,7 +77,8 @@ the recorded history.
                                                       ; looked up in a session of its own: a session
                                                       ; given it runs no guest command, as recorded
     (dbg/frames s :db-1)                              ; at a stop in its process: its calls, named,
-                                                      ; :via :frame-pointers or :scan
+                                                      ; unwound by .eh_frame (:via :cfi), else frame
+                                                      ; pointers, then the stack's scan
     (dbg/moment-when 13 4 #(pos? (dbg/value-of (dbg/mem % page 8) :u64)) {:from-ms 2000 :to-ms 3000})
                                                       ; the first moment a look holds, to the branch
     (dbg/across 13 "event=request_start" #(dbg/calls % (dbg/symbol % :db-1 :handle_request) {:limit 3})
