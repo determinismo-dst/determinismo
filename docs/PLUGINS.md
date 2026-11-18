@@ -120,6 +120,14 @@ host's helpers, refuses a form that reaches past them (I/O, eval, definitions, t
 calls, other namespaces), dry-runs it on recorded generations, and registers it as `:claude-<n>`
 (its code in plugins/clojure/proposed/, for review).
 
+The client's `determinismo.strategy` (clients/clojure) serves the same protocol from whatever REPL
+the client runs in, the JVM's, babashka's or jank's (the viz's), with no project of its own:
+`(strategy/serve! 9120)`, then `--strategy tcp://127.0.0.1:9120`. A strategy is a map of
+functions in a live registry (`:returns`, `:event`, `:decide`, `:branch`, `:end`, each optional),
+`(strategy/use-strategy! :middle)` switches every connection from its next request, and each
+generation's candidates and choices stay in `strategy/generations` for the REPL. e2e
+`repl-strategy` serves its `:middle` from babashka and from jank to a tree exploration.
+
 ## Messages
 
 Every request has a `method`. Every response is a JSON object; `{}` always means "the default".
