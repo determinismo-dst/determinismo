@@ -17,6 +17,17 @@
 //! kept beside it (`determinismo_trace.itf.json`, Quint's trace format): the timeline in the
 //! spec's terms, and where the run stopped when an event is refused.
 //!
+//! A system that says its steps in its log, not through the SDK, has them too: an output line
+//! of a node or a command (`<when> [INFO]  node-1: election won: term=4 tally=2`, hclog's and
+//! logfmt's shape) is an event named by its message (`election_won`: its letters and digits,
+//! "_" for the rest), its `key=value` pairs the details with the line's source ({ source:
+//! "raft-node-1", term: 4, tally: 2 }: digits a number, anything else a string). A word of the
+//! message with a digit in it is no part of the name (an address, an id: "connection from
+//! 10.0.0.6:56392" is `connection_from`). A line that is a JSON object is named by its `msg`,
+//! `message` or `event`, else by its keys (`{"op":"apply","data":"ab12"}` is `op_data`), its
+//! fields the details. A spec with an action of that name takes those lines as steps, in the
+//! timeline's order with the rest.
+//!
 //! With `--invariant` the spec's invariant is asked after every event: where a timeline's bug
 //! shows in the spec's terms.
 //!
@@ -241,21 +252,34 @@ fn trace_read(arena: std.mem.Allocator, source: []const u8, actions: []const []c
     var unnamed: u64 = 0;
     var lines = std.mem.tokenizeScalar(u8, source, '\n');
     while (lines.next()) |text| {
-        // A program's own event: {"seq":..,"vtime_ns":..,"event":{"event":"<name>","details":{..}}}.
-        if (std.mem.indexOf(u8, text, "\"event\":{\"event\":\"") == null) continue;
+        // A program's own event: {"seq":..,"vtime_ns":..,"event":{"event":"<name>","details":{..}}},
+        // or a line of output: {..,"event":{"output":{"source":..,"stream":..,"text":".."}}}.
+        const own = std.mem.indexOf(u8, text, "\"event\":{\"event\":\"") != null;
+        if (!own and std.mem.indexOf(u8, text, "\"event\":{\"output\":{") == null) continue;
         const line = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch continue;
         if (line != .object) continue;
         const event = line.object.get("event") orelse continue;
         if (event != .object) continue;
-        const name = switch (event.object.get("event") orelse continue) {
-            .string => |string| string,
-            else => continue,
-        };
+        var name: []const u8 = "";
+        var said: ?std.json.Value = null;
+        if (own) {
+            name = switch (event.object.get("event") orelse continue) {
+                .string => |string| string,
+                else => continue,
+            };
+            said = event.object.get("details");
+        } else {
+            const output = event.object.get("output") orelse continue;
+            if (output != .object) continue;
+            const step = (try log_step(arena, output.object)) orelse continue;
+            name = step.name;
+            said = step.details;
+        }
         const kind = for (kinds.items) |*kind| {
             if (std.mem.eql(u8, kind.name, name)) break kind;
         } else if (kinds.items.len < kinds_max) added: {
             var example: std.ArrayList(u8) = .empty;
-            if (event.object.get("details")) |details| value_write(arena, &example, details) catch {
+            if (said) |details| value_write(arena, &example, details) catch {
                 example.clearRetainingCapacity();
             };
             try kinds.append(arena, .{ .name = name, .count = 0, .example = example.items });
@@ -270,7 +294,7 @@ fn trace_read(arena: std.mem.Allocator, source: []const u8, actions: []const []c
             continue;
         }
         if (steps.items.len == steps_max) return error.TraceTooLong;
-        const details: ?std.json.Value = if (event.object.get("details")) |details| switch (details) {
+        const details: ?std.json.Value = if (said) |details| switch (details) {
             .object => |fields| if (fields.count() == 0) null else details,
             .null => null,
             else => return error.DetailsNotARecord,
@@ -283,6 +307,130 @@ fn trace_read(arena: std.mem.Allocator, source: []const u8, actions: []const []c
         });
     }
     return .{ .steps = steps.items, .unnamed = unnamed, .kinds = kinds.items };
+}
+
+const LogStep = struct { name: []const u8, details: std.json.Value };
+const log_name_size_max = 64;
+
+/// An output line as a step (the module's description): null for a line that names nothing.
+/// Its pairs begin at the first word that is `key=`; what is before them, less a logger's name
+/// and what precedes it (`<when> [LEVEL] <logger>: `), is the message. A line of pairs alone
+/// (logfmt: `level=info msg="election won" term=4`) is named by its `msg` or `message`.
+fn log_step(arena: std.mem.Allocator, output: std.json.ObjectMap) !?LogStep {
+    const text = switch (output.get("text") orelse return null) {
+        .string => |string| std.mem.trim(u8, string, " \t\r\n"),
+        else => return null,
+    };
+    const source = switch (output.get("source") orelse std.json.Value{ .null = {} }) {
+        .string => |string| string,
+        else => "",
+    };
+    var pairs_at: usize = text.len;
+    var at: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, text, at, '=')) |equals| : (at = equals + 1) {
+        var start = equals;
+        while (start > 0 and log_key_character(text[start - 1])) start -= 1;
+        if (start == equals or !std.ascii.isAlphabetic(text[start])) continue;
+        if (start > 0 and text[start - 1] != ' ') continue;
+        pairs_at = start;
+        break;
+    }
+    var fields: std.json.ObjectMap = .empty;
+    try fields.put(arena, "source", .{ .string = source });
+    if (text.len > 1 and text[0] == '{') {
+        // A JSON object: its fields the details, named by what it calls itself, else its keys.
+        if (std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{})) |parsed| {
+            if (parsed == .object) {
+                var said: []const u8 = "";
+                var keys: std.ArrayList(u8) = .empty;
+                var entries = parsed.object.iterator();
+                while (entries.next()) |entry| {
+                    const key = entry.key_ptr.*;
+                    const naming = std.mem.eql(u8, key, "msg") or std.mem.eql(u8, key, "message") or std.mem.eql(u8, key, "event");
+                    if (naming and said.len == 0 and entry.value_ptr.* == .string) {
+                        said = entry.value_ptr.string;
+                        continue;
+                    }
+                    try keys.appendSlice(arena, key);
+                    try keys.append(arena, ' ');
+                    try fields.put(arena, try log_key(arena, key), entry.value_ptr.*);
+                }
+                const named = (try log_name(arena, if (said.len > 0) said else keys.items)) orelse return null;
+                return .{ .name = named, .details = .{ .object = fields } };
+            }
+        } else |_| {}
+    }
+    var message = std.mem.trimEnd(u8, std.mem.trim(u8, text[0..pairs_at], " \t"), ":");
+    if (std.mem.lastIndexOf(u8, message, ": ")) |colon| message = message[colon + 2 ..];
+    // What a line begins with before its message: a moment, a level in brackets.
+    while (message.len > 0 and (std.ascii.isDigit(message[0]) or message[0] == '[')) {
+        const end = std.mem.indexOfScalar(u8, message, ' ') orelse message.len;
+        message = std.mem.trimStart(u8, message[end..], " ");
+    }
+    var rest = text[pairs_at..];
+    while (rest.len > 0) {
+        rest = std.mem.trimStart(u8, rest, " ");
+        const equals = std.mem.indexOfScalar(u8, rest, '=') orelse break;
+        const key = rest[0..equals];
+        if (key.len == 0 or std.mem.indexOfScalar(u8, key, ' ') != null) break; // Words after the pairs.
+        rest = rest[equals + 1 ..];
+        var value: []const u8 = undefined;
+        if (rest.len > 0 and rest[0] == '"') {
+            const close = std.mem.indexOfScalarPos(u8, rest, 1, '"') orelse rest.len;
+            value = rest[1..close];
+            rest = rest[@min(close + 1, rest.len)..];
+        } else {
+            const end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+            value = std.mem.trimEnd(u8, rest[0..end], ",;"); // "leader=node-2, term=2,".
+            rest = rest[end..];
+        }
+        const name = try log_key(arena, key);
+        if ((std.mem.eql(u8, name, "msg") or std.mem.eql(u8, name, "message")) and message.len == 0) {
+            message = value;
+            continue;
+        }
+        const number = std.fmt.parseInt(i64, value, 10) catch null;
+        try fields.put(arena, name, if (number) |integer| .{ .integer = integer } else .{ .string = value });
+    }
+    const named = (try log_name(arena, message)) orelse return null;
+    return .{ .name = named, .details = .{ .object = fields } };
+}
+
+/// A message as an action's name: its words' letters, lowercase, "_" between them; a word with
+/// a digit in it left out (what changes from one line to the next: an address, an id). Null
+/// when nothing is left, or too much.
+fn log_name(arena: std.mem.Allocator, message: []const u8) !?[]const u8 {
+    var name: std.ArrayList(u8) = .empty;
+    var words = std.mem.tokenizeAny(u8, message, " \t");
+    while (words.next()) |word| {
+        if (std.mem.indexOfAny(u8, word, "0123456789") != null) continue;
+        const start = name.items.len;
+        for (word) |character| {
+            if (std.ascii.isAlphabetic(character)) {
+                try name.append(arena, std.ascii.toLower(character));
+            } else if (name.items.len > start and name.items[name.items.len - 1] != '_') {
+                try name.append(arena, '_');
+            }
+        }
+        while (name.items.len > start and name.items[name.items.len - 1] == '_') name.items.len -= 1;
+        if (name.items.len > start) try name.append(arena, '_');
+    }
+    const named = std.mem.trimEnd(u8, name.items, "_");
+    if (named.len == 0 or named.len > log_name_size_max) return null;
+    return named;
+}
+
+/// A key of a line as a record's field: what is no letter or digit a "_".
+fn log_key(arena: std.mem.Allocator, key: []const u8) ![]const u8 {
+    const name = try arena.dupe(u8, key);
+    for (name) |*character| {
+        if (!std.ascii.isAlphanumeric(character.*)) character.* = '_';
+    }
+    return name;
+}
+
+fn log_key_character(character: u8) bool {
+    return std.ascii.isAlphanumeric(character) or character == '_' or character == '-' or character == '.';
 }
 
 fn integer_of(value: ?std.json.Value) u64 {
@@ -764,6 +912,42 @@ test "a timeline's events as a run: the spec's actions only, a record for the de
     const asked = try trace_module(arena, "bank", "bank", &trace, "conserved");
     try std.testing.expect(std.mem.indexOf(u8, asked, "    init\n      .expect(conserved)\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, asked, "ok: true })).expect(conserved) // event 1") != null);
+}
+
+test "a system's log lines are steps: the message the action, its pairs and source the argument" {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+    const source =
+        \\{"seq":1,"vtime_ns":100,"event":{"output":{"source":"raft-node-1","stream":"stderr","text":"2026-11-19T00:00:03.158Z [INFO]  node-1: election won: term=4 tally=2"}}}
+        \\{"seq":2,"vtime_ns":200,"event":{"output":{"source":"raft-node-0","stream":"stderr","text":"2026-11-19T00:00:03.160Z [DEBUG] node-0: vote granted: from=node-1 term=4 tally=1"}}}
+        \\{"seq":3,"vtime_ns":300,"event":{"output":{"source":"raft-node-2","stream":"stderr","text":"level=info msg=\"Election Won!\" term=5 last-leader-id=\"\" took=1.5ms"}}}
+        \\{"seq":4,"vtime_ns":400,"event":{"output":{"source":"client","stream":"stdout","text":"---- 1234 ----"}}}
+        \\{"seq":5,"vtime_ns":500,"event":{"event":"election_won","details":{"term":6}}}
+        \\{"seq":6,"vtime_ns":600,"event":{"output":{"source":"raft-monitor","stream":"stdout","text":"connection from 10.0.0.6:56392"}}}
+        \\{"seq":7,"vtime_ns":700,"event":{"output":{"source":"raft-node-1","stream":"stdout","text":"{\"op\":\"apply\",\"data\":\"aadb6b27\"}"}}}
+        \\{"seq":8,"vtime_ns":800,"event":{"output":{"source":"raft-client","stream":"stdout","text":"client: leader=raft-node-2:8400, term=2, ok"}}}
+        \\
+    ;
+    const trace = try trace_read(arena, source, &.{"election_won"});
+    try std.testing.expectEqual(3, trace.steps.len); // Two lines of logs and the program's own event.
+    try std.testing.expectEqual(4, trace.unnamed); // vote_granted and the three after: no action of the spec's.
+    try std.testing.expectEqual(5, trace.kinds.len); // A line with no word names nothing.
+    try std.testing.expectEqualStrings("connection_from", trace.kinds[2].name); // Its address no part of the name.
+    try std.testing.expectEqualStrings("op_data", trace.kinds[3].name); // A JSON line, by its keys.
+    try std.testing.expectEqualStrings("{ source: \"raft-node-1\", op: \"apply\", data: \"aadb6b27\" }", trace.kinds[3].example);
+    try std.testing.expectEqualStrings("client", trace.kinds[4].name);
+    try std.testing.expectEqualStrings("{ source: \"raft-client\", leader: \"raft-node-2:8400\", term: 2 }", trace.kinds[4].example);
+    try std.testing.expectEqualStrings("election_won", trace.kinds[0].name);
+    try std.testing.expectEqual(3, trace.kinds[0].count);
+    try std.testing.expectEqualStrings("{ source: \"raft-node-1\", term: 4, tally: 2 }", trace.kinds[0].example);
+    try std.testing.expectEqualStrings("vote_granted", trace.kinds[1].name);
+    try std.testing.expectEqualStrings("{ source: \"raft-node-0\", from: \"node-1\", term: 4, tally: 1 }", trace.kinds[1].example);
+    // logfmt: named by its msg, the level a field as any other, a key's "-" an "_".
+    var third: std.ArrayList(u8) = .empty;
+    try value_write(arena, &third, trace.steps[1].details.?);
+    try std.testing.expectEqualStrings("{ source: \"raft-node-2\", level: \"info\", term: 5, last_leader_id: \"\", took: \"1.5ms\" }", third.items);
+    try std.testing.expectEqual(300, trace.steps[1].vtime_ns);
 }
 
 test "a long trace is a tree of short runs" {

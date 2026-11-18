@@ -74,6 +74,27 @@ read before the write it saw, and a spec that follows the events refuses it.
   steps. Its e2e check (`bank-steps`) runs each timeline's events against the bank they
   describe: none out of order with the lock, a third of them without it.
 
+## Steps from a system's logs
+
+A system that was not written for determinismo says its steps in its log. An output line of a
+node or a command is an event too, named by its message:
+
+    2026-11-19T00:00:03.158Z [INFO]  node-1: election won: term=4 tally=2
+    election_won({ source: "raft-node-1", term: 4, tally: 2 })
+
+- The message is what stands before the line's `key=value` pairs, after a logger's name
+  (`<when> [LEVEL] <logger>: <message>: <pairs>`, hclog's shape; logfmt's `msg="..."` too). Its
+  words' letters make the name, lowercase, `_` between them. A word with a digit in it is left
+  out (an address, an id), so the names stay few.
+- The pairs are the argument, with `source` (the node or command that wrote the line): a value
+  of digits is a number, any other a string; a key's `-` or `.` is `_`.
+- A line that is a JSON object is named by its `msg`, `message` or `event`, else by its keys
+  (`{"op":"apply","data":"ab12"}` is `op_data`), its fields the argument.
+
+A spec with an action of such a name takes those lines as steps, in the timeline's order with
+the program's own events. Asked with a spec that names none of them, the command lists the
+names a timeline has, how many of each and an example: what there is to model.
+
 A step can also happen and never be said: a write whose reply a fault took is in the server
 and not in the trace, and the spec refuses what follows from it (an audit that lists a balance
 no said commit explains). `bank_steps` runs without the fault injector for that. A system
