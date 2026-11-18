@@ -555,6 +555,8 @@ const platform_events = std.StaticStringMap(void).initComptime(.{
     .{"explore_here_ready"},
     .{"fault"},
     .{"fault_custom_done"},
+    .{"fault_exclusions"},
+    .{"fault_exclusions_invalid"},
     .{"fault_custom_failed"},
     .{"fault_failed"},
     .{"fault_heal_failed"},
