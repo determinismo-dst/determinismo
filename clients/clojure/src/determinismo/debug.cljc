@@ -534,46 +534,24 @@ std::string determinismo_debug_hex(std::string const &decimal) {
      (tap/tell :across {:run run :condition condition :timelines (count matched) :results results}
                results))))
 
-(def ^:private rust-escapes
-  [["$LT$" "<"] ["$GT$" ">"] ["$RF$" "&"] ["$BP$" "*"] ["$C$" ","] ["$u20$" " "] ["$u27$" "'"]
-   ["$u5b$" "["] ["$u5d$" "]"] ["$u7b$" "{"] ["$u7d$" "}"] ["$u7e$" "~"] [".." "::"]])
-
-(defn demangle
-  "A symbol's path when it is a nested name (`_ZN<length><part>...E`: Rust's legacy mangling,
-  C++'s namespaces), its Rust hash part dropped and Rust's escapes undone:
-  _ZN10turso_core2io10Completion8complete17h735acbbdf5edf53fE is
-  turso_core::io::Completion::complete. Anything else as it is."
-  [mangled]
-  (if-not (and (string? mangled) (str/starts-with? mangled "_ZN") (str/ends-with? mangled "E"))
-    mangled
-    (loop [at 3 parts []]
-      (let [digits (apply str (take-while (fn [c] (str/includes? "0123456789" (str c))) (subs mangled at)))]
-        (if (= "" digits)
-          (let [parts (if (and (seq parts) (re-matches #"h[0-9a-f]{16}" (peek parts))) (pop parts) parts)]
-            (if (empty? parts)
-              mangled
-              (str/join "::" (map (fn [part] (reduce (fn [text [from to]] (str/replace text from to)) part rust-escapes)) parts))))
-          (let [n (parse-long digits)
-                from (+ at (count digits))]
-            (if (> (+ from n) (count mangled))
-              mangled
-              (recur (+ from n) (conj parts (subs mangled from (+ from n)))))))))))
-
 (defn where
-  "What holds each address in a node's processes (`det-nodes where`): its module and the function
-  of its symbol table there, :name that function's path demangled, :offset how far in. A guest
-  command: the session's future its own after it (look first). Options: :pid, the process.
-  -> [{:address :module :symbol :name :offset} ...]"
+  "Each address named in a node's processes (`det-nodes where`) as a crash's stack names its
+  frames: its source line when its module has the table coverage reads, its Go function and line,
+  its ELF function (Rust's and C++'s demangled) and offset, else its module and offset; :at nil
+  outside their code. A guest command: the session's future its own after it (look first).
+  Options: :pid, the process; :return, each a return address (the call before it named).
+  -> [{:address :at} ...]"
   ([session node addresses] (where session node addresses {}))
   ([session node addresses options]
    (let [node (named node)
          found (vec (mapcat (fn [chunk]
                               (let [said (sh session (str "det-nodes where " node " " (str/join " " (map hex chunk))
-                                                          (when (:pid options) (str " --pid " (:pid options)))))]
+                                                          (when (:pid options) (str " --pid " (:pid options)))
+                                                          (when (:return options) " --return")))]
                                 (keep (fn [line] (when (str/starts-with? line "{") (json/read-json line)))
                                       (str/split-lines (or said "")))))
                             (partition-all 150 addresses)))
-         named-found (mapv (fn [one] (assoc one :address (unhex (:address one)) :name (demangle (:symbol one)))) found)]
+         named-found (mapv (fn [one] (update one :address unhex)) found)]
      (tap/tell :where {:session session :node node :found named-found} named-found))))
 
 (defn- little-u64
@@ -587,9 +565,9 @@ std::string determinismo_debug_hex(std::string const &decimal) {
   "The calls a process is in, at a stop of the session's inside it (a breakpoint's or a watch's:
   the vCPU's registers are then that process's): the words of its stack from the stack pointer
   on (:pages of 4 KiB, 4) that point into a function of one of its modules, innermost first,
-  named by `where` (a guest command after the stack is read). Return addresses only: a leaf
+  named by `where` as return addresses (a guest command after the stack is read). A leaf
   function has none of its own, and a word a returned call left behind is named too. Options:
-  :pid, :pages. -> [{:address :module :symbol :name :offset} ...]"
+  :pid, :pages. -> [{:address :at} ...]"
   ([session node] (frames session node {}))
   ([session node options]
    (let [registers (regs session)
@@ -606,9 +584,9 @@ std::string determinismo_debug_hex(std::string const &decimal) {
                             (range (or (:pages options) 4))))
          ;; User-space addresses only (below 2^47): the rest are data.
          candidates (vec (distinct (filter (fn [w] (and (>= w 4096) (< w 140737488355328))) words)))
-         named-all (where session node candidates (select-keys options [:pid]))
+         named-all (where session node candidates (assoc (select-keys options [:pid]) :return true))
          by-address (into {} (map (fn [one] [(:address one) one]) named-all))
-         stack (vec (dedupe (keep (fn [w] (let [one (get by-address w)] (when (:symbol one) one))) words)))]
+         stack (vec (dedupe (keep (fn [w] (let [one (get by-address w)] (when (:at one) one))) words)))]
      (tap/tell :frames {:session session :node (named node) :frames stack} stack))))
 
 (defn moment-when

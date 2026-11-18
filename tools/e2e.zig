@@ -1260,9 +1260,9 @@ fn check_client(context: *Context) !void {
         \\                            (< 2 (:value (second recorded)) 1024))
         \\          recorded)
         \\    (said "call-params" (= [{{:name "client" :type "i32" :value fd}}] (:params (first served))) (:params serve-fn) (:params (first served)))
-        \\    (said "frames" (and (seq framed) (every? (fn [f] (some? (:symbol f))) framed)
-        \\                        (some (fn [f] (str/includes? (str (:module f)) "selftest")) framed))
-        \\          (mapv (juxt :name :offset :module) framed))
+        \\    (said "frames" (and (seq framed) (every? (fn [f] (string? (:at f))) framed)
+        \\                        (some (fn [f] (str/includes? (:at f) "selftest")) framed))
+        \\          (mapv :at framed))
         \\    (said "moment-when" (and (<= 2490 (:ms reached) 2510) (some? (:rip (:regs reached)))) (dissoc reached :regs) (:rip (:regs reached)))
         \\    (said "across-both" (and (= [0 1] (mapv :branch across))
         \\                             (every? (fn [r] (and (= 1 (count (:result r))) (pos? (first (:result r))))) across))
@@ -1292,7 +1292,7 @@ fn check_client(context: *Context) !void {
             .{ "a function's call, its argument the connection's descriptor", good[5] },
             .{ "the call's parameter by its DWARF name and type (client, i32)", good[6] },
             .{ "a float argument from its vector register, the integer after it from rdi", good[7] },
-            .{ "a stop's frames, named (det-nodes where), the node's own module among them", good[8] },
+            .{ "a stop's frames, named as a crash's stack is (det-nodes where), the node's own code among them", good[8] },
             .{ "moment-when: jiffies' +500 ticks from 2 s found at 2.5 s, to the branch", good[9] },
             .{ "across: the same look in both timelines", good[10] },
         }, "client: the REPL's session, symbols, values, calls and across, from {s} ({s})", .{ runner.name, out[0..@min(out.len, 1200)] });

@@ -442,6 +442,20 @@ pub fn live(arena: std.mem.Allocator, process: *const Process, memory_fd: linux.
 
 pub const Walked = struct { frames: []const Frame, scanned: []const Frame };
 
+/// Each of `addresses` in a live process, named as a walk names its frames (det-nodes where: a
+/// stopped process's stack, read by the VMM, named in the guest): its source line, its Go
+/// function and line, its ELF function and offset, else its module and offset; null for an
+/// address no code mapping of the process holds. `returned`: each a return address, the call
+/// before it named.
+pub fn named(arena: std.mem.Allocator, process: *const Process, addresses: []const u64, returned: bool) ![]const ?[]const u8 {
+    const names: Names = .of(arena, process);
+    const found = try arena.alloc(?[]const u8, addresses.len);
+    for (addresses, found) |address, *name| {
+        name.* = if (process.code_at(address) == null) null else names.name(address, returned);
+    }
+    return found;
+}
+
 fn walk(arena: std.mem.Allocator, process: *const Process, memory: *const Memory, rip: u64, rsp: u64, rbp: u64) ?Walked {
     const names: Names = .of(arena, process);
     var addresses: [frames_max]u64 = undefined;
@@ -534,4 +548,25 @@ test "a core's notes: the first thread's registers, the fault's address" {
     try std.testing.expectEqualStrings("CORE", note.name);
     try std.testing.expectEqual(@as(u64, 0x401234), std.mem.readInt(u64, note.data[prstatus_registers + register_rip * 8 ..][0..8], .little));
     try std.testing.expectEqual(@as(?Note, null), notes.next());
+}
+
+/// A function of the test's own, named by its ELF symbol.
+export fn det_where_named_test_function() callconv(.c) u32 {
+    return 7;
+}
+
+test "named: a function of the process by its ELF symbol, a stack address outside its code" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const process: Process = .read(arena, linux.getpid());
+    defer process.release();
+    var local: u64 = det_where_named_test_function();
+    const addresses = [_]u64{ @intFromPtr(&det_where_named_test_function), @intFromPtr(&local) };
+    const found = try named(arena, &process, &addresses, false);
+    try std.testing.expectEqual(@as(usize, 2), found.len);
+    const function = found[0] orelse return error.TestUnnamed;
+    try std.testing.expect(std.mem.startsWith(u8, function, "det_where_named_test_function+0x0 "));
+    try std.testing.expectEqual(@as(?[]const u8, null), found[1]);
+    local += 1;
 }

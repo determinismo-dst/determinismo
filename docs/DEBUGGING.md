@@ -96,10 +96,11 @@ a stop in any address space is told the process's or not. The REPL's `symbol`, `
 (a variable's writes) and `calls` (a function's calls, its arguments the calling convention's
 registers at its entry, by their parameters' names and types when the module has DWARF: a
 float's from its vector register) take it from there, keeping to the process's address space from its
-first stop there. `det-nodes where <node> <address>...` says what holds each address (its module
-and the function of the module's symbol table there, how far in); the REPL's `frames` reads a
-process's stack at a stop inside it (a breakpoint's, a watch's) and names the words that are
-return addresses, innermost first (`demangle` gives Rust's and C++'s paths), and `moment-when`
+first stop there. `det-nodes where <node> <address>... [--return]` names each address as a crash's
+stack names its frames (its source line, its Go function and line, its ELF function with Rust's
+and C++'s paths demangled, else its module and offset); the REPL's `frames` reads a process's
+stack at a stop inside it (a breakpoint's, a watch's) and names the words that are return
+addresses, innermost first, and `moment-when`
 bisects a timeline to the first moment a look holds (a fresh session each look, to the
 millisecond, then to the taken branch with det:step): where a value changed, for instance, then
 `frames` there for who changed it. `across` does one look in many timelines: a session in each of a run's

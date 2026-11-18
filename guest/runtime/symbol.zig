@@ -17,8 +17,6 @@ const sht_symtab = 2;
 const sht_dynsym = 11;
 const stt_object = 1;
 const stt_func = 2;
-/// A symbol's binding (st_info's high nibble): local to its file.
-const stb_local = 0;
 const stt_tls = 6;
 const stt_gnu_ifunc = 10;
 const et_dyn = 3;
@@ -137,96 +135,6 @@ pub fn find(arena: std.mem.Allocator, pid: linux.pid_t, name: []const u8, field:
     return null;
 }
 
-pub const Where = struct {
-    address: u64,
-    /// The module mapped there (its path as the process maps it); null outside every file.
-    module: ?[]const u8,
-    /// The function holding the address, and how far into it; null when the module's tables
-    /// name none there (a stripped module's own, a PLT stub).
-    symbol: ?[]const u8,
-    offset: u64,
-};
-
-/// What holds `address` in process `pid`: the module its mapping is of and the function of that
-/// module's symbol table whose bytes hold it (det-nodes where: a stack's return addresses named).
-pub fn where(arena: std.mem.Allocator, pid: linux.pid_t, address: u64) Error!Where {
-    var path_buffer: [64]u8 = undefined;
-    const maps_path = std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}/maps", .{pid}, 0) catch unreachable;
-    const maps = file_read(arena, maps_path, maps_size_max) orelse return .{ .address = address, .module = null, .symbol = null, .offset = 0 };
-    const path = mapping_path(maps, address) orelse return .{ .address = address, .module = null, .symbol = null, .offset = 0 };
-    const modules = try modules_of(arena, maps);
-    const module = for (modules) |module| {
-        if (std.mem.eql(u8, module.path, path)) break module;
-    } else return .{ .address = address, .module = path, .symbol = null, .offset = 0 };
-    const root_path = std.fmt.allocPrintSentinel(arena, "/proc/{d}/root{s}", .{ pid, module.path }, 0) catch return error.OutOfMemory;
-    const fd_or_error = linux.open(root_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    if (linux.errno(fd_or_error) != .SUCCESS) return .{ .address = address, .module = path, .symbol = null, .offset = 0 };
-    const fd: linux.fd_t = @intCast(fd_or_error);
-    defer _ = linux.close(fd);
-    // The link-time address: less the module's load bias when it is position independent.
-    const layout = try load_layout(arena, fd) orelse return .{ .address = address, .module = path, .symbol = null, .offset = 0 };
-    const bias: u64 = if (layout.position_independent) bias: {
-        const loaded = module.loaded orelse return .{ .address = address, .module = path, .symbol = null, .offset = 0 };
-        if (loaded < layout.first_load) return .{ .address = address, .module = path, .symbol = null, .offset = 0 };
-        break :bias loaded - layout.first_load;
-    } else 0;
-    const linked = address -% bias;
-    const holding = try symbol_search(arena, fd, .{ .address = linked }) orelse
-        return .{ .address = address, .module = path, .symbol = null, .offset = 0 };
-    return .{ .address = address, .module = path, .symbol = holding.name, .offset = linked - holding.value };
-}
-
-/// The file whose mapping holds `address` in a maps text, or null (anonymous, the stack).
-fn mapping_path(maps: []const u8, address: u64) ?[]const u8 {
-    var lines = std.mem.tokenizeScalar(u8, maps, '\n');
-    while (lines.next()) |line| {
-        var fields = std.mem.tokenizeScalar(u8, line, ' ');
-        const range = fields.next() orelse continue;
-        const dash = std.mem.indexOfScalar(u8, range, '-') orelse continue;
-        const start = std.fmt.parseInt(u64, range[0..dash], 16) catch continue;
-        const end = std.fmt.parseInt(u64, range[dash + 1 ..], 16) catch continue;
-        if (address < start or address >= end) continue;
-        for (0..4) |_| _ = fields.next() orelse return null; // perms, offset, dev, inode
-        const path = std.mem.trim(u8, fields.rest(), " ");
-        if (path.len == 0 or path[0] != '/') return null;
-        return path;
-    }
-    return null;
-}
-
-const Layout = struct { position_independent: bool, first_load: u64 };
-
-/// An ELF file's kind (position independent or not) and its first loadable segment's page.
-fn load_layout(arena: std.mem.Allocator, fd: linux.fd_t) Error!?Layout {
-    var header: [64]u8 = undefined;
-    if (!pread_all(fd, &header, 0)) return null;
-    if (!std.mem.eql(u8, header[0..4], "\x7fELF") or header[4] != 2 or header[5] != 1) return null;
-    const kind = std.mem.readInt(u16, header[16..18], .little);
-    const programs_at = std.mem.readInt(u64, header[32..40], .little);
-    const program_entry = std.mem.readInt(u16, header[54..56], .little);
-    const program_count = std.mem.readInt(u16, header[56..58], .little);
-    if (program_entry < program_header_size or program_count > programs_max) return null;
-    const programs = try arena.alloc(u8, @as(usize, program_count) * program_entry);
-    if (!pread_all(fd, programs, programs_at)) return null;
-    var first_load: ?u64 = null;
-    for (0..program_count) |index| {
-        const entry = programs[index * program_entry ..][0..program_header_size];
-        if (std.mem.readInt(u32, entry[0..4], .little) != pt_load) continue;
-        const address = std.mem.readInt(u64, entry[16..24], .little) / page_size * page_size;
-        if (first_load == null or address < first_load.?) first_load = address;
-    }
-    return .{ .position_independent = kind == et_dyn, .first_load = first_load orelse 0 };
-}
-
-/// det-nodes where's line: {"address","module","symbol","offset"}.
-pub fn where_print(writer: *std.Io.Writer, found: Where) !void {
-    try writer.print("{{\"address\":\"0x{x}\",\"module\":", .{found.address});
-    if (found.module) |module| try std.json.Stringify.value(module, .{}, writer) else try writer.writeAll("null");
-    try writer.writeAll(",\"symbol\":");
-    if (found.symbol) |symbol| try std.json.Stringify.value(symbol, .{}, writer) else try writer.writeAll("null");
-    try writer.print(",\"offset\":{d}}}\n", .{found.offset});
-}
-
 /// The last page of the process's [stack] mapping, where its arguments and environment are.
 fn probe_of(pid: linux.pid_t, maps: []const u8) ?Probe {
     var lines = std.mem.tokenizeScalar(u8, maps, '\n');
@@ -298,8 +206,6 @@ test modules_of {
 }
 
 const Symbol = struct {
-    /// Its name in the table (the file's bytes, unmangled by nothing).
-    name: []const u8 = "",
     value: u64,
     size: u64,
     kind_raw: u8,
@@ -311,14 +217,6 @@ const Symbol = struct {
 
 /// `name` defined in the ELF file `fd` (its .symtab, else its .dynsym), or null.
 fn symbol_find(arena: std.mem.Allocator, fd: linux.fd_t, name: []const u8) Error!?Symbol {
-    return symbol_search(arena, fd, .{ .name = name });
-}
-
-/// What a symbol table is searched for: a name, or the function whose bytes hold a link-time
-/// address (its value at most the address, the address before its value plus its size).
-const Wanted = union(enum) { name: []const u8, address: u64 };
-
-fn symbol_search(arena: std.mem.Allocator, fd: linux.fd_t, wanted: Wanted) Error!?Symbol {
     var header: [64]u8 = undefined;
     if (!pread_all(fd, &header, 0)) return null;
     if (!std.mem.eql(u8, header[0..4], "\x7fELF") or header[4] != 2 or header[5] != 1) return null;
@@ -343,15 +241,11 @@ fn symbol_search(arena: std.mem.Allocator, fd: linux.fd_t, wanted: Wanted) Error
     }
     const sections = try arena.alloc(u8, @as(usize, section_count) * section_entry);
     if (!pread_all(fd, sections, sections_at)) return null;
-    // By address, functions holding it: a global or weak one before a local, then the plainest
-    // of aliases (Zig's exported function and its own "symbol.<name>" at one address).
-    var holding: ?Symbol = null;
-    var holding_global = false;
     // Both tables, the full one first: a stripped module keeps its exported names only.
-    for ([_]u32{ sht_symtab, sht_dynsym }) |table| {
+    for ([_]u32{ sht_symtab, sht_dynsym }) |wanted| {
         for (0..section_count) |index| {
             const entry = sections[index * section_entry ..][0..section_header_size];
-            if (std.mem.readInt(u32, entry[4..8], .little) != table) continue;
+            if (std.mem.readInt(u32, entry[4..8], .little) != wanted) continue;
             const offset = std.mem.readInt(u64, entry[24..32], .little);
             const size = std.mem.readInt(u64, entry[32..40], .little);
             const link = std.mem.readInt(u32, entry[40..44], .little);
@@ -369,48 +263,18 @@ fn symbol_search(arena: std.mem.Allocator, fd: linux.fd_t, wanted: Wanted) Error
                 const name_at = std.mem.readInt(u32, symbol[0..4], .little);
                 const defined_in = std.mem.readInt(u16, symbol[6..8], .little);
                 if (defined_in == 0 or name_at >= strings.len) continue; // Undefined: another module's.
-                const symbol_name = std.mem.sliceTo(strings[name_at..], 0);
-                const value = std.mem.readInt(u64, symbol[8..16], .little);
-                const symbol_bytes = std.mem.readInt(u64, symbol[16..24], .little);
-                const kind_raw = symbol[4] & 0xf;
-                switch (wanted) {
-                    .name => |name| if (!std.mem.eql(u8, symbol_name, name)) continue,
-                    .address => |address| {
-                        if (kind_raw != stt_func and kind_raw != stt_gnu_ifunc) continue;
-                        if (address < value or address - value >= symbol_bytes) continue;
-                        const global = symbol[4] >> 4 != stb_local;
-                        if (holding) |known| {
-                            // A global over a local; among aliases of one binding at one start,
-                            // the plainest (shortest) name: a test binary's exported function is
-                            // local beside its "symbol.<name>".
-                            const better = (global and !holding_global) or (global == holding_global and
-                                value == known.value and symbol_name.len < known.name.len);
-                            if (!better) continue;
-                        }
-                        holding = .{
-                            .name = symbol_name,
-                            .value = value,
-                            .size = symbol_bytes,
-                            .kind_raw = kind_raw,
-                            .position_independent = kind == et_dyn,
-                            .first_load = first_load orelse 0,
-                        };
-                        holding_global = global;
-                        continue;
-                    },
-                }
+                if (!std.mem.eql(u8, std.mem.sliceTo(strings[name_at..], 0), name)) continue;
                 return .{
-                    .name = symbol_name,
-                    .value = value,
-                    .size = symbol_bytes,
-                    .kind_raw = kind_raw,
+                    .value = std.mem.readInt(u64, symbol[8..16], .little),
+                    .size = std.mem.readInt(u64, symbol[16..24], .little),
+                    .kind_raw = symbol[4] & 0xf,
                     .position_independent = kind == et_dyn,
                     .first_load = first_load orelse 0,
                 };
             }
         }
     }
-    return holding;
+    return null;
 }
 
 /// The guest physical address of `address` in process `pid` now: its page's frame from
@@ -496,24 +360,6 @@ export var det_symbol_test_value: u64 = 0x5eed;
 
 export fn det_symbol_test_function(client: i32, ratio: f64) callconv(.c) i64 {
     return client + @as(i64, @intFromFloat(ratio));
-}
-
-test "an address of this process named: the function holding it, how far in" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    std.mem.doNotOptimizeAway(&det_symbol_test_function);
-    const start = @intFromPtr(&det_symbol_test_function);
-    const inside = try where(arena, linux.getpid(), start + 3);
-    try std.testing.expectEqualStrings("det_symbol_test_function", inside.symbol.?);
-    try std.testing.expectEqual(@as(u64, 3), inside.offset);
-    try std.testing.expect(inside.module != null);
-    // The stack: no file there.
-    var local: u64 = 0;
-    std.mem.doNotOptimizeAway(&local);
-    const stack = try where(arena, linux.getpid(), @intFromPtr(&local));
-    try std.testing.expectEqual(@as(?[]const u8, null), stack.module);
-    try std.testing.expectEqual(@as(?[]const u8, null), stack.symbol);
 }
 
 test "a function of this process, its parameters by the module's DWARF" {

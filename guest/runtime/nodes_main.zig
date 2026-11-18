@@ -18,6 +18,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const nodes = @import("nodes.zig");
 const symbol = @import("symbol.zig");
+const where = @import("where.zig");
 const sdk = @import("determinismo");
 const schema = sdk.schema;
 
@@ -29,7 +30,7 @@ const usage =
     \\       det-nodes exec [--coverage] <node> <command>...
     \\       det-nodes list
     \\       det-nodes symbol <node> <name> [--field <path>] [--pid <pid>]
-    \\       det-nodes where <node> <address>... [--pid <pid>]
+    \\       det-nodes where <node> <address>... [--pid <pid>] [--return]
     \\       det-nodes writeback
     \\       det-nodes samples
     \\
@@ -124,16 +125,23 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
     if (eql(u8, command, "where")) {
-        // `where <node> <address>... [--pid <pid>]`: what holds each address in the node's
-        // processes (symbol.zig's where): its module and the function there, a JSON line each,
-        // from the first process that maps it (or the one given): a stack's return addresses
-        // named.
+        // `where <node> <address>... [--pid <pid>] [--return]`: each address named as a crash's
+        // stack names its frames (where.zig: its source line, its Go function and line, its ELF
+        // function and offset, else its module and offset), from the first of the node's
+        // processes (or the one given) whose code holds it; a JSON line each, {"address","at"},
+        // `at` null outside their code. `--return`: each a return address (a stack's words),
+        // the call before it named.
         if (arguments.len < 4) return usage_exit();
         const node = system.node(arguments[2]) orelse return error.UnknownNode;
         var given: ?std.os.linux.pid_t = null;
+        var returned = false;
         var addresses: std.ArrayList(u64) = .empty;
         var index: usize = 3;
         while (index < arguments.len) : (index += 1) {
+            if (eql(u8, arguments[index], "--return")) {
+                returned = true;
+                continue;
+            }
             if (eql(u8, arguments[index], "--pid")) {
                 if (index + 1 >= arguments.len) return usage_exit();
                 given = try std.fmt.parseInt(std.os.linux.pid_t, arguments[index + 1], 10);
@@ -151,14 +159,24 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("det-nodes: {s} has no process\n", .{node.name});
             std.process.exit(1);
         }
-        var out: std.Io.Writer.Allocating = .init(arena);
-        for (addresses.items) |address| {
-            var found = try symbol.where(arena, pids[0], address);
-            for (pids[1..]) |pid| {
-                if (found.module != null) break;
-                found = try symbol.where(arena, pid, address);
+        const names = try arena.alloc(?[]const u8, addresses.items.len);
+        @memset(names, null);
+        for (pids) |pid| {
+            const process: where.Process = .read(arena, pid);
+            defer process.release();
+            const found = try where.named(arena, &process, addresses.items, returned);
+            var unnamed: u32 = 0;
+            for (names, found) |*name, one| {
+                if (name.* == null) name.* = one;
+                unnamed += @intFromBool(name.* == null);
             }
-            try symbol.where_print(&out.writer, found);
+            if (unnamed == 0) break;
+        }
+        var out: std.Io.Writer.Allocating = .init(arena);
+        for (addresses.items, names) |address, name| {
+            try out.writer.print("{{\"address\":\"0x{x}\",\"at\":", .{address});
+            if (name) |text| try std.json.Stringify.value(text, .{}, &out.writer) else try out.writer.writeAll("null");
+            try out.writer.writeAll("}\n");
         }
         const text = out.written();
         var written: usize = 0;
