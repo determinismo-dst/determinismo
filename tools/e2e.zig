@@ -1296,7 +1296,10 @@ fn check_dotnet(context: *Context) !void {
         .{ "2 timelines", count == 2 },
         .{ "the program is inside determinismo", grep(context, "\"message\":\"dotnet: inside determinismo\",\"condition\":true", events) },
         .{ "an assertion's place in the code", grep(context, "\"file\":\"/app/Check.cs\"", events) },
-        .{ "a named decision", grep(context, "\"name\":\"dotnet.account\",\"options\":[\"alice\"", events) },
+        // Its name and its options, wherever the draws file puts its other fields (it has
+        // put kind, count and config between them since the named draws got their kinds).
+        .{ "a named decision", grep(context, "\"name\":\"dotnet.account\"", events) and
+            grep(context, "\"options\":[\"alice\",\"bob\",\"carol\"]", events) },
         .{ "an event", grep(context, "\"event\":\"dotnet_transfer\"", events) },
         .{ "the catalog announced the assertion it never runs", grep(context, "\"message\":\"dotnet: never reached\",\"hit\":false", events) },
         .{ "no property failed", std.mem.indexOf(u8, report, "2 branches, 0 with failing properties") != null },
@@ -3666,7 +3669,9 @@ fn causality_curve(arena: std.mem.Allocator, stdout: []const u8) !struct { momen
 fn check_profile(context: *Context) !void {
     const arena = context.arena;
     const program = try std.fs.path.join(arena, &.{ context.bin, "det-selftest" });
-    const system = [_][]const u8{ "--program", program, "--scenario", "steady", "--seed", "1" };
+    // A timeline of a fixed length: steady's driver phase is drawn, and seed 1's first ended at
+    // 0.96 s, before the moment both parts look at (the command never ran: CommandUnfinished).
+    const system = [_][]const u8{ "--program", program, "--scenario", "steady", "--seed", "1", "--timeline", "3s" };
     var folded: [2][]const u8 = undefined;
     for (&folded, 0..) |*text, run| {
         const name = try std.fmt.allocPrint(arena, "profile-{d}.folded", .{run});
