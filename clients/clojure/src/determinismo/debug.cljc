@@ -436,6 +436,32 @@ std::string determinismo_debug_hex(std::string const &decimal) {
        (break session nil)
        (tap/tell :calls {:session session :address (hex address) :kept kept} kept)))))
 
+(defn across
+  "`f` at a moment of each timeline of `run` an event query keeps: the timelines where
+  `condition` (the query language, as `open`'s :until) matches, in the query's order, the
+  first :most of them (8), or those of :branches. Each is opened as a session at its first
+  match (:until condition, with :open's other options: :rewind-ms, :not-followed-by, ...),
+  `f` called with the session, and the session closed after, also when `f` throws (the
+  error then goes on). One session at a time: a session is a machine. Over the multiverse,
+  a variable's values or a function's calls from the same moment in many timelines:
+  (across 13 \"event=selftest_accepted\" (fn [s] (watch-values s (symbol s :echo :count))))
+  -> [{:branch :matches :first_vtime_ns :timeline (the session's own) :result} ...]"
+  ([run condition f] (across run condition f {}))
+  ([run condition f options]
+   (let [matched (api/query run {:condition condition :output "branches"})
+         wanted (when (:branches options) (set (:branches options)))
+         chosen (if wanted
+                  (filterv (fn [row] (contains? wanted (:branch row))) matched)
+                  (vec (take (or (:most options) 8) matched)))
+         results (mapv (fn [row]
+                         (let [session (open run (merge (:open options) {:branch (:branch row) :until condition}))
+                               result (try (f session) (finally (close session)))]
+                           (assoc (select-keys row [:branch :matches :first_vtime_ns])
+                                  :timeline (timeline session) :result result)))
+                       chosen)]
+     (tap/tell :across {:run run :condition condition :timelines (count matched) :results results}
+               results))))
+
 (defn step-branches
   "On `n` taken branches (jumps, calls, returns), stopped there: the registers then."
   [session n]

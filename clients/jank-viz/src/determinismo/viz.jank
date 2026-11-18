@@ -306,9 +306,14 @@
                               ;; The first found events only: a query that finds thousands
                               ;; marks no more than a map can show (each ring is many vertices,
                               ;; and a frame of ImGui holds 65,536: 2026-11-18, an agent's query).
+                              ;; An answer's moment: an event's, or a timeline's first match
+                              ;; (:output "branches"); a count has none and marks nothing (a
+                              ;; mark without one threw in every frame: across, 2026-11-18).
                               :marks (vec (concat (remove (fn [mark] (= :found (:kind mark))) (:marks s))
-                                                    (map (fn [event] {:timeline (:branch event) :at-ns (:vtime_ns event) :kind :found})
-                                                         (take found-marks-max (:events data))))))))
+                                                    (keep (fn [event]
+                                                            (when-let [at (or (:vtime_ns event) (:first_vtime_ns event))]
+                                                              {:timeline (:branch event) :at-ns at :kind :found}))
+                                                          (take found-marks-max (:events data))))))))
         (swap! told conj [kind data]))
 
     ;; Its flag at once: the session's events reach serve's store when it ends.
@@ -579,6 +584,7 @@
         simulated (last-told :quint-simulate happened)
         watched (last-told :watch-values happened)
         called (last-told :calls happened)
+        across (last-told :across happened)
         value (if (var? value) (deref value) value)
         now (:session s)
         context (cond session (str "timeline #" (:from session) (when (:at-ns session) (str " at " (seconds (:at-ns session)))))
@@ -589,6 +595,11 @@
         view
         (cond
        error {:view :error :said error}
+       ;; One look in many timelines: the timelines, before the looks made in each.
+       across {:view :table :count (count (:results across))
+               :rows (mapv (fn [r] {:timeline (str "#" (:branch r)) :at (micro-seconds (* 1.0 (:first_vtime_ns r)))
+                                    :matches (str (:matches r)) :result (brief (:result r))})
+                           (take 8 (:results across)))}
        ;; Before the looks they make on the way (translate, regs): the values, the calls.
        watched {:view :series :label (str (:address watched) " " (name (:type watched)))
                 :points (mapv (fn [k] {:at-ns (* 1.0 (:vtime_ns k)) :value (:value k)}) (:kept watched))}
@@ -1504,15 +1515,23 @@
 
 (defonce ^{:doc "The last error a frame's drawing threw (its message is drawn in red too)."} draw-error (atom nil))
 
+(defn- frame-failed!
+  "A frame's drawing threw: what it said, kept and drawn in red."
+  [said]
+  (reset! draw-error said)
+  (text! 32 110 red mono (str "draw: " said)))
+
 (defn loop!
   "Frames until the window closes: on the main thread."
   []
   (while (cpp/detviz.alive)
     (cpp/detviz.frame_begin paper)
+    ;; jank binds nil in (catch :default e) (2026-11-18): a thrown value is caught by its
+    ;; type, a native error (a comparison with nil) as std::exception with its what().
     (try
       (draw @state)
-      (catch :default e
-        (reset! draw-error (str e))
-        (text! 32 110 red mono (str "draw: " e))))
+      (catch jank.runtime.object_ref e (frame-failed! (or (ex-message e) (str e))))
+      (catch cpp/std.exception e (frame-failed! (str (cpp/.what e))))
+      (catch :default _ (frame-failed! "an error jank does not say")))
     (cpp/detviz.frame_end))
   (cpp/detviz.close))

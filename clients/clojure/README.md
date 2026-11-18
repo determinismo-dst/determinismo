@@ -70,6 +70,8 @@ the recorded history.
                                                       ; a field by its path, read as its type
     (dbg/calls s (dbg/symbol s "db-1" "handle_request") {:limit 5})
                                                       ; a function's calls, :args at each
+    (dbg/across 13 "event=request_start" #(dbg/calls % (dbg/symbol % :db-1 :handle_request) {:limit 3})
+                                                      ; the same look in each timeline the query keeps
     (dbg/step-branches s 1000)                        ; the registers 1000 branches on
     (dbg/sh s "det-nodes list")                       ; a guest command's output
     (dbg/node-sh s "db-1" "ls /data")                 ; a command inside a node, as it sees itself
