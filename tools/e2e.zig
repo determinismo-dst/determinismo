@@ -5214,7 +5214,13 @@ fn check_repl_strategy(context: *Context) !void {
         try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = script, .data = try std.fmt.allocPrint(arena,
             \\(require '[determinismo.strategy :as strategy] '[determinismo.http :as http])
             \\(strategy/use-strategy! :middle)
-            \\(strategy/serve! {d})
+            \\;; A moment past 2^31 ns from two below it (jank 0.1's + wraps at 32 bits there): served
+            \\;; only when it is right.
+            \\(let [answer (strategy/answer {{:method "returns" :generation 0 :count 1
+            \\                               :candidates [{{:branch 1 :start_ns 1200000000 :end_ns 3200000000 :novel 1}}]}}
+            \\                              (atom {{}}))]
+            \\  (when (= 2200000000 (:vtime_ns (first (:returns answer))))
+            \\    (strategy/serve! {d})))
             \\(http/sleep-ms 1800000)
             \\
         , .{host.port}) });
@@ -5226,7 +5232,7 @@ fn check_repl_strategy(context: *Context) !void {
             if (tcp_listening(host.port)) break true;
             sleep_ms(100);
         } else false;
-        expect(context, listening, "repl strategy ({s}): it listens on {d}", .{ host.name, host.port });
+        expect(context, listening, "repl strategy ({s}): it listens on {d} (its middle of a span past 2^31 ns right)", .{ host.name, host.port });
         if (!listening) continue;
         const tapes = try std.fmt.allocPrint(arena, "{s}/strategy-{s}-tapes", .{ context.scratch, host.name });
         const record = try std.fmt.allocPrint(arena, "{s}/strategy-{s}.jsonl", .{ context.scratch, host.name });

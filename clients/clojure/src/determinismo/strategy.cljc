@@ -98,7 +98,9 @@ std::string determinismo_close(std::string const &fd_text) {
   [_generation candidates n]
   (vec (for [candidate (take n (sort-by (fn [c] (- (or (:novel c) 0))) candidates))]
          {:branch (:branch candidate)
-          :vtime_ns (+ (:start_ns candidate) (quot (- (:end_ns candidate) (:start_ns candidate)) 2))
+          ;; +' and -': exact past 2^31 under jank 0.1 too (its + wraps at 32 bits when both
+          ;; operands fit them), a long on the JVM as +.
+          :vtime_ns (+' (:start_ns candidate) (quot (-' (:end_ns candidate) (:start_ns candidate)) 2))
           :reason (str "middle of timeline " (:branch candidate))})))
 
 (defonce strategies
