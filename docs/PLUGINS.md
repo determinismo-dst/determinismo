@@ -125,8 +125,11 @@ the client runs in, the JVM's, babashka's or jank's (the viz's), with no project
 `(strategy/serve! 9120)`, then `--strategy tcp://127.0.0.1:9120`. A strategy is a map of
 functions in a live registry (`:returns`, `:event`, `:decide`, `:branch`, `:end`, each optional),
 `(strategy/use-strategy! :middle)` switches every connection from its next request, and each
-generation's candidates and choices stay in `strategy/generations` for the REPL. e2e
-`repl-strategy` serves its `:middle` from babashka and from jank to a tree exploration.
+generation's candidates and choices stay in `strategy/generations` for the REPL. Per service,
+`(strategy/use-strategy-for! #"^redis" :mine)` gives the decisions and events whose `source`
+(the asking process) matches a strategy of their own, the run-wide one keeping the returns and
+every other source. e2e `repl-strategy` serves its `:middle` from babashka and from jank to a
+tree exploration, the composer's named draws answered by a strategy of their own.
 
 ## Messages
 
