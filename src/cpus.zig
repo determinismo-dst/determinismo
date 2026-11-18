@@ -55,6 +55,57 @@ const memory_say_every_ns = 5 * 60 * std.time.ns_per_s;
 /// (they inherit it); a process outside any run is a run of its own.
 pub var run_key: ?linux.pid_t = null;
 
+/// Whether `key` is one of this process's ancestors (its parent, its parent's, ...): a run's key
+/// named on a command line is taken only from the run's own explorer.
+pub fn is_ancestor(key: linux.pid_t) bool {
+    if (key <= 1) return false;
+    var pid: linux.pid_t = linux.getppid();
+    var hops: u32 = 0;
+    while (pid > 1 and hops < 64) : (hops += 1) {
+        if (pid == key) return true;
+        pid = parent_of(pid) orelse return false;
+    }
+    return false;
+}
+
+/// A process's parent, from /proc/<pid>/stat (the field after its state).
+fn parent_of(pid: linux.pid_t) ?linux.pid_t {
+    var path_buffer: [32]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}/stat", .{pid}, 0) catch return null;
+    const opened = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(opened) != .SUCCESS) return null;
+    const fd: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(fd);
+    var buffer: [512]u8 = undefined;
+    const size = linux.read(fd, &buffer, buffer.len);
+    if (linux.errno(size) != .SUCCESS) return null;
+    const stat = buffer[0..size];
+    const close = std.mem.lastIndexOfScalar(u8, stat, ')') orelse return null;
+    var fields = std.mem.tokenizeScalar(u8, stat[close + 1 ..], ' ');
+    _ = fields.next() orelse return null; // Its state.
+    return std.fmt.parseInt(linux.pid_t, fields.next() orelse return null, 10) catch null;
+}
+
+test is_ancestor {
+    try std.testing.expect(is_ancestor(linux.getppid()));
+    try std.testing.expect(!is_ancestor(linux.getpid())); // Itself: not an ancestor.
+    try std.testing.expect(!is_ancestor(1)); // Everyone's: never a run's.
+    try std.testing.expect(!is_ancestor(0));
+    // A child of this process: alive, and not an ancestor.
+    const pid = linux.fork();
+    if (pid == 0) {
+        const pause: linux.timespec = .{ .sec = 5, .nsec = 0 };
+        _ = linux.nanosleep(&pause, null);
+        linux.exit_group(0);
+    }
+    defer {
+        _ = linux.kill(@intCast(pid), .KILL);
+        var status: i32 = 0;
+        _ = linux.waitpid(@intCast(pid), &status, 0);
+    }
+    try std.testing.expect(!is_ancestor(@intCast(pid)));
+}
+
 /// The memory this process's VMs may come to use (their guest's size), claimed with the CPU it
 /// takes: set once at its start, forks inherit it. 0: none claimed.
 pub var claim_bytes: u64 = 0;

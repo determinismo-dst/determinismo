@@ -217,6 +217,9 @@ const usage =
     \\                            run goes, beside its workers, and each failing property's first
     \\                            failing timeline at its end: "timelines replay to their recorded
     \\                            history"; 20 by default, 0 for none)
+    \\                            [--run-key <pid>]   (a verify replay's: the run it belongs to,
+    \\                            its explorer's pid, for its CPU and memory; taken from an
+    \\                            ancestor only)
     \\                            [--resume]   (with --record: continue that run, its recorded
     \\                            timelines skipped; the same inputs, seed and branching; a tree
     \\                            without a strategy, from its timelines' summaries)
@@ -587,6 +590,9 @@ const Arguments = struct {
     /// While exploring with a record and tapes, every this many timelines one is replayed from
     /// its tape (replays.zig); 0: none.
     verify_percent: u32 = verify_percent_default,
+    /// The run this process belongs to (`--run-key`, a verify replay's: its explorer's pid),
+    /// taken when that process is one of its ancestors.
+    run_key: ?linux.pid_t = null,
     /// Continue the run whose record is `record_path`: its timelines already recorded are
     /// skipped (flat branching; the same inputs and seed).
     resume_run: bool = false,
@@ -727,7 +733,9 @@ pub fn main(init: std.process.Init) !void {
     if (arguments.command == .validate) std.process.exit(try command_validate(arena, init.io, &arguments));
     // This process and everything it forks are one run sharing the host's CPUs (cpus.zig), and
     // its memory: each of its VMs claims its guest's size with the CPU it runs on.
-    cpus.run_key = linux.getpid();
+    // A verify replay is its explorer's run (`--run-key`, named by the verifier): one of its
+    // ancestors, or the key is not taken.
+    cpus.run_key = if (arguments.run_key) |key| (if (cpus.is_ancestor(key)) key else linux.getpid()) else linux.getpid();
     cpus.claim_bytes = @as(u64, arguments.memory_mib) << 20;
     const vm = try arena.create(VM); // Large (port statistics): never on the stack.
     const profile = arguments.profile orelse "";
@@ -8109,6 +8117,8 @@ fn parse_option(
         }
     } else if (eql(u8, flag, "--record")) {
         arguments.record_path = value;
+    } else if (eql(u8, flag, "--run-key")) {
+        arguments.run_key = try std.fmt.parseInt(linux.pid_t, value, 10);
     } else if (eql(u8, flag, "--verify-replays")) {
         arguments.verify_percent = try std.fmt.parseInt(u32, value, 10);
         if (arguments.verify_percent > 100) return error.Usage;

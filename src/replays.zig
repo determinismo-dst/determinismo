@@ -64,7 +64,7 @@ pub const Verifier = struct {
         const results_path = try std.fmt.allocPrint(arena, "{s}.replays", .{record});
         std.Io.Dir.cwd().deleteFile(io, results_path) catch {};
         const replayer: Replayer = .{
-            .base = try system_pinned(arena, io, try program_kept(arena, io, try replay_argv(arena, argv), tapes), argv),
+            .base = try system_pinned(arena, io, try program_kept(arena, io, try replay_argv(arena, argv, cpus.run_key orelse linux.getpid()), tapes), argv),
             .tapes = tapes,
             .events = flag_value(argv, "--events-dir"),
             .from_snapshot = flag_value(argv, "--from-snapshot") != null,
@@ -204,7 +204,7 @@ fn results_parse(arena: std.mem.Allocator, text: []const u8) !Results {
 
 /// The explorer's own command line for one timeline's replay: what boots the system, without
 /// what drives an exploration (its tape has the seeds and decisions).
-fn replay_argv(arena: std.mem.Allocator, argv: []const [:0]const u8) ![]const []const u8 {
+fn replay_argv(arena: std.mem.Allocator, argv: []const [:0]const u8, run_key: ?linux.pid_t) ![]const []const u8 {
     const with_value = [_][]const u8{
         "--branches",       "--time-budget",   "--jobs",       "--record",         "--tape-dir",
         "--events-dir",     "--branching",     "--generation", "--pipeline",       "--horizon",
@@ -212,7 +212,7 @@ fn replay_argv(arena: std.mem.Allocator, argv: []const [:0]const u8) ![]const []
         "--save-at-ms",     "--data",          "--branch",     "--tape",           "--at-vtime-ms",
         "--until",          "--run-directory", "--exec",       "--exec-script",    "--rewind-ms",
         "--from-branch",    "--from-vtime-ms", "--from-exec",  "--from-snapshot",  "--trace",
-        "--events",         "--seed",
+        "--events",         "--seed",          "--run-key",
     };
     const alone = [_][]const u8{ "--resume", "--archive", "--no-archive", "--continue" };
     // Futures from a saved machine replay from it, released where they were, by their index:
@@ -237,6 +237,10 @@ fn replay_argv(arena: std.mem.Allocator, argv: []const [:0]const u8) ![]const []
             try out.append(arena, argv[index]);
         }
     }
+    // Its run's, so that it queues in its run's turn and counts by its run's claims (cpus.zig):
+    // as a run of its own, each replay claimed its whole guest and had a turn to itself, and the
+    // verifier's batch took 6 of the 7 VMs Vitess's run 2070 had memory for.
+    if (run_key) |key| try out.appendSlice(arena, &.{ "--run-key", try std.fmt.allocPrint(arena, "{d}", .{key}) });
     return out.items; // /proc/self/exe: the explorer's binary, the build that ran.
 }
 
@@ -776,16 +780,32 @@ test replay_argv {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const argv = [_][:0]const u8{ "determinismo", "explore", "--kernel", "k", "--branches", "64", "--resume", "--program", "p", "--record", "r" };
-    const out = try replay_argv(arena.allocator(), &argv);
+    const out = try replay_argv(arena.allocator(), &argv, null);
     try std.testing.expectEqual(6, out.len);
     try std.testing.expectEqualStrings("--kernel", out[2]);
     try std.testing.expectEqualStrings("p", out[5]);
     // A session's fork's futures: replayed from their machine, with the run's seed.
     const futures = [_][:0]const u8{ "determinismo", "explore", "--seed", "7", "--from-snapshot", "s", "--fork-futures", "--branching", "flat", "--at-vtime-ms", "9", "--exec", "det:release", "--continue", "--record", "r", "--branches", "3" };
-    const kept = try replay_argv(arena.allocator(), &futures);
+    const kept = try replay_argv(arena.allocator(), &futures, null);
     try std.testing.expectEqual(14, kept.len);
     try std.testing.expectEqualStrings("7", kept[3]);
     try std.testing.expectEqualStrings("--continue", kept[13]);
+}
+
+test "a verify replay names its run, so it queues in its run's turn and counts by its claims" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const argv = [_][:0]const u8{ "determinismo", "explore", "--program", "p", "--jobs", "40", "--run-key", "7" };
+    const out = try replay_argv(arena.allocator(), &argv, 4242);
+    var named: ?[]const u8 = null;
+    for (out, 0..) |flag, index| {
+        if (std.mem.eql(u8, flag, "--run-key") and index + 1 < out.len) named = out[index + 1];
+    }
+    // The explorer's run (the verifier's: forked from it), once, not the one it was given.
+    try std.testing.expectEqualStrings("4242", named orelse "");
+    var count: usize = 0;
+    for (out) |flag| count += @intFromBool(std.mem.eql(u8, flag, "--run-key"));
+    try std.testing.expectEqual(@as(usize, 1), count);
 }
 
 test system_pinned {
