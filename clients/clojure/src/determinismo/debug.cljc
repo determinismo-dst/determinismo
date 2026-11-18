@@ -563,30 +563,47 @@ std::string determinismo_debug_hex(std::string const &decimal) {
 
 (defn frames
   "The calls a process is in, at a stop of the session's inside it (a breakpoint's or a watch's:
-  the vCPU's registers are then that process's): the words of its stack from the stack pointer
-  on (:pages of 4 KiB, 4) that point into a function of one of its modules, innermost first,
-  named by `where` as return addresses (a guest command after the stack is read). A leaf
-  function has none of its own, and a word a returned call left behind is named too. Options:
-  :pid, :pages. -> [{:address :at :function} ...]"
+  the vCPU's registers are then that process's), innermost first, each named by `where` as a
+  return address (a guest command after the stack is read): first its chain of frame pointers
+  (from rbp, each frame's saved rbp above the last: :via :frame-pointers), as long as it stays in
+  code, then the other words of its stack from the stack pointer on that point into a function
+  of one of its modules (:via :scan: a frame without a frame pointer, or a word a returned call
+  left behind). Both from the stack pages read (:pages of 4 KiB from rsp's, 4). Options: :pid,
+  :pages. -> [{:address :at :function :via} ...]"
   ([session node] (frames session node {}))
   ([session node options]
    (let [registers (regs session)
          space (unhex (:cr3 registers))
          rsp (unhex (:rsp registers))
-         start (- rsp (mod rsp 4096))
+         start (-' rsp (mod rsp 4096))
+         ;; [address word] of every 8 bytes read, from rsp on.
          words (vec (mapcat (fn [page]
-                              (let [va (+ start (* page 4096))
+                              (let [va (+' start (*' page 4096))
                                     physical (translate session space va)]
                                 (when physical
                                   (let [bytes (mem session physical 4096)]
-                                    (keep (fn [i] (when (>= (+ va i) rsp) (little-u64 (subvec bytes i (+ i 8)))))
+                                    (keep (fn [i] (when (>= (+' va i) rsp) [(+' va i) (little-u64 (subvec bytes i (+ i 8)))]))
                                           (range 0 4096 8))))))
                             (range (or (:pages options) 4))))
+         at (into {} words)
+         chain (loop [frame (unhex (:rbp registers)) out []]
+                 (let [returned (get at (+' frame 8))
+                       next (get at frame)]
+                   (if (and returned next (< (count out) 64))
+                     (if (and (> next frame) (< (-' next frame) 1048576))
+                       (recur next (conj out returned))
+                       (conj out returned))
+                     out)))
          ;; User-space addresses only (below 2^47): the rest are data.
-         candidates (vec (distinct (filter (fn [w] (and (>= w 4096) (< w 140737488355328))) words)))
+         user? (fn [w] (and (>= w 4096) (< w 140737488355328)))
+         candidates (vec (distinct (filter user? (concat chain (map second words)))))
          named-all (where session node candidates (assoc (select-keys options [:pid]) :return true))
          by-address (into {} (map (fn [one] [(:address one) one]) named-all))
-         stack (vec (dedupe (keep (fn [w] (let [one (get by-address w)] (when (:at one) one))) words)))]
+         in-code (fn [w] (let [one (get by-address w)] (when (:at one) one)))
+         chained (vec (map (fn [one] (assoc one :via :frame-pointers)) (take-while some? (map in-code chain))))
+         seen (set (map :address chained))
+         scanned (vec (dedupe (keep (fn [[_ w]] (when-not (seen w) (some-> (in-code w) (assoc :via :scan)))) words)))
+         stack (into chained scanned)]
      (tap/tell :frames {:session session :node (named node) :frames stack} stack))))
 
 (defn moment-when
