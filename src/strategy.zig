@@ -40,7 +40,9 @@ const ring_request_at = @sizeOf(Ring);
 /// A memfd's pages are taken as they are written: the room costs what requests use.
 const ring_request_size_max = 16 << 20;
 const ring_reply_at = ring_request_at + ring_request_size_max;
-const ring_size = ring_reply_at + line_size_max;
+const ring_size = std.mem.alignForward(usize, ring_reply_at + line_size_max, std.heap.page_size_min);
+/// POLLRDHUP (x86-64's): the peer closed its end; std.os.linux.POLL leaves it out.
+const poll_rdhup = 0x2000;
 /// Spins before the futex: a plugin answering at once (compiled code) is waited for without a
 /// sleep, one that takes longer (a JSON decoder) costs this much CPU a call at most.
 const ring_spins = 4096;
@@ -996,12 +998,12 @@ fn ring_call(strategy: *Strategy, memory: []u8, request: []const u8) ![]const u8
 fn plugin_gone(strategy: *Strategy) bool {
     var polled = [_]linux.pollfd{.{
         .fd = strategy.from_plugin,
-        .events = linux.POLL.IN | linux.POLL.RDHUP,
+        .events = linux.POLL.IN | poll_rdhup,
         .revents = 0,
     }};
     const ready = linux.poll(&polled, polled.len, 0);
     if (linux.errno(ready) != .SUCCESS or ready == 0) return false;
-    return polled[0].revents & (linux.POLL.HUP | linux.POLL.RDHUP | linux.POLL.ERR) != 0;
+    return polled[0].revents & (linux.POLL.HUP | poll_rdhup | linux.POLL.ERR) != 0;
 }
 
 fn read_line(strategy: *Strategy) ![]const u8 {
@@ -1084,8 +1086,8 @@ fn ring_test_plugin(listener: linux.fd_t) void {
         if (seen != ring_request) {
             const timeout: linux.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
             _ = linux.futex_4arg(&ring.state.raw, .{ .cmd = .WAIT, .private = false }, seen, &timeout);
-            var polled = [_]linux.pollfd{.{ .fd = connection, .events = linux.POLL.IN | linux.POLL.RDHUP, .revents = 0 }};
-            if (linux.poll(&polled, 1, 0) == 1 and polled[0].revents & (linux.POLL.HUP | linux.POLL.RDHUP) != 0) linux.exit_group(0);
+            var polled = [_]linux.pollfd{.{ .fd = connection, .events = linux.POLL.IN | poll_rdhup, .revents = 0 }};
+            if (linux.poll(&polled, 1, 0) == 1 and polled[0].revents & (linux.POLL.HUP | poll_rdhup) != 0) linux.exit_group(0);
             continue;
         }
         var reply_buffer: [64]u8 = undefined;
