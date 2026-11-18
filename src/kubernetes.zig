@@ -136,7 +136,8 @@ pub const ready_script =
     \\#!/bin/sh
     \\# determinismo's setup for imported Kubernetes manifests (kubernetes.zig): applied until all
     \\# of them apply (a namespace or a custom resource definition before what needs it), then
-    \\# every Deployment, StatefulSet and DaemonSet rolled out and every running pod ready.
+    \\# every Deployment, StatefulSet and DaemonSet rolled out, every running pod ready, and the
+    \\# manifests' own Pods running and ready (or done).
     \\export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
     \\# The pods' output as events, each line named after its pod (det-podlogs detaches itself).
     \\/opt/determinismo/bin/det-podlogs
@@ -165,6 +166,21 @@ pub const ready_script =
     \\done
     \\kubectl wait pod --all --all-namespaces --for condition=Ready --field-selector status.phase=Running \
     \\  --timeout $timeout > /dev/null
+    \\# The manifests' own Pods (no owner: an operator's have theirs), as kapp waits for the Pods it
+    \\# applies: Running and Ready, or Succeeded (kapp has no rule for custom resources by default:
+    \\# a CloudNativePG Cluster is applied, not awaited).
+    \\bare='{{range .items}}{{if not .metadata.ownerReferences}}{{.metadata.namespace}} {{.metadata.name}}{{"\n"}}{{end}}{{end}}'
+    \\kubectl get pods --all-namespaces --output go-template="$bare" > /tmp/bare || exit 1
+    \\while read namespace name; do
+    \\  attempts=0
+    \\  until state=$(kubectl get pod $name --namespace $namespace --output \
+    \\      jsonpath='{.status.phase} {.status.conditions[?(@.type=="Ready")].status}') && \
+    \\      { [ "$state" = "Running True" ] || [ "${state%% *}" = Succeeded ]; }; do
+    \\    attempts=$((attempts + 1))
+    \\    [ $attempts -le 600 ] || { echo "pod $namespace/$name never became ready ($state)"; exit 1; }
+    \\    sleep 1
+    \\  done
+    \\done < /tmp/bare
     \\
 ;
 
