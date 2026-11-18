@@ -43,7 +43,14 @@ pub const Found = struct {
     kind: Kind,
     /// Where its first byte is in guest memory now; null when its page is not there yet.
     physical: ?u64,
+    /// A page of the process's own (its main stack's top, always there and never shared): its
+    /// address and physical address, so that a stop in any address space can be told the
+    /// process's (the address translated there lands on that page) or not. A function's
+    /// code and a library's pages are shared by every process mapping them: no test of theirs.
+    probe: ?Probe,
 };
+
+pub const Probe = struct { address: u64, physical: u64 };
 
 pub const Error = error{ ThreadLocal, OutOfMemory };
 
@@ -79,7 +86,23 @@ pub fn find(arena: std.mem.Allocator, pid: linux.pid_t, name: []const u8) Error!
                 else => .other,
             },
             .physical = physical_of(pid, address),
+            .probe = probe_of(pid, maps),
         };
+    }
+    return null;
+}
+
+/// The last page of the process's [stack] mapping, where its arguments and environment are.
+fn probe_of(pid: linux.pid_t, maps: []const u8) ?Probe {
+    var lines = std.mem.tokenizeScalar(u8, maps, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.endsWith(u8, std.mem.trimEnd(u8, line, " "), "[stack]")) continue;
+        const dash = std.mem.indexOfScalar(u8, line, '-') orelse return null;
+        const space = std.mem.indexOfScalarPos(u8, line, dash, ' ') orelse return null;
+        const end = std.fmt.parseInt(u64, line[dash + 1 .. space], 16) catch return null;
+        if (end < page_size) return null;
+        const address = end - page_size;
+        return .{ .address = address, .physical = physical_of(pid, address) orelse return null };
     }
     return null;
 }
@@ -255,12 +278,17 @@ fn pread_all(fd: linux.fd_t, buffer: []u8, offset: u64) bool {
     return true;
 }
 
-/// A JSON line for `det-nodes symbol`: {"pid","module","address","size","kind","physical"}.
+/// A JSON line for `det-nodes symbol`: {"pid","module","address","size","kind","physical",
+/// "probe":{"address","physical"}}.
 pub fn print(writer: *std.Io.Writer, found: Found) !void {
     try writer.print("{{\"pid\":{d},\"module\":", .{found.pid});
     try std.json.Stringify.value(found.module, .{}, writer);
     try writer.print(",\"address\":\"0x{x}\",\"size\":{d},\"kind\":\"{s}\",\"physical\":", .{ found.address, found.size, @tagName(found.kind) });
     if (found.physical) |physical| try writer.print("\"0x{x}\"", .{physical}) else try writer.writeAll("null");
+    try writer.writeAll(",\"probe\":");
+    if (found.probe) |probe| {
+        try writer.print("{{\"address\":\"0x{x}\",\"physical\":\"0x{x}\"}}", .{ probe.address, probe.physical });
+    } else try writer.writeAll("null");
     try writer.writeAll("}\n");
 }
 
@@ -277,5 +305,5 @@ test "a variable of this process, found by its name where the process sees it" {
     try std.testing.expectEqual(Kind.object, found.kind);
     try std.testing.expectEqual(@as(?Found, null), try find(arena, self, "det_symbol_no_such_name"));
     // Its page is there (it was read above); its frame only a privileged reader sees.
-    if (linux.geteuid() == 0) try std.testing.expect(found.physical != null);
+    if (linux.geteuid() == 0) try std.testing.expect(found.physical != null and found.probe != null);
 }

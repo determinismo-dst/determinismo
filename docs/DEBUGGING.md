@@ -80,9 +80,12 @@ and `cr3`): `det:continue` again goes to the next one, so a variable's values ov
 timeline are the stops' lines, each a moment a session can be opened at. A node's variable by
 its name: `det-nodes symbol <node> <name> [pid]`, a guest command, says where it is in the first
 of the node's processes that defines it (its program's symbols, then its libraries'): its
-`address` there, `size`, `kind` and the `physical` address of its page now (null until the
-process first touched it). The REPL's `symbol` and `watch-values` take it from there (a write
-counts when its address space maps that page). Looking moves nothing: these steps leave the vCPU where it is, the next one queued runs there,
+`address` there, `size`, `kind`, the `physical` address of its page now (null until the
+process first touched it) and a `probe`, a page of the process's own (its stack's top) by which
+a stop in any address space is told the process's or not. The REPL's `symbol`, `watch-values`
+(a variable's writes) and `calls` (a function's calls, its arguments the calling convention's
+registers at its entry) take it from there, keeping to the process's address space from its
+first stop there. Looking moves nothing: these steps leave the vCPU where it is, the next one queued runs there,
 and a session (not live) waits for the next request with the machine stopped, so every look
 between requests sees one state; the guest moves only with a guest command (or a step that runs
 it). A bad one answers `[determinismo] debug: {"step":..., "error":...}` and the session goes on.

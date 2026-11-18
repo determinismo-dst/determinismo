@@ -447,13 +447,19 @@ pub fn main(init: std.process.Init) !void {
         if (linux.errno(client) != .SUCCESS) continue;
         defer _ = linux.close(@intCast(client));
         selftest_accepted += 1;
-        serve(@intCast(client));
+        @call(.never_inline, selftest_serve, .{@as(i32, @intCast(client))});
     }
 }
 
 /// The connections this server accepted: a variable with a known course, watched by its name
 /// from a session (e2e debugging: det-nodes symbol, det:watch). Exported, so kept whole.
 export var selftest_accepted: u64 = 0;
+
+/// A connection served: a function by its name with an argument in C's convention (the REPL's
+/// `calls`: its client descriptor in rdi at each call).
+export fn selftest_serve(client: i32) callconv(.c) void {
+    serve(client);
+}
 
 fn on_urgent(_: linux.SIG) callconv(.c) void {}
 

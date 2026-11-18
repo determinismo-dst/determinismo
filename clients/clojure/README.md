@@ -64,6 +64,10 @@ the recorded history.
     (dbg/continue s)                                  ; {:rip "0xffffffff81b96960" ...}
     (dbg/watch-values s "0xffffffff824079c0" 8 {:limit 3 :keep? even?})
                                                       ; jiffies' next even values, each a moment
+    (dbg/watch-values s (dbg/symbol s "db-1" "counter") {:keep? #(> % 100)})
+                                                      ; a node's variable by its name
+    (dbg/calls s (dbg/symbol s "db-1" "handle_request") {:limit 5})
+                                                      ; a function's calls, :args at each
     (dbg/step-branches s 1000)                        ; the registers 1000 branches on
     (dbg/sh s "det-nodes list")                       ; a guest command's output
     (dbg/node-sh s "db-1" "ls /data")                 ; a command inside a node, as it sees itself

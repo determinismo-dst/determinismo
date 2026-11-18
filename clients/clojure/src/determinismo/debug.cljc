@@ -38,7 +38,7 @@
 
 (def ^:private timelines (atom {}))
 
-(declare plan-session open-session sh)
+(declare plan-session open-session sh process-stop?)
 
 (defn open
   "A session held at a moment of `run`'s timeline: its id. The moment: :until, a condition on
@@ -303,20 +303,31 @@ std::string determinismo_debug_hex(std::string const &decimal) {
                        (/ (+ (mod b6 16) low) 16.0) 1023 2047))
       (throw (ex-info (str "determinismo: no such value type " type) {:type type})))))
 
+(defn- named
+  "A node's or a symbol's name as text, given as a string, a keyword or a symbol (:echo,
+  'echo and \"echo\" alike)."
+  [x]
+  (if (or (keyword? x) (symbol? x)) (clojure.core/name x) (str x)))
+
 (defn symbol
   "Where a variable (or function) of a node's processes is, by its name, at the session's
-  moment (`det-nodes symbol`): {:pid :module :address :size :kind :physical}, the address in
-  that process, :physical its page's guest physical address now (nil until the process first
-  touched it). `pid` picks the process; else the first of the node's that defines the name.
-  `watch-values` takes it whole."
-  ([session node name] (symbol session node name nil))
-  ([session node name pid]
-   (let [said (sh session (str "det-nodes symbol " node " " name (when pid (str " " pid))))
+  moment (`det-nodes symbol`): {:pid :module :address :size :kind :physical :probe}, the
+  address in that process, :physical its page's guest physical address now (nil until the
+  process first touched it), :probe a page of the process's own ({:address :physical}: its
+  stack's top) that tells its address space from any other at a stop. `pid` picks the
+  process; else the first of the node's that defines the name. The node and the name are
+  strings, keywords or symbols. `watch-values` (a variable) and `calls` (a function) take it
+  whole."
+  ([session node wanted] (symbol session node wanted nil))
+  ([session node wanted pid]
+   (let [node (named node)
+         wanted (named wanted)
+         said (sh session (str "det-nodes symbol " node " " wanted (when pid (str " " pid))))
          line (some (fn [l] (when (str/starts-with? l "{") l)) (str/split-lines (or said "")))]
      (when-not line
-       (throw (ex-info (str "determinismo: " node " has no " name ": " said) {:node node :name name :said said})))
+       (throw (ex-info (str "determinismo: " node " has no " wanted ": " said) {:node node :name wanted :said said})))
      (let [found (json/read-json line)]
-       (tap/tell :symbol {:session session :node node :name name :found found} found)))))
+       (tap/tell :symbol {:session session :node node :name wanted :found found} found)))))
 
 (defn watch-values
   "A variable's writes from the session's moment on: a write watchpoint on its `size` bytes at
@@ -329,9 +340,8 @@ std::string determinismo_debug_hex(std::string const &decimal) {
   where a session can be opened. -> [{:value :vtime_ns :branches :rip :cr3} ...]
 
   Or a `symbol`'s answer in place of address and size: its process's writes alone. A write
-  counts when its address space maps the variable's page (:physical; the first write's when
-  the page was not there yet), and from the first that does the watch keeps to that address
-  space (its :cr3)."
+  counts when it is in the process's address space (its :probe page translates there), and
+  from the first that does the watch keeps to that address space (its :cr3)."
   ([session address-or-symbol] (watch-values session address-or-symbol nil {}))
   ([session address size-or-options]
    (if (map? address)
@@ -341,7 +351,7 @@ std::string determinismo_debug_hex(std::string const &decimal) {
    (let [named (when (map? address) address)
          address (if named (:address named) address)
          size (if named (:size named) size)
-         physical (when named (some-> (:physical named) unhex))
+         probe (:probe named)
          type (or (:type options) (get {1 :i8 2 :i16 4 :i32 8 :i64} size))
          keep? (or (:keep? options) (fn [_] true))
          limit (or (:limit options) 100)
@@ -353,9 +363,7 @@ std::string determinismo_debug_hex(std::string const &decimal) {
                     (let [stop (continue session (:ms options))]
                       (if-not (and stop (:watch stop) (:hex stop))
                         kept
-                        (let [ours (or (not named) space
-                                       (nil? physical)
-                                       (= physical (translate session (:cr3 stop) address)))
+                        (let [ours (process-stop? session probe space stop)
                               learned (when (and named ours (nil? space)) (:cr3 stop))
                               space (or space learned)]
                           ;; The process's address space found: its writes alone from here.
@@ -368,6 +376,51 @@ std::string determinismo_debug_hex(std::string const &decimal) {
                               (recur (if (keep? value) (conj kept found) kept) (inc stops) space))))))))]
        (watch session nil)
        (tap/tell :watch-values {:session session :address (hex address) :size size :type type :kept kept} kept)))))
+
+(defn- process-stop?
+  "Whether a stop is in the process `probe` names (its page translates to the probe's physical
+  one in the stop's address space), once its address space `space` is known simply that; no
+  probe: any stop."
+  [session probe space stop]
+  (or (nil? probe) (some? space)
+      (= (unhex (:physical probe)) (translate session (:cr3 stop) (:address probe)))))
+
+(defn calls
+  "A function's calls from the session's moment on: a breakpoint at a `symbol`'s function
+  (its entry, in its process's address space), then `continue` to each call, its arguments the
+  registers of x86-64's calling convention ({:args [rdi rsi rdx rcx r8 r9]}, as numbers: an
+  integer's or a pointer's; a float's are in vector registers, not read), kept when :keep?
+  holds for :args. Until :limit kept (100), :max-stops calls (10,000), or :ms of virtual time
+  with no call (60 s); the breakpoint is off after. Each kept call is an exact moment, the
+  function's first instruction not run yet. -> [{:args :vtime_ns :branches :rip :cr3} ...]"
+  ([session found] (calls session found {}))
+  ([session found options]
+   (let [address (:address found)
+         probe (:probe found)
+         keep? (or (:keep? options) (fn [_] true))
+         limit (or (:limit options) 100)
+         most (or (:max-stops options) 10000)
+         register (fn [registers k] (unhex (get registers k)))]
+     (break session address (:cr3 options))
+     (let [kept (loop [kept [] stops 0 space (:cr3 options)]
+                  (if (or (>= (count kept) limit) (>= stops most))
+                    kept
+                    (let [stop (continue session (:ms options))]
+                      (if-not (and stop (:rip stop))
+                        kept
+                        (let [ours (process-stop? session probe space stop)
+                              learned (when (and probe ours (nil? space)) (:cr3 stop))
+                              space (or space learned)
+                              ;; Read where it stopped: arming a breakpoint lets the guest on.
+                              registers (when ours (regs session))]
+                          (when learned (break session address learned))
+                          (if-not ours
+                            (recur kept (inc stops) space)
+                            (let [arguments (mapv (fn [k] (register registers k)) [:rdi :rsi :rdx :rcx :r8 :r9])
+                                  found-call (assoc (select-keys stop [:vtime_ns :branches :rip :cr3]) :args arguments)]
+                              (recur (if (keep? arguments) (conj kept found-call) kept) (inc stops) space))))))))]
+       (break session nil)
+       (tap/tell :calls {:session session :address (hex address) :kept kept} kept)))))
 
 (defn step-branches
   "On `n` taken branches (jumps, calls, returns), stopped there: the registers then."
@@ -399,7 +452,7 @@ std::string determinismo_debug_hex(std::string const &decimal) {
   node's own processes see them): what it printed. A Go program's goroutines, for one:
   (node-sh s \"raft-node-0\" \"kill -QUIT 1\"), then its output as the timeline goes on."
   [session node command]
-  (sh session (str "det-nodes exec " node " sh -c '" (str/replace command "'" "'\\''") "'")))
+  (sh session (str "det-nodes exec " (named node) " sh -c '" (str/replace command "'" "'\\''") "'")))
 
 (defn forks
   "The forks this session started (`sdk.fork` in a REPL at its moment): each fork's run, its

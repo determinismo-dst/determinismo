@@ -1018,6 +1018,9 @@ fn check_debugging_symbol(context: *Context) !void {
     const address = hex_after(named, "address\\\":\\\"0x");
     const physical = hex_after(named, "physical\\\":\\\"0x");
     const object = std.mem.indexOf(u8, named, "kind\\\":\\\"object") != null;
+    // A page of the process's own beside it (its stack's top), there now.
+    const probe = hex_after(named, "probe\\\":{\\\"address\\\":\\\"0x") != null and
+        std.mem.indexOf(u8, named, "probe\\\":null") == null;
     const echo_prefix = "\\\"name\\\":\\\"echo\\\"";
     const address_key = "address\\\":\\\"";
     const echo_at = std.mem.indexOf(u8, named, echo_prefix);
@@ -1040,6 +1043,7 @@ fn check_debugging_symbol(context: *Context) !void {
     const after = little_u64_after(watched, read_prefix, after_at);
     expect_all(context, &.{
         .{ "det-nodes symbol said where it is: an object, its address and its page", object },
+        .{ "and a page of its process's own to tell its address space by (a probe)", probe },
         .{ "its value read at its physical address", before != null },
         .{ "det:watch at its address stopped at the next connection's write, one more", before != null and hit != null and hit.? == before.? + 1 },
         .{ "read again there, the value the stop said", hit != null and after != null and after.? == hit.? },
