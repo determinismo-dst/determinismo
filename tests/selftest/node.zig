@@ -447,6 +447,9 @@ pub fn main(init: std.process.Init) !void {
         if (linux.errno(client) != .SUCCESS) continue;
         defer _ = linux.close(@intCast(client));
         selftest_accepted += 1;
+        selftest_stats.accepted += 1;
+        selftest_stats.last_client = @intCast(client);
+        selftest_stats.ratio = @as(f64, @floatFromInt(selftest_stats.accepted)) / 2.0;
         @call(.never_inline, selftest_serve, .{@as(i32, @intCast(client))});
     }
 }
@@ -454,6 +457,11 @@ pub fn main(init: std.process.Init) !void {
 /// The connections this server accepted: a variable with a known course, watched by its name
 /// from a session (e2e debugging: det-nodes symbol, det:watch). Exported, so kept whole.
 export var selftest_accepted: u64 = 0;
+
+/// The same as a structure whose fields a session reads by their paths (e2e debugging:
+/// det-nodes symbol --field): the count, the last client's descriptor, half the count.
+const Stats = extern struct { accepted: u64, last_client: i32, ratio: f64 };
+export var selftest_stats: Stats = .{ .accepted = 0, .last_client = -1, .ratio = 0 };
 
 /// A connection served: a function by its name with an argument in C's convention (the REPL's
 /// `calls`: its client descriptor in rdi at each call).

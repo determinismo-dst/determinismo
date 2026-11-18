@@ -66,6 +66,8 @@ the recorded history.
                                                       ; jiffies' next even values, each a moment
     (dbg/watch-values s (dbg/symbol s "db-1" "counter") {:keep? #(> % 100)})
                                                       ; a node's variable by its name
+    (dbg/watch-values s (dbg/symbol s :db-1 :stats {:field "latency.p99"}))
+                                                      ; a field by its path, read as its type
     (dbg/calls s (dbg/symbol s "db-1" "handle_request") {:limit 5})
                                                       ; a function's calls, :args at each
     (dbg/step-branches s 1000)                        ; the registers 1000 branches on

@@ -78,10 +78,13 @@ VMM's, the instruction passed once with RF). A watched write's stop says the byt
 memory order, with its moment (`"watch"`, `"size"`, `"hex"` beside `vtime_ns`, `branches`, `rip`
 and `cr3`): `det:continue` again goes to the next one, so a variable's values over a stretch of a
 timeline are the stops' lines, each a moment a session can be opened at. A node's variable by
-its name: `det-nodes symbol <node> <name> [pid]`, a guest command, says where it is in the first
+its name: `det-nodes symbol <node> <name> [--field <path>] [--pid <pid>]`, a guest command, says where it is in the first
 of the node's processes that defines it (its program's symbols, then its libraries'): its
 `address` there, `size`, `kind`, the `physical` address of its page now (null until the
-process first touched it) and a `probe`, a page of the process's own (its stack's top) by which
+process first touched it), its `type` from the module's DWARF (`kind`: signed, unsigned,
+float, boolean, pointer, aggregate; `size`, `name`; null without DWARF), with `--field` a field
+of it by its path (`stats.accepted`, `table[2].key`: structures, unions and arrays followed,
+pointers not) and a `probe`, a page of the process's own (its stack's top) by which
 a stop in any address space is told the process's or not. The REPL's `symbol`, `watch-values`
 (a variable's writes) and `calls` (a function's calls, its arguments the calling convention's
 registers at its entry) take it from there, keeping to the process's address space from its

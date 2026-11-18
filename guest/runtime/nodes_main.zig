@@ -28,7 +28,7 @@ const usage =
     \\       det-nodes upgrade <node> next|base
     \\       det-nodes exec [--coverage] <node> <command>...
     \\       det-nodes list
-    \\       det-nodes symbol <node> <name> [pid]
+    \\       det-nodes symbol <node> <name> [--field <path>] [--pid <pid>]
     \\       det-nodes writeback
     \\       det-nodes samples
     \\
@@ -77,16 +77,37 @@ pub fn main(init: std.process.Init) !void {
         return nodes.upgrade(arena, &system, node, next);
     }
     if (eql(u8, command, "symbol")) {
-        // `symbol <node> <name> [pid]`: where a variable (or function) of the node's processes
-        // is (symbol.zig), a JSON line; the first of its processes that defines the name, or
-        // the one given.
-        if (arguments.len != 4 and arguments.len != 5) return usage_exit();
+        // `symbol <node> <name> [--field <path>] [--pid <pid>]`: where a variable (or function)
+        // of the node's processes is (symbol.zig), a JSON line, with its type when the module has
+        // DWARF; a field of it by its path (`stats.accepted`, `table[2]`); the first of the
+        // node's processes that defines the name, or the one given.
+        if (arguments.len < 4) return usage_exit();
         const node = system.node(arguments[2]) orelse return error.UnknownNode;
+        var field: ?[]const u8 = null;
+        var given: ?std.os.linux.pid_t = null;
+        var option = arguments[4..];
+        while (option.len > 0) {
+            if (option.len < 2) return usage_exit();
+            if (eql(u8, option[0], "--field")) {
+                field = option[1];
+            } else if (eql(u8, option[0], "--pid")) {
+                given = try std.fmt.parseInt(std.os.linux.pid_t, option[1], 10);
+            } else return usage_exit();
+            option = option[2..];
+        }
         var found_pids: [1024]std.os.linux.pid_t = undefined;
-        const pids = if (arguments.len == 5) found_pids[0..1] else found_pids[0..try nodes.processes(node.name, &found_pids)];
-        if (arguments.len == 5) found_pids[0] = try std.fmt.parseInt(std.os.linux.pid_t, arguments[4], 10);
+        const pids = if (given) |pid| blk: {
+            found_pids[0] = pid;
+            break :blk found_pids[0..1];
+        } else found_pids[0..try nodes.processes(node.name, &found_pids)];
         for (pids) |pid| {
-            const found = try symbol.find(arena, pid, arguments[3]) orelse continue;
+            const found = symbol.find(arena, pid, arguments[3], field) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    std.debug.print("det-nodes: {s} in {s} (process {d}): {s}\n", .{ arguments[3], node.name, pid, @errorName(err) });
+                    std.process.exit(1);
+                },
+            } orelse continue;
             var out: std.Io.Writer.Allocating = .init(arena);
             try symbol.print(&out.writer, found);
             const text = out.written();

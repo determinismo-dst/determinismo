@@ -311,23 +311,37 @@ std::string determinismo_debug_hex(std::string const &decimal) {
 
 (defn symbol
   "Where a variable (or function) of a node's processes is, by its name, at the session's
-  moment (`det-nodes symbol`): {:pid :module :address :size :kind :physical :probe}, the
-  address in that process, :physical its page's guest physical address now (nil until the
-  process first touched it), :probe a page of the process's own ({:address :physical}: its
-  stack's top) that tells its address space from any other at a stop. `pid` picks the
-  process; else the first of the node's that defines the name. The node and the name are
-  strings, keywords or symbols. `watch-values` (a variable) and `calls` (a function) take it
-  whole."
-  ([session node wanted] (symbol session node wanted nil))
-  ([session node wanted pid]
+  moment (`det-nodes symbol`): {:pid :module :address :size :kind :physical :type :probe},
+  the address in that process, :physical its page's guest physical address now (nil until
+  the process first touched it), :type its type from the module's DWARF ({:kind :size :name};
+  nil without DWARF), :probe a page of the process's own ({:address :physical}: its stack's
+  top) that tells its address space from any other at a stop. Options: :field, a path into
+  it (\"stats.accepted\", \"table[2].key\": that field's address, size and type); :pid, the
+  process (else the first of the node's that defines the name). The node and the name are
+  strings, keywords or symbols. `watch-values` (a variable, read as its type) and `calls` (a
+  function) take it whole."
+  ([session node wanted] (symbol session node wanted {}))
+  ([session node wanted options]
    (let [node (named node)
          wanted (named wanted)
-         said (sh session (str "det-nodes symbol " node " " wanted (when pid (str " " pid))))
+         said (sh session (str "det-nodes symbol " node " " wanted
+                               (when (:field options) (str " --field " (:field options)))
+                               (when (:pid options) (str " --pid " (:pid options)))))
          line (some (fn [l] (when (str/starts-with? l "{") l)) (str/split-lines (or said "")))]
      (when-not line
        (throw (ex-info (str "determinismo: " node " has no " wanted ": " said) {:node node :name wanted :said said})))
      (let [found (json/read-json line)]
        (tap/tell :symbol {:session session :node node :name wanted :found found} found)))))
+
+(defn- value-type
+  "A symbol's DWARF type (its :type) as value-of's type, or nil (an aggregate, no DWARF)."
+  [described]
+  (let [kind (:kind described)
+        size (:size described)]
+    (cond (= kind "signed") (get {1 :i8 2 :i16 4 :i32 8 :i64} size)
+          (or (= kind "unsigned") (= kind "boolean") (= kind "pointer")) (get {1 :u8 2 :u16 4 :u32 8 :u64} size)
+          (= kind "float") (get {4 :f32 8 :f64} size)
+          :else nil)))
 
 (defn watch-values
   "A variable's writes from the session's moment on: a write watchpoint on its `size` bytes at
@@ -352,7 +366,7 @@ std::string determinismo_debug_hex(std::string const &decimal) {
          address (if named (:address named) address)
          size (if named (:size named) size)
          probe (:probe named)
-         type (or (:type options) (get {1 :i8 2 :i16 4 :i32 8 :i64} size))
+         type (or (:type options) (value-type (:type named)) (get {1 :i8 2 :i16 4 :i32 8 :i64} size))
          keep? (or (:keep? options) (fn [_] true))
          limit (or (:limit options) 100)
          most (or (:max-stops options) 10000)]

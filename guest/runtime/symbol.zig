@@ -10,6 +10,7 @@
 //! files through /proc/<pid>/root), raw system calls, sizes bounded.
 const std = @import("std");
 const linux = std.os.linux;
+const dwarf_types = @import("dwarf_types.zig");
 const assert = std.debug.assert;
 
 const sht_symtab = 2;
@@ -43,6 +44,10 @@ pub const Found = struct {
     kind: Kind,
     /// Where its first byte is in guest memory now; null when its page is not there yet.
     physical: ?u64,
+    /// Its type from the module's DWARF (a field's, with a field asked for); null without it.
+    type: ?Type = null,
+    /// The field asked for (`stats.accepted`): `address` and `size` are its own.
+    field: ?[]const u8 = null,
     /// A page of the process's own (its main stack's top, always there and never shared): its
     /// address and physical address, so that a stop in any address space can be told the
     /// process's (the address translated there lands on that page) or not. A function's
@@ -52,10 +57,24 @@ pub const Found = struct {
 
 pub const Probe = struct { address: u64, physical: u64 };
 
-pub const Error = error{ ThreadLocal, OutOfMemory };
+pub const Type = struct { kind: dwarf_types.Kind, size: u64, name: []const u8 };
 
-/// `name` in process `pid`'s modules, or null when none of them defines it.
-pub fn find(arena: std.mem.Allocator, pid: linux.pid_t, name: []const u8) Error!?Found {
+pub const Error = error{
+    ThreadLocal,
+    OutOfMemory,
+    /// A field asked for of a module without DWARF (stripped), or whose DWARF does not
+    /// describe the variable.
+    NoType,
+    NoSuchField,
+    NotAnAggregate,
+    NotAnArray,
+    IndexOutOfRange,
+    BadPath,
+};
+
+/// `name` in process `pid`'s modules, or null when none of them defines it; with `field` (a path:
+/// `stats.accepted`, `table[2].key`), that field of it, by the module's DWARF.
+pub fn find(arena: std.mem.Allocator, pid: linux.pid_t, name: []const u8, field: ?[]const u8) Error!?Found {
     assert(name.len > 0);
     var path_buffer: [64]u8 = undefined;
     const maps_path = std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}/maps", .{pid}, 0) catch unreachable;
@@ -74,12 +93,24 @@ pub fn find(arena: std.mem.Allocator, pid: linux.pid_t, name: []const u8) Error!
             if (loaded < symbol.first_load) continue;
             break :bias loaded - symbol.first_load;
         } else 0;
-        const address = symbol.value +% bias;
+        // Its type, and a field's place, when the module has DWARF that describes it.
+        const sections = dwarf_types.sections_of(arena, fd) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        const typed: ?dwarf_types.Field = if (sections) |known| dwarf_types.resolve(arena, known, name, field orelse "") catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidDebugInfo => null,
+            error.NoSuchField, error.NotAnAggregate, error.NotAnArray, error.IndexOutOfRange, error.BadPath => |asked| if (field != null) return asked else null,
+        } else null;
+        if (field != null and typed == null) return error.NoType;
+        const address = symbol.value +% bias +% if (field != null) typed.?.offset else 0;
         return .{
             .pid = pid,
             .module = module.path,
             .address = address,
-            .size = symbol.size,
+            .size = if (field != null) typed.?.size else symbol.size,
+            .type = if (typed) |t| .{ .kind = t.kind, .size = t.size, .name = t.name } else null,
+            .field = field,
             .kind = switch (symbol.kind_raw) {
                 stt_object => .object,
                 stt_func, stt_gnu_ifunc => .function,
@@ -285,6 +316,14 @@ pub fn print(writer: *std.Io.Writer, found: Found) !void {
     try std.json.Stringify.value(found.module, .{}, writer);
     try writer.print(",\"address\":\"0x{x}\",\"size\":{d},\"kind\":\"{s}\",\"physical\":", .{ found.address, found.size, @tagName(found.kind) });
     if (found.physical) |physical| try writer.print("\"0x{x}\"", .{physical}) else try writer.writeAll("null");
+    try writer.writeAll(",\"type\":");
+    if (found.type) |t| {
+        try writer.print("{{\"kind\":\"{s}\",\"size\":{d},\"name\":", .{ @tagName(t.kind), t.size });
+        try std.json.Stringify.value(t.name, .{}, writer);
+        try writer.writeAll("}");
+    } else try writer.writeAll("null");
+    try writer.writeAll(",\"field\":");
+    if (found.field) |path| try std.json.Stringify.value(path, .{}, writer) else try writer.writeAll("null");
     try writer.writeAll(",\"probe\":");
     if (found.probe) |probe| {
         try writer.print("{{\"address\":\"0x{x}\",\"physical\":\"0x{x}\"}}", .{ probe.address, probe.physical });
@@ -299,11 +338,14 @@ test "a variable of this process, found by its name where the process sees it" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const self = linux.getpid();
-    const found = (try find(arena, self, "det_symbol_test_value")).?;
+    const found = (try find(arena, self, "det_symbol_test_value", null)).?;
     try std.testing.expectEqual(@intFromPtr(&det_symbol_test_value), found.address);
     try std.testing.expectEqual(@as(u64, 8), found.size);
     try std.testing.expectEqual(Kind.object, found.kind);
-    try std.testing.expectEqual(@as(?Found, null), try find(arena, self, "det_symbol_no_such_name"));
+    try std.testing.expectEqual(@as(?Found, null), try find(arena, self, "det_symbol_no_such_name", null));
+    // Its type from the test binary's DWARF.
+    try std.testing.expectEqual(dwarf_types.Kind.unsigned, found.type.?.kind);
+    try std.testing.expectEqual(@as(u64, 8), found.type.?.size);
     // Its page is there (it was read above); its frame only a privileged reader sees.
     if (linux.geteuid() == 0) try std.testing.expect(found.physical != null and found.probe != null);
 }

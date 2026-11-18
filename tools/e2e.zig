@@ -1048,6 +1048,44 @@ fn check_debugging_symbol(context: *Context) !void {
         .{ "det:watch at its address stopped at the next connection's write, one more", before != null and hit != null and hit.? == before.? + 1 },
         .{ "read again there, the value the stop said", hit != null and after != null and after.? == hit.? },
     }, "debugging: a node's variable by its name (selftest_accepted at 0x{x}, page 0x{x}: {?d}, then {?d})", .{ address.?, physical.?, before, hit });
+    // A structure's fields by their paths, typed by the node's DWARF: selftest_stats whole,
+    // its last_client and its ratio (half its count), the ratio watched as a double.
+    const typed = try explore(context, &(common ++ [_][]const u8{
+        "--tape",                                                                                                                                             tape, "--at-vtime-ms", "3000", "--exec",
+        "det-nodes symbol echo selftest_stats; det-nodes symbol echo selftest_stats --field last_client; det-nodes symbol echo selftest_stats --field ratio",
+    }));
+    const whole_at = std.mem.indexOf(u8, typed, "address\\\":\\\"0x") orelse 0;
+    const base = hex_after(typed[whole_at..], "address\\\":\\\"0x");
+    const aggregate = std.mem.indexOf(u8, typed, "kind\\\":\\\"aggregate\\\",\\\"size\\\":24") != null;
+    const client_at = std.mem.indexOf(u8, typed, "field\\\":\\\"last_client");
+    const ratio_at = std.mem.indexOf(u8, typed, "field\\\":\\\"ratio");
+    // Each line's own address comes before its field: the last address before it.
+    const address_before = struct {
+        fn of(text: []const u8, end: usize) ?u64 {
+            const key = "address\\\":\\\"0x";
+            const at = std.mem.lastIndexOf(u8, text[0..end], key) orelse return null;
+            return hex_after(text[at..end], key);
+        }
+    }.of;
+    const client_address = if (client_at) |at| address_before(typed, at) else null;
+    const ratio_address = if (ratio_at) |at| address_before(typed, at) else null;
+    const client_typed = std.mem.indexOf(u8, typed, "kind\\\":\\\"signed\\\",\\\"size\\\":4") != null;
+    const ratio_typed = std.mem.indexOf(u8, typed, "kind\\\":\\\"float\\\",\\\"size\\\":8") != null;
+    var ratio_hit: ?f64 = null;
+    if (ratio_address) |watched_address| {
+        const ratio_script = try std.fs.path.join(arena, &.{ context.scratch, "debugging-ratio.txt" });
+        try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = ratio_script, .data = try std.fmt.allocPrint(arena, "det:watch 0x{x} 8\ndet:background echo ping | nc -w 1 {s} 7000\ndet:continue 3000\ndet:watch off\n", .{ watched_address, ip }) });
+        const ratio_watched = try explore(context, &(common ++ [_][]const u8{ "--tape", tape, "--at-vtime-ms", "3000", "--exec-script", ratio_script }));
+        const ratio_prefix = try std.fmt.allocPrint(arena, "\"watch\":\"0x{x}\",\"size\":8,\"hex\":\"", .{watched_address});
+        if (little_u64_after(ratio_watched, ratio_prefix, 0)) |bits| ratio_hit = @bitCast(bits);
+    }
+    const expected_ratio: ?f64 = if (before) |count| @as(f64, @floatFromInt(count + 1)) / 2.0 else null;
+    expect_all(context, &.{
+        .{ "the structure whole: an aggregate of 24 bytes", aggregate and base != null },
+        .{ "last_client 8 bytes in, a signed 4-byte integer", base != null and client_address != null and client_address.? == base.? + 8 and client_typed },
+        .{ "ratio 16 bytes in, an 8-byte float", base != null and ratio_address != null and ratio_address.? == base.? + 16 and ratio_typed },
+        .{ "ratio watched: the connection's write, half the count", ratio_hit != null and expected_ratio != null and ratio_hit.? == expected_ratio.? },
+    }, "debugging: a structure's fields by their paths, typed by DWARF (selftest_stats at 0x{x}: ratio {?d})", .{ base orelse 0, ratio_hit });
 }
 
 /// The hexadecimal number right after `prefix` in `text`, or null.
