@@ -3342,7 +3342,9 @@ fn check_runs(context: *Context) !void {
         sleep_ms(100);
     }
     const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
-    const system = [_][]const u8{ "--data", data, "--program", program, "--scenario", "bank", "--branching", "flat", "--jobs", "2" };
+    // --coverage off as every self-test's run in a store asks: bank-test is not instrumented,
+    // and serve's gate stopped run 1 after its fifth timeline ("no coverage in its first 5").
+    const system = [_][]const u8{ "--data", data, "--program", program, "--scenario", "bank", "--branching", "flat", "--jobs", "2", "--coverage", "off" };
     // One to its end, as at a terminal, its events elsewhere (--events-dir): the run links them.
     // serve took the link for no directory (NotDir) and never opened such runs (srv3, 65-71).
     const elsewhere = try std.fs.path.join(arena, &.{ context.scratch, "runs-events-elsewhere" });

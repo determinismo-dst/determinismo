@@ -1262,6 +1262,10 @@ fn run_request_write(
         .branching = @tagName(arguments.branching),
         .faults = arguments.faults_added,
         .no_faults = arguments.faults_none,
+        // The coverage set changes the system (what its nodes report and pause at): serve's
+        // replays of the run need it, and its coverage gate reads "off" here (a terminal's run
+        // with --coverage off was stopped after its fourth timeline, 2026-11-18).
+        .coverage = arguments.coverage,
         .timeline = arguments.timeline_text,
         .min_drive = arguments.min_drive_text,
         .drivers_cpu_weight = arguments.drivers_cpu_weight_text,
