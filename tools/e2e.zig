@@ -5220,8 +5220,9 @@ fn check_shape(context: *Context) !void {
 /// return, over TCP (48 timelines: the pipeline's first two generations of 16 start from the
 /// setup snapshot), and the timelines of its first judged generation start from its moments (each
 /// the middle of a timeline's span, their reason "middle of timeline <n>"), while the composer's
-/// named draws are answered by a strategy of their own (`use-strategy-for!`: zeros); the deepest
-/// timeline replays alone from its tape, without the strategy.
+/// named draws are answered by a strategy of their own (`use-strategy-for!`: zeros), jank's host
+/// through the ring (the shared mapping), babashka's through its socket; the deepest timeline
+/// replays alone from its tape, without the strategy.
 fn check_repl_strategy(context: *Context) !void {
     const bb = context.bb orelse {
         std.debug.print("SKIP repl-strategy: no babashka (-Dbb or $DETERMINISMO_BB)\n", .{});
@@ -5284,13 +5285,17 @@ fn check_repl_strategy(context: *Context) !void {
         // The composer's draws answered zeros: on the tapes as overrides.
         const zeroed = try run_kept(context, &.{ "grep", "-rlF", "\"hex\":\"0000", tapes });
         const zeroed_tapes = count_lines(zeroed.stdout, "branch-");
+        // jank's host takes its calls through the shared mapping (the ring), babashka's its socket.
+        const ringed = std.mem.indexOf(u8, report, "its calls through a shared mapping") != null;
+        const ring_wanted = std.mem.eql(u8, host.name, "jank");
         expect_all(context, &.{
+            .{ "its calls through a ring under jank, its socket under babashka", ringed == ring_wanted },
             .{ "the composer's decisions answered by its own strategy (zeros, on the tapes)", zeroed_tapes > 0 },
             .{ "48 timelines explored", count == 48 },
             .{ "timelines from the strategy's moments", middle > 0 },
             .{ "the deepest replays alone from its tape, without the strategy", deep.depth >= 1 and deep.replays },
-        }, "repl strategy ({s}): {d} timelines, {d} from its moments, {d} tapes with the composer's zeros; #{?d}, {d} deep, replays alone: {}", .{
-            host.name, count, middle, zeroed_tapes, deep.index, deep.depth, deep.replays,
+        }, "repl strategy ({s}): {d} timelines, {d} from its moments, {d} tapes with the composer's zeros, through a ring: {}; #{?d}, {d} deep, replays alone: {}", .{
+            host.name, count, middle, zeroed_tapes, ringed, deep.index, deep.depth, deep.replays,
         });
     }
 }
