@@ -29,6 +29,7 @@ const usage =
     \\       det-nodes exec [--coverage] <node> <command>...
     \\       det-nodes list
     \\       det-nodes symbol <node> <name> [--field <path>] [--pid <pid>]
+    \\       det-nodes where <node> <address>... [--pid <pid>]
     \\       det-nodes writeback
     \\       det-nodes samples
     \\
@@ -121,6 +122,52 @@ pub fn main(init: std.process.Init) !void {
         }
         std.debug.print("det-nodes: no process of {s} defines {s}\n", .{ node.name, arguments[3] });
         std.process.exit(1);
+    }
+    if (eql(u8, command, "where")) {
+        // `where <node> <address>... [--pid <pid>]`: what holds each address in the node's
+        // processes (symbol.zig's where): its module and the function there, a JSON line each,
+        // from the first process that maps it (or the one given): a stack's return addresses
+        // named.
+        if (arguments.len < 4) return usage_exit();
+        const node = system.node(arguments[2]) orelse return error.UnknownNode;
+        var given: ?std.os.linux.pid_t = null;
+        var addresses: std.ArrayList(u64) = .empty;
+        var index: usize = 3;
+        while (index < arguments.len) : (index += 1) {
+            if (eql(u8, arguments[index], "--pid")) {
+                if (index + 1 >= arguments.len) return usage_exit();
+                given = try std.fmt.parseInt(std.os.linux.pid_t, arguments[index + 1], 10);
+                index += 1;
+                continue;
+            }
+            try addresses.append(arena, try std.fmt.parseInt(u64, arguments[index], 0));
+        }
+        var found_pids: [1024]std.os.linux.pid_t = undefined;
+        const pids = if (given) |pid| blk: {
+            found_pids[0] = pid;
+            break :blk found_pids[0..1];
+        } else found_pids[0..try nodes.processes(node.name, &found_pids)];
+        if (pids.len == 0) {
+            std.debug.print("det-nodes: {s} has no process\n", .{node.name});
+            std.process.exit(1);
+        }
+        var out: std.Io.Writer.Allocating = .init(arena);
+        for (addresses.items) |address| {
+            var found = try symbol.where(arena, pids[0], address);
+            for (pids[1..]) |pid| {
+                if (found.module != null) break;
+                found = try symbol.where(arena, pid, address);
+            }
+            try symbol.where_print(&out.writer, found);
+        }
+        const text = out.written();
+        var written: usize = 0;
+        while (written < text.len) {
+            const result = std.os.linux.write(1, text[written..].ptr, text.len - written);
+            if (std.os.linux.errno(result) != .SUCCESS) return error.Write;
+            written += result;
+        }
+        return;
     }
     if (arguments.len != 3) return usage_exit();
     const name = arguments[2];

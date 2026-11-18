@@ -534,6 +534,120 @@ std::string determinismo_debug_hex(std::string const &decimal) {
      (tap/tell :across {:run run :condition condition :timelines (count matched) :results results}
                results))))
 
+(def ^:private rust-escapes
+  [["$LT$" "<"] ["$GT$" ">"] ["$RF$" "&"] ["$BP$" "*"] ["$C$" ","] ["$u20$" " "] ["$u27$" "'"]
+   ["$u5b$" "["] ["$u5d$" "]"] ["$u7b$" "{"] ["$u7d$" "}"] ["$u7e$" "~"] [".." "::"]])
+
+(defn demangle
+  "A symbol's path when it is a nested name (`_ZN<length><part>...E`: Rust's legacy mangling,
+  C++'s namespaces), its Rust hash part dropped and Rust's escapes undone:
+  _ZN10turso_core2io10Completion8complete17h735acbbdf5edf53fE is
+  turso_core::io::Completion::complete. Anything else as it is."
+  [mangled]
+  (if-not (and (string? mangled) (str/starts-with? mangled "_ZN") (str/ends-with? mangled "E"))
+    mangled
+    (loop [at 3 parts []]
+      (let [digits (apply str (take-while (fn [c] (str/includes? "0123456789" (str c))) (subs mangled at)))]
+        (if (= "" digits)
+          (let [parts (if (and (seq parts) (re-matches #"h[0-9a-f]{16}" (peek parts))) (pop parts) parts)]
+            (if (empty? parts)
+              mangled
+              (str/join "::" (map (fn [part] (reduce (fn [text [from to]] (str/replace text from to)) part rust-escapes)) parts))))
+          (let [n (parse-long digits)
+                from (+ at (count digits))]
+            (if (> (+ from n) (count mangled))
+              mangled
+              (recur (+ from n) (conj parts (subs mangled from (+ from n)))))))))))
+
+(defn where
+  "What holds each address in a node's processes (`det-nodes where`): its module and the function
+  of its symbol table there, :name that function's path demangled, :offset how far in. A guest
+  command: the session's future its own after it (look first). Options: :pid, the process.
+  -> [{:address :module :symbol :name :offset} ...]"
+  ([session node addresses] (where session node addresses {}))
+  ([session node addresses options]
+   (let [node (named node)
+         found (vec (mapcat (fn [chunk]
+                              (let [said (sh session (str "det-nodes where " node " " (str/join " " (map hex chunk))
+                                                          (when (:pid options) (str " --pid " (:pid options)))))]
+                                (keep (fn [line] (when (str/starts-with? line "{") (json/read-json line)))
+                                      (str/split-lines (or said "")))))
+                            (partition-all 150 addresses)))
+         named-found (mapv (fn [one] (assoc one :address (unhex (:address one)) :name (demangle (:symbol one)))) found)]
+     (tap/tell :where {:session session :node node :found named-found} named-found))))
+
+(defn- little-u64
+  "8 bytes in memory order (little-endian) as a number, exact: a long when it fits one (so it
+  meets `unhex`'s numbers as map keys), else a bigint."
+  [bytes]
+  (let [n (reduce (fn [n b] (+ (* n 256) b)) 0N (reverse bytes))]
+    (if (<= n 9223372036854775807) (long n) n)))
+
+(defn frames
+  "The calls a process is in, at a stop of the session's inside it (a breakpoint's or a watch's:
+  the vCPU's registers are then that process's): the words of its stack from the stack pointer
+  on (:pages of 4 KiB, 4) that point into a function of one of its modules, innermost first,
+  named by `where` (a guest command after the stack is read). Return addresses only: a leaf
+  function has none of its own, and a word a returned call left behind is named too. Options:
+  :pid, :pages. -> [{:address :module :symbol :name :offset} ...]"
+  ([session node] (frames session node {}))
+  ([session node options]
+   (let [registers (regs session)
+         space (unhex (:cr3 registers))
+         rsp (unhex (:rsp registers))
+         start (- rsp (mod rsp 4096))
+         words (vec (mapcat (fn [page]
+                              (let [va (+ start (* page 4096))
+                                    physical (translate session space va)]
+                                (when physical
+                                  (let [bytes (mem session physical 4096)]
+                                    (keep (fn [i] (when (>= (+ va i) rsp) (little-u64 (subvec bytes i (+ i 8)))))
+                                          (range 0 4096 8))))))
+                            (range (or (:pages options) 4))))
+         ;; User-space addresses only (below 2^47): the rest are data.
+         candidates (vec (distinct (filter (fn [w] (and (>= w 4096) (< w 140737488355328))) words)))
+         named-all (where session node candidates (select-keys options [:pid]))
+         by-address (into {} (map (fn [one] [(:address one) one]) named-all))
+         stack (vec (dedupe (keep (fn [w] (let [one (get by-address w)] (when (:symbol one) one))) words)))]
+     (tap/tell :frames {:session session :node (named node) :frames stack} stack))))
+
+(defn moment-when
+  "The first moment of a timeline where `holds?` is true, by bisection: `holds?` is called with a
+  session opened there (a fresh one each look, closed after), false at :from-ms and true at
+  :to-ms; first to the millisecond, then to the taken branch (det:step on from the millisecond).
+  Looks only in `holds?` (regs, translate, mem; a guest command makes the session's future its
+  own): a session that runs no guest command is the recorded timeline (exact sessions; on an
+  explorer before them a session's future parts slightly from the recording).
+  -> {:ms :branches (taken after :ms) :regs (there)}"
+  [run branch holds? {:keys [from-ms to-ms]}]
+  (let [probe (fn [ms k]
+                (let [s (open run {:branch branch :at-vtime-ms ms})]
+                  (try
+                    (when (pos? k) (step* s (str "det:step " k)))
+                    [(boolean (holds? s)) (regs s)]
+                    (finally (close s)))))
+        [from-held _] (probe from-ms 0)
+        [to-held _] (probe to-ms 0)]
+    (when (or from-held (not to-held))
+      (throw (ex-info "determinismo: moment-when wants false at :from-ms and true at :to-ms"
+                      {:from-ms from-ms :from from-held :to-ms to-ms :to to-held})))
+    (let [[lo hi] (loop [lo from-ms hi to-ms]
+                    (if (<= (- hi lo) 1)
+                      [lo hi]
+                      (let [mid (quot (+ lo hi) 2)]
+                        (if (first (probe mid 0)) (recur lo mid) (recur mid hi)))))
+          [_ at-lo] (probe lo 0)
+          [_ at-hi] (probe hi 0)
+          span (- (:branches at-hi) (:branches at-lo))
+          k (loop [blo 0 bhi span]
+              (if (<= (- bhi blo) 1)
+                bhi
+                (let [mid (quot (+ blo bhi) 2)]
+                  (if (first (probe lo mid)) (recur blo mid) (recur mid bhi)))))
+          [_ at] (probe lo k)
+          found {:ms lo :branches k :regs at}]
+      (tap/tell :moment-when {:run run :branch branch :found found} found))))
+
 (defn step-branches
   "On `n` taken branches (jumps, calls, returns), stopped there: the registers then."
   [session n]
