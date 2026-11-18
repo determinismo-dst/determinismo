@@ -222,15 +222,30 @@ const Names = struct {
                 return gopclntab.name(arena, found, name_size_max) orelse by_module;
             };
         }
+        return names.function(module, base, at) orelse by_module;
+    }
+
+    /// The ELF function of `module` holding `at` (its address less the module's bias), its name
+    /// demangled, and how far in; null where the module's symbols name none.
+    fn function(names: *const Names, module: *const Module, base: []const u8, at: u64) ?[]const u8 {
         const index = (@intFromPtr(module) - @intFromPtr(names.process.modules.ptr)) / @sizeOf(Module);
-        if (index >= names.symbols_read.len) return by_module;
+        if (index >= names.symbols_read.len) return null;
         if (!names.symbols_read[index]) {
             names.symbols_read[index] = true;
-            names.symbols[index] = symbols_load(arena, names.process.pid, module.path);
+            names.symbols[index] = symbols_load(names.arena, names.process.pid, module.path);
         }
-        const symbols = names.symbols[index] orelse return by_module;
-        const found = symbols.find(at) orelse return by_module;
-        return elfsyms.name(arena, found, if (base.len > 0) base else "?", name_size_max) orelse by_module;
+        const symbols = names.symbols[index] orelse return null;
+        const found = symbols.find(at) orelse return null;
+        return elfsyms.name(names.arena, found, if (base.len > 0) base else "?", name_size_max);
+    }
+
+    /// `address`'s ELF function alone, beside the line `name` gives a module with a table of
+    /// lines: null outside code or the module's symbols.
+    fn function_of(names: *const Names, address: u64, returned: bool) ?[]const u8 {
+        const mapping = names.process.code_at(address) orelse return null;
+        const module = names.process.module_of(mapping.path) orelse return null;
+        const at = address - module.bias - @intFromBool(returned);
+        return names.function(module, std.fs.path.basename(mapping.path), at);
     }
 };
 
@@ -442,16 +457,23 @@ pub fn live(arena: std.mem.Allocator, process: *const Process, memory_fd: linux.
 
 pub const Walked = struct { frames: []const Frame, scanned: []const Frame };
 
-/// Each of `addresses` in a live process, named as a walk names its frames (det-nodes where: a
-/// stopped process's stack, read by the VMM, named in the guest): its source line, its Go
-/// function and line, its ELF function and offset, else its module and offset; null for an
-/// address no code mapping of the process holds. `returned`: each a return address, the call
-/// before it named.
-pub fn named(arena: std.mem.Allocator, process: *const Process, addresses: []const u64, returned: bool) ![]const ?[]const u8 {
+/// An address named: `at` as a walk names its frames, `function` its ELF function beside it
+/// (where `at` is a source line, the function holding it).
+pub const Named = struct { at: ?[]const u8, function: ?[]const u8 };
+
+/// Each of `addresses` in a live process (det-nodes where: a stopped process's stack, read by the
+/// VMM, named in the guest): `at` its source line, its Go function and line, its ELF function and
+/// offset, else its module and offset, and `function` its ELF function; both null for an address
+/// no code mapping of the process holds. `returned`: each a return address, the call before it
+/// named.
+pub fn named(arena: std.mem.Allocator, process: *const Process, addresses: []const u64, returned: bool) ![]const Named {
     const names: Names = .of(arena, process);
-    const found = try arena.alloc(?[]const u8, addresses.len);
-    for (addresses, found) |address, *name| {
-        name.* = if (process.code_at(address) == null) null else names.name(address, returned);
+    const found = try arena.alloc(Named, addresses.len);
+    for (addresses, found) |address, *one| {
+        one.* = if (process.code_at(address) == null) .{ .at = null, .function = null } else .{
+            .at = names.name(address, returned),
+            .function = names.function_of(address, returned),
+        };
     }
     return found;
 }
@@ -565,8 +587,11 @@ test "named: a function of the process by its ELF symbol, a stack address outsid
     const addresses = [_]u64{ @intFromPtr(&det_where_named_test_function), @intFromPtr(&local) };
     const found = try named(arena, &process, &addresses, false);
     try std.testing.expectEqual(@as(usize, 2), found.len);
-    const function = found[0] orelse return error.TestUnnamed;
-    try std.testing.expect(std.mem.startsWith(u8, function, "det_where_named_test_function+0x0 "));
-    try std.testing.expectEqual(@as(?[]const u8, null), found[1]);
+    const at = found[0].at orelse return error.TestUnnamed;
+    const function = found[0].function orelse return error.TestUnnamed;
+    try std.testing.expect(std.mem.startsWith(u8, at, "det_where_named_test_function+0x0 "));
+    try std.testing.expectEqualStrings(at, function);
+    try std.testing.expectEqual(@as(?[]const u8, null), found[1].at);
+    try std.testing.expectEqual(@as(?[]const u8, null), found[1].function);
     local += 1;
 }

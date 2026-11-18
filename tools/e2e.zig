@@ -1241,8 +1241,14 @@ fn check_client(context: *Context) !void {
         \\        j (d/open 1 {{:branch 0 :at-vtime-ms 2000}})
         \\        jiffies-at-2s (d/value-of (d/mem j (d/translate j :current jiffies) 8) :u64)
         \\        _ (d/close j)
-        \\        reached (d/moment-when 1 0 (fn [t] (>= (d/value-of (d/mem t (d/translate t :current jiffies) 8) :u64) (+ jiffies-at-2s 500)))
-        \\                               {{:from-ms 2000 :to-ms 3000}})
+        \\        held? (fn [t] (>= (d/value-of (d/mem t (d/translate t :current jiffies) 8) :u64) (+' jiffies-at-2s 500)))
+        \\        reached (d/moment-when 1 0 held? {{:from-ms 2000 :to-ms 3000}})
+        \\        ;; The first moment: not yet one taken branch before it, held at it. (Not 2.5 s
+        \\        ;; itself: a tickless guest's jiffies, read at 2 s, can be behind.)
+        \\        edge (let [e (d/open 1 {{:branch 0 :at-vtime-ms (:ms reached)}})]
+        \\               (try (when (pos? (:branches reached)) (d/step-branches e (dec (:branches reached))))
+        \\                    (let [before (held? e)] (d/step-branches e 1) [before (held? e)])
+        \\                    (finally (d/close e))))
         \\        across (d/across 1 condition
         \\                         (fn [t] (let [found (d/symbol t :echo :selftest_accepted)]
         \\                                   (connect t 1)
@@ -1263,7 +1269,7 @@ fn check_client(context: *Context) !void {
         \\    (said "frames" (and (seq framed) (every? (fn [f] (string? (:at f))) framed)
         \\                        (some (fn [f] (str/includes? (:at f) "selftest")) framed))
         \\          (mapv :at framed))
-        \\    (said "moment-when" (and (<= 2490 (:ms reached) 2510) (some? (:rip (:regs reached)))) (dissoc reached :regs) (:rip (:regs reached)))
+        \\    (said "moment-when" (and (= [false true] edge) (< 2000 (:ms reached) 3000) (some? (:rip (:regs reached)))) (dissoc reached :regs) edge (:rip (:regs reached)))
         \\    (said "across-both" (and (= [0 1] (mapv :branch across))
         \\                             (every? (fn [r] (and (= 1 (count (:result r))) (pos? (first (:result r))))) across))
         \\          (mapv (juxt :branch :timeline :result) across))))
@@ -1293,7 +1299,7 @@ fn check_client(context: *Context) !void {
             .{ "the call's parameter by its DWARF name and type (client, i32)", good[6] },
             .{ "a float argument from its vector register, the integer after it from rdi", good[7] },
             .{ "a stop's frames, named as a crash's stack is (det-nodes where), the node's own code among them", good[8] },
-            .{ "moment-when: jiffies' +500 ticks from 2 s found at 2.5 s, to the branch", good[9] },
+            .{ "moment-when: jiffies' +500 ticks from 2 s, not yet one branch before the moment found, held at it", good[9] },
             .{ "across: the same look in both timelines", good[10] },
         }, "client: the REPL's session, symbols, values, calls and across, from {s} ({s})", .{ runner.name, out[0..@min(out.len, 1200)] });
     }

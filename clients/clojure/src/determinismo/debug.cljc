@@ -537,10 +537,10 @@ std::string determinismo_debug_hex(std::string const &decimal) {
 (defn where
   "Each address named in a node's processes (`det-nodes where`) as a crash's stack names its
   frames: its source line when its module has the table coverage reads, its Go function and line,
-  its ELF function (Rust's and C++'s demangled) and offset, else its module and offset; :at nil
-  outside their code. A guest command: the session's future its own after it (look first).
-  Options: :pid, the process; :return, each a return address (the call before it named).
-  -> [{:address :at} ...]"
+  its ELF function (Rust's and C++'s demangled) and offset, else its module and offset;
+  :function its ELF function beside a source line; both nil outside their code. A guest command:
+  the session's future its own after it (look first). Options: :pid, the process; :return, each
+  a return address (the call before it named). -> [{:address :at :function} ...]"
   ([session node addresses] (where session node addresses {}))
   ([session node addresses options]
    (let [node (named node)
@@ -567,7 +567,7 @@ std::string determinismo_debug_hex(std::string const &decimal) {
   on (:pages of 4 KiB, 4) that point into a function of one of its modules, innermost first,
   named by `where` as return addresses (a guest command after the stack is read). A leaf
   function has none of its own, and a word a returned call left behind is named too. Options:
-  :pid, :pages. -> [{:address :at} ...]"
+  :pid, :pages. -> [{:address :at :function} ...]"
   ([session node] (frames session node {}))
   ([session node options]
    (let [registers (regs session)

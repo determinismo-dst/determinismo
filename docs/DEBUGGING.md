@@ -98,7 +98,8 @@ registers at its entry, by their parameters' names and types when the module has
 float's from its vector register) take it from there, keeping to the process's address space from its
 first stop there. `det-nodes where <node> <address>... [--return]` names each address as a crash's
 stack names its frames (its source line, its Go function and line, its ELF function with Rust's
-and C++'s paths demangled, else its module and offset); the REPL's `frames` reads a process's
+and C++'s paths demangled, else its module and offset), with the ELF function beside a line;
+the REPL's `frames` reads a process's
 stack at a stop inside it (a breakpoint's, a watch's) and names the words that are return
 addresses, innermost first, and `moment-when`
 bisects a timeline to the first moment a look holds (a fresh session each look, to the

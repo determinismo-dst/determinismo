@@ -128,8 +128,9 @@ pub fn main(init: std.process.Init) !void {
         // `where <node> <address>... [--pid <pid>] [--return]`: each address named as a crash's
         // stack names its frames (where.zig: its source line, its Go function and line, its ELF
         // function and offset, else its module and offset), from the first of the node's
-        // processes (or the one given) whose code holds it; a JSON line each, {"address","at"},
-        // `at` null outside their code. `--return`: each a return address (a stack's words),
+        // processes (or the one given) whose code holds it; a JSON line each,
+        // {"address","at","function"} (`function` its ELF function beside a source line), null
+        // outside their code. `--return`: each a return address (a stack's words),
         // the call before it named.
         if (arguments.len < 4) return usage_exit();
         const node = system.node(arguments[2]) orelse return error.UnknownNode;
@@ -159,23 +160,25 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("det-nodes: {s} has no process\n", .{node.name});
             std.process.exit(1);
         }
-        const names = try arena.alloc(?[]const u8, addresses.items.len);
-        @memset(names, null);
+        const names = try arena.alloc(where.Named, addresses.items.len);
+        @memset(names, .{ .at = null, .function = null });
         for (pids) |pid| {
             const process: where.Process = .read(arena, pid);
             defer process.release();
             const found = try where.named(arena, &process, addresses.items, returned);
             var unnamed: u32 = 0;
             for (names, found) |*name, one| {
-                if (name.* == null) name.* = one;
-                unnamed += @intFromBool(name.* == null);
+                if (name.at == null) name.* = one;
+                unnamed += @intFromBool(name.at == null);
             }
             if (unnamed == 0) break;
         }
         var out: std.Io.Writer.Allocating = .init(arena);
         for (addresses.items, names) |address, name| {
             try out.writer.print("{{\"address\":\"0x{x}\",\"at\":", .{address});
-            if (name) |text| try std.json.Stringify.value(text, .{}, &out.writer) else try out.writer.writeAll("null");
+            if (name.at) |text| try std.json.Stringify.value(text, .{}, &out.writer) else try out.writer.writeAll("null");
+            try out.writer.writeAll(",\"function\":");
+            if (name.function) |text| try std.json.Stringify.value(text, .{}, &out.writer) else try out.writer.writeAll("null");
             try out.writer.writeAll("}\n");
         }
         const text = out.written();
