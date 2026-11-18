@@ -4272,21 +4272,23 @@ fn claims_look(state: *TreeState, pool: ?*cpus.Pool, running: []Running, jobs: u
     }
     const held_before = state.claims.held_max;
     state.claims.sample(cpus.host_in_use(), claims_pool.run_held(), @intCast(running.len), jobs, state.ended);
-    const said = state.claims.softened;
     const claim = state.claims.claim(cpus.claim_bytes);
     claims_pool.claim_soft_set(claim);
-    // Said at its first look that counts, and when its VMs first claim less than their guest.
-    if (claim != 0 and !said) {
+    // Said at its first look that counts, and whenever its VMs' claim goes below their guest's
+    // size or back to it (what they hold grew: Vitess's run 2070 claimed 11 GiB of 16 at 40
+    // timelines, its guest's size again some minutes later, and said nothing of it).
+    if (claim != 0 and (state.claims_said == 0 or held_before == 0)) {
         std.debug.print("[determinismo] the run's VMs claim {d} MiB each from now, not their guest's " ++
             "{d}: half again what the host had in use for each ({d} timelines ended)\n", .{
             claim >> 20, cpus.claim_bytes >> 20, state.ended,
         });
-    } else if (held_before == 0 and state.claims.held_max != 0) {
+    } else if (claim == 0 and state.claims.held_max != 0 and (held_before == 0 or state.claims_said != 0)) {
         std.debug.print("[determinismo] the run's VMs claim their guest's {d} MiB each: the host had " ++
-            "{d} MiB in use for each ({d} timelines ended)\n", .{
+            "{d} MiB in use for each at most ({d} timelines ended)\n", .{
             cpus.claim_bytes >> 20, state.claims.held_max >> 20, state.ended,
         });
     }
+    state.claims_said = claim;
 }
 
 const Running = struct {
@@ -5005,6 +5007,8 @@ const TreeState = struct {
     ended: u64 = 0,
     claims: cpus.ClaimLearning = .{},
     claims_looked_ns: u64 = 0,
+    /// The claim said last (0: the guests' size), for a line when it changes.
+    claims_said: u64 = 0,
 
     /// Why a behavior comes first, when it does (each preference as asked).
     fn preferred(state: *const TreeState, behavior: *const Events.Behavior) Preferred {
