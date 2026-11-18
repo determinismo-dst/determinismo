@@ -6540,16 +6540,19 @@ fn check_plan_calls(context: *Context) !void {
             }
         }
     }.wait;
-    const learning = try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(.{ .program = bank, .scenario = "bank", .seed = 1, .branches = 4 }, .{})});
+    // "coverage":"off" as the other checks that start the bank through serve: bank-test is not
+    // instrumented, and serve's gate stopped these runs at their fourth timeline ("0 of 0
+    // choices as imagined", 2026-11-18).
+    const learning = try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(.{ .program = bank, .scenario = "bank", .seed = 1, .branches = 4, .coverage = "off" }, .{})});
     _ = try curl(context, &.{ "-X", "POST", "-d", learning, url ++ "/runs" });
     wait_ended(context, url ++ "/runs/2");
     const Draw = struct { name: []const u8 = "", drew: []const u8 = "" };
     const Setup = struct { index: u32 = 0, draws: []const Draw = &.{} };
     const Imagined = struct { seed: u64 = 0, setups: []const Setup = &.{} };
-    const bank_asked = try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(.{ .program = bank, .scenario = "bank", .seed = 7, .branches = 4, .plan = true }, .{})});
+    const bank_asked = try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(.{ .program = bank, .scenario = "bank", .seed = 7, .branches = 4, .coverage = "off", .plan = true }, .{})});
     const bank_planned = curl(context, &.{ "-X", "POST", "-d", bank_asked, url ++ "/runs" }) catch "";
     const imagined = std.json.parseFromSliceLeaky(Imagined, arena, bank_planned, .{ .ignore_unknown_fields = true }) catch Imagined{};
-    const executed = try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(.{ .program = bank, .scenario = "bank", .seed = imagined.seed, .branches = 4 }, .{})});
+    const executed = try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(.{ .program = bank, .scenario = "bank", .seed = imagined.seed, .branches = 4, .coverage = "off" }, .{})});
     _ = try curl(context, &.{ "-X", "POST", "-d", executed, url ++ "/runs" });
     wait_ended(context, url ++ "/runs/3");
     const first_draws = "{\"sql\":\"SELECT timeline, name, arg_min(drew, pull)::VARCHAR AS drew FROM timeline_draws WHERE part = 'own' GROUP BY timeline, name\"}";
