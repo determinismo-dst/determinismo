@@ -5242,9 +5242,11 @@ fn check_repl_strategy(context: *Context) !void {
         try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = script, .data = try std.fmt.allocPrint(arena,
             \\(require '[determinismo.strategy :as strategy] '[determinismo.http :as http])
             \\(strategy/use-strategy! :middle)
-            \\;; Per service: the composer's named draws all zeros, every other process's left as drawn.
+            \\;; Per service: the composer's named draws all zeros, every other process's left as drawn
+            \\;; (asked only of named draws, told only assertions: no call per pull or log line).
             \\(swap! strategy/strategies assoc :zeros
-            \\       {{:decide (fn [_ request] {{:hex (apply str (repeat (* 2 (:size request)) "0")) :reason "zeros"}})}})
+            \\       {{:decide (fn [_ request] {{:hex (apply str (repeat (* 2 (:size request)) "0")) :reason "zeros"}})
+            \\        :wants ["labeled" "assertions"]}})
             \\(strategy/use-strategy-for! #"^det-composer$" :zeros)
             \\;; Served only when right: a moment past 2^31 ns from two below it (jank 0.1's + wraps at
             \\;; 32 bits there), and decisions by their source.
