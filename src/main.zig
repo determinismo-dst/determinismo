@@ -5524,7 +5524,7 @@ fn tree_judge_poll(arena: std.mem.Allocator, start: MakerStart, state: *TreeStat
         if (making.ready or making.waiting) continue;
         var poll_fds = [_]linux.pollfd{.{ .fd = making.socket, .events = linux.POLL.IN, .revents = 0 }};
         const result = linux.poll(&poll_fds, 1, 0);
-        if (linux.errno(result) == .SUCCESS and result > 0) node_make_finish(arena, making);
+        if (linux.errno(result) == .SUCCESS and result > 0) node_make_finish(making);
     }
     try makings_start(arena, start, makings, state.jobs, &state.nodes_skipped);
     for (makings) |making| if (!making.ready) return false;
@@ -5837,7 +5837,7 @@ fn tree_judge_end(
         var replayed: NodeMaking = .{ .back = making.back, .parent = making.parent, .tape_directory = tapes, .chain_from = making.chain_from };
         const parent_recorded = try Recorded.load(arena, tapes, making.parent.index, making.parent.seed, state.tape_buffer);
         try node_make_start(arena, vm, options, &replayed, parent_recorded);
-        node_make_finish(arena, &replayed);
+        node_make_finish(&replayed);
         const replay_node = replayed.snapshot orelse continue;
         snapshots_compare(making.back, held_node, replay_node);
         node_free(replay_node, branches.snapshot);
@@ -6911,7 +6911,7 @@ fn makings_finish_all(arena: std.mem.Allocator, start: MakerStart, makings: []No
     while (true) {
         try makings_start(arena, start, makings, jobs, skipped);
         if (makings_in_flight(makings) == 0) break; // None waits then: the first always starts.
-        makings_finish_any(arena, makings);
+        makings_finish_any(makings);
     }
     for (makings) |making| assert(making.ready);
 }
@@ -6919,7 +6919,7 @@ fn makings_finish_all(arena: std.mem.Allocator, start: MakerStart, makings: []No
 /// Waits for whichever maker in flight answers first and collects every one that has: not the
 /// oldest, whose wait held the others' room (Kafka 1928's judgment, makers allowed one to three
 /// at a time by memory: a 47 s one done, the next started only as a 194 s one ended; 636 s).
-fn makings_finish_any(arena: std.mem.Allocator, makings: []NodeMaking) void {
+fn makings_finish_any(makings: []NodeMaking) void {
     var polled: [jobs_max]linux.pollfd = undefined;
     var which: [jobs_max]u32 = undefined;
     var count: usize = 0;
@@ -6934,13 +6934,13 @@ fn makings_finish_any(arena: std.mem.Allocator, makings: []NodeMaking) void {
         const ready = linux.poll(&polled, @intCast(count), -1);
         if (linux.errno(ready) == .INTR) continue;
         if (linux.errno(ready) != .SUCCESS) {
-            node_make_finish(arena, &makings[which[0]]); // Waited for in order, as before.
+            node_make_finish(&makings[which[0]]); // Waited for in order, as before.
             return;
         }
         break;
     }
     for (polled[0..count], which[0..count]) |entry, at| {
-        if (entry.revents != 0) node_make_finish(arena, &makings[at]);
+        if (entry.revents != 0) node_make_finish(&makings[at]);
     }
 }
 
@@ -6989,7 +6989,7 @@ test "a maker short of room waits, not the explorer: the one in flight is left t
     // The memory unknown: never a reason to wait.
     try std.testing.expect(maker_may_start(&makings, 40, 0));
     // None in flight: the first starts whatever the memory (its own admission waits).
-    node_make_finish(arena_state.allocator(), &makings[0]);
+    node_make_finish(&makings[0]);
     try std.testing.expect(makings[0].ready);
     try std.testing.expect(maker_may_start(&makings, 40, 1 * gib));
     // Those that wait are not started in a run that starts no timeline any more.
@@ -7017,12 +7017,12 @@ test "a judgment short of room collects the maker that answers first, not the ol
         making.* = .{ .back = undefined, .parent = undefined, .pid = @intCast(pid), .socket = pair[0] };
     }
     const start_ns = monotonic_ns();
-    makings_finish_any(arena_state.allocator(), &makings);
+    makings_finish_any(&makings);
     try std.testing.expect(!makings[0].ready);
     try std.testing.expect(makings[1].ready);
     try std.testing.expect(monotonic_ns() - start_ns < std.time.ns_per_s);
     try std.testing.expectEqual(@as(u32, 1), makings_in_flight(&makings));
-    makings_finish_any(arena_state.allocator(), &makings);
+    makings_finish_any(&makings);
     try std.testing.expectEqual(@as(u32, 0), makings_in_flight(&makings));
 }
 
@@ -7054,7 +7054,7 @@ test "a node whose holder on disk did not load is a replay's: not from disk, no 
             .socket = pair[0],
             .disk = .{ .held = .{ .pid = 0, .worker = 0, .id = 0, .vtime_ns = 5, .disk = true }, .branch = 3, .disk = &disk, .io = std.testing.io },
         };
-        node_make_finish(arena, &making);
+        node_make_finish(&making);
         try std.testing.expect(making.ready);
         try std.testing.expect(making.snapshot != null);
         _ = linux.close(making.snapshot.?.memory_fd);
@@ -7063,7 +7063,7 @@ test "a node whose holder on disk did not load is a replay's: not from disk, no 
     }
 }
 
-fn node_make_finish(arena: std.mem.Allocator, making: *NodeMaking) void {
+fn node_make_finish(making: *NodeMaking) void {
     if (making.ready) return;
     assert(making.pid > 0);
     defer {
@@ -7073,12 +7073,14 @@ fn node_make_finish(arena: std.mem.Allocator, making: *NodeMaking) void {
         making.ready = true; // Collected (made or not): once.
     }
     const fd = fd_pass.receive(making.socket) catch return; // It failed, and said why.
-    const snapshot = arena.create(Snapshot) catch {
+    const snapshot = node_snapshot_create() catch {
         close(fd);
         return;
     };
     if (!read_exact(making.socket, std.mem.asBytes(snapshot))) {
         close(fd);
+        _ = node_snapshots.remove(@intFromPtr(snapshot));
+        std.heap.page_allocator.destroy(snapshot);
         return;
     }
     snapshot.memory_fd = fd;
@@ -7452,10 +7454,61 @@ fn rings_name(snapshot: *const Snapshot, address: u64) void {
 }
 
 /// Releases a tree node's memory (never the setup snapshot's), once its branches ran.
+/// A node's snapshot struct (2.98 MB: the events' state it carries), its own pages so that
+/// node_free gives them back (in the run's arena, a run of short timelines kept every one: 6,230
+/// nodes and 19.5 GiB in Turso's run 2071 at 8.6 hours).
+fn node_snapshot_create() !*Snapshot {
+    const snapshot = try std.heap.page_allocator.create(Snapshot);
+    assert(std.mem.isAligned(@intFromPtr(snapshot), std.heap.page_size_min));
+    node_snapshots.put(std.heap.page_allocator, @intFromPtr(snapshot), {}) catch {
+        std.heap.page_allocator.destroy(snapshot);
+        return error.OutOfMemory;
+    };
+    return snapshot;
+}
+
+/// The node snapshots node_snapshot_create made whose pages node_free has not given back yet.
+var node_snapshots: std.AutoHashMapUnmanaged(usize, void) = .empty;
+
+/// A freed node's snapshot struct, all but the page holding its memory's descriptor (-1 now,
+/// read by node_free again) given back to the kernel: what a Planned still pointing at it reads
+/// of the rest is zeros (nothing does but a log line's start, read only while it lives).
+fn node_pages_release(snapshot: *Snapshot) void {
+    if (!node_snapshots.remove(@intFromPtr(snapshot))) return;
+    const page = std.heap.page_size_min;
+    const base = @intFromPtr(snapshot);
+    const end = std.mem.alignForward(usize, base + @sizeOf(Snapshot), page);
+    const keep_start = std.mem.alignBackward(usize, base + @offsetOf(Snapshot, "memory_fd"), page);
+    const keep_end = std.mem.alignForward(usize, base + @offsetOf(Snapshot, "memory_fd") + @sizeOf(linux.fd_t), page);
+    if (keep_start > base) _ = linux.madvise(@ptrFromInt(base), keep_start - base, linux.MADV.DONTNEED);
+    if (end > keep_end) _ = linux.madvise(@ptrFromInt(keep_end), end - keep_end, linux.MADV.DONTNEED);
+}
+
+test "a freed node's snapshot gives its pages back, its memory's descriptor kept closed" {
+    const snapshot = try node_snapshot_create();
+    defer std.heap.page_allocator.destroy(snapshot);
+    @memset(std.mem.asBytes(snapshot), 1);
+    const root = try node_snapshot_create();
+    defer {
+        _ = node_snapshots.remove(@intFromPtr(root));
+        std.heap.page_allocator.destroy(root);
+    }
+    snapshot.memory_fd = @intCast(linux.memfd_create("node-test", linux.MFD.CLOEXEC));
+    node_free(snapshot, root);
+    try std.testing.expectEqual(@as(linux.fd_t, -1), snapshot.memory_fd);
+    // A byte far from its descriptor reads as the zero page: its memory went back.
+    const bytes = std.mem.asBytes(snapshot);
+    const far = if (@offsetOf(Snapshot, "memory_fd") < bytes.len / 2) bytes.len - 1 else 0;
+    try std.testing.expectEqual(@as(u8, 0), bytes[far]);
+    node_free(snapshot, root); // Freed again: nothing (its descriptor is not closed twice).
+    try std.testing.expectEqual(@as(linux.fd_t, -1), snapshot.memory_fd);
+}
+
 fn node_free(snapshot: *const Snapshot, root: *const Snapshot) void {
     if (snapshot == root or snapshot.memory_fd < 0) return;
     close(snapshot.memory_fd);
     @constCast(snapshot).memory_fd = -1;
+    node_pages_release(@constCast(snapshot));
 }
 
 /// Antithesis's rewind: runs the branch to the first event matching --until, then moves the
