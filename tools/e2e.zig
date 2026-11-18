@@ -1242,7 +1242,7 @@ fn check_client(context: *Context) !void {
         \\    (said "ratios-half-a-connection" (and (= 2 (count ratios)) (every? float? ratios) (== 0.5 (- (second ratios) (first ratios)))) ratios)
         \\    (said "call-descriptor" (and (some? fd) (< 2 fd 1024)) (:args (first served)))
         \\    (said "call-float" (and (= ["ratio" "f64" "client" "i32"] (mapcat (juxt :name :type) recorded))
-        \\                            (double? recorded-ratio) (> recorded-ratio 1.5) (== 0.0 (mod (* 2 recorded-ratio) 1.0))
+        \\                            (float? recorded-ratio) (> recorded-ratio 1.5) (== 0.0 (mod (* 2 recorded-ratio) 1.0))
         \\                            (< 2 (:value (second recorded)) 1024))
         \\          recorded)
         \\    (said "call-params" (= [{{:name "client" :type "i32" :value fd}}] (:params (first served))) (:params serve-fn) (:params (first served)))
