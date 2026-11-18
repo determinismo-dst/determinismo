@@ -735,7 +735,7 @@ pub fn main(init: std.process.Init) !void {
     // its memory: each of its VMs claims its guest's size with the CPU it runs on.
     // A verify replay is its explorer's run (`--run-key`, named by the verifier): one of its
     // ancestors, or the key is not taken.
-    cpus.run_key = if (arguments.run_key) |key| (if (cpus.is_ancestor(key)) key else linux.getpid()) else linux.getpid();
+    cpus.run_key = if (arguments.run_key) |key| (if (cpus.run_key_take(key)) key else linux.getpid()) else linux.getpid();
     cpus.claim_bytes = @as(u64, arguments.memory_mib) << 20;
     const vm = try arena.create(VM); // Large (port statistics): never on the stack.
     const profile = arguments.profile orelse "";

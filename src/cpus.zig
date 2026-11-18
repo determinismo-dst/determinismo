@@ -106,6 +106,83 @@ test is_ancestor {
     try std.testing.expect(!is_ancestor(@intCast(pid)));
 }
 
+/// A verify replay's run (`--run-key`, its explorer's pid): taken only while the explorer is one
+/// of this process's ancestors, and then this process dies with the verifier's thread that
+/// started it. The explorer stops its verifier's process group at the budget's grace and dies
+/// with a stopped run, and each replay is a process group of its own (replays.zig run_to_file):
+/// Vitess's trial run 2072 (2026-11-18) left a replay running minutes after it ended, a CPU and
+/// its 16 GiB claim beside the next run's first VMs. Asked for before the ancestors are read: a
+/// verifier gone between the two leaves this process reparented, and the key refused.
+pub fn run_key_take(key: linux.pid_t) bool {
+    _ = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @backingInt(linux.SIG.KILL), 0, 0, 0);
+    if (is_ancestor(key)) return true;
+    _ = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), 0, 0, 0, 0);
+    return false;
+}
+
+test "a verify replay that took its run's key dies with the verifier that started it" {
+    // This process is the run's explorer, its child the verifier, the child's child the replay.
+    const explorer = linux.getpid();
+    var fds: [2]i32 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), linux.pipe2(&fds, .{ .CLOEXEC = true }));
+    defer _ = linux.close(fds[0]);
+    const verifier = linux.fork();
+    if (verifier == 0) {
+        const replay = linux.fork();
+        if (replay == 0) {
+            const pid: i32 = linux.getpid();
+            var said: [5]u8 = undefined;
+            said[0] = @intFromBool(run_key_take(explorer));
+            @memcpy(said[1..], std.mem.asBytes(&pid));
+            _ = linux.write(fds[1], &said, said.len);
+            const pause: linux.timespec = .{ .sec = 30, .nsec = 0 };
+            _ = linux.nanosleep(&pause, null);
+            linux.exit_group(0);
+        }
+        const pause: linux.timespec = .{ .sec = 30, .nsec = 0 };
+        _ = linux.nanosleep(&pause, null);
+        linux.exit_group(0);
+    }
+    _ = linux.close(fds[1]);
+    var said: [5]u8 = undefined;
+    var read: usize = 0;
+    while (read < said.len) {
+        const size = linux.read(fds[0], said[read..].ptr, said.len - read);
+        if (linux.errno(size) == .INTR) continue;
+        try std.testing.expect(linux.errno(size) == .SUCCESS and size > 0);
+        read += size;
+    }
+    const replay = std.mem.bytesToValue(i32, said[1..5]);
+    defer _ = linux.kill(replay, .KILL); // Survived: not left running after the test.
+    try std.testing.expectEqual(@as(u8, 1), said[0]);
+    // The verifier stopped (the budget's grace over, or the explorer gone): the replay with it.
+    _ = linux.kill(@intCast(verifier), .KILL);
+    var status: i32 = 0;
+    _ = linux.waitpid(@intCast(verifier), &status, 0);
+    var waited_ms: u32 = 0;
+    while (alive(replay) and waited_ms < 3000) : (waited_ms += 10) {
+        const step: linux.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+        _ = linux.nanosleep(&step, null);
+    }
+    try std.testing.expect(!alive(replay));
+}
+
+/// Whether `pid` runs: there and not a zombie.
+fn alive(pid: linux.pid_t) bool {
+    var path_buffer: [32]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}/stat", .{pid}, 0) catch return false;
+    const opened = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(opened) != .SUCCESS) return false;
+    const fd: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(fd);
+    var buffer: [512]u8 = undefined;
+    const size = linux.read(fd, &buffer, buffer.len);
+    if (linux.errno(size) != .SUCCESS) return false;
+    const stat = buffer[0..size];
+    const close = std.mem.lastIndexOfScalar(u8, stat, ')') orelse return false;
+    return close + 2 < stat.len and stat[close + 2] != 'Z' and stat[close + 2] != 'X';
+}
+
 /// The memory this process's VMs may come to use (their guest's size), claimed with the CPU it
 /// takes: set once at its start, forks inherit it. 0: none claimed.
 pub var claim_bytes: u64 = 0;
