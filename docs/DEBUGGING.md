@@ -54,7 +54,8 @@ process that maps it.
 Steps a moment's script runs (`--exec-script`, a serve session's steps), the VMM's own, the
 vCPU stopped:
 
-    det:regs                                  the registers, a JSON line (rip, rsp, ..., cr3)
+    det:regs                                  the registers, a JSON line (rip, rsp, ..., cr3, and
+                                              xmm0 to xmm7's low 64 bits: float arguments)
     det:mem <guest physical address> [bytes]  memory as hex, 4 KiB at most (64 by default)
     det:poke <address>=<hex bytes>[,...]      written into guest RAM
     det:step <n>                              the guest runs on n taken branches (jumps, calls,
@@ -94,7 +95,7 @@ pointers not), a function's `params` from its DWARF definition (`name`, `kind`, 
 a stop in any address space is told the process's or not. The REPL's `symbol`, `watch-values`
 (a variable's writes) and `calls` (a function's calls, its arguments the calling convention's
 registers at its entry, by their parameters' names and types when the module has DWARF: a
-float's not read yet) take it from there, keeping to the process's address space from its
+float's from its vector register) take it from there, keeping to the process's address space from its
 first stop there. `across` does one look in many timelines: a session in each of a run's
 timelines an event query keeps (the first eight, or those named), opened at the condition's
 first match, the look done there and the session closed, one session at a time. Looking moves nothing: these steps leave the vCPU where it is, the next one queued runs there,

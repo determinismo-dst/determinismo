@@ -2339,7 +2339,7 @@ fn debug_breakpoint_hit(vm: *VM) !bool {
         collect.hits += 1;
     }
     const now = try vm.moment();
-    var buffer: [512]u8 = undefined;
+    var buffer: [1024]u8 = undefined;
     var line: std.Io.Writer = .fixed(&buffer);
     line.print("[determinismo] {s}: {{\"vtime_ns\":{d},\"branches\":{d},\"rip\":\"0x{x}\",\"cr3\":\"0x{x}\"", .{
         if (stopping) "break" else "hit", now.vtime_ns, now.branches, regs.rip, sregs.cr3,
@@ -2348,6 +2348,8 @@ fn debug_breakpoint_hit(vm: *VM) !bool {
         line.print(",\"rdi\":\"0x{x}\",\"rsi\":\"0x{x}\",\"rdx\":\"0x{x}\",\"rcx\":\"0x{x}\",\"r8\":\"0x{x}\",\"r9\":\"0x{x}\"", .{
             regs.rdi, regs.rsi, regs.rdx, regs.rcx, regs.r8, regs.r9,
         }) catch unreachable;
+        const vectors = try vm.vector_registers();
+        for (vectors, 0..) |vector, index| line.print(",\"xmm{d}\":\"0x{x}\"", .{ index, vector }) catch unreachable;
     } else {
         const watchpoint = vm.watchpoint.?;
         const guest = GuestMemory{ .bytes = vm.memory };
@@ -2488,13 +2490,31 @@ fn debug_regs(vm: *VM) !void {
     _ = try kvm.ioctl(vm.vcpu_fd, kvm.GET_REGS, @intFromPtr(&regs));
     var sregs: kvm.Sregs = undefined;
     _ = try kvm.ioctl(vm.vcpu_fd, kvm.GET_SREGS, @intFromPtr(&sregs));
+    const vectors = try vm.vector_registers();
     const now = try vm.moment();
     std.debug.print("[determinismo] regs: {{\"vtime_ns\":{d},\"branches\":{d},\"rip\":\"0x{x}\",\"rsp\":\"0x{x}\"," ++
         "\"rbp\":\"0x{x}\",\"rax\":\"0x{x}\",\"rbx\":\"0x{x}\",\"rcx\":\"0x{x}\",\"rdx\":\"0x{x}\",\"rsi\":\"0x{x}\"," ++
-        "\"rdi\":\"0x{x}\",\"r8\":\"0x{x}\",\"r9\":\"0x{x}\",\"rflags\":\"0x{x}\",\"cr3\":\"0x{x}\"}}\n", .{
-        now.vtime_ns, now.branches, regs.rip, regs.rsp, regs.rbp,    regs.rax,  regs.rbx, regs.rcx, regs.rdx,
-        regs.rsi,     regs.rdi,     regs.r8,  regs.r9,  regs.rflags, sregs.cr3,
+        "\"rdi\":\"0x{x}\",\"r8\":\"0x{x}\",\"r9\":\"0x{x}\",\"rflags\":\"0x{x}\",\"cr3\":\"0x{x}\",\"xmm0\":\"0x{x}\"," ++
+        "\"xmm1\":\"0x{x}\",\"xmm2\":\"0x{x}\",\"xmm3\":\"0x{x}\",\"xmm4\":\"0x{x}\",\"xmm5\":\"0x{x}\",\"xmm6\":\"0x{x}\"," ++
+        "\"xmm7\":\"0x{x}\"}}\n", .{
+        now.vtime_ns, now.branches, regs.rip,   regs.rsp,   regs.rbp,    regs.rax,  regs.rbx,   regs.rcx,   regs.rdx,
+        regs.rsi,     regs.rdi,     regs.r8,    regs.r9,    regs.rflags, sregs.cr3, vectors[0], vectors[1], vectors[2],
+        vectors[3],   vectors[4],   vectors[5], vectors[6], vectors[7],
     });
+}
+
+/// The low 64 bits of xmm0 to xmm7, where x86-64's calling convention passes floating-point
+/// arguments (a double whole, a float in the low 32), from the vCPU's XSAVE area (its legacy
+/// region: xmm0 at byte 160, 16 bytes each).
+fn vector_registers(vm: *VM) ![8]u64 {
+    var xsave: kvm.Xsave = undefined;
+    _ = try kvm.ioctl(vm.vcpu_fd, kvm.GET_XSAVE, @intFromPtr(&xsave));
+    var low: [8]u64 = undefined;
+    for (&low, 0..) |*vector, index| {
+        const at = 160 / 4 + 4 * index; // In u32s.
+        vector.* = @as(u64, xsave.region[at]) | @as(u64, xsave.region[at + 1]) << 32;
+    }
+    return low;
 }
 
 /// Guest physical [address, address + size) at the moment, hex (det:mem): 4 KiB at most.

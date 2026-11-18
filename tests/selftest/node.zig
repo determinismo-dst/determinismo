@@ -450,6 +450,7 @@ pub fn main(init: std.process.Init) !void {
         selftest_stats.accepted += 1;
         selftest_stats.last_client = @intCast(client);
         selftest_stats.ratio = @as(f64, @floatFromInt(selftest_stats.accepted)) / 2.0;
+        @call(.never_inline, selftest_record, .{ selftest_stats.ratio, @as(i32, @intCast(client)) });
         @call(.never_inline, selftest_serve, .{@as(i32, @intCast(client))});
     }
 }
@@ -468,6 +469,13 @@ export var selftest_stats: Stats = .{ .accepted = 0, .last_client = -1, .ratio =
 export fn selftest_serve(client: i32) callconv(.c) void {
     serve(client);
 }
+
+/// A float argument before an integer one (the REPL's `calls` by DWARF: ratio in xmm0, client in
+/// rdi, the float not taking an integer register).
+export fn selftest_record(ratio: f64, client: i32) callconv(.c) void {
+    selftest_recorded = if (client >= 0) ratio else -1;
+}
+export var selftest_recorded: f64 = 0;
 
 fn on_urgent(_: linux.SIG) callconv(.c) void {}
 

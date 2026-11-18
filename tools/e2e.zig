@@ -931,6 +931,7 @@ fn check_debugging(context: *Context) !void {
     const zeros = try std.fmt.allocPrint(context.arena, "\"address\":\"0x{x}\",\"size\":8,\"hex\":\"0000000000000000\"", .{physical});
     expect_all(context, &.{
         .{ "det:regs printed the vCPU's registers", std.mem.indexOf(u8, stepped, "[determinismo] regs: {\"vtime_ns\":3000") != null },
+        .{ "det:regs said the vector registers too (xmm0 to xmm7)", std.mem.indexOf(u8, stepped, "\"xmm0\":\"0x") != null and std.mem.indexOf(u8, stepped, "\"xmm7\":\"0x") != null },
         .{ "det:mem printed memory", std.mem.indexOf(u8, stepped, "[determinismo] mem: {") != null },
         .{ "det:translate walked the page tables to jiffies' physical address", std.mem.indexOf(u8, stepped, try std.fmt.allocPrint(context.arena, "\"physical\":\"0x{x}\"", .{physical})) != null },
         .{ "det:poke changed it, det:mem read it back", std.mem.indexOf(u8, stepped, zeros) != null },
@@ -1223,6 +1224,10 @@ fn check_client(context: *Context) !void {
         \\        serve-fn (d/symbol s :echo :selftest_serve)
         \\        _ (connect s 1)
         \\        served (d/calls s serve-fn {{:limit 1 :ms 3000}})
+        \\        record-fn (d/symbol s :echo :selftest_record)
+        \\        _ (connect s 1)
+        \\        recorded (:params (first (d/calls s record-fn {{:limit 1 :ms 3000}})))
+        \\        recorded-ratio (:value (first recorded))
         \\        _ (d/close s)
         \\        across (d/across 1 condition
         \\                         (fn [t] (let [found (d/symbol t :echo :selftest_accepted)]
@@ -1236,6 +1241,10 @@ fn check_client(context: *Context) !void {
         \\    (said "ratio-16-in" (= 16 (- (number (:address ratio)) (number (:address stats)))) (:address stats) (:address ratio))
         \\    (said "ratios-half-a-connection" (and (= 2 (count ratios)) (every? float? ratios) (== 0.5 (- (second ratios) (first ratios)))) ratios)
         \\    (said "call-descriptor" (and (some? fd) (< 2 fd 1024)) (:args (first served)))
+        \\    (said "call-float" (and (= ["ratio" "f64" "client" "i32"] (mapcat (juxt :name :type) recorded))
+        \\                            (double? recorded-ratio) (> recorded-ratio 1.5) (== 0.0 (mod (* 2 recorded-ratio) 1.0))
+        \\                            (< 2 (:value (second recorded)) 1024))
+        \\          recorded)
         \\    (said "call-params" (= [{{:name "client" :type "i32" :value fd}}] (:params (first served))) (:params serve-fn) (:params (first served)))
         \\    (said "across-both" (and (= [0 1] (mapv :branch across))
         \\                             (every? (fn [r] (and (= 1 (count (:result r))) (pos? (first (:result r))))) across))
@@ -1253,7 +1262,7 @@ fn check_client(context: *Context) !void {
     for (runners.items) |runner| {
         const ran = try run_kept(context, runner.argv);
         const out = try std.mem.concat(arena, u8, &.{ ran.stdout, ran.stderr });
-        const names = [_][]const u8{ "regs", "accepted-u64", "ratio-f64", "ratio-16-in", "ratios-half-a-connection", "call-descriptor", "call-params", "across-both" };
+        const names = [_][]const u8{ "regs", "accepted-u64", "ratio-f64", "ratio-16-in", "ratios-half-a-connection", "call-descriptor", "call-params", "call-float", "across-both" };
         var good: [names.len]bool = undefined;
         for (names, 0..) |name, index| good[index] = std.mem.indexOf(u8, out, try std.fmt.allocPrint(arena, "ok {s} ", .{name})) != null;
         expect_all(context, &.{
@@ -1264,7 +1273,8 @@ fn check_client(context: *Context) !void {
             .{ "its writes after two connections, half a connection apart", good[4] },
             .{ "a function's call, its argument the connection's descriptor", good[5] },
             .{ "the call's parameter by its DWARF name and type (client, i32)", good[6] },
-            .{ "across: the same look in both timelines", good[7] },
+            .{ "a float argument from its vector register, the integer after it from rdi", good[7] },
+            .{ "across: the same look in both timelines", good[8] },
         }, "client: the REPL's session, symbols, values, calls and across, from {s} ({s})", .{ runner.name, out[0..@min(out.len, 1200)] });
     }
 }

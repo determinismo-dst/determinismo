@@ -348,6 +348,10 @@ std::string determinismo_debug_hex(std::string const &decimal) {
   "Where x86-64's calling convention puts a function's integer and pointer arguments, in order."
   [:rdi :rsi :rdx :rcx :r8 :r9])
 
+(def ^:private vector-registers
+  "Where it puts floating-point ones (each read in its low 64 bits: det:regs, a collected hit)."
+  [:xmm0 :xmm1 :xmm2 :xmm3 :xmm4 :xmm5 :xmm6 :xmm7])
+
 (defn- register-bytes
   "A register's value (\"0x...\") as its 8 bytes in memory order (little-endian)."
   [said]
@@ -359,22 +363,29 @@ std::string determinismo_debug_hex(std::string const &decimal) {
 (defn- parameter-values
   "A call's parameters (a `symbol`'s :params, from DWARF) by x86-64's calling convention, at the
   function's entry: an integer, a pointer or a boolean in the next of rdi rsi rdx rcx r8 r9,
-  read as its type; a float in a vector register (not read: nil); from an aggregate passed by
-  value on, where each is not known (nil). -> [{:name :type :value} ...]"
+  a float in the next of xmm0 ... xmm7, each read as its type; from an aggregate passed by
+  value on, where each is not known (nil). A register the answer does not have (an explorer
+  before the vector registers) gives nil. -> [{:name :type :value} ...]"
   [params registers]
-  (loop [params params next-register 0 placed true out []]
+  (loop [params params next-integer 0 next-vector 0 placed true out []]
     (if (empty? params)
       out
       (let [param (first params)
             kind (:kind param)
             integer (contains? #{"signed" "unsigned" "boolean" "pointer"} kind)
+            float (= kind "float")
             type (value-type param)
-            register (when (and placed integer type (< next-register (count integer-registers)))
-                       (get registers (nth integer-registers next-register)))
+            register (when (and placed type)
+                       (cond (and integer (< next-integer (count integer-registers)))
+                             (get registers (nth integer-registers next-integer))
+                             (and float (< next-vector (count vector-registers)))
+                             (get registers (nth vector-registers next-vector))
+                             :else nil))
             value (when register (value-of (subvec (register-bytes register) 0 (:size param)) type))]
         (recur (rest params)
-               (if integer (inc next-register) next-register)
-               (and placed (or integer (= kind "float")))
+               (if integer (inc next-integer) next-integer)
+               (if float (inc next-vector) next-vector)
+               (and placed (or integer float))
                (conj out {:name (:name param) :type (:type param) :value value}))))))
 
 ;; A top-level name: jank cannot capture a local bound to a string literal in a closure.
@@ -477,8 +488,8 @@ std::string determinismo_debug_hex(std::string const &decimal) {
   one request (a window, as watch-values'), the first in the process stopped at to learn its
   address space; the breakpoint is off after. Each kept call is an exact moment, the
   function's first instruction not run yet. With the module's DWARF (the symbol's :params),
-  :params says them by name, each read as its type ([{:name \"client\" :type \"i32\" :value 5}];
-  a float's value nil). -> [{:args :params :vtime_ns :branches :rip :cr3} ...]"
+  :params says them by name, each read as its type ([{:name \"client\" :type \"i32\" :value 5}],
+  a float's from its vector register). -> [{:args :params :vtime_ns :branches :rip :cr3} ...]"
   ([session found] (calls session found {}))
   ([session found options]
    (let [address (:address found)
