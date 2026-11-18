@@ -1338,8 +1338,14 @@ test "a VM's memory claim counts while its CPU is held" {
 /// in every look, 169.3 GiB claimed of the 171.9 that may be, 110 GB available; 6.5% of the
 /// workers' time), and larger guests more (8 GiB: 40,472 s of a run 2060).
 pub const ClaimLearning = struct {
-    /// The most the host had in use for each of the run's VMs running, over its looks.
+    /// The looks a claim is learned from at most (claims_look in main.zig looks every 5 s: ten
+    /// minutes).
+    pub const looks_max = 120;
+    /// The most the host had in use for each of the run's VMs running, over its last looks
+    /// (`looks`, looks_max of them).
     held_max: u64 = 0,
+    looks: [looks_max]u64 = @splat(0),
+    looks_count: u32 = 0,
     /// The run said a claim under its guests' size.
     softened: bool = false,
     /// Memory ran short after that: its claims are its guests' size for good.
@@ -1351,10 +1357,17 @@ pub const ClaimLearning = struct {
     /// timelines ended as the run has workers (its VMs seen whole, not young) and while every
     /// worker has a timeline: the VMs admitted are then as many as memory lets in, where a
     /// run short of work (a judgment's nodes awaited, its end) has the host's other memory on
-    /// a few heads, and what it held at most never comes down again.
+    /// a few heads. The most of its last looks_max looks: a high one counts at once, and goes
+    /// once that many came after it (Turso's run 2071 learned 4.4 GiB a VM from one look with
+    /// 9 VMs admitted, where 39 held 1 GiB each for the rest of the run, its 40th worker kept
+    /// waiting for good).
     pub fn sample(learning: *ClaimLearning, in_use: u64, admitted: u32, workers: u32, jobs: u32, ended: u64) void {
         if (ended < jobs or admitted == 0 or workers < jobs) return;
-        learning.held_max = @max(learning.held_max, in_use / admitted);
+        learning.looks[learning.looks_count % looks_max] = in_use / admitted;
+        learning.looks_count += 1;
+        var most: u64 = 0;
+        for (learning.looks[0..@min(learning.looks_count, looks_max)]) |look| most = @max(most, look);
+        learning.held_max = most;
     }
 
     /// The claim to say for a VM of `guest` bytes: half again what one held at most; 0 (its
@@ -1403,6 +1416,21 @@ test "a run learns what its VMs hold once enough ended, and claims half again" {
     var large: ClaimLearning = .{};
     large.sample(150 * gib, 20, 40, 40, 400);
     try std.testing.expectEqual(@as(u64, 0), large.claim(8 * gib));
+}
+
+test "a look past the learning's window no longer counts: an early high one does not hold the claim for good" {
+    const gib: u64 = 1 << 30;
+    var learning: ClaimLearning = .{};
+    // Turso's run 2071 at its 41st timeline: 4.4 GiB in use for each VM admitted (few admitted
+    // yet, the host's other memory on them), past its 4 GiB guest: the guest's size.
+    learning.sample(40 * gib, 9, 40, 40, 41);
+    try std.testing.expectEqual(@as(u64, 0), learning.claim(4 * gib));
+    // Then 1 GiB a VM, 39 admitted, for as many looks as the window holds: the early one gone.
+    for (0..ClaimLearning.looks_max) |_| learning.sample(39 * gib, 39, 40, 40, 500);
+    try std.testing.expectEqual(gib + gib / 2, learning.claim(4 * gib));
+    // One look higher again counts at once (the window's most).
+    learning.sample(39 * 3 * gib, 39, 40, 40, 900);
+    try std.testing.expectEqual(@as(u64, 0), learning.claim(4 * gib));
 }
 
 test "memory short under a learned claim: the guest's size for good; never said, never short" {
