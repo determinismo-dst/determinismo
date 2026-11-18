@@ -28,6 +28,8 @@ pub const Options = struct {
     /// Or a directory of Kubernetes manifests, run in a single-node K3s cluster (kubernetes.zig)
     /// whose images' Antithesis test templates become the scenarios.
     kubernetes: ?[]const u8 = null,
+    /// Images loaded beside those the manifests name (explore's --images, comma-separated).
+    kubernetes_images: ?[]const u8 = null,
     /// A script for the composer and the fault injector (/det/script.json on the system disk).
     script: ?[]const u8 = null,
     /// The profile to resolve; null takes the first one.
@@ -692,7 +694,7 @@ pub fn profile_names(arena: std.mem.Allocator, io: std.Io, options: Options) ![]
 }
 
 fn describe(context: Context, options: Options) !schema.Description {
-    if (options.kubernetes) |directory| return kubernetes_describe(context, directory);
+    if (options.kubernetes) |directory| return kubernetes_describe(context, directory, options.kubernetes_images);
     if (options.compose) |path| {
         const profiles = try context.arena.alloc(schema.Profile, 1);
         profiles[0] = try compose.profile(context.arena, context.io, path);
@@ -718,7 +720,7 @@ fn describe(context: Context, options: Options) !schema.Description {
 /// context made here (`<cache>/kubernetes/<hash>`: K3s, the workload's images saved, the
 /// manifests, the setup and exec scripts, a wrapper per test template), and a scenario per
 /// template directory found in the workload's images, its first command the setup.
-fn kubernetes_describe(context: Context, directory: []const u8) !schema.Description {
+fn kubernetes_describe(context: Context, directory: []const u8, extra_images: ?[]const u8) !schema.Description {
     const arena = context.arena;
     const cwd = std.Io.Dir.cwd();
     // The manifests, by path relative to the directory (sorted: the hash and the copy follow).
@@ -742,6 +744,8 @@ fn kubernetes_describe(context: Context, directory: []const u8) !schema.Descript
         hasher.update(text);
         try kubernetes.images_note(arena, text, &images);
     }
+    // The launch's own (Antithesis's `images`): an operator's, named in a custom resource.
+    if (extra_images) |list| try kubernetes.images_add(arena, list, &images);
     // Every image, as K3s will find it (fully qualified: nothing is pulled in the guest), with
     // its test templates' files: test templates may be in any of them.
     var executables: std.ArrayList([]const u8) = .empty;

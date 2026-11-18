@@ -1552,6 +1552,8 @@ pub const RunRequest = struct {
     program: ?[]const u8 = null,
     compose: ?[]const u8 = null,
     kubernetes: ?[]const u8 = null,
+    /// With kubernetes: images loaded beside those its manifests name (explore's --images).
+    images: ?[]const u8 = null,
     scenario: ?[]const u8 = null,
     profile: ?[]const u8 = null,
     /// Absent: a fresh one, drawn by the server and kept in the run's request.json (as
@@ -3788,6 +3790,7 @@ fn session_futures_start(session: *Session, snapshot: []const u8) !void {
         .program_asked = original.program_asked,
         .compose = original.compose,
         .kubernetes = original.kubernetes,
+        .images = original.images,
         .scenario = original.scenario,
         .profile = original.profile,
         .seed = original.seed,
@@ -5167,6 +5170,7 @@ pub fn system_arguments(
     if (asked.program) |program| try argv.appendSlice(arena, &.{ "--program", program });
     if (asked.compose) |compose| try argv.appendSlice(arena, &.{ "--compose", compose });
     if (asked.kubernetes) |manifests| try argv.appendSlice(arena, &.{ "--kubernetes", manifests });
+    if (asked.images) |list| try argv.appendSlice(arena, &.{ "--images", list });
     try argv.append(arena, if (asked.cpu_modulation) "--cpu-modulation" else "--no-cpu-modulation");
     if (asked.cpu_modulation_stretch_us) |stretch| try argv.appendSlice(arena, &.{ "--cpu-modulation-stretch-us", stretch });
     // They change the system (what its nodes allow): runs and their replays both.

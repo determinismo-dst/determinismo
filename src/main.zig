@@ -25,6 +25,7 @@ const activity = @import("activity.zig");
 const saver_zig = @import("core").saver;
 const build_options = @import("build_options");
 const prepare = @import("prepare.zig");
+const kubernetes = @import("kubernetes.zig");
 const serve = @import("serve.zig");
 const mcp = @import("mcp.zig");
 const merge = @import("merge.zig");
@@ -306,6 +307,8 @@ const usage =
     \\
     \\system options (instead of --disk; see ARCHITECTURE.md §10):
     \\  (--program <test program> | --compose <compose.yaml> | --kubernetes <manifests dir>)
+    \\  [--images <ref,...>]   (with --kubernetes: images loaded beside those the manifests name,
+    \\                         fully qualified, as Antithesis's launch lists them: an operator's)
     \\  [--profile <name>|<a,b,..>|all]
     \\  [--scenario <name>|all] [--cache <dir>] [--script <script.json>]
     \\  [--faults +restart,+crash,-interleave,...]   (fault kinds every node also allows, or none
@@ -656,6 +659,10 @@ const Arguments = struct {
     compose_path: ?[]const u8 = null,
     /// Or a directory of Kubernetes manifests: a K3s node runs them (kubernetes.zig).
     kubernetes_path: ?[]const u8 = null,
+    /// With kubernetes_path: images loaded into the cluster beside those its manifests name in
+    /// `image:` fields (`--images a,b`, Antithesis's launch `images`): an operator's, named in a
+    /// custom resource (CloudNativePG's Cluster `imageName:`, ParadeDB's PostgreSQL).
+    kubernetes_images: ?[]const u8 = null,
     /// Commands and faults follow this script (determinismo script) instead of choosing.
     script_path: ?[]const u8 = null,
     profile: ?[]const u8 = null,
@@ -1271,6 +1278,7 @@ fn run_request_write(
         .program_asked = if (arguments.program_path) |path| try runs.absolute(arena, path) else null,
         .compose = if (arguments.compose_path) |path| try runs.absolute(arena, path) else null,
         .kubernetes = if (arguments.kubernetes_path) |path| try runs.absolute(arena, path) else null,
+        .images = arguments.kubernetes_images,
         .scenario = arguments.scenario,
         .profile = arguments.profile,
         .seed = arguments.seed,
@@ -1525,10 +1533,12 @@ fn system_prepare(
     const sources = @as(u32, @intFromBool(arguments.program_path != null)) +
         @intFromBool(arguments.compose_path != null) + @intFromBool(arguments.kubernetes_path != null);
     if (sources > 1) return error.Usage;
+    if (arguments.kubernetes_images != null and arguments.kubernetes_path == null) return error.Usage;
     const prepared = try prepare.prepare(arena, io, .{
         .program = arguments.program_path,
         .compose = arguments.compose_path,
         .kubernetes = arguments.kubernetes_path,
+        .kubernetes_images = arguments.kubernetes_images,
         .script = arguments.script_path,
         .profile = arguments.profile,
         .cache_directory = arguments.cache_directory,
@@ -8028,6 +8038,10 @@ fn parse_option(
         arguments.compose_path = value;
     } else if (eql(u8, flag, "--kubernetes")) {
         arguments.kubernetes_path = value;
+    } else if (eql(u8, flag, "--images")) {
+        var images = std.mem.tokenizeScalar(u8, value, ',');
+        while (images.next()) |image| if (!kubernetes.qualified(std.mem.trim(u8, image, " "))) return error.Usage;
+        arguments.kubernetes_images = value;
     } else if (eql(u8, flag, "--profile")) {
         arguments.profile = value;
     } else if (eql(u8, flag, "--scenario")) {

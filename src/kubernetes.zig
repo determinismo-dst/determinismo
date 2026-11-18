@@ -75,6 +75,34 @@ pub fn images_note(arena: std.mem.Allocator, manifest: []const u8, images: *std.
     }
 }
 
+/// The images of a comma-separated list (explore's --images) added to `images`, each once.
+pub fn images_add(arena: std.mem.Allocator, list: []const u8, images: *std.ArrayList([]const u8)) !void {
+    var listed = std.mem.tokenizeScalar(u8, list, ',');
+    while (listed.next()) |raw| {
+        const value = std.mem.trim(u8, raw, " ");
+        if (value.len == 0) continue;
+        for (images.items) |known| {
+            if (std.mem.eql(u8, known, value)) break;
+        } else {
+            if (images.items.len == images_max) return error.TooManyImages;
+            try images.append(arena, try arena.dupe(u8, value));
+        }
+    }
+}
+
+test images_add {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var images: std.ArrayList([]const u8) = .empty;
+    // ParadeDB's: its Cluster names PostgreSQL's image as `imageName:`, the launch lists it.
+    try images_note(arena, "  imageName: registry.example/paradedb:18-abc\n  image: docker.io/library/postgres:18\n", &images);
+    try std.testing.expectEqual(@as(usize, 1), images.items.len);
+    try images_add(arena, "registry.example/paradedb:18-abc, docker.io/library/postgres:18", &images);
+    try std.testing.expectEqual(@as(usize, 2), images.items.len); // The known one once.
+    try std.testing.expectEqualStrings("registry.example/paradedb:18-abc", images.items[1]);
+}
+
 /// Antithesis asks for fully qualified references (registry, name and tag or digest): the
 /// guest pulls nothing, so a reference must name the image K3s imported, as written.
 pub fn qualified(reference: []const u8) bool {
