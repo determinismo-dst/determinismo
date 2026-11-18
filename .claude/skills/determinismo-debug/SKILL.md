@@ -42,6 +42,14 @@ Every timeline replays exactly, so a failure is evidence, not flakiness. Follow
    `determinismo extract` for files and core dumps. The guest runs on while a command runs, so
    a long read sees a later moment: `--exec 'det:frozen <command>'` holds the nodes and the
    runner's side still meanwhile (read nodes from outside then: `/proc`, `/run/det/nodes/<node>`).
+   The program's own state, from a REPL (`docs/AGENTS.md`, "A REPL"; `(help "symbol")`): a
+   session at the moment (`(dbg/open run {:branch N :until "<condition>"})`), `dbg/symbol` for
+   a node's variable or function by its name (a field by its path, its type from DWARF),
+   `dbg/watch-values` for each write to it from there, `dbg/calls` for each call with its
+   arguments, each an exact moment to open another session at; `dbg/across` makes the same look
+   at a condition's first match in every timeline that has it (failing timelines against
+   passing ones). For a native program with its symbols (C, C++, Go, Rust, Zig), not a JVM's
+   Java fields.
 5. **Shrink its faults**: `determinismo script <events>` then `determinismo shrink <explore
    options> --script <script.json> --property '<message>'`: the fewest faults that still make it
    fail (or that it needs none), judged over 16 seeds, and the shrunk script for `--script`.
