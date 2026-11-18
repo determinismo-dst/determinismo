@@ -87,6 +87,7 @@
 //! DuckDB instance holds them all) and brought up to date by whoever asks first. A thread
 //! watches runs meanwhile: it reaps them, and ingests the timelines that finished.
 const std = @import("std");
+const regex = @import("regex");
 const main_zig = @import("main.zig");
 const event_files = @import("event_files.zig");
 const build_options = @import("build_options");
@@ -1721,6 +1722,8 @@ fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
         .ignore_unknown_fields = true,
     });
     if (asked.from_snapshot != null) return error.BadRequest; // A session's fork's alone.
+    // Refused here, as the explorer would refuse it at its start (det-faults' regex.zig).
+    if (asked.fault_exclusions) |pattern| _ = regex.Regex.compile(pattern) catch return error.BadRequest;
     if (asked.plan) return run_plan(server, asked, out);
     var run = asked;
     // A machine's checkpoint, as named (refused outside the machines' directory): flat branches.

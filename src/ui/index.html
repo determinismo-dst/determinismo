@@ -355,6 +355,7 @@ dialog h3 { font: 500 22px var(--slab); }
     <label>Scenario<input name="scenario" placeholder="bank"></label>
     <label>Profile<input name="profile" placeholder="default"></label>
     <label data-tip="How long each timeline's drivers run, in virtual time (empty: 4 to 64 command starts)">Timeline length<input name="timeline" placeholder="e.g. 15m"></label>
+    <label data-tip="Antithesis's fault_exclusions: a regular expression (Rust's syntax) over node names, and pod names on Kubernetes; a match gets no faults (e.g. ^(coredns|client)$, or names anywhere: coredns|client)">Fault exclusions<input name="fault_exclusions" placeholder="none: every node and pod gets faults"></label>
     <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px">
       <label>Time budget<input name="time_budget" placeholder="e.g. 10m"></label>
       <label>Timelines (at most)<input name="branches" type="number" value="64" min="1"></label>
@@ -4347,7 +4348,7 @@ $("#run-form").addEventListener("submit", async (event) => {
   if (form.get("seed")) request.seed = Number(form.get("seed")); // Else a fresh one.
   if (form.get("repeat")) request.repeat = true;
   if (form.get("branches")) request.branches = Number(form.get("branches"));
-  for (const key of ["scenario", "profile", "strategy", "time_budget", "timeline", "changed", "changed_repository"]) if (form.get(key)) request[key] = form.get(key);
+  for (const key of ["scenario", "profile", "strategy", "time_budget", "timeline", "changed", "changed_repository", "fault_exclusions"]) if (form.get(key)) request[key] = form.get(key);
   request.branching = request.strategy ? "flat" : form.get("branching");
   if (form.get("jobs")) request.jobs = Number(form.get("jobs"));
   for (const key of ["memory_mib", "verify_replays"]) if (form.get(key)) request[key] = Number(form.get(key));
