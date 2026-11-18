@@ -53,6 +53,32 @@ fn keep_available_min() u64 {
 /// makers are what a tree's pace hangs on, the holders in memory a cache for a few of its
 /// returns (etcd's 12-hour run 2007: 40 of 594 nodes from one, the makers 1.5 at a time for
 /// the room the holders kept).
+/// Whether a timeline's holder on disk is written by its own process, the timeline waiting (its
+/// VM stopped at the moment, its memory as it was), not by a forked writer while it goes on: a
+/// writer keeps every page the VM writes while it runs, up to the VM's whole memory, and so it
+/// may only when that much above the reserve is available. With `--holders-on-disk` writers
+/// were always forked: Vitess's calibration run 2070 (16 GiB guests, a disk that writes a
+/// holder in tens of seconds) went from 83 GB available to 3 in eight minutes, its anonymous
+/// memory from 6 to 35 GB, and the memory guard stopped it at 0.85 hours.
+fn disk_sync(sync_always: bool, available: u64, keep: u64, vm_bytes: u64) bool {
+    if (sync_always) return true;
+    return available != 0 and available < keep + vm_bytes;
+}
+
+test "a holder on disk is written in place when a writer's copies could take the reserve" {
+    const gib: u64 = 1 << 30;
+    const keep: u64 = 187 * gib / 12; // srv4's reserve.
+    // Room: a writer forked, the timeline goes on.
+    try std.testing.expect(!disk_sync(false, 150 * gib, keep, 16 * gib));
+    try std.testing.expect(!disk_sync(false, 25 * gib, keep, 4 * gib));
+    // Vitess's run 2070 (16 GiB guests, holders on disk): 30 GiB available, a writer's copies
+    // up to its VM's 16 would leave less than the reserve; in place.
+    try std.testing.expect(disk_sync(false, 30 * gib, keep, 16 * gib));
+    try std.testing.expect(disk_sync(false, 18 * gib, keep, 4 * gib));
+    try std.testing.expect(disk_sync(true, 150 * gib, keep, 16 * gib)); // Asked for (checks).
+    try std.testing.expect(!disk_sync(false, 0, keep, 16 * gib)); // Unknown: never a reason.
+}
+
 fn leaves(available: u64, keep: u64, vm_bytes: u64, vm_waits: bool, makers: u64) bool {
     if (available < keep) return true;
     if (vm_waits and available < keep + vm_bytes) return true;
@@ -957,7 +983,7 @@ pub const Owner = struct {
         // content. A replay makes such a node right.
         if (vm.events.check_used > 0) return;
         const available = cpus.memory_available();
-        if (owner.disk_always and owner.disk != null) return owner.disk_hold(vm, moment, point, owner.disk_sync_always);
+        if (owner.disk_always and owner.disk != null) return owner.disk_hold(vm, moment, point, disk_sync(owner.disk_sync_always, available, keep_available_min(), vm.memory.len));
         // None in memory either while an explorer's node makers wait for room (it would take
         // what the holders leaving give them): on disk then, as short of memory.
         if (available < make_available_min() + cpus.makers_wanted()) {
@@ -970,11 +996,12 @@ pub const Owner = struct {
                 make_available_min() >> 30,
             });
             owner.short_said = true;
-            // Below the reserve, written by this process while the timeline waits: a writer's
-            // fork costs the pages the VM writes while it runs, and there is no room for them.
+            // Short of a VM's memory above the reserve, written by this process while the
+            // timeline waits: a writer's fork costs the pages the VM writes while it runs, and
+            // there is no room for them (disk_sync).
             // Without it, nodes beside a hunt filling the host's memory were all replays (run
             // 1908, Pulsar's 40 VMs of 8 GB, 12 to 16 GB available: 8 of 9, a judgment of 747 s).
-            if (owner.disk != null) try owner.disk_hold(vm, moment, point, available < keep_available_min() or owner.disk_sync_always);
+            if (owner.disk != null) try owner.disk_hold(vm, moment, point, disk_sync(owner.disk_sync_always, available, keep_available_min(), vm.memory.len));
             return;
         }
         try owner.snapshot.capture(vm);
