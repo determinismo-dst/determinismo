@@ -470,13 +470,19 @@ std::string determinismo_debug_hex(std::string const &decimal) {
 
 (defn sh
   "A command in the guest at the session's moment (`det-nodes exec <node> ...` for a node's):
-  what it printed. The guest runs while it does."
+  what it printed. The guest runs while it does. Its own output only: a command left running
+  (det:background) prints into later steps' output too, under its own id."
   [session command]
   (let [raw (or (step* session command) "")
-        said (->> (str/split-lines raw)
-                  (keep (fn [line]
-                          (when-let [at (str/index-of line "{\"event\":\"exec_output\"")]
-                            (get-in (json/read-json (subs line at)) [:details :text]))))
+        events (keep (fn [line]
+                       (when-let [at (str/index-of line "{\"event\":\"exec_")]
+                         (json/read-json (subs line at))))
+                     (str/split-lines raw))
+        ;; This step's command is the one it starts: the first exec_start in its output.
+        id (some (fn [e] (when (= "exec_start" (:event e)) (get-in e [:details :id]))) events)
+        said (->> events
+                  (filter (fn [e] (and (= "exec_output" (:event e)) (some? id) (= id (get-in e [:details :id])))))
+                  (map (fn [e] (get-in e [:details :text])))
                   (apply str))]
     (tap/tell :sh {:session session :command command :said said :output raw} said)))
 
