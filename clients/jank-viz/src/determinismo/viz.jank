@@ -78,6 +78,16 @@
 (defn- hex2 [byte]
   (str (nth hex-digits (quot byte 16)) (nth hex-digits (mod byte 16))))
 
+(defn- hex-of
+  "An address as 0x... (a non-negative long)."
+  [n]
+  (if (zero? n)
+    "0x0"
+    (loop [n n out ()]
+      (if (zero? n)
+        (apply str "0x" out)
+        (recur (quot n 16) (conj out (nth hex-digits (mod n 16))))))))
+
 (defn- clip
   "`what` cut to `width` points at size `size`."
   [size width what]
@@ -585,6 +595,9 @@
         watched (last-told :watch-values happened)
         called (last-told :calls happened)
         across (last-told :across happened)
+        framed (last-told :frames happened)
+        whered (last-told :where happened)
+        momented (last-told :moment-when happened)
         value (if (var? value) (deref value) value)
         now (:session s)
         context (cond session (str "timeline #" (:from session) (when (:at-ns session) (str " at " (seconds (:at-ns session)))))
@@ -595,6 +608,25 @@
         view
         (cond
        error {:view :error :said error}
+       ;; Before the sessions and looks they make on the way (regs, mem, where, a session per
+       ;; look): the moment found, the calls named.
+       momented (let [found (:found momented)]
+                  {:view :table
+                   :rows [{:timeline (str "#" (:branch momented)) :ms (str (:ms found))
+                           :branches (str "+" (:branches found)) :rip (str (:rip (:regs found)))}]})
+       framed {:view :stack :title (str "calls in " (:node framed))
+               :frames (mapv (fn [f]
+                               ;; Its own code by its line alone; the function beside a line.
+                               (let [shown (frame-of {:at (:at f)})]
+                                 (assoc shown
+                                        :at (if (and (:function f) (not= (:function f) (:at f)))
+                                              (str (:at shown) "   " (:function f))
+                                              (:at shown))
+                                        :scan (= :scan (:via f)))))
+                             (take 12 (:frames framed)))}
+       whered {:view :table :count (count (:found whered))
+               :rows (mapv (fn [w] {:address (hex-of (:address w)) :at (str (:at w)) :function (str (:function w))})
+                           (take 8 (:found whered)))}
        ;; One look in many timelines: the timelines, before the looks made in each.
        across {:view :table :count (count (:results across))
                :rows (mapv (fn [r] {:timeline (str "#" (:branch r)) :at (micro-seconds (* 1.0 (:first_vtime_ns r)))
@@ -604,9 +636,19 @@
        watched {:view :series :label (str (:address watched) " " (name (:type watched)))
                 :points (mapv (fn [k] {:at-ns (* 1.0 (:vtime_ns k)) :value (:value k)}) (:kept watched))}
        called {:view :table :count (count (:kept called))
-               :rows (mapv (fn [k] {:at (micro-seconds (* 1.0 (:vtime_ns k)))
-                                    :rdi (str (nth (:args k) 0)) :rsi (str (nth (:args k) 1))
-                                    :rdx (str (nth (:args k) 2))})
+               :rows (mapv (fn [k]
+                             (if (seq (:params k))
+                               ;; Its parameters by their DWARF names, as many as fit.
+                               ;; A pointer's in hex (a & or * type), the rest as they print.
+                               (into {:at (micro-seconds (* 1.0 (:vtime_ns k)))}
+                                     (map (fn [p] [(:name p) (if (and (integer? (:value p)) (not (neg? (:value p)))
+                                                                      (re-find #"^[&*]|\*$" (str (:type p))))
+                                                               (hex-of (:value p))
+                                                               (brief (:value p)))])
+                                          (take 4 (:params k))))
+                               {:at (micro-seconds (* 1.0 (:vtime_ns k)))
+                                :rdi (str (nth (:args k) 0)) :rsi (str (nth (:args k) 1))
+                                :rdx (str (nth (:args k) 2))}))
                            (take 8 (:kept called)))}
        quint {:view :quint :verdict (:verdict quint) :invariant (:invariant quint)}
        simulated {:view :quint-run :violation (:violation simulated) :invariant (:invariant simulated)
@@ -1025,16 +1067,19 @@
         (recur (+ at 26 (* 20 (count (:lines event)))) (rest left))))))
 
 (defn- draw-stack
-  "Where a process crashed: its signal, the address at fault, its frames from the instruction
-  it stopped at outward; the program's own lines stand out, the first of them in red."
+  "Where a process crashed (its signal, the address at fault) or a stop's calls (frames: their
+  title), its frames from the innermost outward; the program's own lines stand out, the first
+  of them in red, frames from the stack's scan muted."
   [c x y width]
   (text! x y muted mono
-         (str (:process c) "   signal " (:signal c) (when (:fault c) (str "   fault at " (:fault c)))))
+         (if (:title c)
+           (:title c)
+           (str (:process c) "   signal " (:signal c) (when (:fault c) (str "   fault at " (:fault c))))))
   (let [first-own (first (keep-indexed (fn [i frame] (when (:own frame) i)) (:frames c)))]
     (doseq [[i frame] (map-indexed vector (:frames c))]
       (text! x (+ y 28 (* 20 i)) muted small (str "#" i))
       (text! (+ x 34) (+ y 26 (* 20 i))
-             (cond (= i first-own) red (:own frame) ink :else muted)
+             (cond (= i first-own) red (:scan frame) muted (:own frame) ink :else muted)
              mono (clip mono (- width 34) (:at frame))))))
 
 (defn- draw-table
