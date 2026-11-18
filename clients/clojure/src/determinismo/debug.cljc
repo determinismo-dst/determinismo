@@ -563,13 +563,14 @@ std::string determinismo_debug_hex(std::string const &decimal) {
 
 (defn frames
   "The calls a process is in, at a stop of the session's inside it (a breakpoint's or a watch's:
-  the vCPU's registers are then that process's), innermost first, each named by `where` as a
-  return address (a guest command after the stack is read): first its chain of frame pointers
-  (from rbp, each frame's saved rbp above the last: :via :frame-pointers), as long as it stays in
-  code, then the other words of its stack from the stack pointer on that point into a function
-  of one of its modules (:via :scan: a frame without a frame pointer, or a word a returned call
-  left behind). Both from the stack pages read (:pages of 4 KiB from rsp's, 4). Options: :pid,
-  :pages. -> [{:address :at :function :via} ...]"
+  the vCPU's registers are then that process's), innermost first (by their places on the stack),
+  each named by `where` as a return address (a guest command after the stack is read): its chain
+  of frame pointers (from rbp, each frame's saved rbp above the last, as long as it stays in code:
+  :via :frame-pointers; the chain reads the pages it reaches) and the other words of its stack
+  from the stack pointer on that point into a function of one of its modules (:via :scan: a frame
+  without a frame pointer, a function's own return address at its entry, or a word a returned
+  call left behind; :pages of 4 KiB from rsp's, 4).
+  Options: :pid, :pages. -> [{:address :at :function :via} ...]"
   ([session node] (frames session node {}))
   ([session node options]
    (let [registers (regs session)
@@ -585,25 +586,39 @@ std::string determinismo_debug_hex(std::string const &decimal) {
                                     (keep (fn [i] (when (>= (+' va i) rsp) [(+' va i) (little-u64 (subvec bytes i (+ i 8)))]))
                                           (range 0 4096 8))))))
                             (range (or (:pages options) 4))))
-         at (into {} words)
+         ;; The chain's words, from the pages read for the scan, else their own page read then
+         ;; (a large frame's caller lies past them).
+         pages (atom (into {} (map (fn [[address word]] [address word]) words)))
+         word-at (fn [address]
+                   (or (get @pages address)
+                       (let [page (-' address (mod address 4096))
+                             physical (translate session space page)]
+                         (when physical
+                           (let [bytes (mem session physical 4096)]
+                             (swap! pages into (map (fn [i] [(+' page i) (little-u64 (subvec bytes i (+ i 8)))]) (range 0 4096 8)))
+                             (get @pages address))))))
+         ;; [slot return-address] of each frame: its saved rbp's slot plus 8.
          chain (loop [frame (unhex (:rbp registers)) out []]
-                 (let [returned (get at (+' frame 8))
-                       next (get at frame)]
+                 (let [returned (when (pos? frame) (word-at (+' frame 8)))
+                       next (when returned (word-at frame))]
                    (if (and returned next (< (count out) 64))
                      (if (and (> next frame) (< (-' next frame) 1048576))
-                       (recur next (conj out returned))
-                       (conj out returned))
+                       (recur next (conj out [(+' frame 8) returned]))
+                       (conj out [(+' frame 8) returned]))
                      out)))
          ;; User-space addresses only (below 2^47): the rest are data.
          user? (fn [w] (and (>= w 4096) (< w 140737488355328)))
-         candidates (vec (distinct (filter user? (concat chain (map second words)))))
+         candidates (vec (distinct (filter user? (concat (map second chain) (map second words)))))
          named-all (where session node candidates (assoc (select-keys options [:pid]) :return true))
          by-address (into {} (map (fn [one] [(:address one) one]) named-all))
          in-code (fn [w] (let [one (get by-address w)] (when (:at one) one)))
-         chained (vec (map (fn [one] (assoc one :via :frame-pointers)) (take-while some? (map in-code chain))))
-         seen (set (map :address chained))
-         scanned (vec (dedupe (keep (fn [[_ w]] (when-not (seen w) (some-> (in-code w) (assoc :via :scan)))) words)))
-         stack (into chained scanned)]
+         ;; The chain as long as it stays in code; then every frame by its slot, innermost first.
+         chained (vec (take-while (fn [[_ one]] (some? one))
+                                  (map (fn [[slot w]] [slot (some-> (in-code w) (assoc :via :frame-pointers))]) chain)))
+         chain-slots (set (map first chained))
+         scanned (keep (fn [[slot w]] (when-not (chain-slots slot) (some->> (in-code w) (#(assoc % :via :scan)) (vector slot))))
+                       words)
+         stack (vec (dedupe (map second (sort-by first (concat chained scanned)))))]
      (tap/tell :frames {:session session :node (named node) :frames stack} stack))))
 
 (defn moment-when
