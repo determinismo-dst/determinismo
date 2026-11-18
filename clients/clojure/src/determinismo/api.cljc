@@ -178,6 +178,24 @@
   [run-url request-map]
   (lines (request :post (str run-url "/query") request-map)))
 
+(defn watched
+  "A JVM node's watched field or method (DETERMINISMO_WATCH in its environment: docs/SDKS.md)
+  through a run's events: each store's :value or each call's :args, with its :object (the
+  instance; none for a static one) and its moment, in every timeline (:branch for one, :limit
+  10,000). `member` names it as the watch did, `com.x.Raft.currentTerm` (contained: `Raft.term`
+  matches no other). One event a watch says its count was over: {:over n}.
+  -> [{:branch :vtime_ns :name :value | :args :object} ...]"
+  ([id member] (watched id member {}))
+  ([id member options]
+   (let [asked (cond-> {:condition (str "event=watch details.name~" member) :limit (or (:limit options) 10000)}
+                 (:branch options) (assoc :branch (:branch options)))
+         found (lines (request :post (str "/runs/" id "/query") asked))
+         said (mapv (fn [e]
+                      (merge (select-keys e [:branch :vtime_ns])
+                             (select-keys (get-in e [:event :details]) [:name :value :args :object :over])))
+                    found)]
+     (tap/tell :watched {:run id :member member :request asked :found said} said))))
+
 (defn events [id request-map] (lines (request :post (str "/runs/" id "/events") request-map)))
 (defn sql [id text]
   (let [rows (parse (request :post (str "/runs/" id "/sql") {:sql text}))]

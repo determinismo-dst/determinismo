@@ -160,6 +160,21 @@ way, whatever their type. `DETERMINISMO_CRASH_POINTS` in a
 node's environment changes the one in eight (`0`: none). Nodes know their own name as
 `DETERMINISMO_NODE`.
 
+Watches, for a JVM node's state where a native debugger cannot look (a Java field has no fixed
+address for a watchpoint, a JIT-compiled method no fixed entry): `DETERMINISMO_WATCH` in the
+node's environment (comma-separated `<class>.<field>` and `<class>.<method>()`; `<init>` for a
+constructor) makes the agent say every store to the fields and every call of the methods as a
+`watch` event, from the storing or calling thread at that moment: `{"name":"field
+com.x.Raft.currentTerm","value":5,"object":"com.x.Raft@1b6d3586"}`, `{"name":"call
+com.x.Raft.handleVote","args":[3,"n1",0.5],"object":...}`. A value is a primitive's, a
+string's (cut at 200 characters), an enum constant's name, or else its class and identity (no
+program code runs to say it); `object` is the instance (none for a static field or method, nor
+in a constructor). A watched class is instrumented whatever the coverage set says, at load or
+ahead of time (`instrument` reads the variable as it rewrites the jars). The first 10,000 of
+each in a process (`DETERMINISMO_WATCH_MAX`), then one event with `"over"`. The set is the
+program's for the whole run, so every timeline holds its events: `query <run> 'event=watch'`,
+the REPL's `across`, causality's moments.
+
 Any program can mark its own: `sdk.crash_point(name)` (Zig; Python's `crash_point(name)`; Go's `CrashPoint(name)`; C's `det_crash_point(name)`; Rust's `crash_point(name)`; .NET's `Lifecycle.CrashPoint(name)`; JavaScript's
 `crashPoint(name)`;
 `det_crash_point` in libdeterminismo, for Clojure, jank and other FFI callers) where a crash would test something (the

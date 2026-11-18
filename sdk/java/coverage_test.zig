@@ -256,6 +256,101 @@ test "a branch's sides are blocks of their own: the instrumented class runs, no 
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, reported, "rare line"));
 }
 
+/// Fields and methods a watch names (DETERMINISMO_WATCH): a constructor, an instance method, a
+/// static one, and stores of a long, a string, a double, an enum and a static int.
+const watched_java =
+    \\public class Watched {
+    \\  enum Role { FOLLOWER, LEADER }
+    \\  long term;
+    \\  String leader;
+    \\  double ratio;
+    \\  Role role = Role.FOLLOWER;
+    \\  static int count;
+    \\  Watched(long start) { term = start; }
+    \\  void vote(int candidate, String name, double weight) { term++; leader = name; ratio = weight; }
+    \\  static void bump(long by) { count += (int) by; }
+    \\  public static void main(String[] arguments) {
+    \\    Watched w = new Watched(7);
+    \\    w.vote(3, "n\"1", 0.5);
+    \\    w.vote(4, "n2", 1.5);
+    \\    bump(2);
+    \\    w.role = Role.LEADER;
+    \\    System.out.println("term " + w.term + " count " + count);
+    \\  }
+    \\}
+    \\
+;
+
+test "watched fields' stores and methods' calls said with their values, past a coverage set's classes" {
+    const io = std.testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const major = java_major(arena, io) orelse return error.SkipZigTest;
+    if (major < 24) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const sdk_classes = try std.fmt.allocPrint(arena, "{s}/sdk", .{directory});
+    const probe_classes = try std.fmt.allocPrint(arena, "{s}/probe", .{directory});
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{ "javac", "-d", sdk_classes });
+    for (sources[0..4]) |source| {
+        const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ directory, source.name });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = source.text });
+        try argv.append(arena, path);
+    }
+    try run_ok(arena, io, argv.items);
+    const probe_path = try std.fmt.allocPrint(arena, "{s}/Watched.java", .{directory});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = probe_path, .data = watched_java });
+    try run_ok(arena, io, &.{ "javac", "-g", "-d", probe_classes, probe_path });
+    const plain = try std.fmt.allocPrint(arena, "{s}/watched.jar", .{directory});
+    const instrumented = try std.fmt.allocPrint(arena, "{s}/watched-instrumented.jar", .{directory});
+    try run_ok(arena, io, &.{ "jar", "cf", plain, "-C", probe_classes, "." });
+    // Instrumented ahead of time under a prefix that covers nothing: the watch alone brings the
+    // class in.
+    var building = std.process.Environ.Map.init(arena);
+    try building.put("PATH", "/usr/bin:/bin");
+    try building.put("DETERMINISMO_WATCH", "Watched.term,Watched.leader,Watched.ratio,Watched.role,Watched.count,Watched.vote(),Watched.bump(),Watched.<init>()");
+    const built = try std.process.run(arena, io, .{ .argv = &.{ "java", "-cp", sdk_classes, "DeterminismoCoverage", "instrument", "Nothing", plain, instrumented }, .environ_map = &building });
+    try std.testing.expect(built.term == .exited and built.term.exited == 0);
+    const events = try std.fmt.allocPrint(arena, "{s}/events.jsonl", .{directory});
+    const classpath = try std.fmt.allocPrint(arena, "{s}:{s}", .{ instrumented, sdk_classes });
+    var environment = std.process.Environ.Map.init(arena);
+    try environment.put("DETERMINISMO_SDK_LOCAL_OUTPUT", events);
+    try environment.put("DETERMINISMO_WATCH_MAX", "2");
+    try environment.put("PATH", "/usr/bin:/bin");
+    const ran = try std.process.run(arena, io, .{ .argv = &.{ "java", "-cp", classpath, "Watched" }, .environ_map = &environment });
+    try std.testing.expect(ran.term == .exited and ran.term.exited == 0);
+    try std.testing.expect(std.mem.indexOf(u8, ran.stdout, "term 9 count 2") != null);
+    const reported = try std.Io.Dir.cwd().readFileAlloc(io, events, arena, .limited(1 << 20));
+    std.debug.print("events: {s}", .{reported});
+    const said = [_][]const u8{
+        // The constructor: its argument, no object (not usable before it is initialized).
+        "{\"name\":\"call Watched.<init>\",\"args\":[7]}",
+        "{\"name\":\"field Watched.term\",\"value\":7}",
+        // An instance method: its arguments (a string escaped, a double) and its object.
+        "{\"name\":\"call Watched.vote\",\"args\":[3,\"n\\\"1\",0.5],\"object\":\"Watched@",
+        "{\"name\":\"field Watched.term\",\"value\":8,\"object\":\"Watched@",
+        "{\"name\":\"field Watched.leader\",\"value\":\"n\\\"1\",\"object\":\"Watched@",
+        "{\"name\":\"field Watched.ratio\",\"value\":1.5,\"object\":\"Watched@",
+        // The third store of term: past the cap of 2, said once as over.
+        "{\"name\":\"field Watched.term\",\"over\":2}",
+        // A static method (a long argument) and a static field.
+        "{\"name\":\"call Watched.bump\",\"args\":[2]}",
+        "{\"name\":\"field Watched.count\",\"value\":2}",
+        // An enum by its name.
+        "{\"name\":\"field Watched.role\",\"value\":\"LEADER\",\"object\":\"Watched@",
+    };
+    for (said) |line| {
+        if (std.mem.indexOf(u8, reported, line) == null) {
+            std.debug.print("missing: {s}\n", .{line});
+            return error.TestUnexpectedResult;
+        }
+    }
+    try std.testing.expect(std.mem.indexOf(u8, reported, "\"value\":9") == null);
+}
+
 fn run_ok(arena: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
     const result = try std.process.run(arena, io, .{ .argv = argv });
     if (result.term != .exited or result.term.exited != 0) {

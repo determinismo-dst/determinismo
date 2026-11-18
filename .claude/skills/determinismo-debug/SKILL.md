@@ -48,8 +48,10 @@ Every timeline replays exactly, so a failure is evidence, not flakiness. Follow
    `dbg/watch-values` for each write to it from there, `dbg/calls` for each call with its
    arguments, each an exact moment to open another session at; `dbg/across` makes the same look
    at a condition's first match in every timeline that has it (failing timelines against
-   passing ones). For a native program with its symbols (C, C++, Go, Rust, Zig), not a JVM's
-   Java fields.
+   passing ones). For a native program with its symbols (C, C++, Go, Rust, Zig). A JVM's fields
+   and methods: the agent's watches (`DETERMINISMO_WATCH` in the node's environment, docs/SDKS.md)
+   say each store's value and each call's arguments as `watch` events in every timeline, read
+   with `query <run> 'event=watch'` or `across`.
 5. **Shrink its faults**: `determinismo script <events>` then `determinismo shrink <explore
    options> --script <script.json> --property '<message>'`: the fewest faults that still make it
    fail (or that it needs none), judged over 16 seeds, and the shrunk script for `--script`.

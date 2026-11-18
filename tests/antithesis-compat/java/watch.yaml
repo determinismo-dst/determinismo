@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: MIT
+# Watches on the JVM (sdk/java/DeterminismoCoverage, DETERMINISMO_WATCH): the server's epoch and
+# role said at each store, its step() at each call, as `watch` events (tools/e2e.zig's java-watch
+# check):
+#   determinismo explore ... --compose tests/antithesis-compat/java/watch.yaml --scenario crash_points
+services:
+  client:
+    build:
+      context: ../../..
+      dockerfile: tests/antithesis-compat/java/client/Dockerfile
+    command: [sh, -c, "java -cp /app/sdk-classes:/app/classes Ready && exec sleep infinity"]
+    labels:
+      determinismo.no-faults: "true"
+  server:
+    build:
+      context: ../../..
+      dockerfile: tests/antithesis-compat/java/server/Dockerfile
+    command: [sh, -c, "exec java -XX:TieredStopAtLevel=1 -javaagent:/app/determinismo-coverage.jar=StateServer -cp /app/classes:/app/determinismo-coverage.jar StateServer"]
+    environment:
+      DETERMINISMO_WATCH: "StateServer.epoch,StateServer.role,StateServer.step()"
+      DETERMINISMO_WATCH_MAX: "50"
+      DETERMINISMO_CRASH_POINTS: "0"
+    labels:
+      determinismo.no-faults: "true"

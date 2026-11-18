@@ -57,6 +57,17 @@
  * outside quiet periods (`crash_point` events say each request's outcome). At most one a stretch.
  * Stores to fields whose names say they hold the node's view of the cluster (leader, epoch, term,
  * session, member, owner...: CrashTuner's meta-info, whatever their type) are points the same way.
+ *
+ * And watches, the REPL's watch-values and calls for the JVM (a Java field has no fixed address
+ * for a hardware watchpoint, nor a JIT-compiled method a fixed entry): the node's
+ * DETERMINISMO_WATCH (comma-separated: `<class>.<field>`, `<class>.<method>()`) names fields
+ * whose every store says its value and methods whose every call says its arguments, a "watch"
+ * event each ({"name":"field com.x.Raft.currentTerm","value":5,"object":"com.x.Raft@1b6d3586"},
+ * {"name":"call com.x.Raft.handleVote","args":[...],"object":...}), said by the storing or
+ * calling thread at that moment, so a run's every timeline holds them for event queries. A
+ * value is a primitive's, a string's (cut at 200 characters), an enum's name, or else the
+ * object's class and identity: no program code (toString) runs for it. The first
+ * DETERMINISMO_WATCH_MAX (10,000) of each in a process, then one event with "over".
  */
 import java.lang.instrument.Instrumentation;
 import java.util.ArrayList;
@@ -393,6 +404,8 @@ public final class DeterminismoCoverage {
       }
       Determinismo.event("state", "{\"name\":\"state " + name + ": " + state[1] + " -> "
           + state[2] + "\"}");
+    } else if (report instanceof Watched watched) {
+      Determinismo.event("watch", watched.details());
     } else if (report instanceof CrashRequest crash) {
       String name;
       synchronized (DeterminismoCoverage.class) {
@@ -434,6 +447,131 @@ public final class DeterminismoCoverage {
       if (Determinismo.eventUnlocked("state", details.toString())) return;
     }
     send(new Object[] {id, before == null ? "null" : before.name(), next.name()});
+  }
+
+  /** A watch's event, for the sender when its thread cannot write it itself. */
+  private record Watched(String details) {}
+
+  static final int WATCH_MAX = watchMax();
+  private static final ConcurrentHashMap<Integer, java.util.concurrent.atomic.AtomicInteger> watchCounts =
+      new ConcurrentHashMap<>();
+
+  private static int watchMax() {
+    String text = System.getenv("DETERMINISMO_WATCH_MAX");
+    if (text == null || text.isEmpty()) return 10_000;
+    try {
+      return Math.max(0, Integer.parseInt(text.trim()));
+    } catch (NumberFormatException unreadable) {
+      return 10_000;
+    }
+  }
+
+  /**
+   * Called by instrumented code before a store to a watched field: the value about to be stored
+   * (boxed) and the object it goes into (null: a static field, or a store in a constructor,
+   * where the object may not be usable yet).
+   */
+  public static void watchStore(Object object, Object value, int id) {
+    StringBuilder details = watchStart(id, "field ");
+    if (details == null) return;
+    details.append(",\"value\":");
+    watchValue(details, value);
+    if (object != null) {
+      details.append(",\"object\":");
+      watchIdentity(details, object);
+    }
+    watchSay(details.append('}'));
+  }
+
+  /** Called at a watched method's entry: its arguments (boxed) and `this` (null: a static method
+   * or a constructor). */
+  public static void watchCall(Object self, Object[] arguments, int id) {
+    StringBuilder details = watchStart(id, "call ");
+    if (details == null) return;
+    details.append(",\"args\":[");
+    for (int index = 0; index < arguments.length; index++) {
+      if (index > 0) details.append(',');
+      watchValue(details, arguments[index]);
+    }
+    details.append(']');
+    if (self != null) {
+      details.append(",\"object\":");
+      watchIdentity(details, self);
+    }
+    watchSay(details.append('}'));
+  }
+
+  /** The event's start ({"name":"<kind><name>"), or null past the watch's cap (the first one
+   * past it says "over" itself). No lambda and no string concatenation: a probe may run inside a
+   * class's initializer, where linking a call site is nothing to start. */
+  private static StringBuilder watchStart(int id, String kind) {
+    Integer key = id;
+    java.util.concurrent.atomic.AtomicInteger count = watchCounts.get(key);
+    if (count == null) {
+      java.util.concurrent.atomic.AtomicInteger fresh = new java.util.concurrent.atomic.AtomicInteger();
+      count = watchCounts.putIfAbsent(key, fresh);
+      if (count == null) count = fresh;
+    }
+    int seen = count.incrementAndGet();
+    if (seen > WATCH_MAX + 1) return null;
+    String[] names = fieldNames;
+    String name = id < names.length ? names[id] : null;
+    StringBuilder details = new StringBuilder(128).append("{\"name\":\"").append(kind);
+    if (name != null) details.append(name);
+    else details.append('?').append(id);
+    details.append('"');
+    if (seen == WATCH_MAX + 1) {
+      watchSay(details.append(",\"over\":").append(WATCH_MAX).append('}'));
+      return null;
+    }
+    return details;
+  }
+
+  private static void watchSay(StringBuilder details) {
+    String text = details.toString();
+    if (direct() && Determinismo.eventUnlocked("watch", text)) return;
+    send(new Watched(text));
+  }
+
+  /** A value as JSON with no program code run: the JDK's boxes, strings and enums' names, any
+   * other object its class and identity. */
+  private static void watchValue(StringBuilder out, Object value) {
+    if (value == null) {
+      out.append("null");
+    } else if (value instanceof Boolean || value instanceof Integer || value instanceof Long
+        || value instanceof Short || value instanceof Byte) {
+      out.append(value.toString());
+    } else if (value instanceof Double number) {
+      if (number.isNaN() || number.isInfinite()) watchText(out, number.toString());
+      else out.append(number.toString());
+    } else if (value instanceof Float number) {
+      if (number.isNaN() || number.isInfinite()) watchText(out, number.toString());
+      else out.append(number.toString());
+    } else if (value instanceof String || value instanceof Character) {
+      watchText(out, value.toString());
+    } else if (value instanceof Enum<?> constant) {
+      watchText(out, constant.name());
+    } else {
+      watchIdentity(out, value);
+    }
+  }
+
+  private static void watchIdentity(StringBuilder out, Object value) {
+    out.append('"').append(value.getClass().getName()).append('@')
+        .append(Integer.toHexString(System.identityHashCode(value))).append('"');
+  }
+
+  /** A JSON string, cut at 200 characters. */
+  private static void watchText(StringBuilder out, String text) {
+    out.append('"');
+    int end = Math.min(text.length(), 200);
+    for (int index = 0; index < end; index++) {
+      char c = text.charAt(index);
+      if (c == '"' || c == '\\') out.append('\\').append(c);
+      else if (c < 0x20) out.append("\\u00").append(Character.forDigit(c >> 4, 16)).append(Character.forDigit(c & 15, 16));
+      else out.append(c);
+    }
+    out.append('"');
   }
 
   static boolean matches(String name, String[] prefixes) {

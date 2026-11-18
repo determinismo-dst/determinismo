@@ -264,6 +264,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "draws", check_draws },                           .{ "exit-stack", check_exit_stack },
         .{ "plan-calls", check_plan_calls },                 .{ "services", check_services },
         .{ "sites", check_sites },                           .{ "client", check_client },
+        .{ "java-watch", check_java_watch },
     };
     // A check's whole name runs it alone (check.sh's `ui` ran guidance and quiet too).
     var exact = std.mem.eql(u8, only, "tla");
@@ -6977,6 +6978,44 @@ fn check_crash_points(context: *Context) !void {
     }, "crash-points: {d} asked ({d} at the epoch's stores), {d} crashed ({d} faults), the server started {d} times in 16 timelines; the SDK's points crashed the selftest's node {d} times", .{
         asked, stores, crashed, faults, starts, marked,
     });
+}
+
+/// Watches on the JVM (DETERMINISMO_WATCH): StateServer's epoch and role said at each store and
+/// its step() at each call, as `watch` events with their values and object, the first 50 of each
+/// then one "over"; the same seed's timelines say the same (their events' hashes equal: the
+/// objects' identities too).
+fn check_java_watch(context: *Context) !void {
+    var hashes: [2][2]Branch = undefined;
+    var counts: [6]u64 = undefined;
+    for (0..2) |round| {
+        const events = try std.fmt.allocPrint(context.arena, "{s}/java-watch-{d}-events", .{ context.scratch, round });
+        const report = try explore(context, &.{
+            "--compose",    "tests/antithesis-compat/java/watch.yaml", "--scenario", "crash_points",
+            "--seed",       "1",                                       "--branches", "2",
+            "--branching",  "flat",                                    "--events-dir", events,
+        });
+        _ = parse_branches(report, &hashes[round]);
+        if (round > 0) continue;
+        counts = .{
+            try query_count(context, &.{ events, "event=watch details.name~StateServer.epoch details.value=1" }),
+            try query_count(context, &.{ events, "event=watch details.name~StateServer.role details.value=LEADER" }),
+            try query_count(context, &.{ events, "event=watch details.name~StateServer.step details.object~StateServer@" }),
+            try query_count(context, &.{ events, "event=watch details.name~StateServer.step details.over=50" }),
+            try query_count(context, &.{ events, "event=watch details.name~StateServer.step" }),
+            try query_count(context, &.{ events, "event=watch details.name~StateServer.work" }),
+        };
+    }
+    const same = std.mem.eql(u8, hashes[0][0].events_hash, hashes[1][0].events_hash) and
+        std.mem.eql(u8, hashes[0][1].events_hash, hashes[1][1].events_hash);
+    expect_all(context, &.{
+        .{ "the epoch's first store said with its value (1)", counts[0] > 0 },
+        .{ "the role's stores said by the enum constant's name", counts[1] > 0 },
+        .{ "step()'s calls said with their object", counts[2] > 0 },
+        .{ "past 50 calls, one event says the rest are not said", counts[3] == 2 },
+        .{ "so at most 51 step() events a timeline", counts[4] <= 2 * 51 },
+        .{ "a field not watched says nothing", counts[5] == 0 },
+        .{ "the same seed's timelines say the same (events' hashes)", same },
+    }, "java-watch: epoch=1 {d}, LEADER {d}, step() with object {d}, over {d}, step() events {d}", .{ counts[0], counts[1], counts[2], counts[3], counts[4] });
 }
 
 /// A `sometimes` made true comes first among a timeline's new behaviors: the tree returns just

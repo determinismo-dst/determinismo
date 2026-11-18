@@ -8,7 +8,10 @@
 import java.lang.classfile.ClassFile;
 import java.lang.classfile.ClassHierarchyResolver;
 import java.lang.classfile.ClassModel;
+import java.lang.classfile.CodeBuilder;
+import java.lang.classfile.CodeElement;
 import java.lang.classfile.CodeTransform;
+import java.lang.classfile.TypeKind;
 import java.lang.classfile.MethodModel;
 import java.lang.classfile.MethodTransform;
 import java.lang.classfile.Opcode;
@@ -39,6 +42,31 @@ public final class DeterminismoCoverageInstrument {
   private static final MethodTypeDesc STATE = MethodTypeDesc.of(ConstantDescs.CD_void,
       ConstantDescs.CD_Object, ConstantDescs.CD_Object, ConstantDescs.CD_int);
 
+  private static final MethodTypeDesc WATCH_CALL = MethodTypeDesc.of(ConstantDescs.CD_void,
+      ConstantDescs.CD_Object, ConstantDescs.CD_Object.arrayType(), ConstantDescs.CD_int);
+
+  /** The node's watches (DETERMINISMO_WATCH, DeterminismoCoverage's header): fields as
+   * `<class>.<field>`, methods as `<class>.<method>` (written with "()"), and their classes'
+   * internal names, instrumented whatever the coverage set says. */
+  static final Set<String> watchedFields = new java.util.HashSet<>();
+  static final Set<String> watchedMethods = new java.util.HashSet<>();
+  static final Set<String> watchedClasses = new java.util.HashSet<>();
+
+  static {
+    String text = System.getenv("DETERMINISMO_WATCH");
+    if (text != null) {
+      for (String entry : text.split(",")) {
+        String named = entry.trim();
+        boolean method = named.endsWith("()");
+        if (method) named = named.substring(0, named.length() - 2);
+        int dot = named.lastIndexOf('.');
+        if (dot <= 0 || dot == named.length() - 1) continue;
+        (method ? watchedMethods : watchedFields).add(named);
+        watchedClasses.add(named.substring(0, dot).replace('.', '/'));
+      }
+    }
+  }
+
   private DeterminismoCoverageInstrument() {}
 
   /**
@@ -66,9 +94,10 @@ public final class DeterminismoCoverageInstrument {
         String[] covered = coveredPrefixes;
         if (name == null || name.startsWith("Determinismo")
             || DeterminismoCoverage.ahead.contains(name)
-            || !(covered.length == 0 ? !DeterminismoCoverage.jdk(name)
+            || !watchedClasses.contains(name)
+            && (!(covered.length == 0 ? !DeterminismoCoverage.jdk(name)
                 : DeterminismoCoverage.matches(name, covered))
-            || !DeterminismoCoverage.setContains(set, name)) {
+            || !DeterminismoCoverage.setContains(set, name))) {
           return null;
         }
         try {
@@ -107,7 +136,12 @@ public final class DeterminismoCoverageInstrument {
       // fields may not be readable yet (before super()): only their DeterminismoCoverage.lines.
       boolean initializer = method.methodName().equalsString("<init>")
           || method.methodName().equalsString("<clinit>");
-      classes.transformMethod(method, MethodTransform.transformingCode(probes(className, !initializer)));
+      CodeTransform code = probes(className, !initializer);
+      String called = className + "." + method.methodName().stringValue();
+      if (watchedMethods.contains(called)) {
+        code = withCallProbe(code, method, DeterminismoCoverage.registerField(called), initializer);
+      }
+      classes.transformMethod(method, MethodTransform.transformingCode(code));
     });
   }
 
@@ -168,6 +202,7 @@ public final class DeterminismoCoverageInstrument {
         code.loadConstant(id);
         code.invokestatic(SELF, "state", STATE);
       }
+      if (element instanceof FieldInstruction field && watched(field)) watchProbe(code, field, !states);
       code.with(element);
       if (element instanceof LineNumber number) {
         code.loadConstant(DeterminismoCoverage.register(className + ":" + number.line()));
@@ -187,6 +222,88 @@ public final class DeterminismoCoverageInstrument {
         }
       }
     };
+  }
+
+  /** A store to a field the node watches. */
+  private static boolean watched(FieldInstruction field) {
+    if (field.opcode() != Opcode.PUTFIELD && field.opcode() != Opcode.PUTSTATIC) return false;
+    return watchedFields.contains(field.owner().asInternalName().replace('/', '.') + "."
+        + field.name().stringValue());
+  }
+
+  /**
+   * Before a watched store: the value set aside in a local of its own, DeterminismoCoverage.watchStore
+   * told it (boxed) with the object (null for a static field, and in an initializer, where the
+   * object may not be initialized yet), then the stack as it was.
+   */
+  private static void watchProbe(CodeBuilder code, FieldInstruction field, boolean initializer) {
+    TypeKind kind = TypeKind.from(field.typeSymbol());
+    int slot = code.allocateLocal(kind);
+    code.storeLocal(kind, slot);
+    if (field.opcode() == Opcode.PUTFIELD && !initializer) code.dup();
+    else code.aconst_null();
+    code.loadLocal(kind, slot);
+    box(code, kind);
+    code.loadConstant(fieldId(field));
+    code.invokestatic(SELF, "watchStore", STATE);
+    code.loadLocal(kind, slot);
+  }
+
+  /** The method's code with DeterminismoCoverage.watchCall told its arguments at its start. */
+  private static CodeTransform withCallProbe(CodeTransform base, MethodModel method, int id,
+      boolean initializer) {
+    boolean statical = method.flags().has(AccessFlag.STATIC);
+    return new CodeTransform() {
+      @Override
+      public void atStart(CodeBuilder code) {
+        java.util.List<ClassDesc> parameters = method.methodTypeSymbol().parameterList();
+        if (statical || initializer) code.aconst_null();
+        else code.aload(0);
+        code.loadConstant(parameters.size());
+        code.anewarray(ConstantDescs.CD_Object);
+        int slot = statical ? 0 : 1;
+        for (int index = 0; index < parameters.size(); index++) {
+          TypeKind kind = TypeKind.from(parameters.get(index));
+          code.dup();
+          code.loadConstant(index);
+          code.loadLocal(kind, slot);
+          box(code, kind);
+          code.aastore();
+          slot += kind.slotSize();
+        }
+        code.loadConstant(id);
+        code.invokestatic(SELF, "watchCall", WATCH_CALL);
+        base.atStart(code);
+      }
+
+      @Override
+      public void accept(CodeBuilder code, CodeElement element) {
+        base.accept(code, element);
+      }
+
+      @Override
+      public void atEnd(CodeBuilder code) {
+        base.atEnd(code);
+      }
+    };
+  }
+
+  /** A primitive on the stack as its box (valueOf); a reference left as it is. */
+  private static void box(CodeBuilder code, TypeKind kind) {
+    ClassDesc boxed;
+    ClassDesc primitive;
+    switch (kind) {
+      case INT -> { boxed = ConstantDescs.CD_Integer; primitive = ConstantDescs.CD_int; }
+      case LONG -> { boxed = ConstantDescs.CD_Long; primitive = ConstantDescs.CD_long; }
+      case FLOAT -> { boxed = ConstantDescs.CD_Float; primitive = ConstantDescs.CD_float; }
+      case DOUBLE -> { boxed = ConstantDescs.CD_Double; primitive = ConstantDescs.CD_double; }
+      case BOOLEAN -> { boxed = ConstantDescs.CD_Boolean; primitive = ConstantDescs.CD_boolean; }
+      case BYTE -> { boxed = ConstantDescs.CD_Byte; primitive = ConstantDescs.CD_byte; }
+      case SHORT -> { boxed = ConstantDescs.CD_Short; primitive = ConstantDescs.CD_short; }
+      case CHAR -> { boxed = ConstantDescs.CD_Character; primitive = ConstantDescs.CD_char; }
+      default -> { return; }
+    }
+    code.invokestatic(boxed, "valueOf", MethodTypeDesc.of(boxed, primitive));
   }
 
   /** A block probe's id: its own number, with the runtime's block bit. */
@@ -290,7 +407,7 @@ public final class DeterminismoCoverageInstrument {
         if (!entry.isDirectory() && name.endsWith(".class") && !name.endsWith("module-info.class")) {
           String internal = name.substring(0, name.length() - ".class".length());
           if (!internal.startsWith("Determinismo")
-              && DeterminismoCoverage.matches(internal, prefixes)) {
+              && (DeterminismoCoverage.matches(internal, prefixes) || watchedClasses.contains(internal))) {
             try {
               bytes = instrument(internal.replace('/', '.'), bytes, loader);
               DeterminismoCoverage.ahead.add(internal);

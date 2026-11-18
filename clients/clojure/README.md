@@ -25,6 +25,8 @@ on from there, and the analyses of a failing timeline (causality, shrinking, exp
 (api/properties 13)
 (api/sql 13 "SELECT count(*) AS n FROM events WHERE branch = 0")   ; [{:n 2741}]
 (api/query 13 {:condition "event=fault" :branch 0 :limit 5})
+(api/watched 13 "com.x.Raft.currentTerm")              ; a JVM field's stores, every timeline
+                                                      ; (DETERMINISMO_WATCH: docs/SDKS.md)
 (api/wait-run (:id (api/start-run {:program "..." :scenario "bank" :branches 16})))
 (api/extract 13 {:branch 4 :at_vtime_ms 9000 :node "db-1" :path "/etc/db.conf"})   ; its text then
 (api/extract-to 13 {:branch 4 :at_vtime_ms 9000 :node "db-1" :path "/data/db.bin"} "db.bin")
