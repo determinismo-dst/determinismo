@@ -2485,7 +2485,7 @@ fn command_explore(
         if (replay.overrides.step_count > 0 and arguments.until != null) return error.UntilWithTapedSteps;
         const moment_ns: ?u64 = if (arguments.moment_vtime_ms) |ms| ms * std.time.ns_per_ms else null;
         const own: ?[]const u8 = if (exploration.extend != null)
-            try std.mem.concat(context.arena, u8, &.{ "det:extend\x00", arguments.moment_command orelse ":" })
+            try std.mem.concat(context.arena, u8, &.{ "det:extend\x00", arguments.moment_command orelse VM.step_here })
         else
             arguments.moment_command;
         const start_ns = start.tsc / report.tsc_per_ns;
@@ -7895,10 +7895,10 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
     if (!arguments.pipeline_given and jobs_count(&arguments) <= arguments.generation_size) {
         arguments.pipeline = pipeline_depth_few_workers;
     }
-    // An interactive session's first step, when no command was given, is a no-op: its own steps
-    // come after.
+    // An interactive session's first step, when no command was given, is the VMM's no-op
+    // (det:here): its own steps come after, the guest's agent not woken at the moment.
     if (arguments.moment_interactive and arguments.moment_command == null and
-        arguments.moment_script_path == null) arguments.moment_command = ":";
+        arguments.moment_script_path == null) arguments.moment_command = VM.step_here;
     // A command runs at a moment: a virtual time, or the first event matching --until.
     // --exec-at-start's is the snapshot's own (--from-snapshot's).
     if (arguments.exec_at_start and arguments.from_snapshot == null) return error.Usage;
@@ -8370,7 +8370,7 @@ fn start_compose(arena: std.mem.Allocator, arguments: *Arguments, start: []const
     } else {
         try steps.append(arena, try std.fmt.allocPrint(arena, "det:until {d} {s}", .{ start_until_ms, until.? }));
     }
-    try steps.append(arena, arguments.moment_command orelse ":");
+    try steps.append(arena, arguments.moment_command orelse VM.step_here);
     arguments.moment_command = try std.mem.join(arena, "\x00", steps.items);
     arguments.moment_vtime_ms = null;
     arguments.until = null;
@@ -8395,7 +8395,7 @@ test "a moment inside a run's start steps: the start but its final wait, the mom
     const condition = try query.parse(arena, "event=x");
     session.until = &condition;
     try start_compose(arena, &session, start);
-    try std.testing.expectEqualStrings("det:background det-nodes exec app run-tests\x00det:until 86400000 event=x\x00:", session.moment_command.?);
+    try std.testing.expectEqualStrings("det:background det-nodes exec app run-tests\x00det:until 86400000 event=x\x00det:here", session.moment_command.?);
     try std.testing.expect(session.until == null);
     var held: Arguments = .{ .command = .explore };
     try std.testing.expectError(error.Usage, start_compose(arena, &held, start));

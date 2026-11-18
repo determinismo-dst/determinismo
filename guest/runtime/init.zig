@@ -54,6 +54,9 @@ pub fn main(init: std.process.Init) !void {
     memory_check();
     cpu_report();
     cores_wait();
+    // The scenario's end, said before the agent's wait: a moment's steps that never woke the
+    // agent (no hold) stop here, the VMM holding the timeline itself (vm.zig's end_hit).
+    sdk.event("scenario_end", .{ .status = status });
     agent_wait();
     // The sinks' last look (what the nodes wrote last), then it ends.
     if (sinks_pid) |pid| {

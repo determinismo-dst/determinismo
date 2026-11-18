@@ -112,6 +112,15 @@ moment_continue: bool,
 /// The guest's agent holds the timeline already (det:hold, sent where its steps began): this
 /// machine goes on from a snapshot taken after that (Options.moment_held).
 moment_held: bool,
+/// The agent's hold not sent yet: it goes just before the first step the agent acts on (a guest
+/// command, an agent action). Until then the moment's steps only look and run the guest on, the
+/// agent never woken, so a session's future is the recorded timeline's (a hold at the moment
+/// ran the agent there: a session at 2.3 s of Turso's timeline panicked 12.3 us later than the
+/// recording, 2026-11-18). The scenario's end meanwhile is a moment of its own (end_hit).
+hold_owed: bool = false,
+/// The scenario ended (det-init's scenario_end event) while a step ran the guest with no hold:
+/// the step ends there, a moment, and the next step follows (the timeline held so by the VMM).
+end_hit: bool = false,
 /// The moment's commands began: a new timeline from there, which its tape does not describe
 /// (steps after a command, `det:wait` and `det:until`, run it on).
 moment_changed: bool = false,
@@ -1809,12 +1818,14 @@ fn moment_arrive(vm: *VM) !?Outcome {
         std.mem.indexOf(u8, commands, "det:background ") != null;
     // A live session's first step is the moment's own commands: done, said so.
     if (vm.steps_live) vm.live_busy = true;
-    const hold = if (vm.moment_held) "" else "det:hold\x00";
+    // The agent's hold, owed: sent before the first step it acts on (moment_command_one), not
+    // here, where it would run the guest at the moment.
+    vm.hold_owed = !vm.moment_held;
     vm.moment_commands_rest = if (vm.steps_fd != null)
         // Released when the steps' input ends (steps_read).
-        try std.mem.concat(vm.step_arena.allocator(), u8, &.{ hold, commands })
+        commands
     else if (stepped)
-        try std.mem.concat(vm.step_arena.allocator(), u8, &.{ hold, commands, "\x00det:release" })
+        try std.mem.concat(vm.step_arena.allocator(), u8, &.{ commands, "\x00det:release" })
     else
         commands;
     try vm.moment_command_next();
@@ -1881,6 +1892,15 @@ fn moment_command_one(vm: *VM) !bool {
         return false;
     }
     if (!expanded) try vm.step_record(step);
+    if (std.mem.eql(u8, step, step_here)) {
+        // The moment itself, nothing done: an interactive session's first step when none was
+        // asked (a guest no-op, ":", woke the agent at the moment and parted the session's future
+        // from the recorded one).
+        if (vm.moment_commands_rest.len > 0) return true;
+        if (!vm.steps_live and vm.steps_fd != null and try vm.steps_read()) return true;
+        try vm.step_arm(0, null);
+        return false;
+    }
     // The debugger's steps (docs/DEBUGGING.md): the VMM's, the vCPU stopped, then on at once. A
     // bad one is said and the session goes on (a person typing, not a script to abort).
     if (std.mem.eql(u8, step, step_regs) or std.mem.startsWith(u8, step, step_mem) or
@@ -2017,6 +2037,21 @@ fn moment_command_one(vm: *VM) !bool {
     if (step.len > step_size_max) {
         std.debug.print("[determinismo] a step of {d} bytes: at most {d} reach the guest, split it\n", .{ step.len, step_size_max });
         return error.StepTooLong;
+    }
+    if (vm.hold_owed and !std.mem.eql(u8, step, "det:release")) {
+        // The first step the agent acts on: its hold first, then this step again, marked (it is
+        // recorded once already; the hold is the platform's, never on the tape). A release with
+        // no hold sent goes as it is (the agent unlinks a marker that is not there).
+        vm.hold_owed = false;
+        const allocator = vm.step_arena.allocator();
+        const again = try std.mem.concat(allocator, u8, &.{ &[_]u8{expansion_mark}, step });
+        vm.moment_commands_rest = if (vm.moment_commands_rest.len > 0)
+            try std.mem.concat(allocator, u8, &.{ again, "\x00", vm.moment_commands_rest })
+        else
+            again;
+        vm.action_pending = "det:hold";
+        try vm.irq_pulse(irq_action);
+        return false;
     }
     vm.action_pending = step;
     try vm.irq_pulse(irq_action);
@@ -2204,6 +2239,8 @@ const step_branches = "det:step ";
 const step_break = "det:break ";
 const step_watch = "det:watch ";
 const step_continue = "det:continue";
+/// The moment, nothing done (an interactive session's first step when none is asked).
+pub const step_here = "det:here";
 /// `det:checkpoint [name]`: the machine saved where a session can come back to (session_checkpoint).
 const step_checkpoint = "det:checkpoint";
 /// A checkpoint's name, at most (it is queried: details.name=...).
@@ -2765,6 +2802,11 @@ fn io_out(vm: *VM, port: u16, bytes: []const u8) !?Outcome {
             if (vm.until_hit and !vm.moment_reached) {
                 if (try vm.moment_arrive()) |outcome| return outcome;
             }
+            if (vm.end_hit and !vm.moment_reached) {
+                vm.end_hit = false;
+                std.debug.print("[determinismo] the scenario ended: held here, the next step from its end\n", .{});
+                if (try vm.moment_arrive()) |outcome| return outcome;
+            }
             if (vm.strategy_ended) return .strategy_ended;
             // A step ends: a command's end, or a background command's start (its end ends none).
             const step_ended = if (vm.exec_background)
@@ -2904,6 +2946,9 @@ fn handle_request(vm: *VM, address: u32) !void {
                 try vm.checkpoint(moment_now);
                 if (vm.until != null and !vm.until_hit and !vm.moment_reached) {
                     vm.until_hit = vm.until_matches(moment_now, line);
+                }
+                if (vm.hold_owed and !vm.moment_reached and std.mem.startsWith(u8, line, "{\"event\":\"scenario_end\"")) {
+                    vm.end_hit = true;
                 }
                 if (vm.ask_until) |condition| if (!vm.ask_until_hit) {
                     vm.ask_until_hit = vm.condition_matches(condition, moment_now, line);

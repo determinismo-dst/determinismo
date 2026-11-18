@@ -270,6 +270,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "draws", check_draws },                           .{ "exit-stack", check_exit_stack },
         .{ "plan-calls", check_plan_calls },                 .{ "services", check_services },
         .{ "sites", check_sites },                           .{ "client", check_client },
+        .{ "session-exact", check_session_exact },
         .{ "java-watch", check_java_watch },
     };
     // A check's whole name runs it alone (check.sh's `ui` ran guidance and quiet too).
@@ -1225,6 +1226,100 @@ fn check_client(context: *Context) !void {
     }
 }
 
+/// A session that runs no guest command leaves the timeline it opened on as it was: opened at 3 s
+/// of a selftest timeline, its registers read, on to 6 s: its events there are the recorded
+/// ones, the same at the same moments (the guest's agent never woken: no hold at the moment).
+/// On past the scenario's end, it is held there by the VMM and goes on taking steps: a look, then
+/// a guest command (the agent's hold sent then, before it). A guest command mid-timeline still
+/// runs, the session's future its own from there.
+fn check_session_exact(context: *Context) !void {
+    const arena = context.arena;
+    const address = "127.0.0.1:7886";
+    const url = "http://" ++ address;
+    const data = try std.fs.path.join(arena, &.{ context.scratch, "serve-exact" });
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{ context.determinismo, "serve", "--listen", address, "--data", data });
+    try argv.appendSlice(arena, context.machine);
+    var server = try std.process.spawn(context.io, .{ .argv = argv.items, .stdout = .ignore, .stderr = .ignore });
+    defer server.kill(context.io);
+    for (0..50) |_| {
+        const runs: []const u8 = curl(context, &.{url ++ "/runs"}) catch "";
+        if (runs.len > 0) break;
+        sleep_ms(100);
+    }
+    const program = try std.fs.path.join(arena, &.{ context.bin, "det-selftest" });
+    const asked = try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(.{
+        .program = program,
+        .scenario = "steady",
+        .seed = 1,
+        .branches = 1,
+        .branching = "flat",
+        .timeline = "10s",
+    }, .{})});
+    _ = try curl(context, &.{ "-X", "POST", "-d", asked, url ++ "/runs" });
+    for (0..1200) |_| {
+        const run: []const u8 = curl(context, &.{url ++ "/runs/1"}) catch "";
+        if (std.mem.indexOf(u8, run, "\"state\":\"running\"") == null and run.len > 0) break;
+        sleep_ms(500);
+    }
+    const Opened = struct { session: u32 = 0, timeline: ?u32 = null };
+    const Stepped = struct { output: []const u8 = "" };
+    const Session = struct {
+        fn open(c: *Context, at_ms: u32) !Opened {
+            const body = try std.fmt.allocPrint(c.arena, "{{\"branch\":0,\"at_vtime_ms\":{d}}}", .{at_ms});
+            const answer = try curl(c, &.{ "-X", "POST", "-d", body, url ++ "/runs/1/session" });
+            return std.json.parseFromSliceLeaky(Opened, c.arena, answer, .{ .ignore_unknown_fields = true });
+        }
+        fn step(c: *Context, session: u32, exec: []const u8) ![]const u8 {
+            const body = try std.fmt.allocPrint(c.arena, "{f}", .{std.json.fmt(.{ .exec = exec }, .{})});
+            const path = try std.fmt.allocPrint(c.arena, url ++ "/sessions/{d}/step", .{session});
+            const answer = try curl(c, &.{ "-X", "POST", "-d", body, path });
+            return (try std.json.parseFromSliceLeaky(Stepped, c.arena, answer, .{ .ignore_unknown_fields = true })).output;
+        }
+        fn end(c: *Context, session: u32) !void {
+            const path = try std.fmt.allocPrint(c.arena, url ++ "/sessions/{d}/end", .{session});
+            _ = try curl(c, &.{ "-X", "POST", "-d", "{}", path });
+        }
+        fn events(c: *Context, branch: u32) ![]const u8 {
+            const sql = try std.fmt.allocPrint(c.arena, "SELECT vtime_ns, event FROM events WHERE branch = {d} " ++
+                "AND vtime_ns > 3000000000 AND vtime_ns <= 6000000000 ORDER BY seq", .{branch});
+            const body = try std.fmt.allocPrint(c.arena, "{f}", .{std.json.fmt(.{ .sql = sql }, .{})});
+            return curl(c, &.{ "-X", "POST", "-d", body, url ++ "/runs/1/sql" });
+        }
+    };
+    // 1. Looks only, then on: the recorded future.
+    const looked = try Session.open(context, 3000);
+    const regs = try Session.step(context, looked.session, "det:regs");
+    _ = try Session.step(context, looked.session, "det:at 6000000000");
+    try Session.end(context, looked.session);
+    const recorded = try Session.events(context, 0);
+    var own: []const u8 = "";
+    for (0..60) |_| {
+        own = try Session.events(context, looked.timeline orelse 0);
+        if (own.len > 4) break;
+        sleep_ms(500);
+    }
+    // 2. On past the scenario's end: held there, a look, then a guest command.
+    const ended = try Session.open(context, 3000);
+    const past = try Session.step(context, ended.session, "det:at 30000000000");
+    const at_end = try Session.step(context, ended.session, "det:regs");
+    const listed = try Session.step(context, ended.session, "det-nodes list");
+    try Session.end(context, ended.session);
+    // 3. A guest command mid-timeline.
+    const commanded = try Session.open(context, 3000);
+    const mid = try Session.step(context, commanded.session, "det-nodes list");
+    try Session.end(context, commanded.session);
+    expect_all(context, &.{
+        .{ "a look at the moment (det:regs)", std.mem.indexOf(u8, regs, "[determinismo] regs: {") != null },
+        .{ "the recorded timeline has events from 3 s to 6 s", recorded.len > 64 },
+        .{ "a session with no guest command has the same events at the same moments", recorded.len > 64 and std.mem.eql(u8, recorded, own) },
+        .{ "on past the scenario's end, the session is held there", std.mem.indexOf(u8, past, "the scenario ended: held here") != null },
+        .{ "and takes a look there", std.mem.indexOf(u8, at_end, "[determinismo] regs: {") != null },
+        .{ "and runs a guest command there (the agent's hold sent first)", std.mem.indexOf(u8, listed, "\\\"name\\\":\\\"echo\\\"") != null },
+        .{ "a guest command mid-timeline runs", std.mem.indexOf(u8, mid, "\\\"name\\\":\\\"echo\\\"") != null },
+    }, "session-exact: recorded {d} bytes of events from 3 s to 6 s, the session's {d}", .{ recorded.len, own.len });
+}
+
 fn check_tapes(context: *Context) !void {
     const program = try std.fs.path.join(context.arena, &.{ context.bin, "bank-test" });
     const strategy = try std.fs.path.join(context.arena, &.{ context.bin, "det-strategy-mutate" });
@@ -1817,9 +1912,10 @@ fn check_session(context: *Context) !void {
         "head -c 8 /dev/urandom | od -An -tx1\n";
     const steps_path = try std.fs.path.join(arena, &.{ context.scratch, "session.txt" });
     try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = steps_path, .data = steps });
-    // The session's first step is the moment's no-op (`:`): the script's too, the same commands.
+    // The session's first step is the moment's no-op (det:here, the VMM's: the guest's agent not
+    // woken): the script's too, the same steps.
     const script_path = try std.fs.path.join(arena, &.{ context.scratch, "session-script.txt" });
-    try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = script_path, .data = ":\n" ++ steps });
+    try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = script_path, .data = "det:here\n" ++ steps });
     const violation = "assert.message=\"total balance is conserved\" assert.condition=false";
     const branch = try bank_violating_branch(context);
     const base = [_][]const u8{
