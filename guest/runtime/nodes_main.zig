@@ -31,6 +31,7 @@ const usage =
     \\       det-nodes list
     \\       det-nodes symbol <node> <name> [--field <path>] [--pid <pid>]
     \\       det-nodes where <node> <address>... [--pid <pid>] [--return]
+    \\       det-nodes cfi <node> <pc> <return address>... [--pid <pid>]
     \\       det-nodes writeback
     \\       det-nodes samples
     \\
@@ -123,6 +124,71 @@ pub fn main(init: std.process.Init) !void {
         }
         std.debug.print("det-nodes: no process of {s} defines {s}\n", .{ node.name, arguments[3] });
         std.process.exit(1);
+    }
+    if (eql(u8, command, "cfi")) {
+        // `cfi <node> <pc> <return address>... [--pid <pid>]`: how each frame finds its caller
+        // (where.zig's Rule: the CFA as a register plus an offset, the return address and the
+        // caller's rbp from it; the module's .eh_frame, else the frame pointers' rule), with its
+        // name, from the first of the node's processes (or the one given) whose code holds the
+        // pc: a JSON line each, {"address","at","function","cfa_register","cfa_offset",
+        // "return_at","rbp_at","cfi"}, the rule's fields null outside code. A stack read at a
+        // stop is unwound from these where it was read (debug.cljc's frames).
+        if (arguments.len < 4) return usage_exit();
+        const node = system.node(arguments[2]) orelse return error.UnknownNode;
+        var given: ?std.os.linux.pid_t = null;
+        var addresses: std.ArrayList(u64) = .empty;
+        var index: usize = 3;
+        while (index < arguments.len) : (index += 1) {
+            if (eql(u8, arguments[index], "--pid")) {
+                if (index + 1 >= arguments.len) return usage_exit();
+                given = try std.fmt.parseInt(std.os.linux.pid_t, arguments[index + 1], 10);
+                index += 1;
+                continue;
+            }
+            try addresses.append(arena, try std.fmt.parseInt(u64, arguments[index], 0));
+        }
+        if (addresses.items.len == 0) return usage_exit();
+        var found_pids: [1024]std.os.linux.pid_t = undefined;
+        const pids = if (given) |pid| blk: {
+            found_pids[0] = pid;
+            break :blk found_pids[0..1];
+        } else found_pids[0..try nodes.processes(node.name, &found_pids)];
+        if (pids.len == 0) {
+            std.debug.print("det-nodes: {s} has no process\n", .{node.name});
+            std.process.exit(1);
+        }
+        // The process whose code holds the pc: its frames are all its own.
+        const found = for (pids) |pid| {
+            const process: where.Process = .read(arena, pid);
+            const unwound = try where.unwinding(arena, &process, addresses.items);
+            if (unwound[0].named.at != null) break unwound;
+            process.release();
+        } else {
+            std.debug.print("det-nodes: no process of {s} holds 0x{x}\n", .{ node.name, addresses.items[0] });
+            std.process.exit(1);
+        };
+        var out: std.Io.Writer.Allocating = .init(arena);
+        for (addresses.items, found) |address, one| {
+            try out.writer.print("{{\"address\":\"0x{x}\",\"at\":", .{address});
+            if (one.named.at) |text| try std.json.Stringify.value(text, .{}, &out.writer) else try out.writer.writeAll("null");
+            try out.writer.writeAll(",\"function\":");
+            if (one.named.function) |text| try std.json.Stringify.value(text, .{}, &out.writer) else try out.writer.writeAll("null");
+            if (one.rule) |rule| {
+                try out.writer.print(",\"cfa_register\":{d},\"cfa_offset\":{d},\"return_at\":{d},\"rbp_at\":", .{
+                    rule.cfa_register, rule.cfa_offset, rule.return_at,
+                });
+                if (rule.rbp_at) |at| try out.writer.print("{d}", .{at}) else try out.writer.writeAll("null");
+                try out.writer.print(",\"cfi\":{}}}\n", .{rule.cfi});
+            } else try out.writer.writeAll(",\"cfa_register\":null}\n");
+        }
+        const text = out.written();
+        var written: usize = 0;
+        while (written < text.len) {
+            const result = std.os.linux.write(1, text[written..].ptr, text.len - written);
+            if (std.os.linux.errno(result) != .SUCCESS) return error.Write;
+            written += result;
+        }
+        return;
     }
     if (eql(u8, command, "where")) {
         // `where <node> <address>... [--pid <pid>] [--return]`: each address named as a crash's

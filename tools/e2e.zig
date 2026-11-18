@@ -1270,7 +1270,7 @@ fn check_client(context: *Context) !void {
         \\          recorded)
         \\    (said "call-params" (= [{{:name "client" :type "i32" :value fd}}] (:params (first served))) (:params serve-fn) (:params (first served)))
         \\    (said "frames" (and (seq framed) (every? (fn [f] (string? (:at f))) framed)
-        \\                        (some (fn [f] (= :frame-pointers (:via f))) framed)
+        \\                        (= :pc (:via (first framed))) (some (fn [f] (= :cfi (:via f))) framed)
         \\                        (some (fn [f] (str/includes? (:at f) "selftest")) framed))
         \\          (mapv (juxt :at :via) framed))
         \\    (said "moment-when" (and (= [false true] edge) (< 2000 (:ms reached) 3000) (some? (:rip (:regs reached)))) (dissoc reached :regs) edge (:rip (:regs reached)))
@@ -1303,7 +1303,7 @@ fn check_client(context: *Context) !void {
             .{ "a function's call, its argument the connection's descriptor", good[6] },
             .{ "the call's parameter by its DWARF name and type (client, i32)", good[7] },
             .{ "a float argument from its vector register, the integer after it from rdi", good[8] },
-            .{ "a stop's frames, named as a crash's stack is (det-nodes where), its frame pointers' chain among them, the node's own code too", good[9] },
+            .{ "a stop's frames, named as a crash's stack is (det-nodes where), unwound by .eh_frame from the stop's own instruction, the node's own code among them", good[9] },
             .{ "moment-when: jiffies' +500 ticks from 2 s, not yet one branch before the moment found, held at it", good[10] },
             .{ "across: the same look in both timelines", good[11] },
         }, "client: the REPL's session, symbols, values, calls and across, from {s} ({s})", .{ runner.name, out[0..@min(out.len, 1200)] });

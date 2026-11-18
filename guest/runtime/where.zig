@@ -478,6 +478,127 @@ pub fn named(arena: std.mem.Allocator, process: *const Process, addresses: []con
     return found;
 }
 
+/// How the frame an address is in finds its caller (det-nodes cfi): its canonical frame address
+/// (the caller's stack pointer) as a register plus an offset, the return address and the
+/// caller's rbp as offsets from it. From the module's call-frame information (.eh_frame) when it
+/// has a row for the address, else the frame pointers' rule (CFA rbp+16, the return address at
+/// CFA-8, rbp at CFA-16: a module without call frames, Go's).
+pub const Rule = struct {
+    /// DWARF's x86-64 numbering: 6 rbp, 7 rsp.
+    cfa_register: u8,
+    cfa_offset: i64,
+    return_at: i64,
+    /// Where the caller's rbp was saved, from the CFA; null: rbp as it is (not saved here).
+    rbp_at: ?i64,
+    /// Whether it came from the module's .eh_frame (else the frame pointers' rule).
+    cfi: bool,
+};
+
+const dwarf_rbp = 6;
+const dwarf_rsp = 7;
+const dwarf_return = 16;
+const frame_pointers: Rule = .{ .cfa_register = dwarf_rbp, .cfa_offset = 16, .return_at = -8, .rbp_at = -16, .cfi = false };
+
+/// A module's .eh_frame, read from its file through the process's root, ready for lookups; null
+/// without one.
+fn eh_frame_of(arena: std.mem.Allocator, pid: linux.pid_t, path: []const u8) ?std.debug.Dwarf.Unwind {
+    var buffer: [512]u8 = undefined;
+    const file = std.fmt.bufPrintSentinel(&buffer, "/proc/{d}/root{s}", .{ pid, path }, 0) catch return null;
+    const opened = linux.open(file, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(opened) != .SUCCESS) return null;
+    const fd: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(fd);
+    var header: [64]u8 = undefined;
+    if (!pread_all(fd, &header, 0) or !std.mem.eql(u8, header[0..4], "\x7fELF")) return null;
+    const sections_at = std.mem.readInt(u64, header[40..48], .little);
+    const entry_size = std.mem.readInt(u16, header[58..60], .little);
+    const count = std.mem.readInt(u16, header[60..62], .little);
+    const names_index = std.mem.readInt(u16, header[62..64], .little);
+    if (entry_size < 64 or count == 0 or names_index >= count) return null;
+    const sections = fd_read(arena, fd, sections_at, @as(u64, entry_size) * count) orelse return null;
+    if (sections.len < @as(usize, entry_size) * count) return null;
+    const names_header = sections[@as(usize, names_index) * entry_size ..][0..64];
+    const names = fd_read(arena, fd, std.mem.readInt(u64, names_header[24..32], .little), std.mem.readInt(u64, names_header[32..40], .little)) orelse return null;
+    for (0..count) |index| {
+        const section = sections[index * entry_size ..][0..64];
+        const name_at = std.mem.readInt(u32, section[0..4], .little);
+        if (name_at >= names.len) continue;
+        if (!std.mem.eql(u8, std.mem.sliceTo(names[name_at..], 0), ".eh_frame")) continue;
+        const address = std.mem.readInt(u64, section[16..24], .little);
+        const size = std.mem.readInt(u64, section[32..40], .little);
+        const bytes = fd_read(arena, fd, std.mem.readInt(u64, section[24..32], .little), size) orelse return null;
+        if (bytes.len != size) return null;
+        var unwind: std.debug.Dwarf.Unwind = .initSection(.eh_frame, address, bytes);
+        unwind.prepare(arena, 8, .little, true, false) catch return null;
+        return unwind;
+    }
+    return null;
+}
+
+/// The rule of `address` (`returned`: a return address, its call's row: the instruction before
+/// it) in `unwind`, or null where it has no row for it.
+fn rule_in(arena: std.mem.Allocator, unwind: *const std.debug.Dwarf.Unwind, at: u64) ?Rule {
+    const fde_offset = (unwind.lookupPc(at, 8, .little) catch return null) orelse return null;
+    const cie, const fde = unwind.getFde(fde_offset, .little) catch return null;
+    if (at < fde.pc_begin or at >= fde.pc_begin + fde.pc_range) return null;
+    var machine: std.debug.Dwarf.Unwind.VirtualMachine = .{};
+    const row = machine.runTo(arena, at, cie, &fde, 8, .little) catch return null;
+    const cfa = switch (row.cfa) {
+        .reg_off => |register_offset| register_offset,
+        else => return null, // An expression's CFA (a signal frame's): not followed.
+    };
+    if (cfa.register != dwarf_rsp and cfa.register != dwarf_rbp) return null;
+    var rule: Rule = .{ .cfa_register = cfa.register, .cfa_offset = cfa.offset, .return_at = 0, .rbp_at = null, .cfi = true };
+    var return_found = false;
+    for (machine.rowColumns(&row)) |column| {
+        switch (column.rule) {
+            .offset => |offset| {
+                if (column.register == dwarf_return) {
+                    rule.return_at = offset;
+                    return_found = true;
+                }
+                if (column.register == dwarf_rbp) rule.rbp_at = offset;
+            },
+            else => {},
+        }
+    }
+    // x86-64's CIEs leave the return address at CFA-8 implicitly in some compilers' output.
+    if (!return_found) rule.return_at = -8;
+    return rule;
+}
+
+/// Each of `addresses`' rules and names in a live process (det-nodes cfi): the first the
+/// instruction a stop is at, the rest return addresses (their calls' rows). Null for an address
+/// no code mapping of the process holds.
+pub const Unwinding = struct { named: Named, rule: ?Rule };
+
+pub fn unwinding(arena: std.mem.Allocator, process: *const Process, addresses: []const u64) ![]const Unwinding {
+    const names: Names = .of(arena, process);
+    const found = try arena.alloc(Unwinding, addresses.len);
+    const tables = try arena.alloc(?std.debug.Dwarf.Unwind, process.modules.len);
+    const tables_read = try arena.alloc(bool, process.modules.len);
+    @memset(tables_read, false);
+    for (addresses, found, 0..) |address, *one, index| {
+        const returned = index > 0;
+        const mapping = process.code_at(address) orelse {
+            one.* = .{ .named = .{ .at = null, .function = null }, .rule = null };
+            continue;
+        };
+        one.named = .{ .at = names.name(address, returned), .function = names.function_of(address, returned) };
+        one.rule = frame_pointers;
+        const module = process.module_of(mapping.path) orelse continue;
+        const module_index = (@intFromPtr(module) - @intFromPtr(process.modules.ptr)) / @sizeOf(Module);
+        if (!tables_read[module_index]) {
+            tables_read[module_index] = true;
+            tables[module_index] = eh_frame_of(arena, process.pid, module.path);
+        }
+        if (tables[module_index]) |*unwind| {
+            if (rule_in(arena, unwind, address - module.bias - @intFromBool(returned))) |rule| one.rule = rule;
+        }
+    }
+    return found;
+}
+
 fn walk(arena: std.mem.Allocator, process: *const Process, memory: *const Memory, rip: u64, rsp: u64, rbp: u64) ?Walked {
     const names: Names = .of(arena, process);
     var addresses: [frames_max]u64 = undefined;
@@ -594,4 +715,21 @@ test "named: a function of the process by its ELF symbol, a stack address outsid
     try std.testing.expectEqual(@as(?[]const u8, null), found[1].at);
     try std.testing.expectEqual(@as(?[]const u8, null), found[1].function);
     local += 1;
+}
+
+test "unwinding: a function's entry by its .eh_frame (the CFA rsp+8, the return address below it)" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const process: Process = .read(arena, linux.getpid());
+    defer process.release();
+    const entry = @intFromPtr(&det_where_named_test_function);
+    const found = try unwinding(arena, &process, &.{entry});
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    const rule = found[0].rule orelse return error.TestNoRule;
+    try std.testing.expect(rule.cfi);
+    try std.testing.expectEqual(@as(u8, dwarf_rsp), rule.cfa_register);
+    try std.testing.expectEqual(@as(i64, 8), rule.cfa_offset);
+    try std.testing.expectEqual(@as(i64, -8), rule.return_at);
+    try std.testing.expect(found[0].named.at != null);
 }

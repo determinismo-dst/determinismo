@@ -573,64 +573,76 @@ std::string determinismo_debug_hex(std::string const &decimal) {
   (let [n (reduce (fn [n b] (+ (* n 256) b)) 0N (reverse bytes))]
     (if (<= n 9223372036854775807) (long n) n)))
 
+(defn- cfi-rules
+  "Each address's frame rule and name (`det-nodes cfi`): the first the instruction a stop is at,
+  the rest return addresses. A guest command a 150 addresses."
+  [session node pc returns options]
+  (vec (mapcat (fn [chunk]
+                 (let [said (sh session (str "det-nodes cfi " (named node) " " (hex pc) " " (str/join " " (map hex chunk))
+                                             (when (:pid options) (str " --pid " (:pid options)))))]
+                   (keep (fn [line] (when (str/starts-with? line "{") (update (json/read-json line) :address unhex)))
+                         (str/split-lines (or said "")))))
+               (or (seq (partition-all 150 returns)) [[]]))))
+
 (defn frames
   "The calls a process is in, at a stop of the session's inside it (a breakpoint's or a watch's:
-  the vCPU's registers are then that process's), innermost first (by their places on the stack),
-  each named by `where` as a return address (a guest command after the stack is read): its chain
-  of frame pointers (from rbp, each frame's saved rbp above the last, as long as it stays in code:
-  :via :frame-pointers; the chain reads the pages it reaches) and the other words of its stack
-  from the stack pointer on that point into a function of one of its modules (:via :scan: a frame
-  without a frame pointer, a function's own return address at its entry, or a word a returned
-  call left behind; :pages of 4 KiB from rsp's, 4).
+  the vCPU's registers are then that process's), innermost first: the stop's own instruction
+  (:via :pc), then each caller unwound from the stack read at the stop by its frame's rule
+  (`det-nodes cfi`, a guest command after the stack is read: the module's .eh_frame, :via :cfi,
+  else the frame pointers' rule, :via :frame-pointers), each named by `where`'s naming. Past
+  where unwinding stops, the stack's words that point into a function of one of its modules
+  (:via :scan). The stack: :pages of 4 KiB from rsp's (4), and the pages unwinding reaches.
   Options: :pid, :pages. -> [{:address :at :function :via} ...]"
   ([session node] (frames session node {}))
   ([session node options]
    (let [registers (regs session)
          space (unhex (:cr3 registers))
+         rip (unhex (:rip registers))
          rsp (unhex (:rsp registers))
          start (-' rsp (mod rsp 4096))
-         ;; [address word] of every 8 bytes read, from rsp on.
-         words (vec (mapcat (fn [page]
-                              (let [va (+' start (*' page 4096))
-                                    physical (translate session space va)]
-                                (when physical
-                                  (let [bytes (mem session physical 4096)]
-                                    (keep (fn [i] (when (>= (+' va i) rsp) [(+' va i) (little-u64 (subvec bytes i (+ i 8)))]))
-                                          (range 0 4096 8))))))
-                            (range (or (:pages options) 4))))
-         ;; The chain's words, from the pages read for the scan, else their own page read then
-         ;; (a large frame's caller lies past them).
-         pages (atom (into {} (map (fn [[address word]] [address word]) words)))
+         page-words (fn [page]
+                      (let [physical (translate session space page)]
+                        (when physical
+                          (let [bytes (mem session physical 4096)]
+                            (mapv (fn [i] [(+' page i) (little-u64 (subvec bytes i (+ i 8)))]) (range 0 4096 8))))))
+         ;; [address word] of every 8 bytes from rsp on, as read at the stop.
+         words (vec (filter (fn [[address _]] (>= address rsp))
+                            (mapcat (fn [n] (page-words (+' start (*' n 4096)))) (range (or (:pages options) 4)))))
+         pages (atom (into {} words))
          word-at (fn [address]
                    (or (get @pages address)
-                       (let [page (-' address (mod address 4096))
-                             physical (translate session space page)]
-                         (when physical
-                           (let [bytes (mem session physical 4096)]
-                             (swap! pages into (map (fn [i] [(+' page i) (little-u64 (subvec bytes i (+ i 8)))]) (range 0 4096 8)))
-                             (get @pages address))))))
-         ;; [slot return-address] of each frame: its saved rbp's slot plus 8.
-         chain (loop [frame (unhex (:rbp registers)) out []]
-                 (let [returned (when (pos? frame) (word-at (+' frame 8)))
-                       next (when returned (word-at frame))]
-                   (if (and returned next (< (count out) 64))
-                     (if (and (> next frame) (< (-' next frame) 1048576))
-                       (recur next (conj out [(+' frame 8) returned]))
-                       (conj out [(+' frame 8) returned]))
-                     out)))
+                       (do (swap! pages into (page-words (-' address (mod address 4096))))
+                           (get @pages address))))
          ;; User-space addresses only (below 2^47): the rest are data.
          user? (fn [w] (and (>= w 4096) (< w 140737488355328)))
-         candidates (vec (distinct (filter user? (concat (map second chain) (map second words)))))
-         named-all (where session node candidates (assoc (select-keys options [:pid]) :return true))
-         by-address (into {} (map (fn [one] [(:address one) one]) named-all))
-         in-code (fn [w] (let [one (get by-address w)] (when (:at one) one)))
-         ;; The chain as long as it stays in code; then every frame by its slot, innermost first.
-         chained (vec (take-while (fn [[_ one]] (some? one))
-                                  (map (fn [[slot w]] [slot (some-> (in-code w) (assoc :via :frame-pointers))]) chain)))
-         chain-slots (set (map first chained))
-         scanned (keep (fn [[slot w]] (when-not (chain-slots slot) (some->> (in-code w) (#(assoc % :via :scan)) (vector slot))))
+         candidates (vec (distinct (filter user? (map second words))))
+         told (cfi-rules session node rip candidates options)
+         pc-rule (first told)
+         rules (atom (into {} (map (fn [one] [(:address one) one]) (rest told))))
+         rule-of (fn [address]
+                   (or (get @rules address)
+                       (let [one (second (cfi-rules session node rip [address] options))]
+                         (swap! rules assoc address one)
+                         one)))
+         frame (fn [one via slot] (assoc (select-keys one [:address :at :function]) :via via :slot slot))
+         ;; From the pc: each frame's caller by the frame's rule, while it stays in code.
+         unwound (loop [one pc-rule sp rsp bp (unhex (:rbp registers)) out [(frame pc-rule :pc nil)]]
+                   (if (or (nil? (:cfa_register one)) (>= (count out) 64))
+                     out
+                     (let [cfa (+' (if (= 7 (:cfa_register one)) sp bp) (:cfa_offset one))
+                           slot (+' cfa (:return_at one))
+                           returned (when (> cfa sp) (word-at slot))
+                           caller (when (and returned (user? returned)) (rule-of returned))]
+                       (if (and caller (:at caller))
+                         (recur caller cfa (if (:rbp_at one) (or (word-at (+' cfa (:rbp_at one))) bp) bp)
+                                (conj out (frame caller (if (:cfi one) :cfi :frame-pointers) slot)))
+                         out))))
+         last-slot (or (:slot (peek unwound)) rsp)
+         scanned (keep (fn [[slot w]]
+                         (when (> slot last-slot)
+                           (when-let [one (get @rules w)] (when (:at one) (frame one :scan slot)))))
                        words)
-         stack (vec (dedupe (map second (sort-by first (concat chained scanned)))))]
+         stack (mapv (fn [f] (dissoc f :slot)) (dedupe (concat (when (:at pc-rule) unwound) scanned)))]
      (tap/tell :frames {:session session :node (named node) :frames stack} stack))))
 
 (defn moment-when
