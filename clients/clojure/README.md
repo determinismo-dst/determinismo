@@ -73,7 +73,11 @@ the recorded history.
     (dbg/calls s (dbg/symbol s "db-1" "handle_request") {:limit 5})
                                                       ; a function's calls, :args at each and
                                                       ; :params by name ({:name "fd" :value 5})
-    (dbg/frames s :db-1)                              ; at a stop in its process: its calls, named
+    (dbg/symbol-at 13 {:branch 4 :at-vtime-ms 2000} :db-1 :handle_request)
+                                                      ; looked up in a session of its own: a session
+                                                      ; given it runs no guest command, as recorded
+    (dbg/frames s :db-1)                              ; at a stop in its process: its calls, named,
+                                                      ; :via :frame-pointers or :scan
     (dbg/moment-when 13 4 #(pos? (dbg/value-of (dbg/mem % page 8) :u64)) {:from-ms 2000 :to-ms 3000})
                                                       ; the first moment a look holds, to the branch
     (dbg/across 13 "event=request_start" #(dbg/calls % (dbg/symbol % :db-1 :handle_request) {:limit 3})
