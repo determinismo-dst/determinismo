@@ -5853,7 +5853,13 @@ fn check_pausing(context: *Context) !void {
         .{ .profile = "java", .memory_mib = "2048", .property = "no uncaught exceptions (Java)", .frequent = false },
         .{ .profile = "python", .memory_mib = "1024", .property = "no unexpected container exits", .frequent = false },
         .{ .profile = "javascript", .memory_mib = "2048", .property = "no unexpected container exits", .frequent = false },
-        .{ .profile = "dotnet", .memory_mib = "2048", .property = "no unexpected container exits", .frequent = true },
+        // Not frequent: as Java's, Python's and JavaScript's, the race runs again and again in
+        // one process, which draws a stretch every two seconds (about three in a timeline of
+        // 1 to 10 s) where C++'s, Rust's and Go's start a process a run, each with its own
+        // draw (hundreds a timeline). examples/race/README.md's blind runs: 6 finds in 1,479
+        // timelines for .NET, 9 in 953 for Java, against 787 in 2,153 for C++. It was marked
+        // frequent while the draws' count was read as 0 and the whole line red.
+        .{ .profile = "dotnet", .memory_mib = "2048", .property = "no unexpected container exits", .frequent = false },
     };
     const timelines = 32;
     for (languages) |language| {
