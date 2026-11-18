@@ -6344,6 +6344,11 @@ fn check_frozen_start(context: *Context) !void {
 /// States from instrumented code (the JVM agent's enum transitions, SGFuzz's state variables)
 /// guide the tree where line coverage cannot: the state maze's progress runs no new line, and is
 /// solved when its stage is an enum field, never when the same progress is an int.
+/// The state maze (tests/antithesis-compat/java): solved by the tree with the agent's state
+/// transitions to return to, rarely without them. 1,024 timelines and a comparison, not one
+/// seed's 256 and "never with an int": at 256 the enum's solved in two seeds of three and the
+/// int's once by chance (2026-11-18, after a syscall more at each node start, 65ff0f7, moved every
+/// moment and seed 1 from 25 solved to none); at 1,024, 91 and 15 against 0 and 0.
 fn check_states(context: *Context) !void {
     var solved: [2]u64 = undefined;
     var transitions: u64 = 0;
@@ -6354,7 +6359,7 @@ fn check_states(context: *Context) !void {
         const events = try std.fmt.allocPrint(context.arena, "{s}/{s}-events", .{ context.scratch, scenario });
         _ = try explore(context, &.{
             "--compose",    "tests/antithesis-compat/java/compose.yaml", "--scenario", scenario,
-            "--seed",       "1",                                         "--branches", "256",
+            "--seed",       "1",                                         "--branches", "1024",
             "--events-dir", events,
         });
         count.* = try query_count(context, &.{ events, "assert.message=\"the state maze is never solved\" assert.condition=false" });
@@ -6365,8 +6370,8 @@ fn check_states(context: *Context) !void {
         .{ "the composer sees the client's setup declared by our Java SDK", setup_missing == 0 },
         .{ "the agent reports the stage's transitions", transitions > 0 },
         .{ "with its stage an enum, the maze is solved", solved[0] > 0 },
-        .{ "with its progress an int, it is not", solved[1] == 0 },
-    }, "states: the state maze solved in {d} timelines by its enum's transitions ({d} reported), {d} with an int, of 256 each; the setup missed in {d}", .{
+        .{ "with its stage an enum, in more timelines than with its progress an int", solved[0] > solved[1] },
+    }, "states: the state maze solved in {d} timelines by its enum's transitions ({d} reported), {d} with an int, of 1024 each; the setup missed in {d}", .{
         solved[0], transitions, solved[1], setup_missing,
     });
 }
