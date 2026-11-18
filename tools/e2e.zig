@@ -1204,7 +1204,7 @@ fn check_client(context: *Context) !void {
     }
     const script = try std.fs.path.join(arena, &.{ context.scratch, "client.clj" });
     try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = script, .data = try std.fmt.allocPrint(arena,
-        \\(require '[determinismo.api :as api] '[determinismo.debug :as d])
+        \\(require '[determinismo.api :as api] '[determinismo.debug :as d] '[clojure.string :as str])
         \\(def unhex (deref (resolve 'determinismo.debug/unhex)))
         \\(defn number [x] (if (string? x) (unhex x) x))
         \\(defn echo-of [s] (first (filter (fn [n] (= "echo" (:name n))) (d/nodes s))))
@@ -1228,7 +1228,21 @@ fn check_client(context: *Context) !void {
         \\        _ (connect s 1)
         \\        recorded (:params (first (d/calls s record-fn {{:limit 1 :ms 3000}})))
         \\        recorded-ratio (:value (first recorded))
+        \\        _ (connect s 1)
+        \\        _ (d/break s (:address serve-fn) nil)
+        \\        stop (d/continue s 3000)
+        \\        framed (when stop (d/frames s :echo))
+        \\        _ (d/break s nil)
         \\        _ (d/close s)
+        \\        ;; The guest kernel's jiffies by its name, then its moment of reaching +500 ticks.
+        \\        k (d/open 1 {{:branch 0 :at-vtime-ms 2000}})
+        \\        jiffies (unhex (str "0x" (first (str/split (str/trim (d/sh k "grep -m1 ' D jiffies$' /proc/kallsyms")) #" "))))
+        \\        _ (d/close k)
+        \\        j (d/open 1 {{:branch 0 :at-vtime-ms 2000}})
+        \\        jiffies-at-2s (d/value-of (d/mem j (d/translate j :current jiffies) 8) :u64)
+        \\        _ (d/close j)
+        \\        reached (d/moment-when 1 0 (fn [t] (>= (d/value-of (d/mem t (d/translate t :current jiffies) 8) :u64) (+ jiffies-at-2s 500)))
+        \\                               {{:from-ms 2000 :to-ms 3000}})
         \\        across (d/across 1 condition
         \\                         (fn [t] (let [found (d/symbol t :echo :selftest_accepted)]
         \\                                   (connect t 1)
@@ -1246,6 +1260,10 @@ fn check_client(context: *Context) !void {
         \\                            (< 2 (:value (second recorded)) 1024))
         \\          recorded)
         \\    (said "call-params" (= [{{:name "client" :type "i32" :value fd}}] (:params (first served))) (:params serve-fn) (:params (first served)))
+        \\    (said "frames" (and (seq framed) (every? (fn [f] (some? (:symbol f))) framed)
+        \\                        (some (fn [f] (str/includes? (str (:module f)) "selftest")) framed))
+        \\          (mapv (juxt :name :offset :module) framed))
+        \\    (said "moment-when" (and (<= 2490 (:ms reached) 2510) (some? (:rip (:regs reached)))) (dissoc reached :regs) (:rip (:regs reached)))
         \\    (said "across-both" (and (= [0 1] (mapv :branch across))
         \\                             (every? (fn [r] (and (= 1 (count (:result r))) (pos? (first (:result r))))) across))
         \\          (mapv (juxt :branch :timeline :result) across))))
@@ -1262,7 +1280,7 @@ fn check_client(context: *Context) !void {
     for (runners.items) |runner| {
         const ran = try run_kept(context, runner.argv);
         const out = try std.mem.concat(arena, u8, &.{ ran.stdout, ran.stderr });
-        const names = [_][]const u8{ "regs", "accepted-u64", "ratio-f64", "ratio-16-in", "ratios-half-a-connection", "call-descriptor", "call-params", "call-float", "across-both" };
+        const names = [_][]const u8{ "regs", "accepted-u64", "ratio-f64", "ratio-16-in", "ratios-half-a-connection", "call-descriptor", "call-params", "call-float", "frames", "moment-when", "across-both" };
         var good: [names.len]bool = undefined;
         for (names, 0..) |name, index| good[index] = std.mem.indexOf(u8, out, try std.fmt.allocPrint(arena, "ok {s} ", .{name})) != null;
         expect_all(context, &.{
@@ -1274,7 +1292,9 @@ fn check_client(context: *Context) !void {
             .{ "a function's call, its argument the connection's descriptor", good[5] },
             .{ "the call's parameter by its DWARF name and type (client, i32)", good[6] },
             .{ "a float argument from its vector register, the integer after it from rdi", good[7] },
-            .{ "across: the same look in both timelines", good[8] },
+            .{ "a stop's frames, named (det-nodes where), the node's own module among them", good[8] },
+            .{ "moment-when: jiffies' +500 ticks from 2 s found at 2.5 s, to the branch", good[9] },
+            .{ "across: the same look in both timelines", good[10] },
         }, "client: the REPL's session, symbols, values, calls and across, from {s} ({s})", .{ runner.name, out[0..@min(out.len, 1200)] });
     }
 }

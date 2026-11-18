@@ -73,6 +73,9 @@ the recorded history.
     (dbg/calls s (dbg/symbol s "db-1" "handle_request") {:limit 5})
                                                       ; a function's calls, :args at each and
                                                       ; :params by name ({:name "fd" :value 5})
+    (dbg/frames s :db-1)                              ; at a stop in its process: its calls, named
+    (dbg/moment-when 13 4 #(pos? (dbg/value-of (dbg/mem % page 8) :u64)) {:from-ms 2000 :to-ms 3000})
+                                                      ; the first moment a look holds, to the branch
     (dbg/across 13 "event=request_start" #(dbg/calls % (dbg/symbol % :db-1 :handle_request) {:limit 3})
                                                       ; the same look in each timeline the query keeps
     (dbg/step-branches s 1000)                        ; the registers 1000 branches on
