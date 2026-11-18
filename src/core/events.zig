@@ -583,6 +583,7 @@ const platform_events = std.StaticStringMap(void).initComptime(.{
     .{"min_drive"},
     .{"network_baseline"},
     .{"node_address"},
+    .{"node_completed"},
     .{"node_cpu"},
     .{"node_crash"},
     .{"node_crash_files"},
