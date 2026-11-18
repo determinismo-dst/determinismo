@@ -4878,9 +4878,15 @@ fn check_tree(context: *Context) !void {
     const held = holders_made(one) and holders_made(many);
     // Each the node a replay makes, in what the guest can see (--verify-holders remade them).
     const verified = holders_verified(one);
+    // The explorer looks at the host's memory beside its VMs for its run's claims, and says
+    // its first look that counts (its VMs claim their guest's size, or less): without a pool
+    // of its own it never looked, and nothing said so (2026-11-18).
+    const claims_looked = std.mem.indexOf(u8, one, "the run's VMs claim") != null or
+        std.mem.indexOf(u8, many, "the run's VMs claim") != null;
     expect_all(context, &.{
         .{ "64 timelines with one worker", count == 64 },
         .{ "64 timelines with four", parallel_count == 64 },
+        .{ "the explorer looks at what the host holds for its VMs (its run's claims)", claims_looked },
         .{ "the tree deepens (a path at least one deep)", deep.depth >= 1 },
         .{ "the deepest timeline replays alone from its tape", deep.replays },
         .{ "in-run snapshots made nodes, with one worker and with four", held },

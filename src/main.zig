@@ -3746,6 +3746,12 @@ fn explore_tree(
     var sampled_ns: u64 = 0;
     // Whether the run's holders went at its ending (below).
     var holders_dropped = false;
+    // The explorer's own pool, for its run's claims alone (claims_look): its timelines' processes
+    // each open theirs (worker_run), and `branches.pool` is none here. Without one the run's
+    // claims stay its guests' size.
+    var claims_pool: cpus.Pool = undefined;
+    const claims_pool_open = if (claims_pool.open()) |_| true else |_| false;
+    defer if (claims_pool_open) claims_pool.close();
     while (true) {
         busy.advance(running_count);
         if (monotonic_ns() -| sampled_ns >= activity_sample_ns) {
@@ -3763,7 +3769,7 @@ fn explore_tree(
             const split = cpus.memory_split();
             activity.sample(starts[0..running_count], indices[0..running_count], nodes, @intCast(state.queue.items.len - state.queue_head), cpus.memory_available(), if (holding) registry.count else 0, split.anonymous, split.shared);
         }
-        claims_look(&state, branches.pool, running[0..running_count], jobs);
+        claims_look(&state, if (claims_pool_open) &claims_pool else null, running[0..running_count], jobs);
         const late = past_deadline(branches);
         // A run that starts no timeline any more (drained, or past its budget) returns to none of
         // its holders: their memory and disk go now, to the next hunt beside its last timelines,
@@ -4264,13 +4270,23 @@ fn claims_look(state: *TreeState, pool: ?*cpus.Pool, running: []Running, jobs: u
         }
         return;
     }
+    const held_before = state.claims.held_max;
     state.claims.sample(cpus.host_in_use(), claims_pool.run_held(), @intCast(running.len), jobs, state.ended);
     const said = state.claims.softened;
     const claim = state.claims.claim(cpus.claim_bytes);
     claims_pool.claim_soft_set(claim);
-    if (claim != 0 and !said) std.debug.print("[determinismo] the run's VMs claim {d} MiB each from " ++
-        "now, not their guest's {d}: half again what the host had in use for each ({d} timelines " ++
-        "ended)\n", .{ claim >> 20, cpus.claim_bytes >> 20, state.ended });
+    // Said at its first look that counts, and when its VMs first claim less than their guest.
+    if (claim != 0 and !said) {
+        std.debug.print("[determinismo] the run's VMs claim {d} MiB each from now, not their guest's " ++
+            "{d}: half again what the host had in use for each ({d} timelines ended)\n", .{
+            claim >> 20, cpus.claim_bytes >> 20, state.ended,
+        });
+    } else if (held_before == 0 and state.claims.held_max != 0) {
+        std.debug.print("[determinismo] the run's VMs claim their guest's {d} MiB each: the host had " ++
+            "{d} MiB in use for each ({d} timelines ended)\n", .{
+            cpus.claim_bytes >> 20, state.claims.held_max >> 20, state.ended,
+        });
+    }
 }
 
 const Running = struct {
