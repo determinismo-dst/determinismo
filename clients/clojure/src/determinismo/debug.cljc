@@ -272,3 +272,25 @@ std::string determinismo_debug_hex(std::string const &decimal) {
   (->> (str/split-lines (sh session "det-nodes list"))
        (remove str/blank?)
        (mapv json/read-json)))
+
+(defn node-sh
+  "A shell command run inside `node` at the session's moment (its root, its namespaces, as the
+  node's own processes see them): what it printed. A Go program's goroutines, for one:
+  (node-sh s \"raft-node-0\" \"kill -QUIT 1\"), then its output as the timeline goes on."
+  [session node command]
+  (sh session (str "det-nodes exec " node " sh -c '" (str/replace command "'" "'\\''") "'")))
+
+(defn forks
+  "The forks this session started (`sdk.fork` in a REPL at its moment): each fork's run, its
+  futures, its state and verdicts."
+  [session]
+  (call (str "/sessions/" session "/forks") {}))
+
+(defn latest
+  "The last `event` (an event's name) the session's timeline said so far, as its events file has
+  it ({:seq :vtime_ns :event}), or nil: what a window following a session draws from."
+  [session event]
+  (let [[status text] (http/request :get (str *url* "/sessions/" session "/latest?event=" event) nil)]
+    (cond (= status 204) nil
+          (>= status 400) (throw (ex-info (str "determinismo: " status " " text) {:status status :body text}))
+          :else (json/read-json text))))

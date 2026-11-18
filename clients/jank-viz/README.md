@@ -11,7 +11,10 @@ so every evaluation is told to the window with its value, and so is every call o
 DETERMINISMO_URL=http://host:7878 ./viz.sh    # serve's address, else http://127.0.0.1:7878
 ```
 
-Connect an editor to the port (CIDER: `cider-connect-clj`) and work as anywhere:
+Connect an editor to the port (CIDER: `cider-connect-clj`), or an agent (an nREPL client such
+as `clj-nrepl-eval -p $(cat .nrepl-port) '<form>'`), and work as anywhere; `(help)` from
+`determinismo.help` lists what there is. The window draws what either evaluates, so a person
+watches what an agent does:
 
 ```clojure
 (require '[determinismo.api :as d] '[determinismo.debug :as dbg])

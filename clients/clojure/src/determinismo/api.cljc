@@ -1,7 +1,9 @@
 ;; SPDX-License-Identifier: MIT
 ;; determinismo's HTTP API (src/serve.zig) from Clojure, babashka or jank: runs, their timelines
-;; and properties, events (query, SQL), replays, causality analyses, starting and stopping runs.
-;; The debugger's sessions are determinismo.debug.
+;; and properties, events (query, SQL), replays, a node's file at a moment, timelines from a
+;; moment, causality, shrinking and explaining analyses, starting, stopping and resuming runs.
+;; The debugger's sessions are determinismo.debug, Quint is determinismo.quint, and
+;; determinismo.help lists everything with its arguments (`(help)`, `(help "replay")`).
 ;;
 ;;   (require '[determinismo.api :as api])
 ;;   (binding [api/*url* "http://127.0.0.1:7878"] (api/runs))  ; $DETERMINISMO_URL, else this
@@ -106,6 +108,10 @@
     (tap/tell :run/check (assoc checked :run run-id) checked)))
 
 (defn stop-run [id] (parse (request :post (str "/runs/" id "/stop"))))
+(defn resume-run
+  "Resumes a run that was stopped or interrupted, from where it was (its record, its holders)."
+  [id]
+  (parse (request :post (str "/runs/" id "/resume"))))
 (defn output [id] (request :get (str "/runs/" id "/output")))
 
 (defn timelines
@@ -119,6 +125,46 @@
     (tap/tell :properties {:run id :properties judged} judged)))
 (defn discovery [id] (parse (request :get (str "/runs/" id "/discovery"))))
 (defn findings [id] (parse (request :get (str "/runs/" id "/findings"))))
+
+(defn triage
+  "The run's triage report (Markdown): its failing properties, each with its first failing
+  timeline, how often it failed and what came before it. nil for a run that has none."
+  [id]
+  (let [[status text] (http/request :get (str *url* "/runs/" id "/triage") nil)]
+    (cond (= status 404) nil
+          (>= status 400) (throw (ex-info (str "determinismo: " status " " text) {:status status :body text}))
+          :else text)))
+
+(defn failures
+  "Every failing evaluation of the run, as the map marks it: {:property :timeline :vtime_ns ...}."
+  [id]
+  (lines (request :get (str "/runs/" id "/failures"))))
+
+(defn logged
+  "What the run's nodes logged, by template: [{:node :level :template :timelines :lines
+  :first_timeline :example ...}], one a template (a line's words with its numbers and ids left
+  out)."
+  [id]
+  (json/read-json (request :get (str "/runs/" id "/logged"))))
+
+(defn ranges
+  "The ranges the run learned (the highest and lowest of each value its program asked to
+  track): each with its record and the timeline holding it."
+  [id]
+  (parse (request :get (str "/runs/" id "/ranges"))))
+
+(defn activity
+  "Where the run's workers' time went, minute by minute: {:workers :minute_s :minutes [{:timelines
+  :vtime_s :wait_s :busy_s {...} :running ...}]}: its explorer, node makers, holders and
+  verifier."
+  [id]
+  (json/read-json (request :get (str "/runs/" id "/activity"))))
+
+(defn automations
+  "What the commands run at each failing property's first counterexample said: {:property
+  :timeline :vtime_ns :exec :output}."
+  [id]
+  (lines (request :get (str "/runs/" id "/automations"))))
 
 (defn query
   "Events matching a condition (query.zig): {:condition, :branch, :up_to_vtime (s), :output
@@ -240,6 +286,26 @@
   ([id] (parse (request :get (str "/runs/" id "/causality"))))
   ([id n] (parse (request :get (str "/runs/" id "/causality/" n)))))
 
+;; Words in a URL's query: what is not a letter, a digit or one of -_.~ as %XX (UTF-8 bytes of
+;; anything not ASCII are left as they are: serve reads them as they come).
+(def ^:private percent-digits "0123456789ABCDEF")
+
+(defn- percent [c]
+  (let [n (int c)]
+    (if (or (and (>= n 48) (<= n 57)) (and (>= n 65) (<= n 90)) (and (>= n 97) (<= n 122))
+            (= c \-) (= c \_) (= c \.) (= c \~) (> n 127))
+      (str c)
+      (str "%" (nth percent-digits (quot n 16)) (nth percent-digits (mod n 16))))))
+
+(defn- query-text [text]
+  (apply str (map percent text)))
+
+(defn causality-logs
+  "The node output of an analysis's explained future `k` (its lines holding `grep`, when given):
+  what the nodes said in the future that did, or did not, fail."
+  ([id n k] (lines (request :get (str "/runs/" id "/causality/" n "/explained/" k "/logs"))))
+  ([id n k grep] (lines (request :get (str "/runs/" id "/causality/" n "/explained/" k "/logs?grep=" (query-text grep))))))
+
 (defn causality-wait
   "Waits for an analysis to finish (looking every `every-ms`), and returns it."
   ([id n] (causality-wait id n 3000))
@@ -247,6 +313,92 @@
    (loop []
      (let [analysis (causality id n)]
        (if (:done analysis) analysis (do (http/sleep-ms every-ms) (recur)))))))
+
+;; Shrinking and explaining, beside causality: started, listed, stopped as it is.
+(defn shrink-start
+  "Starts shrinking a failing timeline: {:branch :property :timelines}: the fewest of its faults
+  its property's failure still needs (each tried in `timelines` futures). Its {:id}."
+  [id request-map]
+  (parse (request :post (str "/runs/" id "/shrink") request-map)))
+
+(defn shrinks
+  "Every shrinking of a run: [{:id :of :done :result :progress}]."
+  [id]
+  (parse (request :get (str "/runs/" id "/shrink"))))
+
+(defn shrink-stop [id n] (parse (request :post (str "/runs/" id "/shrink/" n "/stop"))))
+
+(defn explain-start
+  "Starts explaining a failing timeline: {:branch :property :faults :variants}: which details of
+  its last `faults` faults its failure needs (each drawn again `variants` times beside a
+  control). Its {:id}."
+  [id request-map]
+  (parse (request :post (str "/runs/" id "/explain") request-map)))
+
+(defn explains
+  "Every explanation of a run: [{:id :of :done :result :progress}]."
+  [id]
+  (parse (request :get (str "/runs/" id "/explain"))))
+
+(defn explain-stop [id n] (parse (request :post (str "/runs/" id "/explain/" n "/stop"))))
+
+(defn analysis-wait
+  "Waits for a shrinking or an explanation (`listing`: shrinks or explains) to finish, looking
+  every `every-ms`, and returns it."
+  ([listing id n] (analysis-wait listing id n 3000))
+  ([listing id n every-ms]
+   (loop []
+     (let [found (first (filter (fn [item] (= n (:id item))) (listing id)))]
+       (if (or (nil? found) (:done found)) found (do (http/sleep-ms every-ms) (recur)))))))
+
+;; At a moment of a timeline: a node's file as it was, the lines its events left out, new
+;; timelines from there. Each marks the moment on the visualization's map.
+(defn extract
+  "A node's file as it was at a moment of a timeline (the timeline replayed to it): {:branch
+  :at_vtime_ms :node :path}. Its text (`extract-to` for a binary file)."
+  [id request-map]
+  (let [text (request :post (str "/runs/" id "/extract") request-map)]
+    (tap/tell :replay {:run id :request (select-keys request-map [:branch :at_vtime_ms])
+                       :output (str "extracted " (:node request-map) ":" (:path request-map))}
+              text)))
+
+(defn extract-to
+  "`extract`, its bytes written to the local file `path` as they are (a database, a core dump).
+  The path."
+  [id request-map path]
+  (let [[status written] (http/download (str *url* "/runs/" id "/extract") (json/write-json request-map) path)]
+    (when (>= status 400)
+      (throw (ex-info (str "determinismo: " status " extracting " (:node request-map) ":" (:path request-map)) {:status status})))
+    (tap/tell :replay {:run id :request (select-keys request-map [:branch :at_vtime_ms])
+                       :output (str "extracted " (:node request-map) ":" (:path request-map) " to " path)}
+              written)))
+
+(defn recover
+  "The output lines a timeline's events left out near a moment (Antithesis's \"Recover filtered
+  logs\"): {:branch :vtime_ns :window_ms}. Oldest first."
+  [id request-map]
+  (let [found (lines (request :post (str "/runs/" id "/recover") request-map))]
+    (tap/tell :replay {:run id :request {:branch (:branch request-map) :at_vtime_ms (quot (:vtime_ns request-map) 1000000)}
+                       :output (str (count found) " lines recovered")}
+              found)))
+
+(defn fork
+  "New timelines from a moment of one: the run's own request (its system, scenario, faults),
+  `branches` of them, flat, each from timeline `branch` at `at-vtime-ms` on (explore's
+  --from-branch --from-vtime-ms); `more` merged into the request (:faults, :decide, ...). The
+  new run, {:id ...}."
+  ([id branch at-vtime-ms branches] (fork id branch at-vtime-ms branches {}))
+  ([id branch at-vtime-ms branches more]
+   (let [original (:request (run id))
+         ;; What a run of its own is not: a budget, a tree's generations, a plan, a CI job, a
+         ;; checkpoint's or a session's start.
+         asked (merge (apply dissoc original [:time_budget :generation :horizon :plan :ci :repeat :from_snapshot
+                                              :from_run :checkpoint :checkpoint_exec :checkpoint_steps :build
+                                              :return_offsets :return_branches])
+                      {:from_branch branch :from_vtime_ms at-vtime-ms :branches branches :branching "flat"}
+                      more)]
+     (tap/tell :replay {:run id :request {:branch branch :at_vtime_ms at-vtime-ms} :output (str branches " timelines from here")} nil)
+     (start-run asked))))
 
 (defn wait-run
   "Waits for a run to finish (looking every `every-ms`), and returns it."
@@ -259,3 +411,14 @@
          (tap/tell :run/done {:run id :state (:state found)} found))))))
 
 (defn strategies [] (parse (request :get "/strategies")))
+
+(defn machines
+  "The machines serve holds (a sandbox's, a CI job's): {:machine :alive :directory
+  :checkpoints}."
+  []
+  (parse (request :get "/machines")))
+
+(defn build
+  "serve's build: {:commit :explorer :kernel :initrd}, what new runs boot with."
+  []
+  (parse (request :get "/build")))

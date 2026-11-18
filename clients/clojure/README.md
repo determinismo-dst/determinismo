@@ -3,8 +3,20 @@
 serve's API from Clojure on the JVM, babashka or jank: one `.cljc` source, no dependencies
 (java.net.http on the JVM and in babashka, curl through C++ on jank).
 
-`determinismo.api`: runs (start, stop, wait), their timelines, properties and findings, events
-(query, SQL), replays and causality analyses.
+Everything the REPL can do, asked of the REPL itself (for a person at an editor and for an agent
+at an nREPL alike):
+
+```clojure
+(require '[determinismo.help :refer [help]])
+(help)                                  ; every function: its arguments, its first line
+(help "moment")                         ; those whose name or documentation says it
+(help 'determinismo.api/fork)           ; one, its whole documentation
+```
+
+`determinismo.api`: runs (start, stop, resume, wait), their timelines, properties, findings,
+failures, triage report, what their nodes logged, learned ranges, activity, events (query, SQL),
+replays, a node's file at a moment, the lines a timeline's events left out, new timelines from a
+moment, and the analyses of a failing timeline (causality, shrinking, explaining).
 
 ```clojure
 (require '[determinismo.api :as api])
@@ -13,6 +25,12 @@ serve's API from Clojure on the JVM, babashka or jank: one `.cljc` source, no de
 (api/sql 13 "SELECT count(*) AS n FROM events WHERE branch = 0")   ; [{:n 2741}]
 (api/query 13 {:condition "event=fault" :branch 0 :limit 5})
 (api/wait-run (:id (api/start-run {:program "..." :scenario "bank" :branches 16})))
+(api/extract 13 {:branch 4 :at_vtime_ms 9000 :node "db-1" :path "/etc/db.conf"})   ; its text then
+(api/extract-to 13 {:branch 4 :at_vtime_ms 9000 :node "db-1" :path "/data/db.bin"} "db.bin")
+(api/recover 13 {:branch 4 :vtime_ns 9000000000})     ; lines its events left out near there
+(api/fork 13 4 9000 16)                               ; 16 new timelines from timeline 4 at 9 s
+(api/shrink-start 13 {:branch 4 :property "..."})     ; the fewest faults the failure needs
+(api/logged 13)                                       ; what the nodes logged, by template
 ```
 
 A run's named draws (src/draws.zig: `knob.<name>`, a fault's parameters, `swarm.<name>`,
@@ -42,6 +60,8 @@ the recorded history.
     (dbg/continue s)                                  ; {:rip "0xffffffff81b96960" ...}
     (dbg/step-branches s 1000)                        ; the registers 1000 branches on
     (dbg/sh s "det-nodes list")                       ; a guest command's output
+    (dbg/node-sh s "db-1" "ls /data")                 ; a command inside a node, as it sees itself
+    (dbg/node-sh s "raft-node-0" "kill -QUIT 1")      ; a Go node's goroutines, to its output
     (dbg/checkpoint s "loaded")                       ; {:name "loaded" :saved true ...}
     (dbg/close s)
     (dbg/resume 13 s "loaded")))                      ; a session back there, not from boot

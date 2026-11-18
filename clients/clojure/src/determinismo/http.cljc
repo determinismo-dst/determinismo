@@ -37,6 +37,27 @@ std::string determinismo_http(std::string const &method, std::string const &url,
   return out.substr(cut + 1) + \"\\n\" + out.substr(0, cut);
 }
 
+// method url body path -> the status: curl, the answer's bytes written to `path` as they are.
+long determinismo_download(std::string const &url, std::string const &body, std::string const &path) {
+  char request[] = \"/tmp/determinismo-http-XXXXXX\";
+  int fd = mkstemp(request);
+  if (fd < 0) return 0;
+  if (!body.empty()) (void)!write(fd, body.data(), body.size());
+  close(fd);
+  std::string command = \"curl -s -m 3600 -o '\" + path + \"' -w '%{http_code}' -X POST\";
+  if (!body.empty()) command += std::string(\" -H 'content-type: application/json' --data-binary @\") + request;
+  command += \" '\" + url + \"'\";
+  std::string out;
+  if (FILE *pipe = popen(command.c_str(), \"r\")) {
+    std::array<char, 64> buffer;
+    size_t n;
+    while ((n = fread(buffer.data(), 1, buffer.size(), pipe)) > 0) out.append(buffer.data(), n);
+    pclose(pipe);
+  }
+  unlink(request);
+  return out.empty() ? 0 : std::stol(out);
+}
+
 void determinismo_sleep_ms(long ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
 
 std::string determinismo_getenv(std::string const &name) {
@@ -64,6 +85,24 @@ std::string determinismo_getenv(std::string const &name) {
                                               (cpp/cast cpp/std.string (or body ""))))
            cut (str/index-of answer "\n")]
        [(parse-long (subs answer 0 cut)) (subs answer (inc cut))])))
+
+(defn download
+  "POSTs `body` (a string) to `url` and writes the answer's bytes to the local file `path`, as
+  they are: [status path]."
+  [url body path]
+  #?(:clj
+     (let [client (java.net.http.HttpClient/newHttpClient)
+           built (-> (java.net.http.HttpRequest/newBuilder (java.net.URI/create url))
+                     (.header "content-type" "application/json")
+                     (.POST (java.net.http.HttpRequest$BodyPublishers/ofString body))
+                     (.build))
+           response (.send client built (java.net.http.HttpResponse$BodyHandlers/ofFile
+                                         (.toPath (java.io.File. ^String path))))]
+       [(.statusCode response) path])
+     :jank
+     [(long (cpp/determinismo_download (cpp/cast cpp/std.string url) (cpp/cast cpp/std.string body)
+                                       (cpp/cast cpp/std.string path)))
+      path]))
 
 (defn sleep-ms [ms]
   #?(:clj (Thread/sleep (long ms))

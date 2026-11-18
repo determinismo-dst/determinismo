@@ -11,6 +11,7 @@
 ;;
 ;; Needs Quint here (`npm install -g @informalsystems/quint`; `:quint` names another command).
 (ns determinismo.quint
+  (:refer-clojure :exclude [agent])
   (:require [clojure.string :as str]
             #?(:clj [clojure.java.shell :as shell])
             [determinismo.api :as api]

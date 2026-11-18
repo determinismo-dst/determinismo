@@ -42,6 +42,18 @@ A replay through `runs exec` takes the run's own inputs (its kernel, initramfs, 
 memory, faults, tape): prefer it to an `explore` command line put together by hand, which the
 tape refuses when anything differs.
 
+## A REPL
+
+The same as a person at an editor: clients/jank-viz started (`./viz.sh`, its nREPL port in
+`.nrepl-port`), or a Clojure REPL or babashka with clients/clojure on the path, and an nREPL
+client (`clj-nrepl-eval`). `(require '[determinismo.help :refer [help]])` then `(help)` lists
+every call there is, with its arguments and documentation: runs and their events
+(determinismo.api), a session held at a moment of a timeline, with the machine's registers,
+memory and breakpoints and commands inside its nodes (determinismo.debug), a node's file at a
+moment, new timelines from a moment, causality, shrinking and explaining, and Quint
+(determinismo.quint). A session stays at its moment between calls, so questions about one moment
+cost one replay. The window draws each evaluation, for whoever watches.
+
 ## Skills
 
 Claude Code skills in `.claude/skills/` (as Antithesis's antithesis-skills):
