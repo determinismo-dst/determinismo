@@ -3125,9 +3125,11 @@ fn check_kubernetes(context: *Context) !void {
         "podman", "build",                                 "--quiet", "--tag", "localhost/determinismo-kubernetes-client:1",
         "--file", "examples/kubernetes/Dockerfile.client", ".",
     });
+    // The probe spared (fault_exclusions, by its pod's name): its output stays whole, and pod
+    // faults show they pass it over.
     const common = [_][]const u8{
-        "--kubernetes", "examples/kubernetes/manifests", "--scenario", "counter", "--seed", "1",
-        "--memory-mib", "4096",
+        "--kubernetes", "examples/kubernetes/manifests", "--scenario",         "counter", "--seed", "1",
+        "--memory-mib", "4096",                          "--fault-exclusions", "^probe$",
     };
     const explored = try std.fmt.allocPrint(arena, "{s}/kubernetes", .{context.scratch});
     const report = try explore(context, &(common ++ [_][]const u8{ "--branches", "4", "--events-dir", explored }));
@@ -3150,6 +3152,12 @@ fn check_kubernetes(context: *Context) !void {
     const named = try run_kept(context, &.{ "grep", "-rhoE", "\"pod\":\"[a-z0-9-]+\"", explored });
     // Pods' containers' exits judged as Antithesis judges a container's (a pod kill's 137).
     const exits = try run_kept(context, &.{ "grep", "-rlF", "\"no unexpected container exits\",\"condition\":true,\"details\":{\"pod\"", explored });
+    // A bare Pod given what Antithesis gives every container (det-kubespec's base spec): its
+    // library, its device, the coverage bitmaps, the SDK's output; nothing missing.
+    const given = try run_kept(context, &.{ "sh", "-c", try std.fmt.allocPrint(arena, "grep -rhoE 'probe given [a-z/.]+' {s} | sort -u | wc -l", .{explored}) });
+    const missing = try run_kept(context, &.{ "grep", "-rlF", "probe missing", explored });
+    const sdk_env = try run_kept(context, &.{ "grep", "-rlF", "probe sdk output /opt/determinismo/sdk/output", explored });
+    const probe_faulted = try run_kept(context, &.{ "sh", "-c", try std.fmt.allocPrint(arena, "grep -rhF '\"pod\":\"probe\"' {s} | grep -cF '\"event\":\"fault\"' || true", .{explored}) });
     var same = false;
     if (count > 0) {
         const index = try std.fmt.allocPrint(arena, "{d}", .{branches[0].index});
@@ -3169,6 +3177,9 @@ fn check_kubernetes(context: *Context) !void {
         .{ "faults on single pods, each naming its pod", pod_faults.stdout.len > 0 and named.stdout.len > 0 },
         .{ "the pods' output as events named after them (redis-0)", pod_output.stdout.len > 0 },
         .{ "pods' container exits judged (no unexpected container exits)", exits.stdout.len > 0 },
+        .{ "a bare Pod given libvoidstar, its device, the coverage and the SDK's output", std.mem.eql(u8, std.mem.trim(u8, given.stdout, " \n"), "4") and missing.stdout.len == 0 },
+        .{ "a bare Pod's environment names the SDK's output", sdk_env.stdout.len > 0 },
+        .{ "no fault of the excluded probe pod (fault_exclusions ^probe$)", std.mem.eql(u8, std.mem.trim(u8, probe_faulted.stdout, " \n"), "0") },
         .{ "no fault of the K3s node or its pods failed to apply or heal", std.mem.eql(u8, std.mem.trim(u8, pod_failures.stdout, " \n"), "0") },
     }, "kubernetes: manifests in K3s, deployed before branching, templates run in their pod; " ++
         "pod faults: {s}", .{std.mem.trim(u8, pod_faults.stdout[0..@min(pod_faults.stdout.len, 120)], "\n")});

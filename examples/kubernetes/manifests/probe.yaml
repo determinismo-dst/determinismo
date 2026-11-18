@@ -1,0 +1,20 @@
+# A bare Pod (no Deployment owns it: an operator makes its pods so, CloudNativePG's PostgreSQL
+# instances among them): Antithesis gives every container its library (/usr/lib/libvoidstar.so)
+# and the SDK's output; the probe says what it was given, as its own output.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: probe
+spec:
+  containers:
+    - name: probe
+      image: docker.io/library/redis:7.4-alpine
+      command:
+        - sh
+        - -c
+        - |
+          for path in /usr/lib/libvoidstar.so /dev/determinismo /opt/determinismo/coverage /opt/determinismo/sdk; do
+            if [ -e "$path" ]; then echo "probe given $path"; else echo "probe missing $path"; fi
+          done
+          echo "probe sdk output ${ANTITHESIS_SDK_LOCAL_OUTPUT:-none}"
+          while true; do sleep 3600; done

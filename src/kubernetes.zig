@@ -8,14 +8,18 @@
 //!
 //! Antithesis deploys the manifests with kapp (a logical order, then waits until they are
 //! ready); here the scenario's first command does it (`ready_path`): it applies them until all
-//! of them apply, gives every container of the workload the Antithesis SDK's output (the node's
-//! /opt/determinismo/sdk, as a hostPath volume), and waits until every Deployment, StatefulSet
-//! and DaemonSet is rolled out and every running pod is ready. setup_complete follows it.
+//! of them apply and waits until every Deployment, StatefulSet and DaemonSet is rolled out and
+//! every running pod is ready. setup_complete follows it.
+//!
+//! Every container gets what Antithesis gives every container, whoever made its pod (a
+//! Deployment, a bare Pod, an operator: CloudNativePG's PostgreSQL instances): the node starts
+//! (`start_path`) by making containerd's default spec its runtime's base with libvoidstar, its
+//! device, the coverage bitmaps and the SDK's output added (det-kubespec), that runtime the
+//! default (`containerd_template`, --default-runtime), then runs K3s.
 //!
 //! Test templates may be in any container (/opt/antithesis/test/v1/<template>/): each one found
 //! in an image the manifests name gets a wrapper at the same path in the node, which runs it in
-//! a running container of that image through kubectl exec. Bare Pods are not patched for the
-//! SDK (a running pod's volumes cannot change).
+//! a running container of that image through kubectl exec.
 const std = @import("std");
 const assert = std.debug.assert;
 
@@ -26,12 +30,19 @@ const airgap_url = "https://github.com/k3s-io/k3s/releases/download/v1.36.5%2Bk3
 /// Outside /opt/determinismo, which a node gets from the runner (read-only, over the image's).
 pub const tools_directory = "/opt/determinismo-kubernetes";
 pub const ready_path = tools_directory ++ "/ready";
+/// The node's entrypoint: the containers' base spec, then K3s (`start_script`).
+pub const start_path = tools_directory ++ "/start";
+pub const entrypoint = [_][]const u8{ "/bin/sh", start_path };
+/// K3s's containerd configuration's template (its documented `base` and one runtime more).
+pub const containerd_template_path = "/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl";
+const base_spec_path = tools_directory ++ "/base-spec.json";
 const exec_path = tools_directory ++ "/exec";
 pub const manifests_directory = tools_directory ++ "/manifests";
 pub const command = [_][]const u8{
     "server",                                     "--snapshotter=native",
     "--disable=traefik,servicelb,metrics-server", "--disable-cloud-controller",
     "--disable-helm-controller",                  "--write-kubeconfig-mode=644",
+    "--default-runtime=determinismo",
 };
 pub const kubeconfig = "KUBECONFIG=/etc/rancher/k3s/k3s.yaml";
 pub const api_port = 6443;
@@ -85,13 +96,47 @@ pub fn dockerfile(arena: std.mem.Allocator, with_images: bool, with_templates: b
     return out.items;
 }
 
+/// The node's start (`start_path`): containerd's default spec with what Antithesis gives every
+/// container (det-kubespec) as the base of the runtime K3s makes every container with, then K3s
+/// with the node's command.
+pub const start_script =
+    \\#!/bin/sh
+    \\# determinismo's start of an imported Kubernetes cluster's node (kubernetes.zig): every
+    \\# container K3s makes gets libvoidstar, its device, the coverage bitmaps and the SDK's
+    \\# output, as Antithesis gives every container, then K3s itself.
+    \\set -e
+    \\mkdir -p
+++ " " ++ std.fs.path.dirname(containerd_template_path).? ++ "\n" ++
+    \\cp
+++ " " ++ tools_directory ++ "/config-v3.toml.tmpl " ++ containerd_template_path ++ "\n" ++
+    \\ctr oci spec | /opt/determinismo/bin/det-kubespec >
+++ " " ++ base_spec_path ++ "\n" ++
+    \\exec k3s "$@"
+    \\
+;
+
+/// K3s's containerd configuration: its own (`base`) and a runtime whose containers start from
+/// the base spec start_script makes, the default (the node's --default-runtime).
+pub const containerd_template =
+    \\{{ template "base" . }}
+    \\
+    \\[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.determinismo]
+    \\  runtime_type = "io.containerd.runc.v2"
+    \\  base_runtime_spec = "
+++ base_spec_path ++
+    \\"
+    \\
+    \\[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.determinismo.options]
+    \\  SystemdCgroup = {{ .SystemdCgroup }}
+    \\
+;
+
 /// The setup command (the node's `ready_path`): kapp's deploy, as a script.
 pub const ready_script =
     \\#!/bin/sh
     \\# determinismo's setup for imported Kubernetes manifests (kubernetes.zig): applied until all
-    \\# of them apply (a namespace or a custom resource definition before what needs it), every
-    \\# container of the workload given the Antithesis SDK's output, then every Deployment,
-    \\# StatefulSet and DaemonSet rolled out and every running pod ready.
+    \\# of them apply (a namespace or a custom resource definition before what needs it), then
+    \\# every Deployment, StatefulSet and DaemonSet rolled out and every running pod ready.
     \\export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
     \\# The pods' output as events, each line named after its pod (det-podlogs detaches itself).
     \\/opt/determinismo/bin/det-podlogs
@@ -110,22 +155,6 @@ pub const ready_script =
     \\  attempts=$((attempts + 1))
     \\  [ $attempts -le 60 ] || { echo "the manifests never applied"; exit 1; }
     \\  sleep 2
-    \\done
-    \\sdk='{"name":"ANTITHESIS_SDK_LOCAL_OUTPUT","value":"/opt/determinismo/sdk/output"}'
-    \\mount='{"name":"determinismo-sdk","mountPath":"/opt/determinismo/sdk"}'
-    \\volume='{"name":"determinismo-sdk","hostPath":{"path":"/opt/determinismo/sdk"}}'
-    \\template='{{range .items}}{{.metadata.namespace}} {{.metadata.name}}{{range .spec.template.spec.containers}} {{.name}}{{end}}{{"\n"}}{{end}}'
-    \\for kind in deployment statefulset daemonset; do
-    \\  kubectl get $kind --all-namespaces --output go-template="$template" > /tmp/workload || exit 1
-    \\  while read namespace name containers; do
-    \\    [ "$namespace" = kube-system ] && continue
-    \\    patched=""
-    \\    for container in $containers; do
-    \\      patched="$patched${patched:+,}{\"name\":\"$container\",\"env\":[$sdk],\"volumeMounts\":[$mount]}"
-    \\    done
-    \\    patch="{\"spec\":{\"template\":{\"spec\":{\"volumes\":[$volume],\"containers\":[$patched]}}}}"
-    \\    kubectl patch $kind $name --namespace $namespace --type strategic --patch "$patch" > /dev/null || exit 1
-    \\  done < /tmp/workload
     \\done
     \\listed='{{range .items}}{{.metadata.namespace}} {{.metadata.name}}{{"\n"}}{{end}}'
     \\for kind in deployment statefulset daemonset; do
@@ -221,6 +250,14 @@ test wrapper {
     const text = try wrapper(arena_state.allocator(), "localhost/client:1", "/opt/antithesis/test/v1/x/it's");
     try std.testing.expectEqualStrings("#!/bin/sh\nexec /opt/determinismo-kubernetes/exec " ++
         "'localhost/client:1' '/opt/antithesis/test/v1/x/it'\\''s' \"$@\"\n", text);
+}
+
+test start_script {
+    try std.testing.expect(std.mem.indexOf(u8, start_script, "\nctr oci spec | /opt/determinismo/bin/det-kubespec > " ++
+        tools_directory ++ "/base-spec.json\nexec k3s \"$@\"\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, containerd_template, "base_runtime_spec = \"" ++ base_spec_path ++ "\"\n") != null);
+    // The pods' SDK output is the base spec's now: no Deployment patched (and restarted) for it.
+    try std.testing.expect(std.mem.indexOf(u8, ready_script, "kubectl patch") == null);
 }
 
 test ready_script {

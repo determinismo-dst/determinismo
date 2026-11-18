@@ -24,6 +24,7 @@ const runtime = [_][]const u8{
     "det-init",        "det-nodes",   "det-composer", "det-faults",  "det-agent",
     "det-stop-faults", "det-profile", "det-core",     "det-podlogs", "det-sinks",
     "det-nrepl-relay", "det-runner",  "det-assert",   "det-egress",  "det-ingress",
+    "det-kubespec",
 };
 const directories = [_][]const u8{
     "bin",                  "sbin",                     "etc",                  "proc",                      "sys",                      "dev",
