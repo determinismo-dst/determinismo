@@ -211,66 +211,66 @@ fn scratches_sweep(io: std.Io, arena: std.mem.Allocator, scratches: []const u8) 
 /// and counts them.
 fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
     const checks = .{
-        .{ "bank", check_bank },                             .{ "shop", check_shop },
-        .{ "tapes", check_tapes },                           .{ "debugging", check_debugging },
-        .{ "python", check_python_strategy },                .{ "egress", check_egress },
-        .{ "ingress", check_ingress },                       .{ "ingress-session", check_ingress_session },
-        .{ "moments", check_moments },                       .{ "properties", check_builtin_properties },
-        .{ "entropy", check_kernel_entropy },                .{ "quiet", check_quiet_period },
-        .{ "clock_jitter", check_clock_jitter },             .{ "query", check_query },
-        .{ "progress", check_progress_while_quiet },         .{ "network", check_network_faults },
-        .{ "serve", check_serve },                           .{ "until", check_until_and_causality },
-        .{ "coverage-gate", check_coverage_gate },           .{ "coverage", check_coverage },
-        .{ "parallel", check_parallel },                     .{ "fork", check_fork },
-        .{ "tree", check_tree },                             .{ "startup-coverage", check_startup_coverage },
-        .{ "memory-climb", check_memory_climb },             .{ "disk", check_disk },
-        .{ "shape", check_shape },                           .{ "end", check_end },
-        .{ "plans", check_plans },                           .{ "durability", check_durability },
-        .{ "mutate", check_mutate },                         .{ "interleave", check_interleave },
-        .{ "checks", check_host_checks },                    .{ "pausing", check_pausing },
-        .{ "shrink", check_shrink },                         .{ "holds", check_holds },
-        .{ "coverage-set", check_coverage_set },             .{ "inject", check_inject },
-        .{ "aim", check_aim },                               .{ "aftershock", check_aftershock },
-        .{ "record-power-loss", check_record_power_loss },   .{ "errno-storm", check_errno_storm },
-        .{ "compose", check_compose },                       .{ "shards", check_shards },
-        .{ "stress", check_stress },                         .{ "controller", check_controller },
-        .{ "clojure", check_clojure },                       .{ "k3s", check_k3s },
-        .{ "script", check_script },                         .{ "modulation", check_cpu_modulation },
-        .{ "profile", check_profile },                       .{ "catalog", check_catalog },
-        .{ "guidance", check_guidance },                     .{ "voidstar", check_voidstar },
-        .{ "changed", check_changed },                       .{ "readdress", check_readdress },
-        .{ "unlist", check_unlist },                         .{ "signal", check_signal },
-        .{ "syscall_error", check_syscall_error },           .{ "swarm", check_swarm },
-        .{ "metastable", check_metastable },                 .{ "file_error", check_file_error },
-        .{ "retroactive", check_retroactive },               .{ "epoch", check_epoch },
-        .{ "drive", check_drive },                           .{ "hang", check_hang },
-        .{ "pinned", check_pinned },                         .{ "slow", check_slow },
-        .{ "ending-window", check_ending_window },           .{ "sought", check_sought },
-        .{ "optimize", check_optimize },                     .{ "states", check_states },
-        .{ "crash-points", check_crash_points },             .{ "nodes-down", check_nodes_down },
-        .{ "stale-pid", check_stale_pid },                   .{ "memory-growth", check_memory_growth },
-        .{ "upgrade", check_upgrade },                       .{ "knobs", check_knobs },
-        .{ "quorum", check_quorum },                         .{ "spare", check_spare },
-        .{ "saved", check_saved },                           .{ "concurrent", check_concurrent },
-        .{ "resume", check_resume },                         .{ "ui", check_ui },
-        .{ "runs", check_runs },                             .{ "kubernetes", check_kubernetes },
-        .{ "steps", check_steps },                           .{ "before-nodes", check_before_nodes },
-        .{ "session", check_session },                       .{ "fast", check_fast },
-        .{ "sandbox", check_sandbox },                       .{ "devproxy", check_devproxy },
-        .{ "sandbox-egress", check_sandbox_egress },         .{ "ci", check_ci },
-        .{ "repl", check_repl },                             .{ "mechanics", check_mechanics },
-        .{ "budget", check_budget },                         .{ "sinks", check_sinks },
-        .{ "dotnet", check_dotnet },                         .{ "lines", check_lines },
-        .{ "voidstar-static", check_voidstar_static },       .{ "frozen-start", check_frozen_start },
-        .{ "hangup", check_hangup },                         .{ "frozen-step", check_frozen_step },
-        .{ "templates", check_templates },                   .{ "volumes", check_volumes },
-        .{ "setup-mode", check_setup_mode },                 .{ "jank", check_jank_repl },
-        .{ "bank-steps", check_bank_steps },                 .{ "checkpoint", check_session_checkpoint },
-        .{ "ingress-checkpoint", check_ingress_checkpoint }, .{ "ingress-crash", check_ingress_crash },
-        .{ "draws", check_draws },                           .{ "exit-stack", check_exit_stack },
-        .{ "plan-calls", check_plan_calls },                 .{ "services", check_services },
-        .{ "sites", check_sites },                           .{ "client", check_client },
-        .{ "session-exact", check_session_exact },
+        .{ "bank", check_bank },                         .{ "shop", check_shop },
+        .{ "tapes", check_tapes },                       .{ "debugging", check_debugging },
+        .{ "python", check_python_strategy },            .{ "egress", check_egress },
+        .{ "ingress", check_ingress },                   .{ "ingress-session", check_ingress_session },
+        .{ "moments", check_moments },                   .{ "properties", check_builtin_properties },
+        .{ "entropy", check_kernel_entropy },            .{ "quiet", check_quiet_period },
+        .{ "clock_jitter", check_clock_jitter },         .{ "query", check_query },
+        .{ "progress", check_progress_while_quiet },     .{ "network", check_network_faults },
+        .{ "fault-exclusions", check_fault_exclusions }, .{ "serve", check_serve },
+        .{ "until", check_until_and_causality },         .{ "coverage-gate", check_coverage_gate },
+        .{ "coverage", check_coverage },                 .{ "parallel", check_parallel },
+        .{ "fork", check_fork },                         .{ "tree", check_tree },
+        .{ "startup-coverage", check_startup_coverage }, .{ "memory-climb", check_memory_climb },
+        .{ "disk", check_disk },                         .{ "shape", check_shape },
+        .{ "end", check_end },                           .{ "plans", check_plans },
+        .{ "durability", check_durability },             .{ "mutate", check_mutate },
+        .{ "interleave", check_interleave },             .{ "checks", check_host_checks },
+        .{ "pausing", check_pausing },                   .{ "shrink", check_shrink },
+        .{ "holds", check_holds },                       .{ "coverage-set", check_coverage_set },
+        .{ "inject", check_inject },                     .{ "aim", check_aim },
+        .{ "aftershock", check_aftershock },             .{ "record-power-loss", check_record_power_loss },
+        .{ "errno-storm", check_errno_storm },           .{ "compose", check_compose },
+        .{ "shards", check_shards },                     .{ "stress", check_stress },
+        .{ "controller", check_controller },             .{ "clojure", check_clojure },
+        .{ "k3s", check_k3s },                           .{ "script", check_script },
+        .{ "modulation", check_cpu_modulation },         .{ "profile", check_profile },
+        .{ "catalog", check_catalog },                   .{ "guidance", check_guidance },
+        .{ "voidstar", check_voidstar },                 .{ "changed", check_changed },
+        .{ "readdress", check_readdress },               .{ "unlist", check_unlist },
+        .{ "signal", check_signal },                     .{ "syscall_error", check_syscall_error },
+        .{ "swarm", check_swarm },                       .{ "metastable", check_metastable },
+        .{ "file_error", check_file_error },             .{ "retroactive", check_retroactive },
+        .{ "epoch", check_epoch },                       .{ "drive", check_drive },
+        .{ "hang", check_hang },                         .{ "pinned", check_pinned },
+        .{ "slow", check_slow },                         .{ "ending-window", check_ending_window },
+        .{ "sought", check_sought },                     .{ "optimize", check_optimize },
+        .{ "states", check_states },                     .{ "crash-points", check_crash_points },
+        .{ "nodes-down", check_nodes_down },             .{ "stale-pid", check_stale_pid },
+        .{ "memory-growth", check_memory_growth },       .{ "upgrade", check_upgrade },
+        .{ "knobs", check_knobs },                       .{ "quorum", check_quorum },
+        .{ "spare", check_spare },                       .{ "saved", check_saved },
+        .{ "concurrent", check_concurrent },             .{ "resume", check_resume },
+        .{ "ui", check_ui },                             .{ "runs", check_runs },
+        .{ "kubernetes", check_kubernetes },             .{ "steps", check_steps },
+        .{ "before-nodes", check_before_nodes },         .{ "session", check_session },
+        .{ "fast", check_fast },                         .{ "sandbox", check_sandbox },
+        .{ "devproxy", check_devproxy },                 .{ "sandbox-egress", check_sandbox_egress },
+        .{ "ci", check_ci },                             .{ "repl", check_repl },
+        .{ "mechanics", check_mechanics },               .{ "budget", check_budget },
+        .{ "sinks", check_sinks },                       .{ "dotnet", check_dotnet },
+        .{ "lines", check_lines },                       .{ "voidstar-static", check_voidstar_static },
+        .{ "frozen-start", check_frozen_start },         .{ "hangup", check_hangup },
+        .{ "frozen-step", check_frozen_step },           .{ "templates", check_templates },
+        .{ "volumes", check_volumes },                   .{ "setup-mode", check_setup_mode },
+        .{ "jank", check_jank_repl },                    .{ "bank-steps", check_bank_steps },
+        .{ "checkpoint", check_session_checkpoint },     .{ "ingress-checkpoint", check_ingress_checkpoint },
+        .{ "ingress-crash", check_ingress_crash },       .{ "draws", check_draws },
+        .{ "exit-stack", check_exit_stack },             .{ "plan-calls", check_plan_calls },
+        .{ "services", check_services },                 .{ "sites", check_sites },
+        .{ "client", check_client },                     .{ "session-exact", check_session_exact },
         .{ "java-watch", check_java_watch },
     };
     // A check's whole name runs it alone (check.sh's `ui` ran guidance and quiet too).
@@ -4245,6 +4245,33 @@ fn check_network_faults(context: *Context) !void {
         "partition replays exactly", .{ groups, clogs, threads, baselines, restores });
 }
 
+/// Antithesis's fault exclusions (`fault_exclusions`, a regex over names): a node whose name
+/// matches gets no faults of its own while the others get theirs; the same seeds without it
+/// fault that node.
+fn check_fault_exclusions(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "shop-test" });
+    const system = [_][]const u8{
+        "--program",  program, "--scenario",  "prices", "--seed", "2",
+        "--branches", "16",    "--branching", "flat",
+    };
+    const plain = try std.fs.path.join(arena, &.{ context.scratch, "exclusions-plain" });
+    const spared = try std.fs.path.join(arena, &.{ context.scratch, "exclusions-spared" });
+    _ = try explore(context, &(system ++ [_][]const u8{ "--events-dir", plain }));
+    _ = try explore(context, &(system ++ [_][]const u8{ "--events-dir", spared, "--fault-exclusions", "^postg.es$" }));
+    const plain_postgres = try query_count(context, &.{ plain, "event=fault details.node=postgres" });
+    const spared_postgres = try query_count(context, &.{ spared, "event=fault details.node=postgres" });
+    const spared_redis = try query_count(context, &.{ spared, "event=fault details.node=redis" });
+    const said = try query_count(context, &.{ spared, "event=fault_exclusions" });
+    expect_all(context, &.{
+        .{ "faults on postgres without exclusions", plain_postgres > 0 },
+        .{ "none on postgres excluded", spared_postgres == 0 },
+        .{ "faults on redis beside it", spared_redis > 0 },
+        .{ "the pattern said in every timeline", said == 16 },
+    }, "fault exclusions: {d} faults on postgres without them, {d} with `^postg.es$`, {d} on " ++
+        "redis beside it; the pattern said in {d} of 16 timelines", .{ plain_postgres, spared_postgres, spared_redis, said });
+}
+
 /// How many events `determinismo query` finds (its --count line).
 fn query_count(context: *Context, arguments: []const []const u8) !u64 {
     var argv: std.ArrayList([]const u8) = .empty;
@@ -7103,9 +7130,9 @@ fn check_java_watch(context: *Context) !void {
     for (0..2) |round| {
         const events = try std.fmt.allocPrint(context.arena, "{s}/java-watch-{d}-events", .{ context.scratch, round });
         const report = try explore(context, &.{
-            "--compose",    "tests/antithesis-compat/java/watch.yaml", "--scenario", "crash_points",
-            "--seed",       "1",                                       "--branches", "2",
-            "--branching",  "flat",                                    "--events-dir", events,
+            "--compose",   "tests/antithesis-compat/java/watch.yaml", "--scenario",   "crash_points",
+            "--seed",      "1",                                       "--branches",   "2",
+            "--branching", "flat",                                    "--events-dir", events,
         });
         _ = parse_branches(report, &hashes[round]);
         if (round > 0) continue;
