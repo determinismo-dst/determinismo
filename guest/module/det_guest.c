@@ -76,7 +76,10 @@ struct det_request {
 } __packed;
 
 static struct det_request *req;
-/* An SDK declared the system's setup complete (antithesis_setup): detfs's `setup` reads 1. */
+/*
+ * An SDK declared the system's setup complete: detfs's `setup` reads 1. Antithesis's SDKs write
+ * {"antithesis_setup":{...}}, ours {"lifecycle":"setup_complete",...} (det_setup_line).
+ */
 static atomic_t det_sdk_setup = ATOMIC_INIT(0);
 static DEFINE_MUTEX(det_lock);
 static DECLARE_WAIT_QUEUE_HEAD(det_actions);
@@ -154,6 +157,20 @@ static void det_call(void)
 	barrier();
 }
 
+/*
+ * Whether an event written to the device declares the setup complete: Antithesis's form, or our
+ * SDKs' lifecycle (each key and value a whole JSON string: inside an output's text the quotes are
+ * escaped, so a line that only mentions them does not match). Without ours, a Compose project
+ * declaring its setup with our SDK (the Java compat project's Ready) had the composer wait its
+ * 300 s in every timeline, the explorer having snapshotted at the declaration long before.
+ */
+static bool det_setup_line(const char *data, size_t n)
+{
+	if (strnstr(data, "\"antithesis_setup\"", n))
+		return true;
+	return strnstr(data, "\"lifecycle\"", n) && strnstr(data, "\"setup_complete\"", n);
+}
+
 static ssize_t det_write(struct file *f, const char __user *buf, size_t n, loff_t *off)
 {
 	if (n > DET_MAX_DATA)
@@ -163,7 +180,7 @@ static ssize_t det_write(struct file *f, const char __user *buf, size_t n, loff_
 		mutex_unlock(&det_lock);
 		return -EFAULT;
 	}
-	if (!atomic_read(&det_sdk_setup) && strnstr((char *)req->data, "\"antithesis_setup\"", n))
+	if (!atomic_read(&det_sdk_setup) && det_setup_line((char *)req->data, n))
 		atomic_set(&det_sdk_setup, 1);
 	req->op = DET_OP_EMIT;
 	req->len = n;

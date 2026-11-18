@@ -6280,6 +6280,9 @@ fn check_frozen_start(context: *Context) !void {
 fn check_states(context: *Context) !void {
     var solved: [2]u64 = undefined;
     var transitions: u64 = 0;
+    // The client's Ready declares its setup with our Java SDK (`{"lifecycle":"setup_complete"}`):
+    // the composer sees it and starts the drivers then, not after its 300 s (sdk_setup_missing).
+    var setup_missing: u64 = 0;
     for ([_][]const u8{ "state", "state_int" }, &solved) |scenario, *count| {
         const events = try std.fmt.allocPrint(context.arena, "{s}/{s}-events", .{ context.scratch, scenario });
         _ = try explore(context, &.{
@@ -6289,13 +6292,15 @@ fn check_states(context: *Context) !void {
         });
         count.* = try query_count(context, &.{ events, "assert.message=\"the state maze is never solved\" assert.condition=false" });
         if (std.mem.eql(u8, scenario, "state")) transitions = try query_count(context, &.{ events, "event=state" });
+        setup_missing += try query_count(context, &.{ events, "event=sdk_setup_missing" });
     }
     expect_all(context, &.{
+        .{ "the composer sees the client's setup declared by our Java SDK", setup_missing == 0 },
         .{ "the agent reports the stage's transitions", transitions > 0 },
         .{ "with its stage an enum, the maze is solved", solved[0] > 0 },
         .{ "with its progress an int, it is not", solved[1] == 0 },
-    }, "states: the state maze solved in {d} timelines by its enum's transitions ({d} reported), {d} with an int, of 256 each", .{
-        solved[0], transitions, solved[1],
+    }, "states: the state maze solved in {d} timelines by its enum's transitions ({d} reported), {d} with an int, of 256 each; the setup missed in {d}", .{
+        solved[0], transitions, solved[1], setup_missing,
     });
 }
 
