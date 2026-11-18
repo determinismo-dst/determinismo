@@ -13,9 +13,10 @@
 //!
 //! Every container gets what Antithesis gives every container, whoever made its pod (a
 //! Deployment, a bare Pod, an operator: CloudNativePG's PostgreSQL instances): the node starts
-//! (`start_path`) by making containerd's default spec its runtime's base with libvoidstar, its
-//! device, the coverage bitmaps and the SDK's output added (det-kubespec), that runtime the
-//! default (`containerd_template`, --default-runtime), then runs K3s.
+//! (`start_path`) by making containerd's default spec the base of its runc runtime (every
+//! container's) with libvoidstar, its device, the coverage bitmaps and the SDK's output added
+//! (det-kubespec; `containerd_dropin`, in the directory K3s's configuration imports), then runs
+//! K3s.
 //!
 //! Test templates may be in any container (/opt/antithesis/test/v1/<template>/): each one found
 //! in an image the manifests name gets a wrapper at the same path in the node, which runs it in
@@ -33,8 +34,9 @@ pub const ready_path = tools_directory ++ "/ready";
 /// The node's entrypoint: the containers' base spec, then K3s (`start_script`).
 pub const start_path = tools_directory ++ "/start";
 pub const entrypoint = [_][]const u8{ "/bin/sh", start_path };
-/// K3s's containerd configuration's template (its documented `base` and one runtime more).
-pub const containerd_template_path = "/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl";
+/// A file of containerd's configuration that K3s's imports (its template's `imports`: the
+/// template directory's config-v3.toml.d/*.toml), merged over K3s's own.
+pub const containerd_dropin_path = "/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.d/determinismo.toml";
 const base_spec_path = tools_directory ++ "/base-spec.json";
 const exec_path = tools_directory ++ "/exec";
 pub const manifests_directory = tools_directory ++ "/manifests";
@@ -42,7 +44,6 @@ pub const command = [_][]const u8{
     "server",                                     "--snapshotter=native",
     "--disable=traefik,servicelb,metrics-server", "--disable-cloud-controller",
     "--disable-helm-controller",                  "--write-kubeconfig-mode=644",
-    "--default-runtime=determinismo",
 };
 pub const kubeconfig = "KUBECONFIG=/etc/rancher/k3s/k3s.yaml";
 pub const api_port = 6443;
@@ -106,28 +107,26 @@ pub const start_script =
     \\# output, as Antithesis gives every container, then K3s itself.
     \\set -e
     \\mkdir -p
-++ " " ++ std.fs.path.dirname(containerd_template_path).? ++ "\n" ++
+++ " " ++ std.fs.path.dirname(containerd_dropin_path).? ++ "\n" ++
     \\cp
-++ " " ++ tools_directory ++ "/config-v3.toml.tmpl " ++ containerd_template_path ++ "\n" ++
+++ " " ++ tools_directory ++ "/determinismo.toml " ++ containerd_dropin_path ++ "\n" ++
     \\ctr oci spec | /opt/determinismo/bin/det-kubespec >
 ++ " " ++ base_spec_path ++ "\n" ++
     \\exec k3s "$@"
     \\
 ;
 
-/// K3s's containerd configuration: its own (`base`) and a runtime whose containers start from
-/// the base spec start_script makes, the default (the node's --default-runtime).
-pub const containerd_template =
-    \\{{ template "base" . }}
+/// What containerd's configuration gets over K3s's (`containerd_dropin_path`): its runc runtime,
+/// the one every container runs with, starts each from the base spec start_script makes.
+/// (A runtime of its own cannot be K3s's default: K3s takes only the runtimes it finds, crun's
+/// and nvidia's, as --default-runtime.)
+pub const containerd_dropin =
+    \\version = 3
     \\
-    \\[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.determinismo]
-    \\  runtime_type = "io.containerd.runc.v2"
+    \\[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc]
     \\  base_runtime_spec = "
 ++ base_spec_path ++
     \\"
-    \\
-    \\[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.determinismo.options]
-    \\  SystemdCgroup = {{ .SystemdCgroup }}
     \\
 ;
 
@@ -271,7 +270,7 @@ test wrapper {
 test start_script {
     try std.testing.expect(std.mem.indexOf(u8, start_script, "\nctr oci spec | /opt/determinismo/bin/det-kubespec > " ++
         tools_directory ++ "/base-spec.json\nexec k3s \"$@\"\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, containerd_template, "base_runtime_spec = \"" ++ base_spec_path ++ "\"\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, containerd_dropin, "runtimes.runc]\n  base_runtime_spec = \"" ++ base_spec_path ++ "\"\n") != null);
     // The pods' SDK output is the base spec's now: no Deployment patched (and restarted) for it.
     try std.testing.expect(std.mem.indexOf(u8, ready_script, "kubectl patch") == null);
 }

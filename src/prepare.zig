@@ -732,7 +732,7 @@ fn kubernetes_describe(context: Context, directory: []const u8) !schema.Descript
     if (files.items.len == 0) return error.NoManifests;
     var hasher = std.hash.Wyhash.init(0);
     // What the context is made of besides them: a change to its scripts or K3s makes another.
-    for ([_][]const u8{ kubernetes.ready_script, kubernetes.exec_script, kubernetes.start_script, kubernetes.containerd_template, kubernetes.k3s_image }) |part| {
+    for ([_][]const u8{ kubernetes.ready_script, kubernetes.exec_script, kubernetes.start_script, kubernetes.containerd_dropin, kubernetes.k3s_image }) |part| {
         hasher.update(part);
     }
     for (files.items) |path| {
@@ -820,7 +820,7 @@ fn kubernetes_context(
     try executable_write(context, try path_join(context, &.{ tools, "ready" }), kubernetes.ready_script);
     try executable_write(context, try path_join(context, &.{ tools, "exec" }), kubernetes.exec_script);
     try executable_write(context, try path_join(context, &.{ tools, "start" }), kubernetes.start_script);
-    try cwd.writeFile(context.io, .{ .sub_path = try path_join(context, &.{ tools, "config-v3.toml.tmpl" }), .data = kubernetes.containerd_template });
+    try cwd.writeFile(context.io, .{ .sub_path = try path_join(context, &.{ tools, "determinismo.toml" }), .data = kubernetes.containerd_dropin });
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     for (executables, owners) |line, image| {
         const file = compose.template_file(line) orelse continue;
