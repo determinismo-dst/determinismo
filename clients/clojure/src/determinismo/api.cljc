@@ -58,7 +58,9 @@
   choice. {:id ...}. With :plan true nothing starts: what it would be (how many timelines its
   budget buys at the rate of the last run like it, the named choices that one drew), a plan
   `execute` starts. `:strategy` is a plugin (\"@all-hooks\", a command) or several, a vector:
-  each asked in order, the first answer winning (serve's strategy, one a line)."
+  each asked in order, the first answer winning (serve's strategy, one a line). `:injectors`
+  are fault injectors of the run's own (uploads, \"@pause-one\", or files of serve's host): each
+  timeline runs det-faults or one of them, a named decision (\"faults.injector\")."
   [request-map]
   (let [asked (cond-> request-map
                 (:decide request-map) (update :decide decide-text)
