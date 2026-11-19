@@ -2659,7 +2659,7 @@ fn command_explore(
     const verifier: ?replays.Verifier = if (arguments.record_path != null and
         arguments.tape_directory != null and arguments.verify_percent > 0 and !moment_steps and
         arguments.branch_only == null and arguments.tape_path == null and arguments.raw_argv.len >= 2)
-        try replays.Verifier.start(context.arena, context.io, arguments.raw_argv, arguments.record_path.?, arguments.tape_directory.?, arguments.verify_percent, jobs)
+        try replays.Verifier.start(context.arena, context.io, arguments.raw_argv, arguments.record_path.?, arguments.tape_directory.?, arguments.verify_percent, jobs, if (exploration.strategy) |strategy| &.{ strategy.to_plugin, strategy.from_plugin } else &.{})
     else
         null;
     if (arguments.branching == .tree) {

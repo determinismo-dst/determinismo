@@ -50,7 +50,8 @@ pub const Verifier = struct {
     pid: linux.pid_t,
     results_path: []const u8,
 
-    /// The verifier's process (a process group of its own, gone with the explorer).
+    /// The verifier's process (a process group of its own, gone with the explorer). `held`: the
+    /// explorer's descriptors it closes at once (a running strategy's pipes).
     pub fn start(
         arena: std.mem.Allocator,
         io: std.Io,
@@ -59,6 +60,7 @@ pub const Verifier = struct {
         tapes: []const u8,
         percent: u32,
         jobs: u32,
+        held: []const linux.fd_t,
     ) !Verifier {
         assert(percent > 0 and percent <= 100);
         const results_path = try std.fmt.allocPrint(arena, "{s}.replays", .{record});
@@ -75,6 +77,10 @@ pub const Verifier = struct {
         if (pid == 0) {
             _ = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @backingInt(linux.SIG.KILL), 0, 0, 0);
             if (linux.getppid() != explorer) linux.exit_group(0);
+            // The explorer's pipes to a strategy running as this forks (the setup's): a plugin
+            // sees its input end only once every holder closed it, and the explorer waits for
+            // it to exit (a setup-decisions run hung on it, 2026-11-18).
+            for (held) |fd| _ = linux.close(fd);
             runs.running_forget(); // The run is the explorer's: it ends with it.
             _ = linux.setpgid(0, 0); // Its replays with it: stopped as one.
             // Forked while the explorer held its CPU for the setup: its replays (programs of
