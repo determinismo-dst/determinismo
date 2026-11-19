@@ -7467,7 +7467,7 @@ fn check_shrink(context: *Context) !void {
 /// the injector restarts and crashes both nodes; its driver is a composer command, so a script
 /// replays it (the selftest's own runner is not one). A failing timeline's script, shrunk with
 /// shrink_by_node.py: its cuts are judged (the witness's faults alone among them), and what is
-/// kept fails as the rule asks and hits the witness only.
+/// kept fails as the rule asks, each fault of it taking the witness down.
 fn check_shrink_plugin(context: *Context) !void {
     const arena = context.arena;
     const common = [_][]const u8{
@@ -7512,16 +7512,24 @@ fn check_shrink_plugin(context: *Context) !void {
     const result = parsed.shrink;
     const needed = @max(1, (result.failing_whole + 1) / 2);
     const asked = std.mem.indexOf(u8, shrunk.stderr, "[determinismo] shrink: the plugin's ") != null;
+    // Each kept fault takes the witness down: its node, or among an outage's (comma-joined).
     var witness_only = result.kept.len > 0;
     for (result.kept) |fault| {
         const node = if (fault == .object) fault.object.get("node") else null;
-        if (node == null or node.? != .string or !std.mem.eql(u8, node.?.string, "witness")) witness_only = false;
+        if (node == null or node.? != .string) {
+            witness_only = false;
+            continue;
+        }
+        var names = std.mem.splitScalar(u8, node.?.string, ',');
+        var hits = false;
+        while (names.next()) |name| hits = hits or std.mem.eql(u8, name, "witness");
+        witness_only = witness_only and hits;
     }
     expect_all(context, &.{
         .{ "the failure needs a fault (none fails it less)", result.failing_whole > 0 and result.failing_none < needed },
         .{ "the plugin's cuts were judged", asked },
         .{ "what is kept fails as the rule asks", result.failing_kept >= needed },
-        .{ "and hits the witness only", witness_only },
+        .{ "and every fault kept takes the witness down", witness_only },
     }, "shrink-plugin: {d} of {d} faults kept, failing in {d}/4 with them, {d}/4 with all, {d}/4 with none ({d} explorations)", .{
         result.kept.len, result.faults, result.failing_kept, result.failing_whole, result.failing_none, result.explorations,
     });
