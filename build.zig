@@ -826,7 +826,8 @@ fn zstd_link(b: *std.Build, module: *std.Build.Module) void {
 }
 
 /// WAMR (the WebAssembly Micro Runtime, 2.4.4: its fast interpreter, C, no JIT, AOT or WASI,
-/// software bounds checks: no signal handlers in the explorer, instruction metering on): wasm
+/// software bounds checks: no signal handlers in the explorer, instruction metering on; checked
+/// under UBSan, its by-design unaligned stores apart): wasm
 /// plugins run inside the explorer (src/wasm_plugin.zig declares its functions: `check`
 /// compiles without it).
 fn wamr_link(b: *std.Build, module: *std.Build.Module) void {
@@ -865,6 +866,10 @@ fn wamr_link(b: *std.Build, module: *std.Build.Module) void {
             "-DWASM_ENABLE_INSTRUCTION_METERING=1",  "-DWASM_ENABLE_LOG=0",
             "-DWASM_HAVE_MREMAP=1",                  "-D_GNU_SOURCE",
             "-DNDEBUG",
+            // Its fast interpreter stores pointers into its compiled code at any address
+            // (WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS on x86-64): by design, so the sanitizer's
+            // alignment check is off for it alone, every other one kept.
+                                         "-fno-sanitize=alignment",
         },
     });
     module.link_libc = true;

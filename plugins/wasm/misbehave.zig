@@ -29,8 +29,12 @@ export fn det_call(size: u32) i32 {
     }
     if (std.mem.indexOf(u8, message, "\"method\":\"random\"") != null) {
         if (!looping) @trap();
-        if (!looped) {
-            looped = true; // Kept: the module's memory outlives the call its budget ended.
+        // Volatile, both ways: its only write is on a path that never returns, so a plain
+        // read may be folded to false and a plain store sunk past the loop, never made. The
+        // module's memory outlives the call its budget ended: the flag is kept.
+        const flag: *volatile bool = &looped;
+        if (!flag.*) {
+            flag.* = true;
             var spins: u64 = 0;
             while (@as(*volatile u64, &spins).* != std.math.maxInt(u64)) spins += 1;
         }
