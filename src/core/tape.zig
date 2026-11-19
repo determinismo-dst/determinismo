@@ -36,7 +36,13 @@ pub const Header = struct {
 };
 
 pub const Extends = struct { branch: u32, vtime_ns: u64 };
-pub const Machine = struct { epoch_seconds: u64, timer_slack_ns: u64, modulation_stretch_ns: [2]u64 };
+pub const Machine = struct {
+    epoch_seconds: u64,
+    timer_slack_ns: u64,
+    modulation_stretch_ns: [2]u64,
+    /// How far into its slack a timer lands at the earliest (VM.Options.timer_delay_permille).
+    timer_delay_permille: u16 = 0,
+};
 
 /// One step of a path: branch `branch` (seed `seed`) ran from the previous step's moment to
 /// `vtime_ns`, where the next one branched from it.
@@ -252,8 +258,9 @@ pub fn write_header(fd: linux.fd_t, header: Header) void {
         writer.print(",\"tsc_jitter_seed\":\"{x:0>16}\"", .{header.tsc_jitter_seed}) catch unreachable;
     }
     if (header.machine) |machine| {
-        writer.print(",\"machine\":{{\"epoch_seconds\":{d},\"timer_slack_ns\":{d},\"modulation_stretch_ns\":[{d},{d}]}}", .{
-            machine.epoch_seconds, machine.timer_slack_ns, machine.modulation_stretch_ns[0], machine.modulation_stretch_ns[1],
+        writer.print(",\"machine\":{{\"epoch_seconds\":{d},\"timer_slack_ns\":{d},\"modulation_stretch_ns\":[{d},{d}],\"timer_delay_permille\":{d}}}", .{
+            machine.epoch_seconds,            machine.timer_slack_ns,       machine.modulation_stretch_ns[0],
+            machine.modulation_stretch_ns[1], machine.timer_delay_permille,
         }) catch unreachable;
     }
     if (header.fork) |fork| {
@@ -580,10 +587,13 @@ fn machine_parse(value: std.json.Value) !Machine {
     if (epoch != .integer or slack != .integer or stretch != .array or stretch.array.items.len != 2) return error.BadTape;
     for (stretch.array.items) |item| if (item != .integer or item.integer < 0) return error.BadTape;
     if (epoch.integer < 0 or slack.integer < 0) return error.BadTape;
+    const delay: i64 = if (value.object.get("timer_delay_permille")) |given| if (given == .integer) given.integer else return error.BadTape else 0;
+    if (delay < 0 or delay > 1000) return error.BadTape;
     return .{
         .epoch_seconds = @intCast(epoch.integer),
         .timer_slack_ns = @intCast(slack.integer),
         .modulation_stretch_ns = .{ @intCast(stretch.array.items[0].integer), @intCast(stretch.array.items[1].integer) },
+        .timer_delay_permille = @intCast(delay),
     };
 }
 
@@ -855,7 +865,7 @@ test "a tape keeps the machine a strategy decided for its run" {
     const allocator = std.testing.allocator;
     var pipe: [2]linux.fd_t = undefined;
     try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&pipe, .{})));
-    const machine: Machine = .{ .epoch_seconds = 951782400, .timer_slack_ns = 250_000, .modulation_stretch_ns = .{ 5_000_000, 90_000_000 } };
+    const machine: Machine = .{ .epoch_seconds = 951782400, .timer_slack_ns = 250_000, .modulation_stretch_ns = .{ 5_000_000, 90_000_000 }, .timer_delay_permille = 600 };
     write_header(pipe[1], .{ .inputs = 0xaa, .exploration_seed = 3, .branch = 1, .branch_seed = 9, .machine = machine });
     _ = linux.close(pipe[1]);
     var buffer: [4096]u8 = undefined;

@@ -280,6 +280,8 @@ tsc_per_branch: u32,
 /// CPU modulation, in branches only (Options.cpu_modulation).
 modulation: ?Modulation,
 timer_slack_tsc: u64,
+/// Where in its slack a timer lands at the earliest (Options.timer_delay_permille), in ticks.
+timer_delay_tsc: u64,
 serial: Serial,
 rtc: RTC,
 pit: PIT,
@@ -406,6 +408,12 @@ pub const Options = struct {
     /// timers: a busy YugabyteDB guest ran at 0.99x virtual time with it, 0.62x with 100 us
     /// (fewer interrupts, timers due together firing at once, fewer exact stops; srv3).
     timer_slack_ns: u64 = std.time.ns_per_ms,
+    /// How far into its slack a timer's interrupt lands at the earliest, in thousandths of the
+    /// slack: the soft stop at the first clock read past deadline + this (0, the default: past
+    /// the deadline itself). Interrupts later than their deadline by up to the slack, as a loaded
+    /// host delivers them: what a plugin's machine may choose (Strategy.machine). Part of a
+    /// timeline's inputs when not 0.
+    timer_delay_permille: u16 = 0,
     /// Root of all guest randomness: seeds the guest kernel's RNG at boot and answers every
     /// randomness pull from /dev/determinismo.
     seed: u64,
@@ -840,6 +848,7 @@ fn init_machine(vm: *VM, options: *const Options) !void {
         .tsc_per_branch = options.tsc_per_branch,
         .modulation = null,
         .timer_slack_tsc = options.timer_slack_ns * tsc_per_ns,
+        .timer_delay_tsc = options.timer_slack_ns * tsc_per_ns * options.timer_delay_permille / 1000,
         .serial = .{},
         .rtc = .{ .epoch_seconds = options.epoch_seconds },
         .pit = .{ .tsc_hz = cpuid.tsc_hz },
@@ -1708,11 +1717,13 @@ fn timer_arm(vm: *VM) !void {
         inline else => |kind| try vm.trace("target-" ++ @tagName(kind), state.branches + branches_left),
     }
     if (timer_tsc) |deadline| if (vm.timer_slack_tsc > 0) {
+        // Its landing point: the deadline, or as far into its slack as the machine says.
+        const landing = deadline + vm.timer_delay_tsc;
         // Due already (a hold point within its slack stopped first): the next clock read.
-        const soft_tsc = if (deadline * 1000 <= now_milli)
+        const soft_tsc = if (landing * 1000 <= now_milli)
             state.tsc
         else
-            state.tsc + @divCeil(deadline * 1000 - now_milli, permille);
+            state.tsc + @divCeil(landing * 1000 - now_milli, permille);
         try vm.soft_set(soft_tsc);
     };
 }
@@ -2595,7 +2606,7 @@ fn timer_due(vm: *VM) !void {
     if (!vm.deterministic or vm.timer_slack_tsc == 0) return; // No slack: stops are exact.
     const deadline = vm.pit.deadline_tsc() orelse return;
     const state = try vm.det_state();
-    if (state.tsc < deadline) return;
+    if (state.tsc < deadline + vm.timer_delay_tsc) return;
     // Whatever the target: a hold point or a moment armed before the timer's hard stop does not
     // move where it fires.
     try vm.target_set(0);

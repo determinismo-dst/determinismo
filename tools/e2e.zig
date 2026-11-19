@@ -1632,10 +1632,28 @@ fn check_machine_decisions(context: *Context) !void {
     const tape = try std.fs.path.join(arena, &.{ tapes, "branch-0.jsonl" });
     const replay = try explore(context, &(common ++ look ++ [_][]const u8{ "--tape", tape }));
     const replay_dated = std.mem.indexOf(u8, replay, "2000-02-29") != null;
+    // Timers landing 900/1000 into their slack: another timeline, which replays alone as it ran.
+    const late_tapes = try std.fs.path.join(arena, &.{ context.scratch, "machine-late-tapes" });
+    const late = try explore(context, &(common ++ look ++ [_][]const u8{
+        "--branches", "1",                                                    "--jobs",     "1",
+        "--strategy", "python3 plugins/python/machine_date.py 951782400 900", "--tape-dir", late_tapes,
+    }));
+    var first: [1]Branch = undefined;
+    var landed: [1]Branch = undefined;
+    var landed_replayed: [1]Branch = undefined;
+    const late_replay = try explore(context, &(common ++ look ++ [_][]const u8{
+        "--tape", try std.fs.path.join(arena, &.{ late_tapes, "branch-0.jsonl" }),
+    }));
+    const parsed = parse_branches(report, &first) == 1 and parse_branches(late, &landed) == 1 and
+        parse_branches(late_replay, &landed_replayed) == 1;
+    const moved = parsed and !std.mem.eql(u8, first[0].events_hash, landed[0].events_hash);
+    const late_replays = parsed and std.mem.eql(u8, landed[0].events_hash, landed_replayed[0].events_hash);
     expect_all(context, &.{
         .{ "the strategy decided the machine (wall clock 951782400)", decided },
         .{ "the guest's date at 3 s is 2000-02-29", dated },
         .{ "the timeline replayed from its tape alone boots the same machine", replay_dated },
+        .{ "timers landing 900/1000 into their slack make another timeline", moved },
+        .{ "which replays alone from its tape as it ran", late_replays },
     }, "machine decisions", .{});
 }
 

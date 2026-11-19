@@ -320,7 +320,7 @@ const usage =
     \\machine options:
     \\  --kernel <bzImage> [--initrd <file>] [--memory-mib <n>] [--disk <image>]...
     \\  [--cmdline <text> | --append <text>] [--deterministic] [--seed <n>]
-    \\  [--margin-branches <n>] [--timer-slack-us <n>] [--branch-event <raw PMU event>]
+    \\  [--margin-branches <n>] [--timer-slack-us <n>] [--timer-landing-permille <0-1000>] [--branch-event <raw PMU event>]
     \\  [--watch <guest physical address>[:<bytes>]]   (debugging a replay: every write to those
     \\                   bytes logged, its moment, RIP and CR3; the history stays the recorded one)
     \\  [--tsc-jitter-seed <n>] [--tsc-jitter-exact] [--cpuid <file>] [--guest-cpu host|vm_v1]
@@ -372,6 +372,8 @@ const Arguments = struct {
     /// A replay's watchpoint (`--watch <guest physical address>[:<size>]`, debugging only).
     watch: ?VM.Watch = null,
     timer_slack_us: u64 = 1000,
+    /// How far into its slack a timer lands at the earliest (VM.Options.timer_delay_permille).
+    timer_delay_permille: u16 = 0,
     /// The raw PMU event that is the guest's clock (see VM.Options.branch_event).
     branch_event: u64 = VM.branch_event_default,
     /// Another host's guest CPUID table (`determinismo cpuid`'s), to replay its runs here.
@@ -990,6 +992,7 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
         .margin_branches = arguments.margin_branches,
         .watch = arguments.watch,
         .timer_slack_ns = arguments.timer_slack_us * std.time.ns_per_us,
+        .timer_delay_permille = arguments.timer_delay_permille,
         .branch_event = arguments.branch_event,
         .cpuid_table = cpuid_table,
         .cpuid_msrs = cpuid_msrs,
@@ -1932,6 +1935,7 @@ fn machine_adopt(arguments: *Arguments, machine: tape.Machine) void {
     arguments.epoch_seconds = machine.epoch_seconds;
     arguments.timer_slack_us = machine.timer_slack_ns / std.time.ns_per_us;
     arguments.cpu_modulation_stretch_ns = machine.modulation_stretch_ns;
+    arguments.timer_delay_permille = machine.timer_delay_permille;
     arguments.machine_adopted = machine;
 }
 
@@ -2301,16 +2305,18 @@ fn command_explore(
                     .epoch_seconds = options.epoch_seconds,
                     .timer_slack_ns = options.timer_slack_ns,
                     .modulation_stretch_ns = options.modulation_stretch_ns,
+                    .timer_delay_permille = options.timer_delay_permille,
                 },
                 .tsc_jitter_seed = options.tsc_jitter_seed,
             });
             options.epoch_seconds = decided.machine.epoch_seconds;
             options.timer_slack_ns = decided.machine.timer_slack_ns;
             options.modulation_stretch_ns = decided.machine.modulation_stretch_ns;
+            options.timer_delay_permille = decided.machine.timer_delay_permille;
             options.tsc_jitter_seed = decided.tsc_jitter_seed;
             exploration.machine = decided.machine;
-            std.debug.print("[determinismo] the machine its strategy decided: wall clock {d}, timer slack {d} us, jitter {x:0>16}, stretches {d}-{d} us\n", .{
-                decided.machine.epoch_seconds, decided.machine.timer_slack_ns / std.time.ns_per_us, decided.tsc_jitter_seed,
+            std.debug.print("[determinismo] the machine its strategy decided: wall clock {d}, timer slack {d} us landing at {d}/1000 of it, jitter {x:0>16}, stretches {d}-{d} us\n", .{
+                decided.machine.epoch_seconds, decided.machine.timer_slack_ns / std.time.ns_per_us, decided.machine.timer_delay_permille, decided.tsc_jitter_seed,
                 decided.machine.modulation_stretch_ns[0] / std.time.ns_per_us, decided.machine.modulation_stretch_ns[1] / std.time.ns_per_us,
             });
         }
@@ -7787,6 +7793,8 @@ fn inputs_hash(options: *const VM.Options, arguments: *const Arguments) u64 {
     if (options.initrd) |initrd| hasher.update(initrd);
     hasher.update(options.cmdline);
     hasher.update(std.mem.asBytes(&options.timer_slack_ns)); // Where timer interrupts land.
+    // And how far into their slack, when not at once (none before the landing point existed).
+    if (options.timer_delay_permille != 0) hasher.update(std.mem.asBytes(&options.timer_delay_permille));
     hasher.update(std.mem.asBytes(&options.branch_event)); // What time is made of.
     // And what its low bits read (none for runs before the jitter: their inputs unchanged).
     if (options.tsc_jitter_seed != 0) hasher.update(std.mem.asBytes(&options.tsc_jitter_seed));
@@ -8193,6 +8201,10 @@ fn parse_option(
         arguments.tsc_jitter_seed = try std.fmt.parseInt(u64, value, 0);
     } else if (eql(u8, flag, "--timer-slack-us")) {
         arguments.timer_slack_us = try std.fmt.parseInt(u64, value, 10);
+    } else if (eql(u8, flag, "--timer-landing-permille")) {
+        const permille = try std.fmt.parseInt(u16, value, 10);
+        if (permille > 1000) return error.Usage;
+        arguments.timer_delay_permille = permille;
     } else if (eql(u8, flag, "--events")) {
         arguments.events_path = value;
     } else if (eql(u8, flag, "--faults-record")) {

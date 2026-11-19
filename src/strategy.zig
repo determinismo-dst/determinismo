@@ -449,17 +449,19 @@ const stretch_us_min = 1;
 const stretch_us_max = 10 * std.time.us_per_s;
 
 /// The machine a run boots, a strategy's to decide when it wants (`"wants":["machine"]`):
-/// `{"method":"machine","epoch_seconds":E,"timer_slack_us":S,"tsc_jitter_seed":"<hex>",
-/// "modulation_stretch_us":[low,high]}`, the run's own, and the reply's fields replace them
+/// `{"method":"machine","epoch_seconds":E,"timer_slack_us":S,"timer_delay_permille":D,
+/// "tsc_jitter_seed":"<hex>","modulation_stretch_us":[low,high]}`, the run's own (D: how far into
+/// its slack a timer lands at the earliest, thousandths), and the reply's fields replace them
 /// (each within its bounds, else BadPluginReply). Asked once, before the machine is made.
 pub const MachineChoice = struct { machine: tape.Machine, tsc_jitter_seed: u64 };
 
 pub fn machine(strategy: *Strategy, given: MachineChoice) !MachineChoice {
     assert(strategy.wants_machine);
     var writer: std.Io.Writer = .fixed(&strategy.request);
-    try writer.print("{{\"method\":\"machine\",\"epoch_seconds\":{d},\"timer_slack_us\":{d},\"tsc_jitter_seed\":\"{x:0>16}\",\"modulation_stretch_us\":[{d},{d}]}}", .{
+    try writer.print("{{\"method\":\"machine\",\"epoch_seconds\":{d},\"timer_slack_us\":{d},\"timer_delay_permille\":{d},\"tsc_jitter_seed\":\"{x:0>16}\",\"modulation_stretch_us\":[{d},{d}]}}", .{
         given.machine.epoch_seconds,
         given.machine.timer_slack_ns / std.time.ns_per_us,
+        given.machine.timer_delay_permille,
         given.tsc_jitter_seed,
         given.machine.modulation_stretch_ns[0] / std.time.ns_per_us,
         given.machine.modulation_stretch_ns[1] / std.time.ns_per_us,
@@ -473,6 +475,10 @@ pub fn machine(strategy: *Strategy, given: MachineChoice) !MachineChoice {
     if (reply.get("timer_slack_us")) |value| {
         if (value != .integer or value.integer < 0 or value.integer > timer_slack_us_max) return error.BadPluginReply;
         chosen.machine.timer_slack_ns = @as(u64, @intCast(value.integer)) * std.time.ns_per_us;
+    }
+    if (reply.get("timer_delay_permille")) |value| {
+        if (value != .integer or value.integer < 0 or value.integer > 1000) return error.BadPluginReply;
+        chosen.machine.timer_delay_permille = @intCast(value.integer);
     }
     if (reply.get("tsc_jitter_seed")) |value| {
         if (value != .string or value.string.len != 16) return error.BadPluginReply;

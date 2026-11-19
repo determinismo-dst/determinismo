@@ -156,11 +156,13 @@ Two hooks before the timelines, each for a plugin that asks for it in its hello'
   answers go on the setup's own tape (`setup.jsonl` beside the timelines'), which a replay
   applies as its setup runs again. What the setup decided, every timeline of the run shares.
 - `"machine"`: the machine the run boots, asked once before it does:
-  `{"method":"machine","epoch_seconds":E,"timer_slack_us":S,"tsc_jitter_seed":"<hex>","modulation_stretch_us":[low,high]}`,
+  `{"method":"machine","epoch_seconds":E,"timer_slack_us":S,"timer_delay_permille":D,"tsc_jitter_seed":"<hex>","modulation_stretch_us":[low,high]}`,
   the run's own. The reply's fields replace them: the guest's wall clock at boot (Unix
   seconds, up to 2100: a leap day, a year's end, a date past a certificate's expiry), how far
-  past a timer's deadline its interrupt may land (up to 1 s), the clock's jitter, and CPU
-  modulation's stretches (1 us to 10 s, low below high). The machine is in every tape's header
+  past a timer's deadline its interrupt may land (up to 1 s), how far into that slack it lands
+  at the earliest (thousandths: interrupts late as a loaded host makes them; explore's
+  `--timer-landing-permille`), the clock's jitter, and CPU modulation's stretches (1 us to
+  10 s, low below high). The machine is in every tape's header
   and the run's record: a replay and a resume boot it, never asking again.
   `plugins/python/machine_date.py` sets the wall clock.
 
