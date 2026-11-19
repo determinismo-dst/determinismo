@@ -219,8 +219,27 @@ var natives = [_]NativeSymbol{
 };
 var runtime_ready = false;
 
+/// How far below runtime_init's frame the main thread's stack is mapped before WAMR measures it.
+const stack_premap_size = 2 << 20;
+
+/// The main thread's stack grown `stack_premap_size` below this frame, page by page from the top.
+/// WAMR measures a thread's stack boundary once and keeps it (os_thread_get_stack_boundary), and
+/// musl's pthread_getattr_np gives the main thread's stack as mapped so far: measured from the
+/// explorer's first load, a worker instantiating its module from deeper frames (its start
+/// function, shared memory's, checked against that boundary) failed with "native stack
+/// overflow". The explorer's main thread has 8 MiB.
+noinline fn stack_premap() void {
+    var room: [stack_premap_size]u8 = undefined;
+    var at: usize = room.len;
+    while (at >= std.heap.page_size_min) {
+        at -= std.heap.page_size_min;
+        @as(*volatile u8, &room[at]).* = 0;
+    }
+}
+
 fn runtime_init() !void {
     if (runtime_ready) return;
+    stack_premap();
     if (!wasm_runtime_init()) return error.WasmRuntime;
     if (!wasm_runtime_register_natives(abi, &natives, natives.len)) return error.WasmRuntime;
     runtime_ready = true;
