@@ -1334,6 +1334,7 @@ fn run_script(
 ) void {
     const start_ns = monotonic_ns();
     var injections: u32 = 0;
+    following_script = true;
     for (faults) |*fault| {
         sleep_through_ns(start_ns + fault.at_ns -| monotonic_ns());
         if (stopping.load(.acquire)) break;
@@ -1626,8 +1627,15 @@ fn node_busy(index: usize) bool {
 fn node_admits(index: usize, layer: Layer) bool {
     if (nodes_faulted[index][@backingInt(layer)] != null) return false;
     if (!node_busy(index)) return true;
+    // A scripted fault overlapped another where it was recorded: that overlap was drawn there.
+    // Drawn again in a replay (whose regime is .fixed, overlap 0), every overlap was refused:
+    // a 90 s throttle over a process pause, gone from the bank's scripted timeline.
+    if (following_script) return true;
     return sdk.random_below_named("fault.overlap", 8) < regime.overlap_eighths;
 }
+
+/// Following a script (run_script): its faults are applied as they were, not admitted anew.
+var following_script = false;
 /// For starting nodes again when their fault ends (set once faults start).
 var arena_active: ?std.mem.Allocator = null;
 /// How long a graceful stop waits for the node to exit before it is killed. A node's main
@@ -1657,6 +1665,19 @@ test "a node takes one fault a layer, and one in each only as the regime's overl
     var admitted: u32 = 0;
     for (0..400) |_| admitted += @intFromBool(node_admits(0, .process));
     try std.testing.expect(admitted > 100 and admitted < 300);
+}
+
+test "a script's fault overlapping another is admitted as it was, though a replay's regime draws none" {
+    defer regime = .fixed;
+    defer nodes_faulted[0] = @splat(null);
+    defer following_script = false;
+    nodes_faulted[0][@backingInt(Layer.process)] = .{ .applied = .{ .kind = .process_pause, .node = "redis", .duration_ns = 0 }, .end_ns = 0 };
+    regime = .fixed; // A replay's: overlap 0.
+    following_script = true;
+    // A throttle over a process pause (the bank's scripted timeline): the other layer, admitted.
+    for (0..50) |_| try std.testing.expect(node_admits(0, .condition));
+    // The same layer stays one fault at a time, scripted or not.
+    try std.testing.expect(!node_admits(0, .process));
 }
 
 fn node_slot(system: *const schema.System, name: []const u8, layer: Layer) ?*?NodeFault {
@@ -2102,8 +2123,12 @@ fn takes_down(kind: Kind) bool {
 fn node_start(system: *const schema.System, applied: *const Applied) bool {
     const layer = layer_of(applied.kind);
     const slot = node_slot(system, applied.node, layer) orelse return false;
-    // Busy in its layer, or in the other without the regime's overlap: skipped, not logged.
-    if (!node_admits(node_slot_index(system, applied.node).?, layer)) return false;
+    // Busy in its layer, or in the other without the regime's overlap: skipped, not logged
+    // (drawn faults turned away are many); a scripted one is logged: the script said it ran.
+    if (!node_admits(node_slot_index(system, applied.node).?, layer)) {
+        if (following_script) sdk.event("fault_skipped", .{ .kind = @tagName(applied.kind), .node = applied.node, .err = "LayerBusy" });
+        return false;
+    }
     // Crash points and aftershocks start here, not through apply.
     if (!quorum_kept(system, applied)) {
         sdk.event("fault_skipped", .{ .kind = @tagName(applied.kind), .node = applied.node, .err = "QuorumKept" });
