@@ -3906,6 +3906,9 @@ fn check_kubernetes(context: *Context) !void {
     // namespace): none.
     const pod_failures = try run_kept(context, &.{ "sh", "-c", try std.fmt.allocPrint(arena, "grep -rh 'fault_failed\\|fault_heal_failed' {s} | grep -c kubernetes || true", .{explored}) });
     const named = try run_kept(context, &.{ "grep", "-rhoE", "\"pod\":\"[a-z0-9-]+\"", explored });
+    // Every pod fault names its pod, never its cgroup's pod<uid> (a StatefulSet's pod made again
+    // after a kill went unnamed: no exclusion pattern matched it).
+    const unnamed = try run_kept(context, &.{ "sh", "-c", try std.fmt.allocPrint(arena, "grep -rhF '\"event\":\"fault\"' {s} | grep -cE '\"pod\":\"pod[0-9a-f]{{8}}-' || true", .{explored}) });
     // Pods' containers' exits judged as Antithesis judges a container's (a pod kill's 137).
     const exits = try run_kept(context, &.{ "grep", "-rlF", "\"no unexpected container exits\",\"condition\":true,\"details\":{\"pod\"", explored });
     // A bare Pod given what Antithesis gives every container (det-kubespec's base spec): its
@@ -3934,6 +3937,7 @@ fn check_kubernetes(context: *Context) !void {
         .{ "no property failed", passing },
         .{ "a timeline replays exactly", same },
         .{ "faults on single pods, each naming its pod", pod_faults.stdout.len > 0 and named.stdout.len > 0 },
+        .{ "no pod fault names a pod by its cgroup (pod<uid>)", std.mem.eql(u8, std.mem.trim(u8, unnamed.stdout, " \n"), "0") },
         .{ "the pods' output as events named after them (redis-0)", pod_output.stdout.len > 0 },
         .{ "pods' container exits judged (no unexpected container exits)", exits.stdout.len > 0 },
         .{ "a bare Pod given libvoidstar, its device, the coverage and the SDK's output", std.mem.eql(u8, std.mem.trim(u8, given.stdout, " \n"), "4") and missing.stdout.len == 0 },

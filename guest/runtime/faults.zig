@@ -2350,6 +2350,9 @@ fn pod_pick(node: []const u8, index: u32, pod: *Pod, spare_drivers: bool) !linux
         pod.path_size = picked.len;
         pod.name_size = 0;
         if (try pod_process(pod)) |pid| {
+            if (pod.name_size == 0) if (pod_name_logged(node, std.fs.path.basename(picked), &pod.name_buffer)) |logged| {
+                pod.name_size = logged.len;
+            };
             if (excluded(pod.name())) continue;
             return pid;
         }
@@ -2418,6 +2421,63 @@ fn pod_has_templates(path: []const u8) bool {
         if (linux.errno(linux.access(templates, linux.F_OK)) == .SUCCESS) return true;
     }
     return false;
+}
+
+/// A pod's name from kubelet's log directory for it (/var/log/pods/<namespace>_<name>_<uid>, made
+/// as the pod is synced, before its containers), seen through the node's main process: where no
+/// process of the pod names it (its sandbox's first, between its containers' restarts). Unnamed,
+/// a pod went by its cgroup's pod<uid>, which no exclusion pattern matches (run 2089: 36 of
+/// them, CloudNativePG's paradedb-1 made again after a kill among them; an e2e kubernetes run
+/// 6 of its 15 pod faults).
+fn pod_name_logged(node: []const u8, cgroup: []const u8, buffer: *[64]u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, cgroup, "pod")) return null;
+    const uid = cgroup["pod".len..];
+    const main_pid = nodes.pid_recorded(node) orelse return null;
+    var path_buffer: [nodes.path_size_max]u8 = undefined;
+    const path = nodes.print_z(&path_buffer, "/proc/{d}/root/var/log/pods", .{main_pid}) catch return null;
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true };
+    const opened = linux.open(path, flags, 0);
+    if (linux.errno(opened) != .SUCCESS) return null;
+    const fd: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(fd);
+    var entries: [8192]u8 align(8) = undefined;
+    while (true) {
+        const size = linux.getdents64(fd, &entries, entries.len);
+        if (linux.errno(size) != .SUCCESS or size == 0) return null;
+        var at: usize = 0;
+        while (at < size) {
+            const entry: *align(1) const linux.dirent64 = @ptrCast(&entries[at]);
+            at += entry.reclen;
+            const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&entry.name)), 0);
+            const pod_name = logged_pod_name(name, uid) orelse continue;
+            if (pod_name.len > buffer.len) return null;
+            @memcpy(buffer[0..pod_name.len], pod_name);
+            return buffer[0..pod_name.len];
+        }
+    }
+}
+
+/// The pod's name in a kubelet log directory's name, <namespace>_<name>_<uid> (neither a
+/// namespace nor a pod name holds an underscore), if it is the pod's whose uid is `uid`.
+fn logged_pod_name(directory: []const u8, uid: []const u8) ?[]const u8 {
+    if (uid.len == 0 or directory.len <= uid.len + 1) return null;
+    if (!std.mem.endsWith(u8, directory, uid)) return null;
+    const rest = directory[0 .. directory.len - uid.len];
+    if (rest[rest.len - 1] != '_') return null;
+    const namespaced = rest[0 .. rest.len - 1];
+    const separator = std.mem.indexOfScalar(u8, namespaced, '_') orelse return null;
+    const name = namespaced[separator + 1 ..];
+    if (name.len == 0 or std.mem.indexOfScalar(u8, name, '_') != null) return null;
+    return name;
+}
+
+test logged_pod_name {
+    const uid = "25cf8475-769e-4799-b9d6-7f3c529fbdcf";
+    try std.testing.expectEqualStrings("paradedb-1", logged_pod_name("default_paradedb-1_" ++ uid, uid).?);
+    try std.testing.expectEqualStrings("cnpg-cloudnative-pg-5bbd99d7d7-v5zx4", logged_pod_name("cnpg-system_cnpg-cloudnative-pg-5bbd99d7d7-v5zx4_" ++ uid, uid).?);
+    try std.testing.expect(logged_pod_name("default_paradedb-1_17e60db2-673e-4815-aa60-df28a91eed28", uid) == null);
+    try std.testing.expect(logged_pod_name("paradedb-1_" ++ uid, uid) == null); // No namespace.
+    try std.testing.expect(logged_pod_name(uid, uid) == null);
 }
 
 /// A process's HOSTNAME (from its environment), into `buffer`.
