@@ -21,6 +21,7 @@ const regex = @import("regex");
 const fd_pass = @import("fd_pass.zig");
 const holders = @import("holders.zig");
 const event_files = @import("event_files.zig");
+const triage = @import("triage.zig");
 const bandit_zig = @import("bandit.zig");
 const activity = @import("activity.zig");
 const saver_zig = @import("core").saver;
@@ -861,6 +862,8 @@ fn command_tool(
         profiler.stacks_run(arena, io, argv[0], rest)
     else if (eql(u8, name, "query"))
         query.run(arena, io, rest)
+    else if (eql(u8, name, "triage"))
+        triage.run(arena, io, environ, rest)
     else if (eql(u8, name, "events"))
         event_sets.run(arena, io, rest)
     else if (eql(u8, name, "tla"))
@@ -8956,6 +8959,7 @@ test {
     _ = @import("cpus.zig");
     _ = @import("holders.zig");
     _ = @import("event_files.zig");
+    _ = @import("triage.zig");
     _ = @import("activity.zig");
     _ = @import("checks.zig");
     _ = @import("causality.zig");

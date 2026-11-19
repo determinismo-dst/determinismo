@@ -135,6 +135,17 @@ determinismo explore ... --strategy "python3 plugins/python/decide_named.py node
                          --strategy "python3 plugins/python/count_check.py fault 0"
 ```
 
+A checker plugin also triages runs that ended: `determinismo triage --events <run>/events
+--strategy <plugin>` (serve: `POST /runs/<id>/triage {"strategy": ...}`, the client's
+`triage-start`) tells it each stored timeline as a run would have (`branch`, the timeline's own
+events, `check`, `branch_end` with the properties it failed) and keeps its verdicts, by message:
+what it labels timelines with once a bug is known ("known: #3217", a sometimes), for runs made
+before it was, without running them again. The run's events are read, nothing replayed, by
+serve's current explorer whatever the run's; an event's `source` is not stored (""), and no
+histories are given to `check`. `plugins/python/signatures.py <label>=<regex>...` (or `@<file>`, a
+signature a line) labels each timeline whose events match; live as a run's `--strategy`, it
+labels the same (the e2e `triage` and `serve` checks).
+
 A run can bring fault injectors of its own: `--injector <executable>`, again for each (serve's
 `injectors`: uploads by `@<name>` or files, kept by content as its program is). They go on the
 system disk (`/det/injectors/<name>`, part of the run's inputs), and each timeline's injector is

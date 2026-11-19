@@ -365,9 +365,26 @@
 
 (defn explain-stop [id n] (parse (request :post (str "/runs/" id "/explain/" n "/stop"))))
 
+(defn triage-start
+  "Starts a triage of a run that ended: checker plugins (`strategy`: one, or several a vector;
+  uploads as \"@<name>\") told its stored timelines and asked to check each, as a run would
+  have: what a plugin labels them with once a bug is known (plugins/python/signatures.py), for
+  runs made before. Its {:id}; its result (triages) the verdicts by message: [{:type :message
+  :held [timeline ...] :failed [...]}]."
+  [id strategy]
+  (let [joined (if (sequential? strategy) (str/join "\n" strategy) strategy)]
+    (parse (request :post (str "/runs/" id "/triage") {:strategy joined}))))
+
+(defn triages
+  "Every triage of a run: [{:id :of :done :result :progress}]."
+  [id]
+  (parse (request :get (str "/runs/" id "/triage"))))
+
+(defn triage-stop [id n] (parse (request :post (str "/runs/" id "/triage/" n "/stop"))))
+
 (defn analysis-wait
-  "Waits for a shrinking or an explanation (`listing`: shrinks or explains) to finish, looking
-  every `every-ms`, and returns it."
+  "Waits for a shrinking, an explanation or a triage (`listing`: shrinks, explains or triages)
+  to finish, looking every `every-ms`, and returns it."
   ([listing id n] (analysis-wait listing id n 3000))
   ([listing id n every-ms]
    (loop []
