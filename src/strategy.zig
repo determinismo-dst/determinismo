@@ -424,7 +424,10 @@ test "a plugin that wants named decisions and assertions is asked and told only 
 /// Where a branch starts when not at the setup snapshot: a moment of another (the tree's).
 pub const From = struct { branch: u32, vtime_ns: u64 };
 
-pub fn branch(strategy: *Strategy, index: u32, seed: u64, from: ?From) !void {
+/// A timeline's start: its index, seed and where it branches from. The reply may give the
+/// timeline another seed (`{"seed":"<16 hex digits>"}`: which random future it gets), its tape's
+/// header then saying it: null keeps the explorer's.
+pub fn branch(strategy: *Strategy, index: u32, seed: u64, from: ?From) !?u64 {
     // A plan is a timeline's: the next one's first named decision asks for its own.
     strategy.plan_count = 0;
     strategy.flushed_ns = 0;
@@ -438,7 +441,10 @@ pub fn branch(strategy: *Strategy, index: u32, seed: u64, from: ?From) !void {
         });
     }
     try writer.writeAll("}");
-    _ = try strategy.call(writer.buffered());
+    const reply = try strategy.call(writer.buffered());
+    const chosen = reply.get("seed") orelse return null;
+    if (chosen != .string or chosen.string.len != 16) return error.BadPluginReply;
+    return std.fmt.parseInt(u64, chosen.string, 16) catch error.BadPluginReply;
 }
 
 /// What a run's machine may be: the guest's wall clock no later than 2100, a timer's slack at

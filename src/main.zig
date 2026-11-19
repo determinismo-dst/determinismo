@@ -3270,7 +3270,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
             position_next;
         position_next += 1;
         if (position >= total) break;
-        const place = branch_place(branches, first + position, single, position) orelse continue;
+        var place = branch_place(branches, first + position, single, position) orelse continue;
         const index = place.index;
         maker.index = index;
         if (exploration.done) |resumed| {
@@ -3285,6 +3285,15 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         wait_deadline_ns = branches.deadline_ns;
         const held = if (branches.pool) |pool| (pool.take_unless(wait_over) orelse break) else null;
         defer if (held) |cpu| branches.pool.?.give(cpu);
+        // Its strategy hears it start first, and may give it another seed (another random
+        // future), which its tape's header then says (a replay takes it from there).
+        if (exploration.strategy) |strategy| {
+            const from: ?Strategy.From = if (place.path.len == 0) null else .{
+                .branch = place.path[place.path.len - 1].branch,
+                .vtime_ns = place.path[place.path.len - 1].vtime_ns,
+            };
+            if (try strategy.branch(place.index, place.seed, from)) |seed| place.seed = seed;
+        }
         options.seed = place.seed;
         Events.ranges_salt = place.seed; // Its own draw over the range buckets (events.zig).
         const moment_ms = branches.arguments.moment_vtime_ms;
@@ -3537,13 +3546,6 @@ fn branch_announce(
     exploration: *const Exploration,
     place: Planned,
 ) !void {
-    if (exploration.strategy) |strategy| {
-        const from: ?Strategy.From = if (place.path.len == 0) null else .{
-            .branch = place.path[place.path.len - 1].branch,
-            .vtime_ns = place.path[place.path.len - 1].vtime_ns,
-        };
-        try strategy.branch(place.index, place.seed, from);
-    }
     if (exploration.extend) |extend| {
         vm.tape_fd = extend.tape_fd; // Its header there since its number was taken.
     } else if (exploration.tape_directory) |directory| {

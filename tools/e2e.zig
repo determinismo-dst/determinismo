@@ -211,68 +211,69 @@ fn scratches_sweep(io: std.Io, arena: std.mem.Allocator, scratches: []const u8) 
 /// and counts them.
 fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
     const checks = .{
-        .{ "bank", check_bank },                             .{ "shop", check_shop },
-        .{ "tapes", check_tapes },                           .{ "debugging", check_debugging },
-        .{ "python", check_python_strategy },                .{ "setup-decisions", check_setup_decisions },
-        .{ "machine-decisions", check_machine_decisions },   .{ "egress", check_egress },
-        .{ "ingress", check_ingress },                       .{ "ingress-session", check_ingress_session },
-        .{ "moments", check_moments },                       .{ "properties", check_builtin_properties },
-        .{ "entropy", check_kernel_entropy },                .{ "quiet", check_quiet_period },
-        .{ "clock_jitter", check_clock_jitter },             .{ "query", check_query },
-        .{ "progress", check_progress_while_quiet },         .{ "network", check_network_faults },
-        .{ "fault-exclusions", check_fault_exclusions },     .{ "serve", check_serve },
-        .{ "until", check_until_and_causality },             .{ "coverage-gate", check_coverage_gate },
-        .{ "coverage", check_coverage },                     .{ "parallel", check_parallel },
-        .{ "fork", check_fork },                             .{ "tree", check_tree },
-        .{ "startup-coverage", check_startup_coverage },     .{ "memory-climb", check_memory_climb },
-        .{ "disk", check_disk },                             .{ "shape", check_shape },
-        .{ "repl-strategy", check_repl_strategy },           .{ "end", check_end },
-        .{ "plans", check_plans },                           .{ "durability", check_durability },
-        .{ "mutate", check_mutate },                         .{ "interleave", check_interleave },
-        .{ "checks", check_host_checks },                    .{ "pausing", check_pausing },
-        .{ "shrink", check_shrink },                         .{ "holds", check_holds },
-        .{ "coverage-set", check_coverage_set },             .{ "inject", check_inject },
-        .{ "aim", check_aim },                               .{ "aftershock", check_aftershock },
-        .{ "record-power-loss", check_record_power_loss },   .{ "errno-storm", check_errno_storm },
-        .{ "compose", check_compose },                       .{ "shards", check_shards },
-        .{ "stress", check_stress },                         .{ "controller", check_controller },
-        .{ "clojure", check_clojure },                       .{ "k3s", check_k3s },
-        .{ "script", check_script },                         .{ "modulation", check_cpu_modulation },
-        .{ "profile", check_profile },                       .{ "catalog", check_catalog },
-        .{ "guidance", check_guidance },                     .{ "voidstar", check_voidstar },
-        .{ "changed", check_changed },                       .{ "readdress", check_readdress },
-        .{ "unlist", check_unlist },                         .{ "signal", check_signal },
-        .{ "syscall_error", check_syscall_error },           .{ "swarm", check_swarm },
-        .{ "metastable", check_metastable },                 .{ "file_error", check_file_error },
-        .{ "retroactive", check_retroactive },               .{ "epoch", check_epoch },
-        .{ "drive", check_drive },                           .{ "hang", check_hang },
-        .{ "pinned", check_pinned },                         .{ "slow", check_slow },
-        .{ "ending-window", check_ending_window },           .{ "sought", check_sought },
-        .{ "optimize", check_optimize },                     .{ "states", check_states },
-        .{ "crash-points", check_crash_points },             .{ "nodes-down", check_nodes_down },
-        .{ "stale-pid", check_stale_pid },                   .{ "memory-growth", check_memory_growth },
-        .{ "upgrade", check_upgrade },                       .{ "knobs", check_knobs },
-        .{ "quorum", check_quorum },                         .{ "spare", check_spare },
-        .{ "saved", check_saved },                           .{ "concurrent", check_concurrent },
-        .{ "resume", check_resume },                         .{ "ui", check_ui },
-        .{ "runs", check_runs },                             .{ "kubernetes", check_kubernetes },
-        .{ "steps", check_steps },                           .{ "before-nodes", check_before_nodes },
-        .{ "session", check_session },                       .{ "fast", check_fast },
-        .{ "sandbox", check_sandbox },                       .{ "devproxy", check_devproxy },
-        .{ "sandbox-egress", check_sandbox_egress },         .{ "ci", check_ci },
-        .{ "repl", check_repl },                             .{ "mechanics", check_mechanics },
-        .{ "budget", check_budget },                         .{ "sinks", check_sinks },
-        .{ "dotnet", check_dotnet },                         .{ "lines", check_lines },
-        .{ "voidstar-static", check_voidstar_static },       .{ "frozen-start", check_frozen_start },
-        .{ "hangup", check_hangup },                         .{ "frozen-step", check_frozen_step },
-        .{ "templates", check_templates },                   .{ "volumes", check_volumes },
-        .{ "setup-mode", check_setup_mode },                 .{ "jank", check_jank_repl },
-        .{ "bank-steps", check_bank_steps },                 .{ "checkpoint", check_session_checkpoint },
-        .{ "ingress-checkpoint", check_ingress_checkpoint }, .{ "ingress-crash", check_ingress_crash },
-        .{ "draws", check_draws },                           .{ "exit-stack", check_exit_stack },
-        .{ "plan-calls", check_plan_calls },                 .{ "services", check_services },
-        .{ "sites", check_sites },                           .{ "client", check_client },
-        .{ "session-exact", check_session_exact },           .{ "java-watch", check_java_watch },
+        .{ "bank", check_bank },                           .{ "shop", check_shop },
+        .{ "tapes", check_tapes },                         .{ "debugging", check_debugging },
+        .{ "python", check_python_strategy },              .{ "setup-decisions", check_setup_decisions },
+        .{ "machine-decisions", check_machine_decisions }, .{ "branch-seeds", check_branch_seeds },
+        .{ "egress", check_egress },                       .{ "ingress", check_ingress },
+        .{ "ingress-session", check_ingress_session },     .{ "moments", check_moments },
+        .{ "properties", check_builtin_properties },       .{ "entropy", check_kernel_entropy },
+        .{ "quiet", check_quiet_period },                  .{ "clock_jitter", check_clock_jitter },
+        .{ "query", check_query },                         .{ "progress", check_progress_while_quiet },
+        .{ "network", check_network_faults },              .{ "fault-exclusions", check_fault_exclusions },
+        .{ "serve", check_serve },                         .{ "until", check_until_and_causality },
+        .{ "coverage-gate", check_coverage_gate },         .{ "coverage", check_coverage },
+        .{ "parallel", check_parallel },                   .{ "fork", check_fork },
+        .{ "tree", check_tree },                           .{ "startup-coverage", check_startup_coverage },
+        .{ "memory-climb", check_memory_climb },           .{ "disk", check_disk },
+        .{ "shape", check_shape },                         .{ "repl-strategy", check_repl_strategy },
+        .{ "end", check_end },                             .{ "plans", check_plans },
+        .{ "durability", check_durability },               .{ "mutate", check_mutate },
+        .{ "interleave", check_interleave },               .{ "checks", check_host_checks },
+        .{ "pausing", check_pausing },                     .{ "shrink", check_shrink },
+        .{ "holds", check_holds },                         .{ "coverage-set", check_coverage_set },
+        .{ "inject", check_inject },                       .{ "aim", check_aim },
+        .{ "aftershock", check_aftershock },               .{ "record-power-loss", check_record_power_loss },
+        .{ "errno-storm", check_errno_storm },             .{ "compose", check_compose },
+        .{ "shards", check_shards },                       .{ "stress", check_stress },
+        .{ "controller", check_controller },               .{ "clojure", check_clojure },
+        .{ "k3s", check_k3s },                             .{ "script", check_script },
+        .{ "modulation", check_cpu_modulation },           .{ "profile", check_profile },
+        .{ "catalog", check_catalog },                     .{ "guidance", check_guidance },
+        .{ "voidstar", check_voidstar },                   .{ "changed", check_changed },
+        .{ "readdress", check_readdress },                 .{ "unlist", check_unlist },
+        .{ "signal", check_signal },                       .{ "syscall_error", check_syscall_error },
+        .{ "swarm", check_swarm },                         .{ "metastable", check_metastable },
+        .{ "file_error", check_file_error },               .{ "retroactive", check_retroactive },
+        .{ "epoch", check_epoch },                         .{ "drive", check_drive },
+        .{ "hang", check_hang },                           .{ "pinned", check_pinned },
+        .{ "slow", check_slow },                           .{ "ending-window", check_ending_window },
+        .{ "sought", check_sought },                       .{ "optimize", check_optimize },
+        .{ "states", check_states },                       .{ "crash-points", check_crash_points },
+        .{ "nodes-down", check_nodes_down },               .{ "stale-pid", check_stale_pid },
+        .{ "memory-growth", check_memory_growth },         .{ "upgrade", check_upgrade },
+        .{ "knobs", check_knobs },                         .{ "quorum", check_quorum },
+        .{ "spare", check_spare },                         .{ "saved", check_saved },
+        .{ "concurrent", check_concurrent },               .{ "resume", check_resume },
+        .{ "ui", check_ui },                               .{ "runs", check_runs },
+        .{ "kubernetes", check_kubernetes },               .{ "steps", check_steps },
+        .{ "before-nodes", check_before_nodes },           .{ "session", check_session },
+        .{ "fast", check_fast },                           .{ "sandbox", check_sandbox },
+        .{ "devproxy", check_devproxy },                   .{ "sandbox-egress", check_sandbox_egress },
+        .{ "ci", check_ci },                               .{ "repl", check_repl },
+        .{ "mechanics", check_mechanics },                 .{ "budget", check_budget },
+        .{ "sinks", check_sinks },                         .{ "dotnet", check_dotnet },
+        .{ "lines", check_lines },                         .{ "voidstar-static", check_voidstar_static },
+        .{ "frozen-start", check_frozen_start },           .{ "hangup", check_hangup },
+        .{ "frozen-step", check_frozen_step },             .{ "templates", check_templates },
+        .{ "volumes", check_volumes },                     .{ "setup-mode", check_setup_mode },
+        .{ "jank", check_jank_repl },                      .{ "bank-steps", check_bank_steps },
+        .{ "checkpoint", check_session_checkpoint },       .{ "ingress-checkpoint", check_ingress_checkpoint },
+        .{ "ingress-crash", check_ingress_crash },         .{ "draws", check_draws },
+        .{ "exit-stack", check_exit_stack },               .{ "plan-calls", check_plan_calls },
+        .{ "services", check_services },                   .{ "sites", check_sites },
+        .{ "client", check_client },                       .{ "session-exact", check_session_exact },
+        .{ "java-watch", check_java_watch },
     };
     // A check's whole name runs it alone (check.sh's `ui` ran guidance and quiet too).
     var exact = std.mem.eql(u8, only, "tla");
@@ -1612,6 +1613,34 @@ fn check_maze(context: *Context, maze: Maze, index: usize) !void {
         .{ "it fails, as the original", ran_one and replayed[0].failing },
         .{ "its events hash is the original's", ran_one and std.mem.eql(u8, replayed[0].events_hash, branch.events_hash) },
     }, "coverage ({s}): the solving branch {d} replays from its tape", .{ maze.label, branch.index });
+}
+
+/// A timeline's seed is a strategy's to give at its `branch`: same_seed.py gives three timelines
+/// one seed, so they are the same timeline (one events hash), and one replays alone from its tape
+/// (the seed in its header); without the strategy, the three differ.
+fn check_branch_seeds(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
+    const tapes = try std.fs.path.join(arena, &.{ context.scratch, "seed-tapes" });
+    const common = [_][]const u8{ "--program", program, "--scenario", "bank", "--seed", "3" };
+    const seeded = try explore(context, &(common ++ [_][]const u8{
+        "--branches", "3", "--jobs", "1", "--strategy", "python3 plugins/python/same_seed.py 0x42", "--tape-dir", tapes,
+    }));
+    const plain = try explore(context, &(common ++ [_][]const u8{ "--branches", "3", "--jobs", "1" }));
+    var same: [3]Branch = undefined;
+    var differ: [3]Branch = undefined;
+    const counted = parse_branches(seeded, &same) == 3 and parse_branches(plain, &differ) == 3;
+    const one = counted and std.mem.eql(u8, same[0].events_hash, same[1].events_hash) and
+        std.mem.eql(u8, same[1].events_hash, same[2].events_hash);
+    const apart = counted and !std.mem.eql(u8, differ[0].events_hash, differ[1].events_hash);
+    const replay = try explore(context, &(common ++ [_][]const u8{ "--tape", try std.fs.path.join(arena, &.{ tapes, "branch-2.jsonl" }) }));
+    var replayed: [1]Branch = undefined;
+    const replays = counted and parse_branches(replay, &replayed) == 1 and std.mem.eql(u8, replayed[0].events_hash, same[2].events_hash);
+    expect_all(context, &.{
+        .{ "three timelines given one seed are one timeline", one },
+        .{ "without the strategy they differ", apart },
+        .{ "one replays alone from its tape, the seed in its header", replays },
+    }, "branch seeds", .{});
 }
 
 /// The machine a run boots is a strategy's to decide (its `machine` request): machine_date.py

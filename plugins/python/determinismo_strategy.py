@@ -17,6 +17,7 @@ A strategy is an object with any of these methods; missing ones answer the defau
     machine(request)                          with wants "machine": the run's machine before it boots
                                               ({"epoch_seconds", "timer_slack_us", "tsc_jitter_seed",
                                               "modulation_stretch_us"}), the fields to change
+    branch(index, seed[, start])              a timeline starts: return an int to give it another seed
     plan()                                    with wants "plans": {"<decision name>": [[low, high,
                                               weight], ...]}, drawn from by the explorer
     branch_end(index, outcome, events, failing)   return True to stop the exploration
@@ -59,7 +60,10 @@ def _dispatch(strategy, name, request):
             # Where it starts, when the tree explorer branched it from another: {"branch", "vtime_ns"}.
             if "start" in inspect.signature(strategy.branch).parameters:
                 arguments.append(request.get("from"))
-            strategy.branch(*arguments)
+            # An int returned is the timeline's seed instead (another random future).
+            seed = strategy.branch(*arguments)
+            if isinstance(seed, int):
+                return {"seed": f"{seed:016x}"}
         return {}
     if method == "returns":
         # The tree explorer's generation ended: which moments to return to (branch, vtime_ns,
