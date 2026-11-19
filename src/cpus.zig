@@ -403,7 +403,7 @@ pub const Pool = struct {
             // (holders go below the reserve, holders.zig: they make room before a VM waits).
             const available = memory_available(); // 0: unknown, never a reason to wait.
             const below = available != 0 and available < memory_reserve() / 2 + sessions_reserve_bytes();
-            if (below or !pool.claim_fits(pool.claim_now())) {
+            if (below or !pool.memory_fits()) {
                 if (memory_since == null) {
                     memory_since = monotonic_ns();
                     // The run's processes queued behind this one wait for it too.
@@ -635,6 +635,25 @@ pub const Pool = struct {
         if (!fits(claimed, bytes, total, 0, host_reserve(total) + sessions_reserve_bytes())) return false;
         const available = if (pool.available_counts) memory_available() else 0;
         return fits(0, bytes, std.math.maxInt(u64) / 2, available, reserve_bytes());
+    }
+
+    /// Whether a VM of this run fits, memory-wise (above half the reserve, checked apart): its
+    /// claim beside the others (claim_fits), or, with none of the run's VMs running, its own
+    /// nodes holding memory (stalled_alone).
+    fn memory_fits(pool: *Pool) bool {
+        return pool.claim_fits(pool.claim_now()) or pool.stalled_alone();
+    }
+
+    /// None of this run's VMs runs while its own nodes hold memory: one of its VMs starts,
+    /// whatever the claims. Its nodes leave only as its timelines run (their returns take
+    /// them), so claims they push past the host's memory held the run for good: ParadeDB's run
+    /// 2091, 134.5 GiB of its nodes beside 32 GiB guests not learned yet (39 timelines ended of
+    /// 40 workers: learning needs one each, and VMs running), its 40 workers waiting and none
+    /// running, the host 46 GB available. What its VM holds is its guest's use (about 20 GB
+    /// there), not the claim; memory below half the reserve still waits (take).
+    fn stalled_alone(pool: *Pool) bool {
+        if (pool.run_held() != 0) return false;
+        return nodes_of(pool.directory_buffer[0..pool.directory_size], run_of_this_process()) > 0;
     }
 
     /// The bytes of every live process's nodes claim (nodes_claim): counted in the admission on
@@ -1489,6 +1508,23 @@ fn nodes_claimed(directory: []const u8) u64 {
     return total;
 }
 
+/// The nodes claim of one process (nodes-<pid> in the pool's directory: an explorer's, its run's
+/// key), while that process holds it; 0 without one.
+fn nodes_of(directory: []const u8, pid: u64) u64 {
+    if (directory.len == 0) return 0;
+    var path_buffer: [160]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buffer, "{s}/nodes-{d}", .{ directory, pid }, 0) catch return 0;
+    const opened = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(opened) != .SUCCESS) return 0;
+    const fd: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(fd);
+    // Nobody holds it: its process is gone (nodes_claimed removes it), or has just made it.
+    if (linux.errno(linux.flock(fd, std.posix.LOCK.SH | std.posix.LOCK.NB)) == .SUCCESS) return 0;
+    var value: [8]u8 = @splat(0);
+    if (linux.pread(fd, &value, value.len, 0) != value.len) return 0;
+    return std.mem.bytesToValue(u64, &value);
+}
+
 /// Whether `bytes` more fit: within the claims (the VMs holding CPUs, each its guest's size) and
 /// the reserve, and there now (`available`, 0 when unknown): claims miss what holds memory
 /// without a CPU (holders, in-run snapshots, host checks' services), and a check beside a hunt
@@ -1676,6 +1712,39 @@ test "memory short under a learned claim: the guest's size for good; never said,
     try std.testing.expect(learning.short(7 * gib, 16 * gib)); // Still short: yes again.
     try std.testing.expect(!learning.short(40 * gib, 16 * gib));
     try std.testing.expectEqual(@as(u64, 0), learning.claim(4 * gib)); // For good.
+}
+
+test "a run none of whose VMs runs starts one beside its own nodes, whatever the claims" {
+    var pool: Pool = undefined;
+    try pool.open();
+    defer pool.close();
+    pool.available_counts = false; // The claims' accounting alone.
+    const total = meminfo("MemTotal:");
+    if (total == 0) return error.SkipZigTest;
+    const saved = claim_bytes;
+    defer claim_bytes = saved;
+    claim_bytes = total / 4;
+    // This run's nodes fill the host (run 2091's 134.5 GiB): no claim fits beside them.
+    var path_buffer: [160]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/nodes-{d}", .{ pool.directory_buffer[0..pool.directory_size], run_of_this_process() }, 0);
+    const opened = linux.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o600);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(opened));
+    const fd: linux.fd_t = @intCast(opened);
+    defer {
+        _ = linux.close(fd);
+        _ = linux.unlink(path);
+    }
+    _ = linux.flock(fd, std.posix.LOCK.EX);
+    const nodes = std.mem.toBytes(total);
+    _ = linux.pwrite(fd, &nodes, nodes.len, 0);
+    try std.testing.expect(!pool.claim_fits(pool.claim_now()));
+    // None of its VMs runs: one starts.
+    try std.testing.expectEqual(@as(u32, 0), pool.run_held());
+    try std.testing.expect(pool.memory_fits());
+    const held = pool.take();
+    defer pool.give(held);
+    // One runs: the claims decide again, and the next waits.
+    try std.testing.expect(!pool.memory_fits());
 }
 
 test "a run's VMs count as what the run learned they hold, another run's as its guest" {
