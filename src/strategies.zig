@@ -152,8 +152,8 @@ pub fn judge(strategies: *Strategies, index: u32, histories: []const Strategy.Hi
     return count;
 }
 
-/// Where the tree returns: each that decides is told the generation; the first that names
-/// returns gives them (and its fill).
+/// Where the tree returns: each is told the generation (a plugin that only chooses returns
+/// decides nothing else: `decides` false); the first that names returns gives them (and its fill).
 pub fn returns(
     strategies: *Strategies,
     arena: std.mem.Allocator,
@@ -166,7 +166,6 @@ pub fn returns(
 ) !Strategy.Answer {
     var answer: Strategy.Answer = .{};
     for (strategies.plugins) |plugin| {
-        if (!plugin.decides) continue;
         const own = try plugin.returns(arena, generation, candidates, archive, count, branches, budget);
         if (answer.returns.len == 0 and own.returns.len > 0) answer = own;
     }
