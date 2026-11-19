@@ -12,6 +12,16 @@
 //!   import request_read(buffer, length) i32        copies the request's next bytes; 0 at its end
 //!   import reply_write(bytes, length) i32          appends to the reply; nonzero past its room
 //!   import log(level, bytes, length)               a line on the explorer's standard error
+//!   import http(request, length) i32               an HTTP request, described in JSON: the
+//!                                                  response's size, read with response_read
+//!   import response_read(buffer, length) i32      copies the response's next bytes; 0 at its end
+//!
+//! And WASI (wasi_snapshot_preview1) for a module that imports it: its arguments (its name, then
+//! the ones after its path), the explorer's environment, the clocks, randomness, standard output
+//! and error (the explorer's standard error), sockets, and two directories: `/run` (the
+//! explorer's working directory: the run's) and `/state` (~/.local/share/determinismo/plugins/
+//! <name>, kept across runs). What a module reads there or over the network is outside the
+//! messages: replays need it no more than a program's (its answers are on the tapes).
 //!
 //! The host owns the request and the reply: a module needs no allocator of its own exported,
 //! and reads a large request (a history) in parts.
@@ -21,8 +31,8 @@
 //! fails answers `{}` (the defaults), said on standard error; the explorer goes on.
 //!
 //! The module's memory is a plain mapping of the explorer's: it forks with it, a timeline's
-//! process carrying the plugin's state as of its start. It imports nothing else: a module
-//! that reads no clock and draws from no host is a function of the messages it is sent.
+//! process carrying the plugin's state as of its start. A module that imports nothing but the
+//! messages' functions is a function of the messages it is sent.
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
@@ -78,6 +88,22 @@ extern fn wasm_runtime_clear_exception(instance: *Instance) void;
 extern fn det_wasm_interrupt(env: *ExecEnv) void;
 extern fn det_wasm_interrupt_clear(env: *ExecEnv) void;
 extern fn wasm_runtime_set_native_stack_boundary(env: *ExecEnv, boundary: [*]u8) void;
+extern fn wasm_runtime_set_wasi_args_ex(
+    module: *Module,
+    directories: [*]const [*:0]const u8,
+    directory_count: u32,
+    mapped: [*]const [*:0]const u8,
+    mapped_count: u32,
+    environment: [*]const [*:0]const u8,
+    environment_count: u32,
+    argv: [*]const [*:0]const u8,
+    argc: c_int,
+    stdin: i64,
+    stdout: i64,
+    stderr: i64,
+) void;
+extern fn wasm_runtime_set_wasi_addr_pool(module: *Module, pool: [*]const [*:0]const u8, count: u32) void;
+extern fn wasm_runtime_set_wasi_ns_lookup_pool(module: *Module, pool: [*]const [*:0]const u8, count: u32) void;
 
 /// The call in progress (the explorer is one thread: one at a time), for the host functions.
 const Call = struct {
@@ -109,6 +135,73 @@ fn reply_write(_: *ExecEnv, bytes: [*]const u8, length: u32) callconv(.c) i32 {
     return 0;
 }
 
+/// The last `http` call's response (JSON: its status and body, or its error), read in parts.
+var response: std.ArrayList(u8) = .empty;
+var response_at: usize = 0;
+/// A response's body at most.
+const response_size_max = 64 << 20;
+/// One client a process (its root certificates read once); no connection is kept between
+/// requests: a timeline's process forked from another never shares one.
+var http_client: ?std.http.Client = null;
+
+/// `request`: {"method": "GET", "url": "https://...", "headers": {"name": "value"}, "body":
+/// "..."}. The response, read with response_read: {"status": 200, "body": "..."}, or
+/// {"error": "..."}. Its size is the answer (-1 outside a call). The call's deadline waits
+/// for it (a language model's answer takes seconds).
+fn http(_: *ExecEnv, bytes: [*]const u8, length: u32) callconv(.c) i32 {
+    if (current == null) return -1;
+    const paused = deadline_pause();
+    defer deadline_resume(paused);
+    response.clearRetainingCapacity();
+    response_at = 0;
+    http_answer(bytes[0..length]) catch |err| {
+        response.clearRetainingCapacity();
+        response.print(std.heap.c_allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch return -1;
+    };
+    return @intCast(@min(response.items.len, std.math.maxInt(i32)));
+}
+
+fn http_answer(request: []const u8) !void {
+    const gpa = std.heap.c_allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, request, .{});
+    if (parsed != .object) return error.RequestNotAnObject;
+    const url = parsed.object.get("url") orelse return error.RequestWithoutUrl;
+    if (url != .string) return error.RequestWithoutUrl;
+    const method_name = if (parsed.object.get("method")) |value| (if (value == .string) value.string else "GET") else "GET";
+    const method = std.meta.stringToEnum(std.http.Method, method_name) orelse return error.UnknownMethod;
+    const body: ?[]const u8 = if (parsed.object.get("body")) |value| (if (value == .string) value.string else null) else null;
+    var headers: std.ArrayList(std.http.Header) = .empty;
+    if (parsed.object.get("headers")) |value| if (value == .object) {
+        var entries = value.object.iterator();
+        while (entries.next()) |entry| if (entry.value_ptr.* == .string) {
+            try headers.append(arena, .{ .name = entry.key_ptr.*, .value = entry.value_ptr.string });
+        };
+    };
+    if (http_client == null) http_client = .{ .allocator = gpa, .io = std.Io.Threaded.global_single_threaded.io() };
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const result = try http_client.?.fetch(.{
+        .location = .{ .url = url.string },
+        .method = method,
+        .payload = body,
+        .extra_headers = headers.items,
+        .keep_alive = false,
+        .response_writer = &out.writer,
+    });
+    if (out.written().len > response_size_max) return error.ResponseTooLarge;
+    try response.print(gpa, "{{\"status\":{d},\"body\":{f}}}", .{ @backingInt(result.status), std.json.fmt(out.written(), .{}) });
+}
+
+fn response_read(_: *ExecEnv, buffer: [*]u8, length: u32) callconv(.c) i32 {
+    if (current == null) return -1;
+    const count = @min(length, response.items.len - response_at);
+    @memcpy(buffer[0..count], response.items[response_at..][0..count]);
+    response_at += count;
+    return @intCast(count);
+}
+
 fn log(_: *ExecEnv, level: i32, bytes: [*]const u8, length: u32) callconv(.c) void {
     const name = if (current) |call| call.name else "wasm";
     const levels = [_][]const u8{ "error", "warn", "info", "debug" };
@@ -121,6 +214,8 @@ var natives = [_]NativeSymbol{
     .{ .symbol = "request_read", .function = &request_read, .signature = "(*~)i" },
     .{ .symbol = "reply_write", .function = &reply_write, .signature = "(*~)i" },
     .{ .symbol = "log", .function = &log, .signature = "(i*~)" },
+    .{ .symbol = "http", .function = &http, .signature = "(*~)i" },
+    .{ .symbol = "response_read", .function = &response_read, .signature = "(*~)i" },
 };
 var runtime_ready = false;
 
@@ -196,6 +291,8 @@ pub fn load(arena: std.mem.Allocator, command: []const u8, environ: [:null]const
         std.debug.print("[determinismo] wasm plugin {s}: {s}\n", .{ path, std.mem.sliceTo(&error_buffer, 0) });
         return error.WasmLoad;
     };
+    const name = std.fs.path.basename(path);
+    try wasi_set(arena, module, name, arguments.items, environ);
     const instance = wasm_runtime_instantiate(module, stack_size, 0, &error_buffer, error_buffer.len) orelse {
         std.debug.print("[determinismo] wasm plugin {s}: {s}\n", .{ path, std.mem.sliceTo(&error_buffer, 0) });
         return error.WasmInstantiate;
@@ -212,10 +309,48 @@ pub fn load(arena: std.mem.Allocator, command: []const u8, environ: [:null]const
         .instance = instance,
         .env = env,
         .call_function = call_function,
-        .name = std.fs.path.basename(path),
+        .name = name,
         .arguments = arguments.items,
     };
     return plugin;
+}
+
+/// WASI's arguments, used if the module imports it: its name and arguments, the explorer's
+/// environment, standard output to the explorer's standard error, `/run` and `/state`, any
+/// address its sockets ask for.
+fn wasi_set(
+    arena: std.mem.Allocator,
+    module: *Module,
+    name: []const u8,
+    arguments: []const []const u8,
+    environ: [:null]const ?[*:0]const u8,
+) !void {
+    var cwd_buffer: [4096]u8 = undefined;
+    const cwd_size = linux.getcwd(&cwd_buffer, cwd_buffer.len);
+    if (linux.errno(cwd_size) != .SUCCESS) return error.WorkingDirectory;
+    const cwd = std.mem.sliceTo(&cwd_buffer, 0);
+    const home = environ_value(environ, "HOME") orelse "/tmp";
+    const stem = if (std.mem.endsWith(u8, name, ".wasm")) name[0 .. name.len - ".wasm".len] else name;
+    const state = try std.fmt.allocPrint(arena, "{s}/.local/share/determinismo/plugins/{s}", .{ home, stem });
+    try directory_make(arena, state);
+    const directories = try arena.alloc([*:0]const u8, 2);
+    directories[0] = try arena.dupeSentinel(u8, cwd, 0);
+    directories[1] = try arena.dupeSentinel(u8, state, 0);
+    const mapped = try arena.alloc([*:0]const u8, 2);
+    mapped[0] = try std.fmt.allocPrintSentinel(arena, "/run::{s}", .{cwd}, 0);
+    mapped[1] = try std.fmt.allocPrintSentinel(arena, "/state::{s}", .{state}, 0);
+    var environment: std.ArrayList([*:0]const u8) = .empty;
+    for (environ) |entry| try environment.append(arena, entry orelse continue);
+    const argv = try arena.alloc([*:0]const u8, arguments.len + 1);
+    argv[0] = try arena.dupeSentinel(u8, stem, 0);
+    for (arguments, argv[1..]) |argument, *slot| slot.* = try arena.dupeSentinel(u8, argument, 0);
+    const stdin = linux.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(stdin) != .SUCCESS) return error.DevNull;
+    wasm_runtime_set_wasi_args_ex(module, directories.ptr, 2, mapped.ptr, 2, environment.items.ptr, @intCast(environment.items.len), argv.ptr, @intCast(argv.len), @intCast(stdin), 2, 2);
+    const anywhere = [_][*:0]const u8{ "0.0.0.0/0", "::/0" };
+    wasm_runtime_set_wasi_addr_pool(module, &anywhere, anywhere.len);
+    const any_name = [_][*:0]const u8{"*"};
+    wasm_runtime_set_wasi_ns_lookup_pool(module, &any_name, any_name.len);
 }
 
 /// The call in progress's environment, for the deadline's signal; and whether it fired.
@@ -242,6 +377,20 @@ fn deadline_arm(env: *ExecEnv) void {
     deadline_env = env;
     const value: linux.itimerspec = .{ .it_interval = .{ .sec = 0, .nsec = 0 }, .it_value = .{ .sec = deadline_seconds, .nsec = 0 } };
     _ = linux.setitimer(@backingInt(linux.ITIMER.REAL), &value, null);
+}
+
+/// The deadline's time left, the timer stopped: a host function waiting on the network.
+fn deadline_pause() linux.itimerspec {
+    var left: linux.itimerspec = undefined;
+    const off: linux.itimerspec = .{ .it_interval = .{ .sec = 0, .nsec = 0 }, .it_value = .{ .sec = 0, .nsec = 0 } };
+    _ = linux.setitimer(@backingInt(linux.ITIMER.REAL), &off, &left);
+    return left;
+}
+
+/// The timer again with what was left (the kernel's own values, given back as they came).
+fn deadline_resume(left: linux.itimerspec) void {
+    if (left.it_value.sec == 0 and left.it_value.nsec == 0) return;
+    _ = linux.setitimer(@backingInt(linux.ITIMER.REAL), &left, null);
 }
 
 fn deadline_disarm(env: *ExecEnv) void {

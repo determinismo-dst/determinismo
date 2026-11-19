@@ -66,8 +66,8 @@ the module's content under `~/.cache/determinismo/wasm`), and WAMR's runtime, co
 determinismo, loads it. Each message is then a direct call, no process, pipe or ring. Measured
 on an x86-64 host, a decision answered by `plugins/wasm/all_hooks.zig` (std.json parsing its
 request) took 5 µs a call; the same message to a program took about 43 µs over the ring and
-80 to 170 µs over pipes. Its arguments come in the hello (`"arguments":[...]`), a module having
-no argv. The ABI `determinismo_1` (the import module's name; a module built for another is
+80 to 170 µs over pipes. Its arguments come in the hello (`"arguments":[...]`), and as its argv
+to a WASI module. The ABI `determinismo_1` (the import module's name; a module built for another is
 refused at load):
 
 | | |
@@ -76,21 +76,32 @@ refused at load):
 | `import request_read(buffer, length) i32` | Copies the request's next bytes into the module's memory; 0 at its end. |
 | `import reply_write(bytes, length) i32` | Appends to the reply (16 KiB at most); nonzero past its room. |
 | `import log(level, bytes, length)` | A line on determinismo's standard error (0 error, 1 warn, 2 info, 3 debug). |
+| `import http(request, length) i32` | An HTTP request, `{"method": "POST", "url": "https://...", "headers": {...}, "body": "..."}`: the response's size, `{"status": 200, "body": "..."}` or `{"error": "..."}`. The call's deadline waits for it. |
+| `import response_read(buffer, length) i32` | Copies the last response's next bytes; 0 at its end. |
+
+A module can import WASI (`wasi_snapshot_preview1`) too: its arguments (its name, then the ones
+after its path), the explorer's environment, the clocks, randomness, standard output and error
+(the explorer's standard error), sockets, and two directories: `/run`, the explorer's working
+directory (the run's), and `/state`, `~/.local/share/determinismo/plugins/<name>`, kept across
+runs. With `http` a plugin reaches serve's API from its hello's `run_url` (the run's events, SQL,
+earlier runs) or any service, a language model's included. What it reads from outside the
+messages needs no replay: its answers are on the tapes (`plugins/wasm/reach.zig` does each of
+these).
 
 The host owns the request and the reply: a module exports no allocator, and reads a large
 request (a history) in parts.
 A module declares shared memory (it is compiled so that its loops and calls check a terminate
 flag); one without it is refused at load. A call has a deadline (2 s): a module that traps,
 runs past it, returns nonzero or outgrows the reply answers `{}` (the defaults), said on
-standard error, and the exploration goes on. The module's memory is the explorer's: it forks with it, each
-timeline's process carrying the plugin's state as of its start, as a holder carries the
-machine's. It imports nothing else (no clock, no files, no randomness of its own): its answers
-are a function of the messages it was sent, and its overrides are on the tapes as any plugin's.
-Zig builds one with `-target wasm32-freestanding
+standard error, and the exploration goes on. The module's memory is the explorer's: it forks
+with it, each timeline's process carrying the plugin's state as of its start, as a holder
+carries the machine's. Its overrides are on the tapes as any plugin's.
+Zig builds one with `-target wasm32-wasi
 -mcpu=mvp+atomics+bulk_memory+sign_ext+mutable_globals+nontrapping_fptoint -fno-entry -rdynamic
---shared-memory --max-memory=268435456` (`plugins/wasm/decide_named.zig`, built and installed
-with the self-tests); Rust, C and TinyGo target wasm32 too, with shared memory. From a REPL, the Clojure client builds one from its source and uploads it to
-serve, where a run names it:
+-mexec-model=reactor --shared-memory --max-memory=268435456`, or `wasm32-freestanding` for one
+without WASI (`plugins/wasm/decide_named.zig`, built and installed with the self-tests); Rust,
+C and TinyGo target wasm32 too, with shared memory. From a REPL, the Clojure client builds one
+from its source and uploads it to serve, where a run names it:
 
 ```clojure
 (def module (d/wasm-build "plugins/wasm/decide_named.zig"))   ; zig on this machine

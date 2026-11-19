@@ -19,6 +19,8 @@ const Context = struct {
     machine: []const []const u8,
     bin: []const u8,
     scratch: []const u8,
+    /// Its user's home: where a wasm plugin's /state is (~/.local/share/determinismo/plugins).
+    home: []const u8 = "/root",
     /// Babashka, for notebooks ($DETERMINISMO_BB); without it their evaluation is skipped.
     bb: ?[]const u8 = null,
     /// jank, for the REPL's client as the viz runs it ($DETERMINISMO_JANK).
@@ -155,6 +157,7 @@ pub fn main(init: std.process.Init) !void {
     var context = Context{
         .arena = arena,
         .io = init.io,
+        .home = home,
         .bb = bb,
         .jank = jank,
         .determinismo = try std.fs.path.join(arena, &.{ bin, "determinismo" }),
@@ -211,72 +214,73 @@ fn scratches_sweep(io: std.Io, arena: std.mem.Allocator, scratches: []const u8) 
 /// and counts them.
 fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
     const checks = .{
-        .{ "bank", check_bank },                             .{ "shop", check_shop },
-        .{ "tapes", check_tapes },                           .{ "debugging", check_debugging },
-        .{ "python", check_python_strategy },                .{ "setup-decisions", check_setup_decisions },
-        .{ "machine-decisions", check_machine_decisions },   .{ "branch-seeds", check_branch_seeds },
-        .{ "plugin-faults", check_plugin_faults },           .{ "plugin-checks", check_plugin_checks },
-        .{ "device-models", check_device_models },           .{ "plugin-histories", check_plugin_histories },
-        .{ "wasm-plugin", check_wasm_plugin },               .{ "wasm-misbehaving", check_wasm_misbehaving },
-        .{ "wasm-upload", check_wasm_upload },               .{ "egress", check_egress },
-        .{ "ingress", check_ingress },                       .{ "ingress-session", check_ingress_session },
-        .{ "moments", check_moments },                       .{ "properties", check_builtin_properties },
-        .{ "entropy", check_kernel_entropy },                .{ "quiet", check_quiet_period },
-        .{ "clock_jitter", check_clock_jitter },             .{ "query", check_query },
-        .{ "progress", check_progress_while_quiet },         .{ "network", check_network_faults },
-        .{ "fault-exclusions", check_fault_exclusions },     .{ "serve", check_serve },
-        .{ "until", check_until_and_causality },             .{ "coverage-gate", check_coverage_gate },
-        .{ "coverage", check_coverage },                     .{ "parallel", check_parallel },
-        .{ "fork", check_fork },                             .{ "tree", check_tree },
-        .{ "startup-coverage", check_startup_coverage },     .{ "memory-climb", check_memory_climb },
-        .{ "disk", check_disk },                             .{ "shape", check_shape },
-        .{ "repl-strategy", check_repl_strategy },           .{ "end", check_end },
-        .{ "plans", check_plans },                           .{ "durability", check_durability },
-        .{ "mutate", check_mutate },                         .{ "interleave", check_interleave },
-        .{ "checks", check_host_checks },                    .{ "pausing", check_pausing },
-        .{ "shrink", check_shrink },                         .{ "holds", check_holds },
-        .{ "coverage-set", check_coverage_set },             .{ "inject", check_inject },
-        .{ "aim", check_aim },                               .{ "aftershock", check_aftershock },
-        .{ "record-power-loss", check_record_power_loss },   .{ "errno-storm", check_errno_storm },
-        .{ "compose", check_compose },                       .{ "shards", check_shards },
-        .{ "stress", check_stress },                         .{ "controller", check_controller },
-        .{ "clojure", check_clojure },                       .{ "k3s", check_k3s },
-        .{ "script", check_script },                         .{ "modulation", check_cpu_modulation },
-        .{ "profile", check_profile },                       .{ "catalog", check_catalog },
-        .{ "guidance", check_guidance },                     .{ "voidstar", check_voidstar },
-        .{ "changed", check_changed },                       .{ "readdress", check_readdress },
-        .{ "unlist", check_unlist },                         .{ "signal", check_signal },
-        .{ "syscall_error", check_syscall_error },           .{ "swarm", check_swarm },
-        .{ "metastable", check_metastable },                 .{ "file_error", check_file_error },
-        .{ "retroactive", check_retroactive },               .{ "epoch", check_epoch },
-        .{ "drive", check_drive },                           .{ "hang", check_hang },
-        .{ "pinned", check_pinned },                         .{ "slow", check_slow },
-        .{ "ending-window", check_ending_window },           .{ "sought", check_sought },
-        .{ "optimize", check_optimize },                     .{ "states", check_states },
-        .{ "crash-points", check_crash_points },             .{ "nodes-down", check_nodes_down },
-        .{ "stale-pid", check_stale_pid },                   .{ "memory-growth", check_memory_growth },
-        .{ "upgrade", check_upgrade },                       .{ "knobs", check_knobs },
-        .{ "quorum", check_quorum },                         .{ "spare", check_spare },
-        .{ "saved", check_saved },                           .{ "concurrent", check_concurrent },
-        .{ "resume", check_resume },                         .{ "ui", check_ui },
-        .{ "runs", check_runs },                             .{ "kubernetes", check_kubernetes },
-        .{ "steps", check_steps },                           .{ "before-nodes", check_before_nodes },
-        .{ "session", check_session },                       .{ "fast", check_fast },
-        .{ "sandbox", check_sandbox },                       .{ "devproxy", check_devproxy },
-        .{ "sandbox-egress", check_sandbox_egress },         .{ "ci", check_ci },
-        .{ "repl", check_repl },                             .{ "mechanics", check_mechanics },
-        .{ "budget", check_budget },                         .{ "sinks", check_sinks },
-        .{ "dotnet", check_dotnet },                         .{ "lines", check_lines },
-        .{ "voidstar-static", check_voidstar_static },       .{ "frozen-start", check_frozen_start },
-        .{ "hangup", check_hangup },                         .{ "frozen-step", check_frozen_step },
-        .{ "templates", check_templates },                   .{ "volumes", check_volumes },
-        .{ "setup-mode", check_setup_mode },                 .{ "jank", check_jank_repl },
-        .{ "bank-steps", check_bank_steps },                 .{ "checkpoint", check_session_checkpoint },
-        .{ "ingress-checkpoint", check_ingress_checkpoint }, .{ "ingress-crash", check_ingress_crash },
-        .{ "draws", check_draws },                           .{ "exit-stack", check_exit_stack },
-        .{ "plan-calls", check_plan_calls },                 .{ "services", check_services },
-        .{ "sites", check_sites },                           .{ "client", check_client },
-        .{ "session-exact", check_session_exact },           .{ "java-watch", check_java_watch },
+        .{ "bank", check_bank },                           .{ "shop", check_shop },
+        .{ "tapes", check_tapes },                         .{ "debugging", check_debugging },
+        .{ "python", check_python_strategy },              .{ "setup-decisions", check_setup_decisions },
+        .{ "machine-decisions", check_machine_decisions }, .{ "branch-seeds", check_branch_seeds },
+        .{ "plugin-faults", check_plugin_faults },         .{ "plugin-checks", check_plugin_checks },
+        .{ "device-models", check_device_models },         .{ "plugin-histories", check_plugin_histories },
+        .{ "wasm-plugin", check_wasm_plugin },             .{ "wasm-misbehaving", check_wasm_misbehaving },
+        .{ "wasm-reach", check_wasm_reach },               .{ "wasm-upload", check_wasm_upload },
+        .{ "egress", check_egress },                       .{ "ingress", check_ingress },
+        .{ "ingress-session", check_ingress_session },     .{ "moments", check_moments },
+        .{ "properties", check_builtin_properties },       .{ "entropy", check_kernel_entropy },
+        .{ "quiet", check_quiet_period },                  .{ "clock_jitter", check_clock_jitter },
+        .{ "query", check_query },                         .{ "progress", check_progress_while_quiet },
+        .{ "network", check_network_faults },              .{ "fault-exclusions", check_fault_exclusions },
+        .{ "serve", check_serve },                         .{ "until", check_until_and_causality },
+        .{ "coverage-gate", check_coverage_gate },         .{ "coverage", check_coverage },
+        .{ "parallel", check_parallel },                   .{ "fork", check_fork },
+        .{ "tree", check_tree },                           .{ "startup-coverage", check_startup_coverage },
+        .{ "memory-climb", check_memory_climb },           .{ "disk", check_disk },
+        .{ "shape", check_shape },                         .{ "repl-strategy", check_repl_strategy },
+        .{ "end", check_end },                             .{ "plans", check_plans },
+        .{ "durability", check_durability },               .{ "mutate", check_mutate },
+        .{ "interleave", check_interleave },               .{ "checks", check_host_checks },
+        .{ "pausing", check_pausing },                     .{ "shrink", check_shrink },
+        .{ "holds", check_holds },                         .{ "coverage-set", check_coverage_set },
+        .{ "inject", check_inject },                       .{ "aim", check_aim },
+        .{ "aftershock", check_aftershock },               .{ "record-power-loss", check_record_power_loss },
+        .{ "errno-storm", check_errno_storm },             .{ "compose", check_compose },
+        .{ "shards", check_shards },                       .{ "stress", check_stress },
+        .{ "controller", check_controller },               .{ "clojure", check_clojure },
+        .{ "k3s", check_k3s },                             .{ "script", check_script },
+        .{ "modulation", check_cpu_modulation },           .{ "profile", check_profile },
+        .{ "catalog", check_catalog },                     .{ "guidance", check_guidance },
+        .{ "voidstar", check_voidstar },                   .{ "changed", check_changed },
+        .{ "readdress", check_readdress },                 .{ "unlist", check_unlist },
+        .{ "signal", check_signal },                       .{ "syscall_error", check_syscall_error },
+        .{ "swarm", check_swarm },                         .{ "metastable", check_metastable },
+        .{ "file_error", check_file_error },               .{ "retroactive", check_retroactive },
+        .{ "epoch", check_epoch },                         .{ "drive", check_drive },
+        .{ "hang", check_hang },                           .{ "pinned", check_pinned },
+        .{ "slow", check_slow },                           .{ "ending-window", check_ending_window },
+        .{ "sought", check_sought },                       .{ "optimize", check_optimize },
+        .{ "states", check_states },                       .{ "crash-points", check_crash_points },
+        .{ "nodes-down", check_nodes_down },               .{ "stale-pid", check_stale_pid },
+        .{ "memory-growth", check_memory_growth },         .{ "upgrade", check_upgrade },
+        .{ "knobs", check_knobs },                         .{ "quorum", check_quorum },
+        .{ "spare", check_spare },                         .{ "saved", check_saved },
+        .{ "concurrent", check_concurrent },               .{ "resume", check_resume },
+        .{ "ui", check_ui },                               .{ "runs", check_runs },
+        .{ "kubernetes", check_kubernetes },               .{ "steps", check_steps },
+        .{ "before-nodes", check_before_nodes },           .{ "session", check_session },
+        .{ "fast", check_fast },                           .{ "sandbox", check_sandbox },
+        .{ "devproxy", check_devproxy },                   .{ "sandbox-egress", check_sandbox_egress },
+        .{ "ci", check_ci },                               .{ "repl", check_repl },
+        .{ "mechanics", check_mechanics },                 .{ "budget", check_budget },
+        .{ "sinks", check_sinks },                         .{ "dotnet", check_dotnet },
+        .{ "lines", check_lines },                         .{ "voidstar-static", check_voidstar_static },
+        .{ "frozen-start", check_frozen_start },           .{ "hangup", check_hangup },
+        .{ "frozen-step", check_frozen_step },             .{ "templates", check_templates },
+        .{ "volumes", check_volumes },                     .{ "setup-mode", check_setup_mode },
+        .{ "jank", check_jank_repl },                      .{ "bank-steps", check_bank_steps },
+        .{ "checkpoint", check_session_checkpoint },       .{ "ingress-checkpoint", check_ingress_checkpoint },
+        .{ "ingress-crash", check_ingress_crash },         .{ "draws", check_draws },
+        .{ "exit-stack", check_exit_stack },               .{ "plan-calls", check_plan_calls },
+        .{ "services", check_services },                   .{ "sites", check_sites },
+        .{ "client", check_client },                       .{ "session-exact", check_session_exact },
+        .{ "java-watch", check_java_watch },
     };
     // A check's whole name runs it alone (check.sh's `ui` ran guidance and quiet too).
     var exact = std.mem.eql(u8, only, "tla");
@@ -1884,6 +1888,49 @@ fn check_wasm_upload(context: *Context) !void {
         .{ "serve took the upload as a wasm module", std.mem.indexOf(u8, uploaded, "\"kind\":\"wasm\"") != null },
         .{ "the run's strategy is the module, run inside the explorer", std.mem.indexOf(u8, run, "\"strategy_name\":\"wasm/decide-named\"") != null },
     }, "wasm upload: {s}; run {s}", .{ std.mem.trim(u8, uploaded, "\n"), run[0..@min(run.len, 400)] });
+}
+
+/// A wasm plugin reaches outside its messages: reach.wasm (WASI) reads its arguments and the wall
+/// clock at its hello, fetches serve's /build with the `http` host function, and writes what it
+/// found into its /state directory (~/.local/share/determinismo/plugins/reach).
+fn check_wasm_reach(context: *Context) !void {
+    const arena = context.arena;
+    const address = "127.0.0.1:7894";
+    const data = try std.fs.path.join(arena, &.{ context.scratch, "wasm-reach-serve" });
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{ context.determinismo, "serve", "--listen", address, "--data", data });
+    try argv.appendSlice(arena, context.machine);
+    var server = try std.process.spawn(context.io, .{ .argv = argv.items, .stdout = .ignore, .stderr = .ignore });
+    defer server.kill(context.io);
+    const url = "http://" ++ address ++ "/build";
+    for (0..50) |_| {
+        const build: []const u8 = curl(context, &.{url}) catch "";
+        if (build.len > 0) break;
+        sleep_ms(100);
+    }
+    const reached_path = try std.fs.path.join(arena, &.{ context.home, ".local/share/determinismo/plugins/reach/reached.txt" });
+    std.Io.Dir.cwd().deleteFile(context.io, reached_path) catch {};
+    const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
+    const module = try std.fs.path.join(arena, &.{ context.bin, "reach.wasm" });
+    const output = try explore(context, &.{
+        "--program",  program,                                                         "--scenario", "bank", "--seed", "3", "--branches", "1", "--jobs", "1",
+        "--strategy", try std.fmt.allocPrint(arena, "wasm:{s} {s}", .{ module, url }),
+    });
+    var branches: [1]Branch = undefined;
+    const ran = parse_branches(output, &branches) == 1;
+    const reached: []const u8 = std.Io.Dir.cwd().readFileAlloc(context.io, reached_path, arena, .limited(1 << 16)) catch "";
+    const clock_ns = clock: {
+        const at = std.mem.indexOf(u8, reached, "clock_ns=") orelse break :clock 0;
+        const digits = reached[at + "clock_ns=".len ..];
+        const end = std.mem.indexOfScalar(u8, digits, ' ') orelse break :clock 0;
+        break :clock std.fmt.parseInt(u64, digits[0..end], 10) catch 0;
+    };
+    expect_all(context, &.{
+        .{ "the run went on", ran },
+        .{ "its arguments through WASI: its name, then the URL", std.mem.indexOf(u8, reached, "name=reach argument=" ++ url) != null },
+        .{ "the wall clock through WASI (past 2020)", clock_ns > 1_577_836_800 * std.time.ns_per_s },
+        .{ "serve's /build fetched with http", std.mem.indexOf(u8, reached, "\"status\":200") != null and std.mem.indexOf(u8, reached, "commit") != null },
+    }, "wasm reach: {s}", .{std.mem.trim(u8, reached, "\n")});
 }
 
 /// A wasm plugin's failure is its answer's, never the exploration's: misbehave.wasm traps, then

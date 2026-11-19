@@ -561,6 +561,27 @@ pub fn build(b: *std.Build) void {
     wasm_misbehave.shared_memory = true;
     wasm_misbehave.max_memory = wasm_memory_max;
     phases.install(b, phases.selftest, wasm_misbehave);
+    // And the `wasm-reach` check's: a WASI module (its arguments, the clock, /state) that fetches
+    // a URL with the `http` host function.
+    const wasm_reach = b.addExecutable(.{
+        .name = "reach",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("plugins/wasm/reach.zig"),
+            .target = b.resolveTargetQuery(.{
+                .cpu_arch = .wasm32,
+                .os_tag = .wasi,
+                .cpu_model = .{ .explicit = &std.Target.wasm.cpu.mvp },
+                .cpu_features_add = std.Target.wasm.featureSet(&.{ .atomics, .bulk_memory, .sign_ext, .mutable_globals, .nontrapping_fptoint }),
+            }),
+            .optimize = .ReleaseSmall,
+        }),
+    });
+    wasm_reach.entry = .disabled;
+    wasm_reach.rdynamic = true;
+    wasm_reach.wasi_exec_model = .reactor;
+    wasm_reach.shared_memory = true;
+    wasm_reach.max_memory = wasm_memory_max;
+    phases.install(b, phases.selftest, wasm_reach);
     const e2e_run = b.addRunArtifact(e2e);
     // What it runs: determinismo, the guest, the self-tests and the workloads its checks name.
     for ([_]*std.Build.Step{ phases.determinismo, phases.guest, phases.selftest }) |phase| e2e_run.step.dependOn(phase);
@@ -832,17 +853,19 @@ fn zstd_link(b: *std.Build, module: *std.Build.Module) void {
 
 /// WAMR (the WebAssembly Micro Runtime, 2.4.4): wasm plugins run inside the explorer as native
 /// code, each module compiled ahead of time by WAMR's wamrc (src/wasm_plugin.zig), this its
-/// loader and runtime in C, no interpreter, no JIT, no WASI. Software bounds checks (no signal
-/// handlers but the deadline's), shared memory and the thread manager's terminate flag (a call
-/// past its deadline is stopped: src/wasm_interrupt.c). src/wasm_plugin.zig declares its
+/// loader and runtime in C, no interpreter, no JIT; WASI (files under its preopened directories,
+/// clocks, randomness, its arguments and environment, sockets) for a module that imports it.
+/// Software bounds checks (no signal handlers but the deadline's), shared memory and the thread
+/// manager's terminate flag (a call past its deadline is stopped: src/wasm_interrupt.c). src/wasm_plugin.zig declares its
 /// functions: `check` compiles without it.
 fn wamr_link(b: *std.Build, module: *std.Build.Module) void {
     const wamr = b.dependency("wamr", .{});
     const includes = [_][]const u8{
-        "core",                       "core/iwasm/include",           "core/iwasm/common",
-        "core/iwasm/aot",             "core/iwasm/interpreter",       "core/iwasm/libraries/thread-mgr",
-        "core/shared/platform/linux", "core/shared/platform/include", "core/shared/utils",
-        "core/shared/mem-alloc",
+        "core",                                                               "core/iwasm/include",                                             "core/iwasm/common",
+        "core/iwasm/aot",                                                     "core/iwasm/interpreter",                                         "core/iwasm/libraries/thread-mgr",
+        "core/shared/platform/linux",                                         "core/shared/platform/include",                                   "core/shared/utils",
+        "core/shared/mem-alloc",                                              "core/shared/platform/common/libc-util",                          "core/iwasm/libraries/libc-wasi",
+        "core/iwasm/libraries/libc-wasi/sandboxed-system-primitives/include", "core/iwasm/libraries/libc-wasi/sandboxed-system-primitives/src",
     };
     for (includes) |directory| module.addIncludePath(wamr.path(directory));
     const flags = [_][]const u8{
@@ -851,7 +874,7 @@ fn wamr_link(b: *std.Build, module: *std.Build.Module) void {
         "-DWASM_ENABLE_INTERP=0",                "-DWASM_ENABLE_AOT=1",
         "-DWASM_ENABLE_JIT=0",                   "-DWASM_ENABLE_THREAD_MGR=1",
         "-DWASM_ENABLE_SHARED_MEMORY=1",         "-DWASM_ENABLE_LIBC_BUILTIN=0",
-        "-DWASM_ENABLE_LIBC_WASI=0",             "-DWASM_ENABLE_BULK_MEMORY=1",
+        "-DWASM_ENABLE_LIBC_WASI=1",             "-DWASM_ENABLE_BULK_MEMORY=1",
         "-DWASM_ENABLE_REF_TYPES=1",             "-DWASM_DISABLE_HW_BOUND_CHECK=1",
         "-DWASM_DISABLE_STACK_HW_BOUND_CHECK=1", "-DWASM_DISABLE_WAKEUP_BLOCKING_OP=1",
         "-DWASM_ENABLE_LOG=0",                   "-DWASM_HAVE_MREMAP=1",
@@ -863,25 +886,31 @@ fn wamr_link(b: *std.Build, module: *std.Build.Module) void {
     module.addCSourceFiles(.{
         .root = wamr.path("core"),
         .files = &.{
-            "iwasm/common/wasm_application.c",                  "iwasm/common/wasm_c_api.c",
-            "iwasm/common/wasm_blocking_op.c",                  "iwasm/common/wasm_exec_env.c",
-            "iwasm/common/wasm_loader_common.c",                "iwasm/common/wasm_memory.c",
-            "iwasm/common/wasm_native.c",                       "iwasm/common/wasm_runtime_common.c",
-            "iwasm/common/wasm_shared_memory.c",                "iwasm/common/arch/invokeNative_em64.s",
-            "iwasm/aot/aot_loader.c",                           "iwasm/aot/aot_runtime.c",
-            "iwasm/aot/aot_intrinsic.c",                        "iwasm/aot/arch/aot_reloc_x86_64.c",
-            "iwasm/libraries/thread-mgr/thread_manager.c",      "shared/platform/linux/platform_init.c",
-            "shared/platform/common/posix/posix_blocking_op.c", "shared/platform/common/posix/posix_malloc.c",
-            "shared/platform/common/posix/posix_memmap.c",      "shared/platform/common/posix/posix_sleep.c",
-            "shared/platform/common/posix/posix_thread.c",      "shared/platform/common/posix/posix_time.c",
-            "shared/utils/bh_assert.c",                         "shared/utils/bh_bitmap.c",
-            "shared/utils/bh_common.c",                         "shared/utils/bh_hashmap.c",
-            "shared/utils/bh_leb128.c",                         "shared/utils/bh_list.c",
-            "shared/utils/bh_log.c",                            "shared/utils/bh_queue.c",
-            "shared/utils/bh_vector.c",                         "shared/utils/runtime_timer.c",
-            "shared/mem-alloc/mem_alloc.c",                     "shared/mem-alloc/ems/ems_alloc.c",
-            "shared/mem-alloc/ems/ems_gc.c",                    "shared/mem-alloc/ems/ems_hmu.c",
+            "iwasm/common/wasm_application.c",                                         "iwasm/common/wasm_c_api.c",
+            "iwasm/common/wasm_blocking_op.c",                                         "iwasm/common/wasm_exec_env.c",
+            "iwasm/common/wasm_loader_common.c",                                       "iwasm/common/wasm_memory.c",
+            "iwasm/common/wasm_native.c",                                              "iwasm/common/wasm_runtime_common.c",
+            "iwasm/common/wasm_shared_memory.c",                                       "iwasm/common/arch/invokeNative_em64.s",
+            "iwasm/aot/aot_loader.c",                                                  "iwasm/aot/aot_runtime.c",
+            "iwasm/aot/aot_intrinsic.c",                                               "iwasm/aot/arch/aot_reloc_x86_64.c",
+            "iwasm/libraries/thread-mgr/thread_manager.c",                             "shared/platform/linux/platform_init.c",
+            "shared/platform/common/posix/posix_blocking_op.c",                        "shared/platform/common/posix/posix_malloc.c",
+            "shared/platform/common/posix/posix_memmap.c",                             "shared/platform/common/posix/posix_sleep.c",
+            "shared/platform/common/posix/posix_thread.c",                             "shared/platform/common/posix/posix_time.c",
+            "shared/utils/bh_assert.c",                                                "shared/utils/bh_bitmap.c",
+            "shared/utils/bh_common.c",                                                "shared/utils/bh_hashmap.c",
+            "shared/utils/bh_leb128.c",                                                "shared/utils/bh_list.c",
+            "shared/utils/bh_log.c",                                                   "shared/utils/bh_queue.c",
+            "shared/utils/bh_vector.c",                                                "shared/utils/runtime_timer.c",
+            "shared/mem-alloc/mem_alloc.c",                                            "shared/mem-alloc/ems/ems_alloc.c",
+            "shared/mem-alloc/ems/ems_gc.c",                                           "shared/mem-alloc/ems/ems_hmu.c",
             "shared/mem-alloc/ems/ems_kfc.c",
+            // WASI.
+                                                     "iwasm/libraries/libc-wasi/libc_wasi_wrapper.c",
+            "iwasm/libraries/libc-wasi/sandboxed-system-primitives/src/blocking_op.c", "iwasm/libraries/libc-wasi/sandboxed-system-primitives/src/posix.c",
+            "iwasm/libraries/libc-wasi/sandboxed-system-primitives/src/random.c",      "iwasm/libraries/libc-wasi/sandboxed-system-primitives/src/str.c",
+            "shared/platform/common/posix/posix_file.c",                               "shared/platform/common/posix/posix_clock.c",
+            "shared/platform/common/posix/posix_socket.c",                             "shared/platform/common/libc-util/libc_errno.c",
         },
         .flags = &flags,
     });
