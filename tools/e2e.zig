@@ -1643,7 +1643,7 @@ fn check_plugin_faults(context: *Context) !void {
     const replay = try explore(context, &(common ++ [_][]const u8{ "--tape", try std.fs.path.join(arena, &.{ tapes, "branch-1.jsonl" }) }));
     var replayed: [1]Branch = undefined;
     const replays = count == 4 and parse_branches(replay, &replayed) == 1 and
-        std.mem.eql(u8, replayed[0].events_hash, branches[1].events_hash);
+        std.mem.eql(u8, replayed[0].events_hash, hash_of(branches[0..count], 1));
     expect_all(context, &.{
         .{ "the guest's injector read the plugin's fault", listed > 0 },
         .{ "it drew and ran it in the node", drawn > 0 and ran > 0 },
@@ -1863,7 +1863,7 @@ fn check_setup_decisions(context: *Context) !void {
     const replay = try explore(context, &(common ++ [_][]const u8{ "--tape", tape }));
     var replayed: [1]Branch = undefined;
     const replays = count == 4 and parse_branches(replay, &replayed) == 1 and
-        std.mem.eql(u8, replayed[0].events_hash, branches[1].events_hash);
+        std.mem.eql(u8, replayed[0].events_hash, hash_of(branches[0..count], 1));
     // The same tapes without the setup's.
     const bare = try std.fs.path.join(arena, &.{ context.scratch, "setup-tapes-bare" });
     _ = try run_kept(context, &.{ "cp", "-r", tapes, bare });
@@ -1871,7 +1871,7 @@ fn check_setup_decisions(context: *Context) !void {
     const bare_replay = try explore(context, &(common ++ [_][]const u8{ "--tape", try std.fs.path.join(arena, &.{ bare, "branch-1.jsonl" }) }));
     var bare_replayed: [1]Branch = undefined;
     const parted = count != 4 or parse_branches(bare_replay, &bare_replayed) != 1 or
-        !std.mem.eql(u8, bare_replayed[0].events_hash, branches[1].events_hash);
+        !std.mem.eql(u8, bare_replayed[0].events_hash, hash_of(branches[0..count], 1));
     expect_all(context, &.{
         .{ "the setup's node.start_draw answered by the strategy, every draw of it (7)", answered },
         .{ "a timeline replays alone from its tapes, the setup's included", replays },
@@ -9294,6 +9294,13 @@ fn first_moment(output: []const u8, prefix: []const u8, at: []const u8) ?[]const
         return line[0 .. found + at.len];
     }
     return null;
+}
+
+/// The events hash of timeline `index` among a report's (its lines come as timelines end: with
+/// several jobs, not in their order); "" when it is not there.
+fn hash_of(branches: []const Branch, index: u32) []const u8 {
+    for (branches) |branch| if (branch.index == index) return branch.events_hash;
+    return "";
 }
 
 fn parse_branches(report: []const u8, branches: []Branch) u32 {
