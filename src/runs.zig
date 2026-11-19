@@ -10,8 +10,9 @@ const std = @import("std");
 /// The version of what an explorer persists and a later one reads back on a resume: the
 /// timelines' summaries (record.jsonl.summaries), the record's lines, the holders' registry
 /// and their files' names, the history and the bandit's files. Bumped when any of them changes:
-/// a run made with another keeps its own explorer (serve.zig's core_same). 1: 2026-11-15.
-pub const state_format: u32 = 1;
+/// a run made with another keeps its own explorer (serve.zig's core_same). 1: 2026-11-15. 2:
+/// 2026-11-19, a timeline's own clock in its summary (SummaryHeader.jitter_seed).
+pub const state_format: u32 = 2;
 const assert = std.debug.assert;
 const linux = std.os.linux;
 

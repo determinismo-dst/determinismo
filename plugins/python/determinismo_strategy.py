@@ -16,7 +16,8 @@ A strategy is an object with any of these methods; missing ones answer the defau
     machine(request)                          with wants "machine": the run's machine before it boots
                                               ({"epoch_seconds", "timer_slack_us", "tsc_jitter_seed",
                                               "modulation_stretch_us"}), the fields to change
-    branch(index, seed[, start])              a timeline starts: return an int to give it another seed
+    branch(index, seed[, start])              a timeline starts: return an int to give it another seed,
+                                              or {"seed", "jitter_seed"} (its own clock too)
     plan()                                    with wants "plans": {"<decision name>": [[low, high,
                                               weight], ...]}, drawn from by the explorer
     check(index[, histories])                 with wants "check": a timeline ended; its assertions,
@@ -62,10 +63,19 @@ def _dispatch(strategy, name, request):
             # Where it starts, when the tree explorer branched it from another: {"branch", "vtime_ns"}.
             if "start" in inspect.signature(strategy.branch).parameters:
                 arguments.append(request.get("from"))
-            # An int returned is the timeline's seed instead (another random future).
-            seed = strategy.branch(*arguments)
-            if isinstance(seed, int):
-                return {"seed": f"{seed:016x}"}
+            # An int returned is the timeline's seed instead (another random future); a dict may
+            # also give its own clock, {"seed": int, "jitter_seed": int} (from the setup snapshot:
+            # a timeline from a moment keeps its parent's).
+            chosen = strategy.branch(*arguments)
+            if isinstance(chosen, int):
+                return {"seed": f"{chosen:016x}"}
+            if isinstance(chosen, dict):
+                reply = {}
+                if chosen.get("seed") is not None:
+                    reply["seed"] = f"{chosen['seed']:016x}"
+                if chosen.get("jitter_seed") is not None:
+                    reply["clock"] = {"jitter_seed": f"{chosen['jitter_seed']:016x}"}
+                return reply
         return {}
     if method == "returns":
         # The tree explorer's generation ended: which moments to return to (branch, vtime_ns,

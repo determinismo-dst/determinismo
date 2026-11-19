@@ -450,10 +450,19 @@ test "a plugin that wants named decisions and assertions is asked and told only 
 /// Where a branch starts when not at the setup snapshot: a moment of another (the tree's).
 pub const From = struct { branch: u32, vtime_ns: u64 };
 
-/// A timeline's start: its index, seed and where it branches from. The reply may give the
-/// timeline another seed (`{"seed":"<16 hex digits>"}`: which random future it gets), its tape's
-/// header then saying it: null keeps the explorer's.
-pub fn branch(strategy: *Strategy, index: u32, seed: u64, from: ?From) !?u64 {
+/// What a strategy chose for a timeline at its start: null keeps the explorer's.
+pub const BranchChoice = struct {
+    /// Another seed (`"seed":"<16 hex digits>"`): which random future it gets.
+    seed: ?u64 = null,
+    /// Its own clock (`"clock":{"jitter_seed":"<16 hex digits>"}`): the low bits its RDTSC
+    /// reads jitter by (VM.Options.tsc_jitter_seed), from the setup snapshot on. A timeline from
+    /// a moment of another keeps that one's clock: a choice for it is refused.
+    jitter_seed: ?u64 = null,
+};
+
+/// A timeline's start: its index, seed and where it branches from. The reply may choose its
+/// seed and its clock (BranchChoice), its tape's header then saying them.
+pub fn branch(strategy: *Strategy, index: u32, seed: u64, from: ?From) !BranchChoice {
     // A plan is a timeline's: the next one's first named decision asks for its own.
     strategy.plan_count = 0;
     strategy.flushed_ns = 0;
@@ -468,9 +477,22 @@ pub fn branch(strategy: *Strategy, index: u32, seed: u64, from: ?From) !?u64 {
     }
     try writer.writeAll("}");
     const reply = try strategy.call(writer.buffered());
-    const chosen = reply.get("seed") orelse return null;
-    if (chosen != .string or chosen.string.len != 16) return error.BadPluginReply;
-    return std.fmt.parseInt(u64, chosen.string, 16) catch error.BadPluginReply;
+    var choice: BranchChoice = .{};
+    if (reply.get("seed")) |chosen| choice.seed = try hex16(chosen);
+    if (reply.get("clock")) |clock| {
+        if (clock != .object) return error.BadPluginReply;
+        if (clock.object.get("jitter_seed")) |chosen| {
+            if (from != null) return error.BadPluginReply; // Its parent's clock goes on.
+            choice.jitter_seed = try hex16(chosen);
+        }
+    }
+    return choice;
+}
+
+/// A reply's 64-bit value as 16 hex digits.
+fn hex16(value: std.json.Value) !u64 {
+    if (value != .string or value.string.len != 16) return error.BadPluginReply;
+    return std.fmt.parseInt(u64, value.string, 16) catch error.BadPluginReply;
 }
 
 /// What a run's machine may be: the guest's wall clock no later than 2100, a timer's slack at

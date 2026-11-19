@@ -214,73 +214,73 @@ fn scratches_sweep(io: std.Io, arena: std.mem.Allocator, scratches: []const u8) 
 /// and counts them.
 fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
     const checks = .{
-        .{ "bank", check_bank },                           .{ "shop", check_shop },
-        .{ "tapes", check_tapes },                         .{ "debugging", check_debugging },
-        .{ "python", check_python_strategy },              .{ "setup-decisions", check_setup_decisions },
-        .{ "machine-decisions", check_machine_decisions }, .{ "branch-seeds", check_branch_seeds },
-        .{ "plugin-faults", check_plugin_faults },         .{ "plugin-checks", check_plugin_checks },
-        .{ "device-models", check_device_models },         .{ "plugin-histories", check_plugin_histories },
-        .{ "wasm-plugin", check_wasm_plugin },             .{ "wasm-misbehaving", check_wasm_misbehaving },
-        .{ "wasm-reach", check_wasm_reach },               .{ "wasm-upload", check_wasm_upload },
-        .{ "egress", check_egress },                       .{ "ingress", check_ingress },
-        .{ "ingress-session", check_ingress_session },     .{ "moments", check_moments },
-        .{ "properties", check_builtin_properties },       .{ "entropy", check_kernel_entropy },
-        .{ "quiet", check_quiet_period },                  .{ "clock_jitter", check_clock_jitter },
-        .{ "query", check_query },                         .{ "progress", check_progress_while_quiet },
-        .{ "network", check_network_faults },              .{ "fault-exclusions", check_fault_exclusions },
-        .{ "serve", check_serve },                         .{ "until", check_until_and_causality },
-        .{ "coverage-gate", check_coverage_gate },         .{ "coverage", check_coverage },
-        .{ "parallel", check_parallel },                   .{ "fork", check_fork },
-        .{ "tree", check_tree },                           .{ "startup-coverage", check_startup_coverage },
-        .{ "memory-climb", check_memory_climb },           .{ "disk", check_disk },
-        .{ "shape", check_shape },                         .{ "repl-strategy", check_repl_strategy },
-        .{ "end", check_end },                             .{ "plans", check_plans },
-        .{ "durability", check_durability },               .{ "mutate", check_mutate },
-        .{ "interleave", check_interleave },               .{ "checks", check_host_checks },
-        .{ "pausing", check_pausing },                     .{ "shrink", check_shrink },
-        .{ "holds", check_holds },                         .{ "coverage-set", check_coverage_set },
-        .{ "inject", check_inject },                       .{ "aim", check_aim },
-        .{ "aftershock", check_aftershock },               .{ "record-power-loss", check_record_power_loss },
-        .{ "errno-storm", check_errno_storm },             .{ "compose", check_compose },
-        .{ "shards", check_shards },                       .{ "stress", check_stress },
-        .{ "controller", check_controller },               .{ "clojure", check_clojure },
-        .{ "k3s", check_k3s },                             .{ "script", check_script },
-        .{ "modulation", check_cpu_modulation },           .{ "profile", check_profile },
-        .{ "catalog", check_catalog },                     .{ "guidance", check_guidance },
-        .{ "voidstar", check_voidstar },                   .{ "changed", check_changed },
-        .{ "readdress", check_readdress },                 .{ "unlist", check_unlist },
-        .{ "signal", check_signal },                       .{ "syscall_error", check_syscall_error },
-        .{ "swarm", check_swarm },                         .{ "metastable", check_metastable },
-        .{ "file_error", check_file_error },               .{ "retroactive", check_retroactive },
-        .{ "epoch", check_epoch },                         .{ "drive", check_drive },
-        .{ "hang", check_hang },                           .{ "pinned", check_pinned },
-        .{ "slow", check_slow },                           .{ "ending-window", check_ending_window },
-        .{ "sought", check_sought },                       .{ "optimize", check_optimize },
-        .{ "states", check_states },                       .{ "crash-points", check_crash_points },
-        .{ "nodes-down", check_nodes_down },               .{ "stale-pid", check_stale_pid },
-        .{ "memory-growth", check_memory_growth },         .{ "upgrade", check_upgrade },
-        .{ "knobs", check_knobs },                         .{ "quorum", check_quorum },
-        .{ "spare", check_spare },                         .{ "saved", check_saved },
-        .{ "concurrent", check_concurrent },               .{ "resume", check_resume },
-        .{ "ui", check_ui },                               .{ "runs", check_runs },
-        .{ "kubernetes", check_kubernetes },               .{ "steps", check_steps },
-        .{ "before-nodes", check_before_nodes },           .{ "session", check_session },
-        .{ "fast", check_fast },                           .{ "sandbox", check_sandbox },
-        .{ "devproxy", check_devproxy },                   .{ "sandbox-egress", check_sandbox_egress },
-        .{ "ci", check_ci },                               .{ "repl", check_repl },
-        .{ "mechanics", check_mechanics },                 .{ "budget", check_budget },
-        .{ "sinks", check_sinks },                         .{ "dotnet", check_dotnet },
-        .{ "lines", check_lines },                         .{ "voidstar-static", check_voidstar_static },
-        .{ "frozen-start", check_frozen_start },           .{ "hangup", check_hangup },
-        .{ "frozen-step", check_frozen_step },             .{ "templates", check_templates },
-        .{ "volumes", check_volumes },                     .{ "setup-mode", check_setup_mode },
-        .{ "jank", check_jank_repl },                      .{ "bank-steps", check_bank_steps },
-        .{ "checkpoint", check_session_checkpoint },       .{ "ingress-checkpoint", check_ingress_checkpoint },
-        .{ "ingress-crash", check_ingress_crash },         .{ "draws", check_draws },
-        .{ "exit-stack", check_exit_stack },               .{ "plan-calls", check_plan_calls },
-        .{ "services", check_services },                   .{ "sites", check_sites },
-        .{ "client", check_client },                       .{ "session-exact", check_session_exact },
-        .{ "java-watch", check_java_watch },
+        .{ "bank", check_bank },                             .{ "shop", check_shop },
+        .{ "tapes", check_tapes },                           .{ "debugging", check_debugging },
+        .{ "python", check_python_strategy },                .{ "setup-decisions", check_setup_decisions },
+        .{ "machine-decisions", check_machine_decisions },   .{ "branch-seeds", check_branch_seeds },
+        .{ "plugin-faults", check_plugin_faults },           .{ "plugin-checks", check_plugin_checks },
+        .{ "device-models", check_device_models },           .{ "plugin-histories", check_plugin_histories },
+        .{ "wasm-plugin", check_wasm_plugin },               .{ "wasm-misbehaving", check_wasm_misbehaving },
+        .{ "wasm-reach", check_wasm_reach },                 .{ "wasm-upload", check_wasm_upload },
+        .{ "timeline-clocks", check_timeline_clocks },       .{ "egress", check_egress },
+        .{ "ingress", check_ingress },                       .{ "ingress-session", check_ingress_session },
+        .{ "moments", check_moments },                       .{ "properties", check_builtin_properties },
+        .{ "entropy", check_kernel_entropy },                .{ "quiet", check_quiet_period },
+        .{ "clock_jitter", check_clock_jitter },             .{ "query", check_query },
+        .{ "progress", check_progress_while_quiet },         .{ "network", check_network_faults },
+        .{ "fault-exclusions", check_fault_exclusions },     .{ "serve", check_serve },
+        .{ "until", check_until_and_causality },             .{ "coverage-gate", check_coverage_gate },
+        .{ "coverage", check_coverage },                     .{ "parallel", check_parallel },
+        .{ "fork", check_fork },                             .{ "tree", check_tree },
+        .{ "startup-coverage", check_startup_coverage },     .{ "memory-climb", check_memory_climb },
+        .{ "disk", check_disk },                             .{ "shape", check_shape },
+        .{ "repl-strategy", check_repl_strategy },           .{ "end", check_end },
+        .{ "plans", check_plans },                           .{ "durability", check_durability },
+        .{ "mutate", check_mutate },                         .{ "interleave", check_interleave },
+        .{ "checks", check_host_checks },                    .{ "pausing", check_pausing },
+        .{ "shrink", check_shrink },                         .{ "holds", check_holds },
+        .{ "coverage-set", check_coverage_set },             .{ "inject", check_inject },
+        .{ "aim", check_aim },                               .{ "aftershock", check_aftershock },
+        .{ "record-power-loss", check_record_power_loss },   .{ "errno-storm", check_errno_storm },
+        .{ "compose", check_compose },                       .{ "shards", check_shards },
+        .{ "stress", check_stress },                         .{ "controller", check_controller },
+        .{ "clojure", check_clojure },                       .{ "k3s", check_k3s },
+        .{ "script", check_script },                         .{ "modulation", check_cpu_modulation },
+        .{ "profile", check_profile },                       .{ "catalog", check_catalog },
+        .{ "guidance", check_guidance },                     .{ "voidstar", check_voidstar },
+        .{ "changed", check_changed },                       .{ "readdress", check_readdress },
+        .{ "unlist", check_unlist },                         .{ "signal", check_signal },
+        .{ "syscall_error", check_syscall_error },           .{ "swarm", check_swarm },
+        .{ "metastable", check_metastable },                 .{ "file_error", check_file_error },
+        .{ "retroactive", check_retroactive },               .{ "epoch", check_epoch },
+        .{ "drive", check_drive },                           .{ "hang", check_hang },
+        .{ "pinned", check_pinned },                         .{ "slow", check_slow },
+        .{ "ending-window", check_ending_window },           .{ "sought", check_sought },
+        .{ "optimize", check_optimize },                     .{ "states", check_states },
+        .{ "crash-points", check_crash_points },             .{ "nodes-down", check_nodes_down },
+        .{ "stale-pid", check_stale_pid },                   .{ "memory-growth", check_memory_growth },
+        .{ "upgrade", check_upgrade },                       .{ "knobs", check_knobs },
+        .{ "quorum", check_quorum },                         .{ "spare", check_spare },
+        .{ "saved", check_saved },                           .{ "concurrent", check_concurrent },
+        .{ "resume", check_resume },                         .{ "ui", check_ui },
+        .{ "runs", check_runs },                             .{ "kubernetes", check_kubernetes },
+        .{ "steps", check_steps },                           .{ "before-nodes", check_before_nodes },
+        .{ "session", check_session },                       .{ "fast", check_fast },
+        .{ "sandbox", check_sandbox },                       .{ "devproxy", check_devproxy },
+        .{ "sandbox-egress", check_sandbox_egress },         .{ "ci", check_ci },
+        .{ "repl", check_repl },                             .{ "mechanics", check_mechanics },
+        .{ "budget", check_budget },                         .{ "sinks", check_sinks },
+        .{ "dotnet", check_dotnet },                         .{ "lines", check_lines },
+        .{ "voidstar-static", check_voidstar_static },       .{ "frozen-start", check_frozen_start },
+        .{ "hangup", check_hangup },                         .{ "frozen-step", check_frozen_step },
+        .{ "templates", check_templates },                   .{ "volumes", check_volumes },
+        .{ "setup-mode", check_setup_mode },                 .{ "jank", check_jank_repl },
+        .{ "bank-steps", check_bank_steps },                 .{ "checkpoint", check_session_checkpoint },
+        .{ "ingress-checkpoint", check_ingress_checkpoint }, .{ "ingress-crash", check_ingress_crash },
+        .{ "draws", check_draws },                           .{ "exit-stack", check_exit_stack },
+        .{ "plan-calls", check_plan_calls },                 .{ "services", check_services },
+        .{ "sites", check_sites },                           .{ "client", check_client },
+        .{ "session-exact", check_session_exact },           .{ "java-watch", check_java_watch },
     };
     // A check's whole name runs it alone (check.sh's `ui` ran guidance and quiet too).
     var exact = std.mem.eql(u8, only, "tla");
@@ -1705,6 +1705,85 @@ fn check_plugin_histories(context: *Context) !void {
         .{ "every record, each right", std.mem.eql(u8, every, "PASS") and std.mem.eql(u8, right, "PASS") },
         .{ "the program's own check still judges it", std.mem.eql(u8, own, "PASS") },
     }, "plugin histories: given {s}, every {s}, right {s}; the program's {s}", .{ given, every, right, own });
+}
+
+/// A timeline's own clock: clock.py gives each timeline from the setup snapshot its own jitter
+/// at its branch, a tree's child keeping its root's. Its tape says it, so a replay needs no
+/// plugin: a flat timeline replays alone, and so does a tree's deepest, with its root's clock.
+fn check_timeline_clocks(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
+    const tapes = try std.fs.path.join(arena, &.{ context.scratch, "clock-tapes" });
+    const common = [_][]const u8{ "--program", program, "--scenario", "bank", "--seed", "3" };
+    const flat = try explore(context, &(common ++ [_][]const u8{
+        "--branches", "3", "--jobs", "1", "--strategy", "python3 plugins/python/clock.py", "--tape-dir", tapes,
+    }));
+    const plain = try explore(context, &(common ++ [_][]const u8{ "--branches", "3", "--jobs", "1" }));
+    var clocked: [3]Branch = undefined;
+    var unclocked: [3]Branch = undefined;
+    const counted = parse_branches(flat, &clocked) == 3 and parse_branches(plain, &unclocked) == 3;
+    var moved = false;
+    if (counted) for (clocked) |branch| {
+        moved = moved or !std.mem.eql(u8, branch.events_hash, hash_of(&unclocked, branch.index));
+    };
+    const tape_1 = try std.fs.path.join(arena, &.{ tapes, "branch-1.jsonl" });
+    const own = tape_value(context, tape_1, "clock_jitter_seed");
+    const replay = try explore(context, &(common ++ [_][]const u8{ "--tape", tape_1 }));
+    var replayed: [1]Branch = undefined;
+    const replays = counted and parse_branches(replay, &replayed) == 1 and
+        std.mem.eql(u8, replayed[0].events_hash, hash_of(&clocked, 1));
+    // A tree: its deepest child has its root's clock, and replays alone with it.
+    const tree_tapes = try std.fs.path.join(arena, &.{ context.scratch, "clock-tree-tapes" });
+    const record = try std.fs.path.join(arena, &.{ context.scratch, "clock-tree.jsonl" });
+    const tree = try explore(context, &.{
+        "--program",  program, "--scenario",  "bank",                            "--seed",       "5",
+        "--branches", "48",    "--branching", "tree",                            "--generation", "16",
+        "--jobs",     "2",     "--strategy",  "python3 plugins/python/clock.py", "--tape-dir",   tree_tapes,
+        "--record",   record,
+    });
+    var tree_branches: [48]Branch = undefined;
+    const tree_count = parse_branches(tree, &tree_branches);
+    const deep = try deepest_replays(context, program, record, tree_tapes, tree_branches[0..tree_count], &.{});
+    var inherited = false;
+    var child_clock: []const u8 = "";
+    var root_clock: []const u8 = "";
+    if (deep.index) |index| {
+        const child = try std.fmt.allocPrint(arena, "{s}/branch-{d}.jsonl", .{ tree_tapes, index });
+        child_clock = tape_value(context, child, "clock_jitter_seed");
+        const root_index = chain_root(context, child);
+        if (root_index) |root| {
+            root_clock = tape_value(context, try std.fmt.allocPrint(arena, "{s}/branch-{d}.jsonl", .{ tree_tapes, root }), "clock_jitter_seed");
+            inherited = child_clock.len > 0 and std.mem.eql(u8, child_clock, root_clock);
+        }
+    }
+    expect_all(context, &.{
+        .{ "a timeline's tape says its own clock", own.len > 0 },
+        .{ "it replays alone from its tape", replays },
+        .{ "the clocks change the timelines", moved },
+        .{ "a tree's deepest child has its root's clock", inherited and deep.depth > 0 },
+        .{ "and replays alone with it", deep.replays },
+    }, "timeline clocks: branch 1's {s}; the tree's deepest {?d} (depth {d}) {s}, its root's {s}", .{ own, deep.index, deep.depth, child_clock, root_clock });
+}
+
+/// A tape header's string value for `key` (`"key":"<value>"`), or "".
+fn tape_value(context: *Context, path: []const u8, key: []const u8) []const u8 {
+    const text = std.Io.Dir.cwd().readFileAlloc(context.io, path, context.arena, .limited(1 << 20)) catch return "";
+    const line = text[0 .. std.mem.indexOfScalar(u8, text, '\n') orelse text.len];
+    const needle = std.fmt.allocPrint(context.arena, "\"{s}\":\"", .{key}) catch return "";
+    const at = std.mem.indexOf(u8, line, needle) orelse return "";
+    const rest = line[at + needle.len ..];
+    return rest[0 .. std.mem.indexOfScalar(u8, rest, '"') orelse rest.len];
+}
+
+/// The first ancestor in a tape's chain (its root timeline), if it has one.
+fn chain_root(context: *Context, path: []const u8) ?u32 {
+    const text = std.Io.Dir.cwd().readFileAlloc(context.io, path, context.arena, .limited(1 << 20)) catch return null;
+    const line = text[0 .. std.mem.indexOfScalar(u8, text, '\n') orelse text.len];
+    const needle = "\"chain\":[{\"branch\":";
+    const at = std.mem.indexOf(u8, line, needle) orelse return null;
+    const rest = line[at + needle.len ..];
+    const end = std.mem.indexOfNone(u8, rest, "0123456789") orelse rest.len;
+    return std.fmt.parseInt(u32, rest[0..end], 10) catch null;
 }
 
 /// PASS or FAIL: the report's line for the property whose message is `message`.

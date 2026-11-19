@@ -2085,10 +2085,14 @@ const SummaryHeader = extern struct {
     cut: u8,
     /// The behaviors' layout (summary_format): another build's are refused.
     format: u8 = summary_format,
-    reserved: [6]u8 = @splat(0),
+    /// 1: `jitter_seed` is its own clock (Summary.jitter_seed); 0: the run's.
+    own_clock: u8 = 0,
+    reserved: [5]u8 = @splat(0),
+    jitter_seed: u64 = 0,
 };
 
-/// Bumped whenever Events.Behavior changes. 1: `sought`. 2: `score`.
+/// Bumped whenever Events.Behavior changes. 1: `sought`. 2: `score`. (SummaryHeader's own
+/// fields move runs.state_format: 2, a timeline's own clock.)
 const summary_format = 2;
 
 /// What an explorer persists and a later one reads back on a resume, by layout (persisted_hash): the timelines' summaries and the behaviors they carry, the record's
@@ -2162,8 +2166,8 @@ fn persisted_hash(comptime T: type, hasher: *std.hash.Wyhash) void {
 test "what an explorer persists changes only with runs.state_format" {
     // A failure here: the layout changed. Bump runs.state_format and set both below to the new
     // values (a run made before then resumes on its own explorer, never on one that misreads it).
-    try std.testing.expectEqual(@as(u32, 1), runs.state_format);
-    try std.testing.expectEqual(@as(u64, 8234011517226672808), persisted_layout);
+    try std.testing.expectEqual(@as(u32, 2), runs.state_format);
+    try std.testing.expectEqual(@as(u64, 14215628497550469628), persisted_layout);
 }
 
 fn summary_write(fd: linux.fd_t, summary: *const Summary) void {
@@ -2175,6 +2179,8 @@ fn summary_write(fd: linux.fd_t, summary: *const Summary) void {
         .trace_hash = summary.trace_hash,
         .last_pull_ns = summary.last_pull_ns,
         .cut = @intFromBool(summary.cut),
+        .own_clock = @intFromBool(summary.jitter_seed != null),
+        .jitter_seed = summary.jitter_seed orelse 0,
     };
     const behaviors = std.mem.sliceAsBytes(summary.behaviors[0..summary.behavior_count]);
     const vectors = [_]std.posix.iovec_const{
@@ -2208,6 +2214,7 @@ fn summary_load(summary: *Summary, bytes: []const u8) void {
     summary.trace_hash = header.trace_hash;
     summary.last_pull_ns = header.last_pull_ns;
     summary.cut = header.cut != 0;
+    summary.jitter_seed = if (header.own_clock != 0) header.jitter_seed else null;
     summary.ended_early = false;
     summary.again_ns = null;
     summary.holder_count = 0; // Gone with the run: its moments are made again by replay.
@@ -3300,14 +3307,21 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         const held = if (branches.pool) |pool| (pool.take_unless(wait_over) orelse break) else null;
         defer if (held) |cpu| branches.pool.?.give(cpu);
         // Its strategy hears it start first, and may give it another seed (another random
-        // future), which its tape's header then says (a replay takes it from there).
+        // future) and, from the setup snapshot, its own clock, which its tape's header then
+        // says (a replay takes them from there).
         if (exploration.strategy) |strategy| {
             const from: ?Strategy.From = if (place.path.len == 0) null else .{
                 .branch = place.path[place.path.len - 1].branch,
                 .vtime_ns = place.path[place.path.len - 1].vtime_ns,
             };
-            if (try strategy.branch(place.index, place.seed, from)) |seed| place.seed = seed;
+            const choice = try strategy.branch(place.index, place.seed, from);
+            if (choice.seed) |seed| place.seed = seed;
+            if (choice.jitter_seed) |jitter| place.jitter_seed = jitter;
         }
+        // Its clock: its own (Planned.jitter_seed) for its VM alone, the run's for the rest.
+        const jitter_run = options.tsc_jitter_seed;
+        defer options.tsc_jitter_seed = jitter_run;
+        if (place.jitter_seed) |jitter| options.tsc_jitter_seed = jitter;
         options.seed = place.seed;
         Events.ranges_salt = place.seed; // Its own draw over the range buckets (events.zig).
         const moment_ms = branches.arguments.moment_vtime_ms;
@@ -3577,6 +3591,7 @@ fn branch_announce(
             .exploration_seed = exploration.exploration_seed,
             .branch = place.index,
             .branch_seed = place.seed,
+            .clock_jitter_seed = place.jitter_seed,
             .fork = exploration.fork,
             .chain = place.path,
             .host = exploration.host,
@@ -3609,6 +3624,7 @@ fn branch_place(branches: Branches, index_flat: usize, single: bool, position: u
             branch_seed(seed_base(exploration), index),
         .snapshot = branches.snapshot,
         .path = if (replay) |tape_replay| tape_replay.header.chain else &.{},
+        .jitter_seed = if (replay) |tape_replay| tape_replay.header.clock_jitter_seed else null,
     };
 }
 
@@ -3628,6 +3644,10 @@ const Planned = struct {
     disk_origin: ?holders.Origin = null,
     /// The archive cell its return went to (TreeReturn.cell).
     cell: ?u64 = null,
+    /// Its own clock's jitter (VM.Options.tsc_jitter_seed from the setup snapshot on): its
+    /// strategy's choice at its branch, a child's its root timeline's (a machine's clock goes
+    /// on where it branched, its replay one clock along its lineage). Null: the run's.
+    jitter_seed: ?u64 = null,
 };
 
 /// How a branch went, for planning the next generation: the behaviors it reached first, when.
@@ -3670,6 +3690,9 @@ const Summary = struct {
     /// disk: a resumed run's recorded timelines credit nothing.
     bandit_uses: [bandit_zig.uses_max]bandit_zig.Use = undefined,
     bandit_use_count: u8 = 0,
+    /// Its own clock (Planned.jitter_seed), which its strategy may have chosen in the worker:
+    /// the tree gives it to the timelines it plans from this one.
+    jitter_seed: ?u64 = null,
 
     const failing_max = 16;
 };
@@ -3692,6 +3715,7 @@ const Summaries = struct {
         const summary = &summaries.items[summaries.count];
         summaries.count += 1;
         summary.index = place.index;
+        summary.jitter_seed = place.jitter_seed;
         summary.start_ns = place.snapshot.tsc / (cpuid_tsc_hz / std.time.ns_per_s);
         summary.end_ns = if (vm.moment()) |moment| moment.vtime_ns else |_| summary.start_ns;
         summary.behavior_count = vm.events.behavior_count;
@@ -5781,6 +5805,11 @@ fn tree_judge_begin(
         entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
     };
     state.novelty.judge(done, &state.seen);
+    // Each timeline's clock as its worker ran it (its strategy may have chosen it there): the
+    // plan's, which the timelines planned from it inherit.
+    for (done) |summary| if (summary.jitter_seed) |jitter| for (plan.items) |*entry| {
+        if (entry.index == summary.index) entry.jitter_seed = jitter;
+    };
     for (done) |summary| try archive_add(arena, state, plan.items, summary);
     var candidate_count: u32 = 0;
     const generation_seed = state.base ^ (@as(u64, generation) *% 0x9e3779b97f4a7c15);
@@ -6088,6 +6117,7 @@ fn tree_judge_end(
                 else
                     null,
                 .disk_origin = if (making.disk) |on_disk| .{ .branch = on_disk.branch, .vtime_ns = on_disk.held.vtime_ns } else null,
+                .jitter_seed = parent.jitter_seed, // Its root's clock goes on.
             });
             state.next_index += 1;
             returns_planned += 1;
@@ -6927,9 +6957,12 @@ fn node_make_start(
         const waited_ns = (activity.now_ms() -| start_ms) * std.time.ns_per_ms;
         const parent = making.parent;
         const at = making.back.vtime_ns;
+        // Replayed on the parent's clock (Planned.jitter_seed): its root's, if it chose one.
+        var parent_options = options.*;
+        if (parent.jitter_seed) |jitter| parent_options.tsc_jitter_seed = jitter;
         var from = parent.snapshot;
         assert(parent_recorded.seed == parent.seed);
-        if (making.disk) |on_disk| if (disk_node(arena, vm, options, on_disk, parent_recorded, at)) |snapshot| {
+        if (making.disk) |on_disk| if (disk_node(arena, vm, &parent_options, on_disk, parent_recorded, at)) |snapshot| {
             pool.give(cpu);
             activity.interval(.node_disk, start_ms, activity.now_ms(), .{ .wait_ns = waited_ns });
             fd_pass.send(pair[1], snapshot.memory_fd) catch linux.exit_group(1);
@@ -6943,7 +6976,7 @@ fn node_make_start(
             // Each ancestor with its own tape (its overrides), read in turn into one table.
             const ancestor = arena.create(tape.Overrides) catch linux.exit_group(1);
             var failure: ?node_core.ChainFailure = null;
-            from = node_core.chain(arena, vm, options, from, parent.path, making.tape_directory, ancestor, &failure) catch |err| {
+            from = node_core.chain(arena, vm, &parent_options, from, parent.path, making.tape_directory, ancestor, &failure) catch |err| {
                 const segment = failure.?.segment;
                 if (failure.?.tape_unread) {
                     say("[determinismo] tree: branch {d}'s tape unread: {s}\n", .{ segment.branch, @errorName(err) });
@@ -6953,7 +6986,7 @@ fn node_make_start(
                 linux.exit_group(1);
             };
         }
-        const snapshot = node_make(arena, vm, options, from, parent_recorded, at, parent.path.len > 0) catch |err| {
+        const snapshot = node_make(arena, vm, &parent_options, from, parent_recorded, at, parent.path.len > 0) catch |err| {
             say("[determinismo] tree: no snapshot at {d}ns of branch {d}: {s}\n", .{
                 at, parent.index, @errorName(err),
             });

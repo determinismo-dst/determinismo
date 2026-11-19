@@ -25,6 +25,10 @@ pub const Header = struct {
     /// The clock's jitter it ran with (VM.Options.tsc_jitter_seed, part of `inputs`): a replay
     /// from the tape boots with it (0: none, as every tape before 2026-11-07).
     tsc_jitter_seed: u64 = 0,
+    /// The timeline's own clock jitter (its strategy's at its branch, a tree child's its root
+    /// timeline's): its VM's from the setup snapshot on, the setup's being `tsc_jitter_seed`
+    /// (in `inputs`). A replay starts its timeline with it. Null: the run's.
+    clock_jitter_seed: ?u64 = null,
     /// The machine a strategy decided for its run (its `machine` request: the guest's wall clock
     /// at boot, where timer interrupts land in their slack, CPU modulation's stretches; part of
     /// `inputs`): a replay from the tape boots it. Null: the run's options as given.
@@ -260,6 +264,7 @@ pub fn write_header(fd: linux.fd_t, header: Header) void {
     if (header.tsc_jitter_seed != 0) {
         writer.print(",\"tsc_jitter_seed\":\"{x:0>16}\"", .{header.tsc_jitter_seed}) catch unreachable;
     }
+    if (header.clock_jitter_seed) |seed| writer.print(",\"clock_jitter_seed\":\"{x:0>16}\"", .{seed}) catch unreachable;
     if (header.machine) |machine| {
         writer.print(",\"machine\":{{\"epoch_seconds\":{d},\"timer_slack_ns\":{d},\"modulation_stretch_ns\":[{d},{d}],\"timer_delay_permille\":{d},\"custom_faults\":\"{s}\"}}", .{
             machine.epoch_seconds,
@@ -440,6 +445,10 @@ fn header_take(header_line: []const u8, fba: *std.heap.FixedBufferAllocator) !He
             try hex_field(header.object, "tsc_jitter_seed")
         else
             0,
+        .clock_jitter_seed = if (header.object.get("clock_jitter_seed") != null)
+            try hex_field(header.object, "clock_jitter_seed")
+        else
+            null,
         .machine = if (header.object.get("machine")) |machine| try machine_parse(machine) else null,
     };
     if (header.object.get("chain")) |chain| {
@@ -645,6 +654,17 @@ test "a tape keeps the clock's jitter its timeline ran with" {
     defer allocator.destroy(overrides);
     const header = try parse(buffer[0..size], scratch, overrides);
     try std.testing.expectEqual(@as(u64, 0x1235), header.tsc_jitter_seed);
+    try std.testing.expectEqual(@as(?u64, null), header.clock_jitter_seed);
+    // A timeline's own clock, beside the run's.
+    var own: [2]linux.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&own, .{})));
+    write_header(own[1], .{ .inputs = 0xaa, .exploration_seed = 3, .branch = 2, .branch_seed = 9, .tsc_jitter_seed = 0x1235, .clock_jitter_seed = 0x77 });
+    _ = linux.close(own[1]);
+    const own_size = linux.read(own[0], &buffer, buffer.len);
+    _ = linux.close(own[0]);
+    const owned = try parse(buffer[0..own_size], scratch, overrides);
+    try std.testing.expectEqual(@as(?u64, 0x77), owned.clock_jitter_seed);
+    try std.testing.expectEqual(@as(u64, 0x1235), owned.tsc_jitter_seed);
     // A tape from before it: none.
     try std.testing.expectEqual(@as(u64, 0), try jitter_seed("{\"tape\":2,\"inputs\":\"00000000000000aa\"}\n", scratch));
 }
