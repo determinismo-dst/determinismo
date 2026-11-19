@@ -25,9 +25,10 @@ pub const Header = struct {
     /// The clock's jitter it ran with (VM.Options.tsc_jitter_seed, part of `inputs`): a replay
     /// from the tape boots with it (0: none, as every tape before 2026-11-07).
     tsc_jitter_seed: u64 = 0,
-    /// The timeline's own clock jitter (its strategy's at its branch, a tree child's its root
-    /// timeline's): its VM's from the setup snapshot on, the setup's being `tsc_jitter_seed`
-    /// (in `inputs`). A replay starts its timeline with it. Null: the run's.
+    /// The timeline's own clock jitter (its strategy's at its branch, else a tree child's
+    /// parent's): its VM's from where it starts (the setup snapshot, or its branch point), the
+    /// setup's being `tsc_jitter_seed` (in `inputs`); its ancestors' are in `chain`. A replay
+    /// starts its timeline with it. Null: the run's.
     clock_jitter_seed: ?u64 = null,
     /// The machine a strategy decided for its run (its `machine` request: the guest's wall clock
     /// at boot, where timer interrupts land in their slack, CPU modulation's stretches; part of
@@ -53,7 +54,10 @@ pub const Machine = struct {
 
 /// One step of a path: branch `branch` (seed `seed`) ran from the previous step's moment to
 /// `vtime_ns`, where the next one branched from it.
-pub const Segment = struct { branch: u32, seed: u64, vtime_ns: u64 };
+/// An ancestor of a tree's timeline: its index and seed, the moment the next left it, and the
+/// clock it ran on (its own: Header.clock_jitter_seed; null, the run's), which a replay of the
+/// chain boots that segment with.
+pub const Segment = struct { branch: u32, seed: u64, vtime_ns: u64, jitter_seed: ?u64 = null };
 pub const chain_length_max = 64;
 
 /// A moment of a branch of the setup snapshot, where a nested snapshot is taken.
@@ -239,7 +243,7 @@ pub const Overrides = struct {
 pub fn write_header(fd: linux.fd_t, header: Header) void {
     assert(fd >= 0);
     assert(header.chain.len <= chain_length_max);
-    var buffer: [512 + chain_length_max * 80 + pokes_size_max * 2]u8 = undefined;
+    var buffer: [512 + chain_length_max * 112 + pokes_size_max * 2]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
     writer.print("{{\"tape\":{d},\"inputs\":\"{x:0>16}\",\"exploration_seed\":\"{x:0>16}\"," ++
         "\"branch\":{d},\"branch_seed\":\"{x:0>16}\"", .{
@@ -254,9 +258,13 @@ pub fn write_header(fd: linux.fd_t, header: Header) void {
         writer.writeAll(",\"chain\":[") catch unreachable;
         for (header.chain, 0..) |segment, index| {
             if (index > 0) writer.writeAll(",") catch unreachable;
-            writer.print("{{\"branch\":{d},\"seed\":\"{x:0>16}\",\"vtime_ns\":{d}}}", .{
+            writer.print("{{\"branch\":{d},\"seed\":\"{x:0>16}\",\"vtime_ns\":{d}", .{
                 segment.branch, segment.seed, segment.vtime_ns,
             }) catch unreachable;
+            if (segment.jitter_seed) |jitter| {
+                writer.print(",\"jitter_seed\":\"{x:0>16}\"", .{jitter}) catch unreachable;
+            }
+            writer.writeAll("}") catch unreachable;
         }
         writer.writeAll("]") catch unreachable;
     }
@@ -461,6 +469,10 @@ fn header_take(header_line: []const u8, fba: *std.heap.FixedBufferAllocator) !He
                 .seed = try hex_field(item.object, "seed"),
                 .vtime_ns = @intCast((item.object.get("vtime_ns") orelse
                     return error.BadTape).integer),
+                .jitter_seed = if (item.object.get("jitter_seed") != null)
+                    try hex_field(item.object, "jitter_seed")
+                else
+                    null,
             };
         }
         result.chain = segments;
@@ -667,6 +679,21 @@ test "a tape keeps the clock's jitter its timeline ran with" {
     try std.testing.expectEqual(@as(u64, 0x1235), owned.tsc_jitter_seed);
     // A tape from before it: none.
     try std.testing.expectEqual(@as(u64, 0), try jitter_seed("{\"tape\":2,\"inputs\":\"00000000000000aa\"}\n", scratch));
+    // A tree child's: its chain says each ancestor's clock (a root on its own, a child of it on
+    // the run's), beside its own.
+    const chain = [_]Segment{
+        .{ .branch = 0, .seed = 0x11, .vtime_ns = 2_000_000_000, .jitter_seed = 0xab },
+        .{ .branch = 4, .seed = 0x44, .vtime_ns = 5_000_000_000 },
+    };
+    var child: [2]linux.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&child, .{})));
+    write_header(child[1], .{ .inputs = 0xaa, .exploration_seed = 3, .branch = 9, .branch_seed = 9, .tsc_jitter_seed = 0x1235, .clock_jitter_seed = 0xcd, .chain = &chain });
+    _ = linux.close(child[1]);
+    const child_size = linux.read(child[0], &buffer, buffer.len);
+    _ = linux.close(child[0]);
+    const chained = try parse(buffer[0..child_size], scratch, overrides);
+    try std.testing.expectEqualSlices(Segment, &chain, chained.chain);
+    try std.testing.expectEqual(@as(?u64, 0xcd), chained.clock_jitter_seed);
 }
 
 fn hex_field(object: std.json.ObjectMap, key: []const u8) !u64 {

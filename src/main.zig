@@ -2337,7 +2337,7 @@ fn command_explore(
             }
             exploration.machine = decided.machine;
             say("[determinismo] the machine its strategy decided: wall clock {d}, timer slack {d} us landing at {d}/1000 of it, jitter {x:0>16}, stretches {d}-{d} us\n", .{
-                decided.machine.epoch_seconds, decided.machine.timer_slack_ns / std.time.ns_per_us, decided.machine.timer_delay_permille, decided.tsc_jitter_seed,
+                decided.machine.epoch_seconds,                                 decided.machine.timer_slack_ns / std.time.ns_per_us,           decided.machine.timer_delay_permille, decided.tsc_jitter_seed,
                 decided.machine.modulation_stretch_ns[0] / std.time.ns_per_us, decided.machine.modulation_stretch_ns[1] / std.time.ns_per_us,
             });
         }
@@ -2445,7 +2445,7 @@ fn command_explore(
             const before = try lineage_of(context.arena, context.io, tapes, header);
             const lineage = try context.arena.alloc(tape.Segment, before.len + 1);
             @memcpy(lineage[0..before.len], before);
-            lineage[before.len] = .{ .branch = header.branch, .seed = header.branch_seed, .vtime_ns = moment_ms * std.time.ns_per_ms };
+            lineage[before.len] = .{ .branch = header.branch, .seed = header.branch_seed, .vtime_ns = moment_ms * std.time.ns_per_ms, .jitter_seed = header.clock_jitter_seed };
             var own = header;
             own.host = exploration.host;
             own.extends = .{ .branch = header.branch, .vtime_ns = moment_ms * std.time.ns_per_ms };
@@ -2605,12 +2605,12 @@ fn command_explore(
             undefined;
         // From a snapshot of the branch itself (--tape-snapshot): its ancestors are behind it.
         const chain = if (arguments.tape_snapshot != null) &.{} else replay.header.chain;
-        // Its ancestors on its clock (the header's): a tree's child keeps its root's, which the
-        // exploration ran them on; the run's would replay another prefix.
-        var lineage = options.*;
-        if (replay.header.clock_jitter_seed) |jitter| lineage.tsc_jitter_seed = jitter;
+        // Its ancestors each on the clock it ran on (the chain's segments say them), the
+        // timeline itself on its own (the header's).
+        var own_clock = options.*;
+        if (replay.header.clock_jitter_seed) |jitter| own_clock.tsc_jitter_seed = jitter;
         var failure: ?node_core.ChainFailure = null;
-        start = try node_core.chain(context.arena, vm, &lineage, start, chain, directory, ancestor, &failure);
+        start = try node_core.chain(context.arena, vm, options, start, chain, directory, ancestor, &failure);
         // Futures from a moment of the taped branch (`--tape ... --from-vtime-ms`, causality
         // analysis): the branch itself replayed to the moment, then new branches from there,
         // with their own seeds.
@@ -2619,7 +2619,7 @@ fn command_explore(
             const recorded = try Recorded.load(context.arena, directory, replay.header.branch, replay.header.branch_seed, own);
             const at = ms * std.time.ns_per_ms;
             const branch_point = replay.header.chain.len > 0;
-            start = try node_make(context.arena, vm, &lineage, start, recorded, at, branch_point);
+            start = try node_make(context.arena, vm, &own_clock, start, recorded, at, branch_point);
             exploration.replay = null;
             exploration.exploration_seed = futures_seed(exploration.exploration_seed, start);
         }
@@ -3648,9 +3648,9 @@ const Planned = struct {
     disk_origin: ?holders.Origin = null,
     /// The archive cell its return went to (TreeReturn.cell).
     cell: ?u64 = null,
-    /// Its own clock's jitter (VM.Options.tsc_jitter_seed from the setup snapshot on): its
-    /// strategy's choice at its branch, a child's its root timeline's (a machine's clock goes
-    /// on where it branched, its replay one clock along its lineage). Null: the run's.
+    /// Its own clock's jitter (VM.Options.tsc_jitter_seed from where it starts): its strategy's
+    /// choice at its branch, else a child's its parent's. Its path's segments say each
+    /// ancestor's, which a replay boots each segment with. Null: the run's.
     jitter_seed: ?u64 = null,
 };
 
@@ -6101,6 +6101,7 @@ fn tree_judge_end(
             .branch = parent.index,
             .seed = parent.seed,
             .vtime_ns = at,
+            .jitter_seed = parent.jitter_seed,
         };
         for (0..(back.branches orelse state.children)) |_| {
             index_settle(state);
@@ -6121,7 +6122,7 @@ fn tree_judge_end(
                 else
                     null,
                 .disk_origin = if (making.disk) |on_disk| .{ .branch = on_disk.branch, .vtime_ns = on_disk.held.vtime_ns } else null,
-                .jitter_seed = parent.jitter_seed, // Its root's clock goes on.
+                .jitter_seed = parent.jitter_seed, // Its parent's clock, unless its strategy chooses one.
             });
             state.next_index += 1;
             returns_planned += 1;
@@ -6961,7 +6962,8 @@ fn node_make_start(
         const waited_ns = (activity.now_ms() -| start_ms) * std.time.ns_per_ms;
         const parent = making.parent;
         const at = making.back.vtime_ns;
-        // Replayed on the parent's clock (Planned.jitter_seed): its root's, if it chose one.
+        // The parent's segment on its clock (Planned.jitter_seed), its ancestors each on theirs
+        // (its path's segments, from the run's options).
         var parent_options = options.*;
         if (parent.jitter_seed) |jitter| parent_options.tsc_jitter_seed = jitter;
         var from = parent.snapshot;
@@ -6980,7 +6982,7 @@ fn node_make_start(
             // Each ancestor with its own tape (its overrides), read in turn into one table.
             const ancestor = arena.create(tape.Overrides) catch linux.exit_group(1);
             var failure: ?node_core.ChainFailure = null;
-            from = node_core.chain(arena, vm, &parent_options, from, parent.path, making.tape_directory, ancestor, &failure) catch |err| {
+            from = node_core.chain(arena, vm, options, from, parent.path, making.tape_directory, ancestor, &failure) catch |err| {
                 const segment = failure.?.segment;
                 if (failure.?.tape_unread) {
                     say("[determinismo] tree: branch {d}'s tape unread: {s}\n", .{ segment.branch, @errorName(err) });
@@ -8717,7 +8719,7 @@ fn lineage_of(arena: std.mem.Allocator, io: std.Io, tapes: []const u8, header: t
     const before = try lineage_of(arena, io, tapes, extended);
     const lineage = try arena.alloc(tape.Segment, before.len + 1);
     @memcpy(lineage[0..before.len], before);
-    lineage[before.len] = .{ .branch = extends.branch, .seed = extended.branch_seed, .vtime_ns = extends.vtime_ns };
+    lineage[before.len] = .{ .branch = extends.branch, .seed = extended.branch_seed, .vtime_ns = extends.vtime_ns, .jitter_seed = extended.clock_jitter_seed };
     return lineage;
 }
 

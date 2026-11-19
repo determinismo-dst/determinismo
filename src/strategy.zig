@@ -455,8 +455,8 @@ pub const BranchChoice = struct {
     /// Another seed (`"seed":"<16 hex digits>"`): which random future it gets.
     seed: ?u64 = null,
     /// Its own clock (`"clock":{"jitter_seed":"<16 hex digits>"}`): the low bits its RDTSC
-    /// reads jitter by (VM.Options.tsc_jitter_seed), from the setup snapshot on. A timeline from
-    /// a moment of another keeps that one's clock: a choice for it is refused.
+    /// reads jitter by (VM.Options.tsc_jitter_seed), from where it starts (the setup snapshot, or
+    /// a moment of another, whose clock it keeps without one).
     jitter_seed: ?u64 = null,
 };
 
@@ -482,7 +482,6 @@ pub fn branch(strategy: *Strategy, index: u32, seed: u64, from: ?From) !BranchCh
     if (reply.get("clock")) |clock| {
         if (clock != .object) return error.BadPluginReply;
         if (clock.object.get("jitter_seed")) |chosen| {
-            if (from != null) return error.BadPluginReply; // Its parent's clock goes on.
             choice.jitter_seed = try hex16(chosen);
         }
     }

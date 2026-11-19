@@ -165,7 +165,10 @@ pub fn chain(
             failure.* = .{ .segment = segment, .tape_unread = true };
             return err;
         };
-        start = make(arena, vm, options, start, recorded, segment.vtime_ns, depth > 0) catch |err| {
+        // Each ancestor on the clock it ran on (`options`: the run's, for one that had none).
+        var segment_options = options.*;
+        if (segment.jitter_seed) |jitter| segment_options.tsc_jitter_seed = jitter;
+        start = make(arena, vm, &segment_options, start, recorded, segment.vtime_ns, depth > 0) catch |err| {
             failure.* = .{ .segment = segment, .tape_unread = false };
             return err;
         };

@@ -17,7 +17,7 @@
 ;;   :decide  (fn [state request]) -> {:hex "<bytes>"} to answer a randomness pull, nil the default
 ;;   :branch  (fn [state request]) and :end (fn [state request]): a timeline's start and end;
 ;;            :branch may return {:seed "<16 hex digits>"}: the timeline's seed instead, and
-;;            {:clock {:jitter_seed "<16 hex digits>"}}: its own clock (from the setup snapshot)
+;;            {:clock {:jitter_seed "<16 hex digits>"}}: its own clock (from where it starts)
 ;;   :machine (fn [request]) -> the machine the run boots, before it does: {:epoch_seconds ...
 ;;            :timer_slack_us ... :tsc_jitter_seed "<hex>" :modulation_stretch_us [low high]}, any
 ;;            of them (docs/PLUGINS.md's machine)

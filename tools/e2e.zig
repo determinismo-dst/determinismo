@@ -1707,9 +1707,10 @@ fn check_plugin_histories(context: *Context) !void {
     }, "plugin histories: given {s}, every {s}, right {s}; the program's {s}", .{ given, every, right, own });
 }
 
-/// A timeline's own clock: clock.py gives each timeline from the setup snapshot its own jitter
-/// at its branch, a tree's child keeping its root's. Its tape says it, so a replay needs no
-/// plugin: a flat timeline replays alone, and so does a tree's deepest, with its root's clock.
+/// A timeline's own clock: clock.py gives each timeline its own jitter at its branch, a tree's
+/// child from its branch point. Its tape says it, and a child's chain its ancestors' (each
+/// segment's clock), so a replay needs no plugin: a flat timeline replays alone, and so does a
+/// tree's deepest, each ancestor on its own clock.
 fn check_timeline_clocks(context: *Context) !void {
     const arena = context.arena;
     const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
@@ -1732,7 +1733,7 @@ fn check_timeline_clocks(context: *Context) !void {
     var replayed: [1]Branch = undefined;
     const replays = counted and parse_branches(replay, &replayed) == 1 and
         std.mem.eql(u8, replayed[0].events_hash, hash_of(&clocked, 1));
-    // A tree: its deepest child has its root's clock, and replays alone with it.
+    // A tree: its deepest child has a clock of its own, its chain its root's, and replays alone.
     const tree_tapes = try std.fs.path.join(arena, &.{ context.scratch, "clock-tree-tapes" });
     const record = try std.fs.path.join(arena, &.{ context.scratch, "clock-tree.jsonl" });
     const tree = try explore(context, &.{
@@ -1753,15 +1754,18 @@ fn check_timeline_clocks(context: *Context) !void {
         const root_index = chain_root(context, child);
         if (root_index) |root| {
             root_clock = tape_value(context, try std.fmt.allocPrint(arena, "{s}/branch-{d}.jsonl", .{ tree_tapes, root }), "clock_jitter_seed");
-            inherited = child_clock.len > 0 and std.mem.eql(u8, child_clock, root_clock);
+            // Its own, and its chain's first segment (its root) says the root's.
+            const chained = tape_value(context, child, "jitter_seed");
+            inherited = child_clock.len > 0 and root_clock.len > 0 and !std.mem.eql(u8, child_clock, root_clock) and
+                std.mem.eql(u8, chained, root_clock);
         }
     }
     expect_all(context, &.{
         .{ "a timeline's tape says its own clock", own.len > 0 },
         .{ "it replays alone from its tape", replays },
         .{ "the clocks change the timelines", moved },
-        .{ "a tree's deepest child has its root's clock", inherited and deep.depth > 0 },
-        .{ "and replays alone with it", deep.replays },
+        .{ "a tree's deepest child has its own clock, its chain its root's", inherited and deep.depth > 0 },
+        .{ "and replays alone, each ancestor on its clock", deep.replays },
     }, "timeline clocks: branch 1's {s}; the tree's deepest {?d} (depth {d}) {s}, its root's {s}", .{ own, deep.index, deep.depth, child_clock, root_clock });
 }
 

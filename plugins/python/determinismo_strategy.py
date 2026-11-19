@@ -64,8 +64,8 @@ def _dispatch(strategy, name, request):
             if "start" in inspect.signature(strategy.branch).parameters:
                 arguments.append(request.get("from"))
             # An int returned is the timeline's seed instead (another random future); a dict may
-            # also give its own clock, {"seed": int, "jitter_seed": int} (from the setup snapshot:
-            # a timeline from a moment keeps its parent's).
+            # also give its own clock, {"seed": int, "jitter_seed": int} (from where it starts:
+            # without one, a timeline from a moment keeps its parent's).
             chosen = strategy.branch(*arguments)
             if isinstance(chosen, int):
                 return {"seed": f"{chosen:016x}"}
