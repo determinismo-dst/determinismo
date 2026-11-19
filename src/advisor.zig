@@ -7,7 +7,7 @@
 const std = @import("std");
 const VM = @import("core").vm;
 const Events = @import("core").events;
-const Strategy = @import("strategy.zig");
+const Strategies = @import("strategies.zig");
 const bandit = @import("bandit.zig");
 const Draws = @import("draws.zig").Draws;
 
@@ -28,7 +28,7 @@ const again_reason = "another driver phase: the tree returned here for an object
 const answered_after = [_][]const u8{ "{\"name\":\"composer.drive_ms\"", "{\"name\":\"det.fork_index\"" };
 
 pub const Explorer = struct {
-    strategy: ?*Strategy,
+    strategy: ?*Strategies,
     learned: ?*const bandit.Bandit,
     /// The configuration draws' buckets this timeline drew, credited when it is judged.
     uses: [bandit.uses_max]bandit.Use = undefined,
@@ -106,7 +106,7 @@ pub const Explorer = struct {
                 ended = strategy.take_end() or ended; // Its batch before the decision.
                 if (overridden) return .{
                     .overridden = true,
-                    .reason = strategy.reason[0..strategy.reason_size],
+                    .reason = strategy.reason,
                     .decision = true,
                     .done = true,
                     .ended = ended,

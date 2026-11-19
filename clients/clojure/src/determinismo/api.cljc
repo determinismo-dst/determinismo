@@ -57,9 +57,12 @@
   (a map of a label to a range's number or an option's name): the run as it goes with that
   choice. {:id ...}. With :plan true nothing starts: what it would be (how many timelines its
   budget buys at the rate of the last run like it, the named choices that one drew), a plan
-  `execute` starts."
+  `execute` starts. `:strategy` is a plugin (\"@all-hooks\", a command) or several, a vector:
+  each asked in order, the first answer winning (serve's strategy, one a line)."
   [request-map]
-  (let [asked (cond-> request-map (:decide request-map) (update :decide decide-text))]
+  (let [asked (cond-> request-map
+                (:decide request-map) (update :decide decide-text)
+                (sequential? (:strategy request-map)) (update :strategy #(str/join "\n" %)))]
     (if (:plan asked)
       (let [planned (assoc (parse (request :post "/runs" asked)) :request (dissoc request-map :plan))]
         (tap/tell :run/plan planned planned))

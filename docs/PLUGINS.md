@@ -115,6 +115,19 @@ A run keeps the upload it names by content, as it keeps its program: its request
 the name changes the runs started after it, never a running one or its resume; a repeat takes
 the latest.
 
+Several plugins can serve one run: `--strategy` given once for each (serve's `strategy` one a
+line; the Clojure client's `:strategy` a vector), each on its own transport, asked in the order
+given (src/strategies.zig). A decision, a timeline's seed or clock and where the tree returns are
+the first answer's; every plugin hears the timelines' starts and ends and the events it wants;
+the machine passes from one to the next, each seeing what the ones before it decided; every
+checker's verdicts are the timeline's; the first plugin that plans draws its plan before any is
+asked. So a checker, a fault plugin and a decision maker combine as they come:
+
+```sh
+determinismo explore ... --strategy "python3 plugins/python/decide_named.py node.start_draw 7" \
+                         --strategy "python3 plugins/python/count_check.py fault 0"
+```
+
 A plugin can run anywhere: `tcp://<address>:<port>` connects to one already listening (one
 connection per exploration worker). `plugins/python/serve_tcp.py <port> <command>` serves any
 plugin command that way, and an SSH tunnel brings it to the host from a laptop:

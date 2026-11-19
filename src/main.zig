@@ -14,6 +14,7 @@ const Snapshot = @import("core").snapshot;
 const Events = @import("core").events;
 const report = @import("report.zig");
 const Strategy = @import("strategy.zig");
+const Strategies = @import("strategies.zig");
 const tape = @import("core").tape;
 const guest_memory = @import("core").guest_memory;
 const regex = @import("regex");
@@ -162,7 +163,8 @@ const usage =
     \\                            [--branching tree|flat]   (tree, the default: also from moments
     \\                            of earlier branches that reached new behaviors; replay one by
     \\                            its tape)
-    \\                            [--strategy "<plugin> <args>"] [--tape-dir <dir>]
+    \\                            [--strategy "<plugin> <args>"]...   (several: each asked in
+    \\                            order, strategies.zig) [--tape-dir <dir>]
     \\                            [--run-url <url>]   (the run's HTTP API, told to the strategy:
     \\                            serve gives it) [--history <file>]   (the behaviors the
     \\                            system's last runs reached, record.jsonl.behaviors: one they
@@ -1802,7 +1804,7 @@ const Exploration = struct {
     /// record, so that a replay by another build says so.
     host: u64 = 0,
     exploration_seed: u64,
-    strategy: ?*Strategy = null,
+    strategy: ?*Strategies = null,
     tape_directory: ?[]const u8 = null,
     /// Set when replaying one recorded branch.
     replay: ?struct { header: tape.Header, overrides: *tape.Overrides } = null,
@@ -2681,10 +2683,13 @@ fn command_explore(
     // parts from it wherever they changed something (a trial that filled /run, run 717).
     const moment_steps = arguments.moment_command != null or arguments.moment_script_path != null or
         arguments.moment_interactive;
+    // The strategy plugins' connections, closed in the verifier's process.
+    var held_buffer: [2 * Strategies.plugins_max]linux.fd_t = undefined;
+    const held: []const linux.fd_t = if (exploration.strategy) |strategy| strategy.held(&held_buffer) else &.{};
     const verifier: ?replays.Verifier = if (arguments.record_path != null and
         arguments.tape_directory != null and arguments.verify_percent > 0 and !moment_steps and
         arguments.branch_only == null and arguments.tape_path == null and arguments.raw_argv.len >= 2)
-        try replays.Verifier.start(context.arena, context.io, arguments.raw_argv, arguments.record_path.?, arguments.tape_directory.?, arguments.verify_percent, jobs, if (exploration.strategy) |strategy| if (strategy.wasm == null) &.{ strategy.to_plugin, strategy.from_plugin } else &.{} else &.{})
+        try replays.Verifier.start(context.arena, context.io, arguments.raw_argv, arguments.record_path.?, arguments.tape_directory.?, arguments.verify_percent, jobs, held)
     else
         null;
     if (arguments.branching == .tree) {
@@ -2794,7 +2799,7 @@ const moment_after_snapshot = node_core.moment_after_snapshot;
 
 fn strategy_start(context: Context, arguments: *const Arguments, exploration: *Exploration) !void {
     const command = arguments.strategy_command orelse return;
-    const strategy = try context.arena.create(Strategy);
+    const strategy = try context.arena.create(Strategies);
     try strategy.start(context.arena, command, context.environ);
     try strategy.hello(exploration.exploration_seed, arguments.run_url);
     exploration.strategy = strategy;
@@ -6692,7 +6697,7 @@ const Counts = struct {
 
 fn tree_returns(
     arena: std.mem.Allocator,
-    strategy: ?*Strategy,
+    strategy: ?*Strategies,
     generation: u32,
     chosen: []const Candidate,
     counts: Counts,
@@ -7806,7 +7811,7 @@ fn events_file(arena: std.mem.Allocator, directory: []const u8, name: []const u8
 /// check's; a replay without the plugin keeps the guest hash, not them (Strategy.judge).
 const StrategyCheck = struct {
     inner: ?VM.EndChecks,
-    strategy: *Strategy,
+    strategy: *Strategies,
     index: u32,
 
     fn hook(check: *const StrategyCheck) VM.EndChecks {
@@ -7856,7 +7861,7 @@ fn say(comptime format: []const u8, arguments: anytype) void {
 /// Tells the strategy how the branch ended; returns true when it asks to stop.
 const BranchResult = struct { index: u32, outcome: VM.Outcome };
 
-fn strategy_branch_end(strategy: *Strategy, vm: *VM, branch: BranchResult) !bool {
+fn strategy_branch_end(strategy: *Strategies, vm: *VM, branch: BranchResult) !bool {
     var failing_buffer: [64][]const u8 = undefined;
     var failing_count: u32 = 0;
     for (vm.events.properties[0..vm.events.property_count]) |*property| {
@@ -8483,7 +8488,11 @@ fn parse_option(
     } else if (eql(u8, flag, "--jobs")) {
         arguments.jobs = try std.fmt.parseInt(u32, value, 10);
     } else if (eql(u8, flag, "--strategy")) {
-        arguments.strategy_command = value;
+        // Given again: another plugin, after the ones before it (strategies.zig: one a line).
+        arguments.strategy_command = if (arguments.strategy_command) |before|
+            try std.fmt.allocPrint(arena, "{s}\n{s}", .{ before, value })
+        else
+            value;
     } else if (eql(u8, flag, "--tape-dir")) {
         arguments.tape_directory = value;
     } else if (eql(u8, flag, "--tape")) {
@@ -8867,6 +8876,7 @@ test branch_seed {
 
 test {
     _ = @import("strategy.zig");
+    _ = @import("strategies.zig");
     _ = @import("wasm_plugin.zig");
     _ = @import("core").kvm;
     _ = @import("core").rtc;

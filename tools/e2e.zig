@@ -214,73 +214,74 @@ fn scratches_sweep(io: std.Io, arena: std.mem.Allocator, scratches: []const u8) 
 /// and counts them.
 fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
     const checks = .{
-        .{ "bank", check_bank },                             .{ "shop", check_shop },
-        .{ "tapes", check_tapes },                           .{ "debugging", check_debugging },
-        .{ "python", check_python_strategy },                .{ "setup-decisions", check_setup_decisions },
-        .{ "machine-decisions", check_machine_decisions },   .{ "branch-seeds", check_branch_seeds },
-        .{ "plugin-faults", check_plugin_faults },           .{ "plugin-checks", check_plugin_checks },
-        .{ "device-models", check_device_models },           .{ "plugin-histories", check_plugin_histories },
-        .{ "wasm-plugin", check_wasm_plugin },               .{ "wasm-misbehaving", check_wasm_misbehaving },
-        .{ "wasm-reach", check_wasm_reach },                 .{ "wasm-upload", check_wasm_upload },
-        .{ "timeline-clocks", check_timeline_clocks },       .{ "egress", check_egress },
-        .{ "ingress", check_ingress },                       .{ "ingress-session", check_ingress_session },
-        .{ "moments", check_moments },                       .{ "properties", check_builtin_properties },
-        .{ "entropy", check_kernel_entropy },                .{ "quiet", check_quiet_period },
-        .{ "clock_jitter", check_clock_jitter },             .{ "query", check_query },
-        .{ "progress", check_progress_while_quiet },         .{ "network", check_network_faults },
-        .{ "fault-exclusions", check_fault_exclusions },     .{ "serve", check_serve },
-        .{ "until", check_until_and_causality },             .{ "coverage-gate", check_coverage_gate },
-        .{ "coverage", check_coverage },                     .{ "parallel", check_parallel },
-        .{ "fork", check_fork },                             .{ "tree", check_tree },
-        .{ "startup-coverage", check_startup_coverage },     .{ "memory-climb", check_memory_climb },
-        .{ "disk", check_disk },                             .{ "shape", check_shape },
-        .{ "repl-strategy", check_repl_strategy },           .{ "end", check_end },
-        .{ "plans", check_plans },                           .{ "durability", check_durability },
-        .{ "mutate", check_mutate },                         .{ "interleave", check_interleave },
-        .{ "checks", check_host_checks },                    .{ "pausing", check_pausing },
-        .{ "shrink", check_shrink },                         .{ "holds", check_holds },
-        .{ "coverage-set", check_coverage_set },             .{ "inject", check_inject },
-        .{ "aim", check_aim },                               .{ "aftershock", check_aftershock },
-        .{ "record-power-loss", check_record_power_loss },   .{ "errno-storm", check_errno_storm },
-        .{ "compose", check_compose },                       .{ "shards", check_shards },
-        .{ "stress", check_stress },                         .{ "controller", check_controller },
-        .{ "clojure", check_clojure },                       .{ "k3s", check_k3s },
-        .{ "script", check_script },                         .{ "modulation", check_cpu_modulation },
-        .{ "profile", check_profile },                       .{ "catalog", check_catalog },
-        .{ "guidance", check_guidance },                     .{ "voidstar", check_voidstar },
-        .{ "changed", check_changed },                       .{ "readdress", check_readdress },
-        .{ "unlist", check_unlist },                         .{ "signal", check_signal },
-        .{ "syscall_error", check_syscall_error },           .{ "swarm", check_swarm },
-        .{ "metastable", check_metastable },                 .{ "file_error", check_file_error },
-        .{ "retroactive", check_retroactive },               .{ "epoch", check_epoch },
-        .{ "drive", check_drive },                           .{ "hang", check_hang },
-        .{ "pinned", check_pinned },                         .{ "slow", check_slow },
-        .{ "ending-window", check_ending_window },           .{ "sought", check_sought },
-        .{ "optimize", check_optimize },                     .{ "states", check_states },
-        .{ "crash-points", check_crash_points },             .{ "nodes-down", check_nodes_down },
-        .{ "stale-pid", check_stale_pid },                   .{ "memory-growth", check_memory_growth },
-        .{ "upgrade", check_upgrade },                       .{ "knobs", check_knobs },
-        .{ "quorum", check_quorum },                         .{ "spare", check_spare },
-        .{ "saved", check_saved },                           .{ "concurrent", check_concurrent },
-        .{ "resume", check_resume },                         .{ "ui", check_ui },
-        .{ "runs", check_runs },                             .{ "kubernetes", check_kubernetes },
-        .{ "steps", check_steps },                           .{ "before-nodes", check_before_nodes },
-        .{ "session", check_session },                       .{ "fast", check_fast },
-        .{ "sandbox", check_sandbox },                       .{ "devproxy", check_devproxy },
-        .{ "sandbox-egress", check_sandbox_egress },         .{ "ci", check_ci },
-        .{ "repl", check_repl },                             .{ "mechanics", check_mechanics },
-        .{ "budget", check_budget },                         .{ "sinks", check_sinks },
-        .{ "dotnet", check_dotnet },                         .{ "lines", check_lines },
-        .{ "voidstar-static", check_voidstar_static },       .{ "frozen-start", check_frozen_start },
-        .{ "hangup", check_hangup },                         .{ "frozen-step", check_frozen_step },
-        .{ "templates", check_templates },                   .{ "volumes", check_volumes },
-        .{ "setup-mode", check_setup_mode },                 .{ "jank", check_jank_repl },
-        .{ "bank-steps", check_bank_steps },                 .{ "checkpoint", check_session_checkpoint },
-        .{ "ingress-checkpoint", check_ingress_checkpoint }, .{ "ingress-crash", check_ingress_crash },
-        .{ "draws", check_draws },                           .{ "exit-stack", check_exit_stack },
-        .{ "plan-calls", check_plan_calls },                 .{ "services", check_services },
-        .{ "sites", check_sites },                           .{ "client", check_client },
-        .{ "session-exact", check_session_exact },           .{ "java-watch", check_java_watch },
+        .{ "bank", check_bank },                           .{ "shop", check_shop },
+        .{ "tapes", check_tapes },                         .{ "debugging", check_debugging },
+        .{ "python", check_python_strategy },              .{ "setup-decisions", check_setup_decisions },
+        .{ "machine-decisions", check_machine_decisions }, .{ "branch-seeds", check_branch_seeds },
+        .{ "plugin-faults", check_plugin_faults },         .{ "plugin-checks", check_plugin_checks },
+        .{ "device-models", check_device_models },         .{ "plugin-histories", check_plugin_histories },
+        .{ "wasm-plugin", check_wasm_plugin },             .{ "wasm-misbehaving", check_wasm_misbehaving },
+        .{ "wasm-reach", check_wasm_reach },               .{ "plugins-many", check_plugins_many },
+        .{ "wasm-upload", check_wasm_upload },             .{ "timeline-clocks", check_timeline_clocks },
+        .{ "egress", check_egress },                       .{ "ingress", check_ingress },
+        .{ "ingress-session", check_ingress_session },     .{ "moments", check_moments },
+        .{ "properties", check_builtin_properties },       .{ "entropy", check_kernel_entropy },
+        .{ "quiet", check_quiet_period },                  .{ "clock_jitter", check_clock_jitter },
+        .{ "query", check_query },                         .{ "progress", check_progress_while_quiet },
+        .{ "network", check_network_faults },              .{ "fault-exclusions", check_fault_exclusions },
+        .{ "serve", check_serve },                         .{ "until", check_until_and_causality },
+        .{ "coverage-gate", check_coverage_gate },         .{ "coverage", check_coverage },
+        .{ "parallel", check_parallel },                   .{ "fork", check_fork },
+        .{ "tree", check_tree },                           .{ "startup-coverage", check_startup_coverage },
+        .{ "memory-climb", check_memory_climb },           .{ "disk", check_disk },
+        .{ "shape", check_shape },                         .{ "repl-strategy", check_repl_strategy },
+        .{ "end", check_end },                             .{ "plans", check_plans },
+        .{ "durability", check_durability },               .{ "mutate", check_mutate },
+        .{ "interleave", check_interleave },               .{ "checks", check_host_checks },
+        .{ "pausing", check_pausing },                     .{ "shrink", check_shrink },
+        .{ "holds", check_holds },                         .{ "coverage-set", check_coverage_set },
+        .{ "inject", check_inject },                       .{ "aim", check_aim },
+        .{ "aftershock", check_aftershock },               .{ "record-power-loss", check_record_power_loss },
+        .{ "errno-storm", check_errno_storm },             .{ "compose", check_compose },
+        .{ "shards", check_shards },                       .{ "stress", check_stress },
+        .{ "controller", check_controller },               .{ "clojure", check_clojure },
+        .{ "k3s", check_k3s },                             .{ "script", check_script },
+        .{ "modulation", check_cpu_modulation },           .{ "profile", check_profile },
+        .{ "catalog", check_catalog },                     .{ "guidance", check_guidance },
+        .{ "voidstar", check_voidstar },                   .{ "changed", check_changed },
+        .{ "readdress", check_readdress },                 .{ "unlist", check_unlist },
+        .{ "signal", check_signal },                       .{ "syscall_error", check_syscall_error },
+        .{ "swarm", check_swarm },                         .{ "metastable", check_metastable },
+        .{ "file_error", check_file_error },               .{ "retroactive", check_retroactive },
+        .{ "epoch", check_epoch },                         .{ "drive", check_drive },
+        .{ "hang", check_hang },                           .{ "pinned", check_pinned },
+        .{ "slow", check_slow },                           .{ "ending-window", check_ending_window },
+        .{ "sought", check_sought },                       .{ "optimize", check_optimize },
+        .{ "states", check_states },                       .{ "crash-points", check_crash_points },
+        .{ "nodes-down", check_nodes_down },               .{ "stale-pid", check_stale_pid },
+        .{ "memory-growth", check_memory_growth },         .{ "upgrade", check_upgrade },
+        .{ "knobs", check_knobs },                         .{ "quorum", check_quorum },
+        .{ "spare", check_spare },                         .{ "saved", check_saved },
+        .{ "concurrent", check_concurrent },               .{ "resume", check_resume },
+        .{ "ui", check_ui },                               .{ "runs", check_runs },
+        .{ "kubernetes", check_kubernetes },               .{ "steps", check_steps },
+        .{ "before-nodes", check_before_nodes },           .{ "session", check_session },
+        .{ "fast", check_fast },                           .{ "sandbox", check_sandbox },
+        .{ "devproxy", check_devproxy },                   .{ "sandbox-egress", check_sandbox_egress },
+        .{ "ci", check_ci },                               .{ "repl", check_repl },
+        .{ "mechanics", check_mechanics },                 .{ "budget", check_budget },
+        .{ "sinks", check_sinks },                         .{ "dotnet", check_dotnet },
+        .{ "lines", check_lines },                         .{ "voidstar-static", check_voidstar_static },
+        .{ "frozen-start", check_frozen_start },           .{ "hangup", check_hangup },
+        .{ "frozen-step", check_frozen_step },             .{ "templates", check_templates },
+        .{ "volumes", check_volumes },                     .{ "setup-mode", check_setup_mode },
+        .{ "jank", check_jank_repl },                      .{ "bank-steps", check_bank_steps },
+        .{ "checkpoint", check_session_checkpoint },       .{ "ingress-checkpoint", check_ingress_checkpoint },
+        .{ "ingress-crash", check_ingress_crash },         .{ "draws", check_draws },
+        .{ "exit-stack", check_exit_stack },               .{ "plan-calls", check_plan_calls },
+        .{ "services", check_services },                   .{ "sites", check_sites },
+        .{ "client", check_client },                       .{ "session-exact", check_session_exact },
+        .{ "java-watch", check_java_watch },
     };
     // A check's whole name runs it alone (check.sh's `ui` ran guidance and quiet too).
     var exact = std.mem.eql(u8, only, "tla");
@@ -1686,6 +1687,47 @@ fn check_plugin_checks(context: *Context) !void {
         .{ "a fault sometimes: passes", std.mem.eql(u8, some, "PASS") },
         .{ "a replay without the plugin keeps the guest hash", recorded.len > 0 and std.mem.eql(u8, recorded, replayed) },
     }, "plugin checks: {d} timelines, asked {d} times; {d} faults; at most 0: {s}, sometimes: {s}; guest {s} replayed {s}", .{ count, asked, faults, most, some, recorded, replayed });
+}
+
+/// Two plugins in one run (`--strategy` twice: strategies.zig): decide_named.py answers the
+/// setup's node.start_draw and count_check.py judges each timeline; both take effect, the run
+/// says both names, and a timeline replays from its tape without either.
+fn check_plugins_many(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
+    const tapes = try std.fs.path.join(arena, &.{ context.scratch, "plugins-many-tapes" });
+    const events = try std.fs.path.join(arena, &.{ context.scratch, "plugins-many-events" });
+    const common = [_][]const u8{ "--program", program, "--scenario", "bank", "--seed", "3", "--no-swarm" };
+    const report = try explore(context, &(common ++ [_][]const u8{
+        "--branches", "4",                                                        "--jobs",       "2",
+        "--strategy", "python3 plugins/python/decide_named.py node.start_draw 7", "--strategy",   "python3 plugins/python/count_check.py fault 0",
+        "--tape-dir", tapes,                                                      "--events-dir", events,
+    }));
+    var branches: [4]Branch = undefined;
+    const count = parse_branches(report, &branches);
+    // The first's answer: the setup's draw of node.start_draw overridden to 7.
+    const draws = std.Io.Dir.cwd().readFileAlloc(context.io, try std.fs.path.join(arena, &.{ events, "draws-setup.jsonl" }), arena, .limited(1 << 20)) catch "";
+    var answered = false;
+    var lines = std.mem.tokenizeScalar(u8, draws, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "\"name\":\"node.start_draw\"") == null) continue;
+        answered = std.mem.indexOf(u8, line, "\"value\":7,") != null and std.mem.indexOf(u8, line, "\"overridden\":0,") == null;
+    }
+    // The second's verdicts, asked once a timeline.
+    const asked = try query_count(context, &.{ events, "event=strategy_check" });
+    const most = report_verdict(report, "at most 0 fault events in a timeline");
+    const named = std.mem.indexOf(u8, report, "[determinismo] strategy: decide-named") != null and
+        std.mem.indexOf(u8, report, "[determinismo] strategy: count-check") != null;
+    const replay = try explore(context, &(common ++ [_][]const u8{ "--tape", try std.fs.path.join(arena, &.{ tapes, "branch-1.jsonl" }) }));
+    var replayed: [1]Branch = undefined;
+    const replays = count == 4 and parse_branches(replay, &replayed) == 1 and
+        std.mem.eql(u8, replayed[0].events_hash, hash_of(branches[0..count], 1));
+    expect_all(context, &.{
+        .{ "the first plugin answers the setup's node.start_draw (7)", answered },
+        .{ "the second judges each timeline", count == 4 and asked == 4 and most.len > 0 },
+        .{ "both plugins said hello", named },
+        .{ "a timeline replays alone from its tape", replays },
+    }, "plugins many: {d} timelines, checked {d} times, at most 0 faults: {s}", .{ count, asked, most });
 }
 
 /// A checker plugin over a history: history_check.py is given det-selftest's `squares` records

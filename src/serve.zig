@@ -1946,7 +1946,7 @@ fn run_start(server: *Server, asked_as_given: RunRequest, out: *std.Io.Writer) !
     };
     // An uploaded strategy kept by content as the program is: its record says which bytes
     // answered, and a resume runs them, whatever was uploaded under its name since.
-    if (asked.strategy) |strategy| if (std.mem.startsWith(u8, strategy, "@")) {
+    if (asked.strategy) |strategy| if (uploads_named(strategy)) {
         asked.strategy_asked = strategy;
         asked.strategy = try strategy_resolve(server, strategy);
     };
@@ -5168,6 +5168,28 @@ fn strategy_name_valid(name: []const u8) bool {
 /// as a run's program), with the arguments (`wasm:` before a WebAssembly module's: run inside
 /// the explorer). Anything else is a command as given.
 fn strategy_resolve(server: *Server, strategy: []const u8) ![]const u8 {
+    if (!uploads_named(strategy)) return strategy;
+    // Several plugins, one a line (strategies.zig): each resolved alone.
+    var resolved: std.Io.Writer.Allocating = .init(server.arena);
+    var lines = std.mem.splitScalar(u8, strategy, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) try resolved.writer.writeAll("\n");
+        first = false;
+        try resolved.writer.writeAll(try plugin_resolve(server, line));
+    }
+    return resolved.written();
+}
+
+/// Whether any of a strategy's plugins (one a line) names an upload (`@<name>`).
+fn uploads_named(strategy: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, strategy, '\n');
+    while (lines.next()) |line| if (std.mem.startsWith(u8, line, "@")) return true;
+    return false;
+}
+
+/// One plugin's command: an upload's kept copy (`@<name> args`), or as given.
+fn plugin_resolve(server: *Server, strategy: []const u8) ![]const u8 {
     if (!std.mem.startsWith(u8, strategy, "@")) return strategy;
     const end = std.mem.indexOfScalar(u8, strategy, ' ') orelse strategy.len;
     const name = strategy[1..end];

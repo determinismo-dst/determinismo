@@ -11,7 +11,7 @@ const wasm_plugin = @import("wasm_plugin.zig");
 
 pub const override_size_max = tape.override_size_max;
 pub const reason_size_max = tape.reason_size_max;
-const name_size_max = 128;
+pub const name_size_max = 128;
 const line_size_max = 16 * 1024;
 const parse_buffer_size = 64 * 1024;
 const argument_count_max = 16;
