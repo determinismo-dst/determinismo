@@ -3349,7 +3349,15 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
             options.from_hold = .{ .idle = idle };
         }
         defer options.from_hold = null;
+        // Its strategy judges it at its end too, when it wants (after the program's checks).
+        var strategy_check: StrategyCheck = undefined;
+        const end_checks_own = options.end_checks;
+        if (exploration.strategy) |strategy| if (strategy.wants_check) {
+            strategy_check = .{ .inner = end_checks_own, .strategy = strategy, .index = place.index };
+            options.end_checks = strategy_check.hook();
+        };
         try vm.init_from_snapshot(options, place.snapshot);
+        options.end_checks = end_checks_own;
         defer vm.deinit();
         // A timeline extending another (a session's): its lineage the parent's and the parent up
         // to the moment, its events its own from there on, in the run's events.
@@ -7753,6 +7761,31 @@ fn events_file(arena: std.mem.Allocator, directory: []const u8, name: []const u8
     const path = try std.fs.path.join(arena, &.{ directory, name });
     return open_for_writing(arena, path);
 }
+
+/// A timeline's end checks with its strategy's after the program's own (Strategy.judge): the
+/// plugin's assertions are the timeline's at its end moment, after its guest hash, as a host
+/// check's; a replay without the plugin keeps the guest hash, not them (Strategy.judge).
+const StrategyCheck = struct {
+    inner: ?VM.EndChecks,
+    strategy: *Strategy,
+    index: u32,
+
+    fn hook(check: *const StrategyCheck) VM.EndChecks {
+        return .{ .context = check, .run = run };
+    }
+
+    fn run(context: *const anyopaque, events: *Events, end: Events.Moment, keep: ?[]const u8) anyerror!void {
+        const check: *const StrategyCheck = @ptrCast(@alignCast(context));
+        if (check.inner) |inner| try inner.run(inner.context, events, end, keep);
+        const buffer = try std.heap.page_allocator.alloc(u8, Strategy.check_assertions_max * Strategy.check_line_size_max);
+        defer std.heap.page_allocator.free(buffer);
+        var lines: [Strategy.check_assertions_max][]const u8 = undefined;
+        const count = try check.strategy.judge(check.index, buffer, &lines);
+        for (lines[0..count]) |line| try events.emit(end, line);
+        var said: [128]u8 = undefined;
+        try events.emit(end, try std.fmt.bufPrint(&said, "{{\"event\":\"strategy_check\",\"details\":{{\"assertions\":{d}}}}}", .{count}));
+    }
+};
 
 /// Tells the strategy how the branch ended; returns true when it asks to stop.
 const BranchResult = struct { index: u32, outcome: VM.Outcome };

@@ -8,7 +8,6 @@ A strategy is an object with any of these methods; missing ones answer the defau
                                               reason), ...], up to count (the explorer fills
                                               the rest); with `wants = ["behaviors"]` each
                                               candidate has its behaviors (docs/PLUGINS.md)
-    branch(index, seed)                       before each branch
     random(pull, default, source, moment[, decision])
                                               a decision: return bytes to override, or None;
                                               `decision` is its label when the guest named it
@@ -20,6 +19,9 @@ A strategy is an object with any of these methods; missing ones answer the defau
     branch(index, seed[, start])              a timeline starts: return an int to give it another seed
     plan()                                    with wants "plans": {"<decision name>": [[low, high,
                                               weight], ...]}, drawn from by the explorer
+    check(index)                              with wants "check": a timeline ended; its assertions,
+                                              [{"type": "always"|"sometimes"|..., "message",
+                                              "condition", "details"}, ...], the timeline's
     branch_end(index, outcome, events, failing)   return True to stop the exploration
 
 `default` is the bytes the branch would get; `source` is the asking process's name; `moment`
@@ -125,6 +127,9 @@ def _dispatch(strategy, name, request):
         # With `wants = ["machine", ...]`: the machine the run boots, asked before it does
         # (the run's own as the request); the fields the reply gives replace them.
         return strategy.machine(request) if hasattr(strategy, "machine") else {}
+    if method == "check":
+        # With `wants = ["check", ...]`: the timeline ended (its events told); its verdicts.
+        return {"assertions": list(strategy.check(request["index"]) or [])} if hasattr(strategy, "check") else {}
     if method == "branch_end":
         stop = False
         if hasattr(strategy, "branch_end"):

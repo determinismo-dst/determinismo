@@ -20,6 +20,10 @@
 ;;   :machine (fn [request]) -> the machine the run boots, before it does: {:epoch_seconds ...
 ;;            :timer_slack_us ... :tsc_jitter_seed "<hex>" :modulation_stretch_us [low high]}, any
 ;;            of them (docs/PLUGINS.md's machine)
+;;   :check   (fn [state request]) -> a timeline that ended, judged from the events it was told:
+;;            [{:type "always" :message "..." :condition bool :details {...}} ...], the
+;;            timeline's assertions (docs/PLUGINS.md's check); with :wants ["plans"] it is never
+;;            asked for a decision
 ;; :wants (["behaviors"], ["labeled"], ["setup"]: the setup's decisions too, ...) and :decide make
 ;; the hello's answer. `state` is an atom
 ;; per connection: one exploration worker's timelines, reset at each branch. Every answer a
@@ -288,9 +292,11 @@ std::string determinismo_close(std::string const &fd_text) {
       (let [all (every-strategy)]
         {:name (str #?(:jank "jank/" :default "clojure/") (name @current)
                     (when (seq @by-source) (str " +" (count @by-source) " per source")))
-         :decides (boolean (some :decide all))
+         ;; A checker is told the timeline's events: it is in the timelines as a decider is.
+         :decides (boolean (some #(or (:decide %) (:check %)) all))
          :wants (vec (distinct (concat (mapcat (fn [one] (or (:wants one) ["behaviors"])) all)
-                                       (when (some :machine all) ["machine"]))))
+                                       (when (some :machine all) ["machine"])
+                                       (when (some :check all) ["check"]))))
          :ring ring-supported?})
       (= method "branch")
       ;; A :branch function may give the timeline another seed: {:seed "<16 hex digits>"}.
@@ -307,6 +313,8 @@ std::string determinismo_close(std::string const &fd_text) {
         (if ended {:end true} {}))
       (= method "machine")
       (or (when-let [f (:machine chosen)] (f request)) {})
+      (= method "check")
+      {:assertions (vec (or (when-let [f (:check chosen)] (f state request)) []))}
       (= method "random")
       (or (when-let [f (:decide (strategy-for (:source request)))] (f state request)) {})
       (= method "branch_end")

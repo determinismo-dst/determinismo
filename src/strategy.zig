@@ -124,6 +124,9 @@ wants_plans: bool = false,
 wants_setup: bool = false,
 /// `"wants": ["machine"]`: asked for the machine a run boots before it does (`machine`).
 wants_machine: bool = false,
+/// `"wants": ["check"]`: asked to judge each timeline that ended (`check`, at its end moment):
+/// its assertions are the timeline's, as a host check's (checks.zig).
+wants_check: bool = false,
 plan: [plan_labels_max]Planned = undefined,
 plan_count: u8 = 0,
 /// When the last batch went (virtual time): a plan older than `plan_refresh_ns` is refreshed.
@@ -295,6 +298,7 @@ pub fn hello(strategy: *Strategy, exploration_seed: u64, run_url: ?[]const u8) !
     strategy.wants_plans = false;
     strategy.wants_setup = false;
     strategy.wants_machine = false;
+    strategy.wants_check = false;
     strategy.plan_count = 0;
     strategy.flushed_ns = 0;
     strategy.batch_count = 0;
@@ -314,6 +318,7 @@ pub fn hello(strategy: *Strategy, exploration_seed: u64, run_url: ?[]const u8) !
         if (std.mem.eql(u8, item.string, "plans")) strategy.wants_plans = true;
         if (std.mem.eql(u8, item.string, "setup")) strategy.wants_setup = true;
         if (std.mem.eql(u8, item.string, "machine")) strategy.wants_machine = true;
+        if (std.mem.eql(u8, item.string, "check")) strategy.wants_check = true;
     };
     // A plan comes with a batch's reply: plans need batches.
     if (strategy.wants_plans) strategy.wants_batched = true;
@@ -1043,6 +1048,49 @@ pub fn branch_end(strategy: *Strategy, end: BranchEnd) !bool {
     const reply = try strategy.call(writer.buffered());
     const stop_value = reply.get("stop") orelse return false;
     return stop_value == .bool and stop_value.bool;
+}
+
+/// A plugin's verdicts on a timeline: at most this many, each an assertion event line.
+pub const check_assertions_max = 64;
+pub const check_line_size_max = 4096; // Events.emit's largest event.
+const assertion_types = [_][]const u8{ "always", "always_or_unreachable", "sometimes", "reachable", "unreachable" };
+
+/// A timeline that ended, judged by a plugin that wants "check" (its events told first):
+/// `{"method":"check","index":I}`, the reply `{"assertions":[{"type":"always"|"sometimes"|...,
+/// "message":"...","condition":bool,"details":{...}},...]}`. Each is written into `lines` as an
+/// assertion event (`{"assert":{...}}`, as the SDKs make), in `buffer`; returns how many.
+pub fn judge(strategy: *Strategy, index: u32, buffer: []u8, lines: [][]const u8) !usize {
+    assert(lines.len >= check_assertions_max);
+    _ = try strategy.flush(); // Its last events first: it judges the whole timeline.
+    strategy.ended = false;
+    var writer: std.Io.Writer = .fixed(&strategy.request);
+    try writer.print("{{\"method\":\"check\",\"index\":{d}}}", .{index});
+    const reply = try strategy.call(writer.buffered());
+    const assertions = reply.get("assertions") orelse return 0;
+    if (assertions != .array or assertions.array.items.len > check_assertions_max) return error.BadPluginReply;
+    var used: usize = 0;
+    for (assertions.array.items, 0..) |item, position| {
+        if (item != .object) return error.BadPluginReply;
+        const kind = item.object.get("type") orelse return error.BadPluginReply;
+        const message = item.object.get("message") orelse return error.BadPluginReply;
+        if (kind != .string or message != .string or message.string.len == 0) return error.BadPluginReply;
+        const known = for (assertion_types) |name| {
+            if (std.mem.eql(u8, name, kind.string)) break true;
+        } else false;
+        if (!known) return error.BadPluginReply;
+        const condition = item.object.get("condition") orelse std.json.Value{ .bool = true };
+        if (condition != .bool) return error.BadPluginReply;
+        const details = item.object.get("details") orelse std.json.Value{ .object = .empty };
+        if (details != .object) return error.BadPluginReply;
+        const room = buffer[used..@min(buffer.len, used + check_line_size_max)];
+        var line: std.Io.Writer = .fixed(room);
+        line.print("{{\"assert\":{{\"type\":\"{s}\",\"message\":{f},\"condition\":{},\"details\":{f}}}}}", .{
+            kind.string, std.json.fmt(message.string, .{}), condition.bool, std.json.fmt(details, .{}),
+        }) catch return error.BadPluginReply;
+        lines[position] = line.buffered();
+        used += line.buffered().len;
+    }
+    return assertions.array.items.len;
 }
 
 /// One request line and its reply, for other plugins on this transport (causality planners).
