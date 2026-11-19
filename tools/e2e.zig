@@ -5933,7 +5933,7 @@ fn check_guidance(context: *Context) !void {
     });
     const guided_events = try std.fmt.allocPrint(arena, "{s}/guidance-guided", .{context.scratch});
     _ = try explore(context, &(common ++ [_][]const u8{ "--strategy", strategy, "--events-dir", guided_events }));
-    const solved = "assert.message=\"maze sum\" assert.condition=true";
+    const solved = "assert.message=\"maze sum: the digits add up\" assert.condition=true";
     const random_solved = try query_count(context, &.{ random_events, solved });
     const guided_solved = try query_count(context, &.{ guided_events, solved });
     expect_all(context, &.{
