@@ -4224,6 +4224,16 @@ fn check_serve(context: *Context) !void {
             std.mem.indexOf(u8, build, "\"initrd\":\"") != null },
     }, "serve /build: {s}", .{build});
     const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
+    // A guest past what a VM takes: refused with the limit said, no run started (trial 2083 on
+    // srv4: 40 GiB, a run in error with the explorer's usage text).
+    const oversized = try std.fmt.allocPrint(arena, "{{\"program\":{f},\"scenario\":\"bank\",\"seed\":3,\"memory_mib\":40960}}", .{std.json.fmt(program, .{})});
+    const refused = try run_kept(context, &.{ "curl", "-s", "-w", "\n%{http_code}", "-H", "Content-Type: application/json", "-X", "POST", "-d", oversized, url ++ "/runs" });
+    const refused_runs = curl(context, &.{url ++ "/runs"}) catch "";
+    expect_all(context, &.{
+        .{ "a guest past a VM's size is refused (400)", std.mem.endsWith(u8, std.mem.trimEnd(u8, refused.stdout, "\n"), "\n400") },
+        .{ "the refusal says the limit", std.mem.indexOf(u8, refused.stdout, "a VM takes 64 to 32768 MiB") != null },
+        .{ "no run started for it", std.mem.indexOf(u8, refused_runs, "\"id\":") == null },
+    }, "serve oversized guest: {s}; runs {s}", .{ refused.stdout, refused_runs });
     // With an automation: a command run at each failing property's first counterexample once
     // the run ends (schema.Automation).
     const body = try std.fmt.allocPrint(arena, "{{\"program\":{f},\"scenario\":\"bank\",\"coverage\":\"off\"," ++
