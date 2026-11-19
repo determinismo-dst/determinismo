@@ -472,7 +472,8 @@ fn compiled(arena: std.mem.Allocator, path: []const u8, wasm: []const u8, enviro
     const directory = try std.fmt.allocPrint(arena, "{s}/.cache/determinismo/wasm", .{home});
     try directory_make(arena, directory);
     const aot = try std.fmt.allocPrint(arena, "{s}/{x:0>16}.aot", .{ directory, hasher.final() });
-    if (file_read(arena, aot)) |bytes| return bytes else |_| {}
+    const aot_z = try arena.dupeSentinel(u8, aot, 0);
+    if (linux.errno(linux.access(aot_z, linux.R_OK)) == .SUCCESS) return aligned(arena, try file_read(arena, aot));
     const tools = try std.fmt.allocPrintSentinel(arena, "{s}/opt/wamrc/wamrc", .{home}, 0);
     const tools_wamrc: ?[]const u8 = if (linux.errno(linux.access(tools, linux.X_OK)) == .SUCCESS) tools else null;
     const wamrc = environ_value(environ, "DETERMINISMO_WAMRC") orelse tools_wamrc orelse try path_find(arena, "wamrc", environ) orelse {
@@ -507,10 +508,18 @@ fn compiled(arena: std.mem.Allocator, path: []const u8, wasm: []const u8, enviro
         return error.WasmCompile;
     }
     const output_z = try arena.dupeSentinel(u8, output, 0);
-    const aot_z = try arena.dupeSentinel(u8, aot, 0);
     if (linux.errno(linux.rename(output_z, aot_z)) != .SUCCESS) return error.WasmCompile;
     std.debug.print("[determinismo] wasm plugin {s}: compiled to native code ({s})\n", .{ path, aot });
-    return file_read(arena, aot);
+    return aligned(arena, try file_read(arena, aot));
+}
+
+/// A compiled module's bytes where WAMR's loader reads them: it aligns its cursor to each word
+/// it reads (read_uint32), so from a buffer at an odd address the magic number is read past
+/// (the explorer's arena gives bytes at any address: "magic header not detected").
+fn aligned(arena: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const copy = try arena.alignedAlloc(u8, .@"16", bytes.len);
+    @memcpy(copy, bytes);
+    return copy;
 }
 
 fn environ_value(environ: [:null]const ?[*:0]const u8, name: []const u8) ?[]const u8 {
