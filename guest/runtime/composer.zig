@@ -607,8 +607,19 @@ fn run_script(composer: *Composer, script: *const Script) void {
             composer.start(command);
         }
     }
+    // The faults' phase at its moment though no command came at or after it (a singleton
+    // driver starts before the faults do): while the commands run, as without a script.
+    if (phase == .before) if (script.faults_start_ns) |at| {
+        sleep_until(start_ns + at);
+        sdk.event("faults_phase", .{ .state = "start" });
+        composer.faults_start();
+        phase = .faults;
+    };
     composer.wait_all();
-    if (phase == .faults) composer.faults_stop();
+    if (phase == .faults) {
+        composer.faults_stop();
+        sdk.event("faults_phase", .{ .state = "stop" });
+    }
     sdk.event("composer_done", .{ .commands_started = composer.started_count, .script = true });
 }
 
@@ -641,10 +652,19 @@ fn singleton_drawn() bool {
 
 fn run_singleton(composer: *Composer) void {
     assert(composer.kind_count(.singleton_driver) > 0);
+    // Announced as every driver start is: a script records them (script.zig), and replays them.
+    // Unannounced, a singleton scenario's script had no commands, and its replay no driver phase
+    // and so no faults: a shrink of it judged the whole script failing nowhere.
     if (composer.kind_count(.anytime) > 0) {
-        if (sdk.random_below(2) == 0) composer.start(composer.pick(.anytime));
+        if (sdk.random_below(2) == 0) {
+            const anytime = composer.pick(.anytime);
+            announce(anytime, "start");
+            composer.start(anytime);
+        }
     }
-    composer.start(composer.pick(.singleton_driver));
+    const driver = composer.pick(.singleton_driver);
+    announce(driver, "start");
+    composer.start(driver);
     composer.wait_all();
 }
 
