@@ -741,16 +741,9 @@ fn kubernetes_describe(context: Context, directory: []const u8, extra_images: ?[
     while (lines.next()) |path| try files.append(arena, path);
     std.sort.insertion([]const u8, files.items, {}, string_before);
     if (files.items.len == 0) return error.NoManifests;
-    var hasher = std.hash.Wyhash.init(0);
-    // What the context is made of besides them: a change to its scripts or K3s makes another.
-    for ([_][]const u8{ kubernetes.ready_script, kubernetes.exec_script, kubernetes.start_script, kubernetes.containerd_dropin, kubernetes.k3s_image, kubernetes.images_format }) |part| {
-        hasher.update(part);
-    }
     for (files.items) |path| {
         const text = try cwd.readFileAlloc(context.io, path, arena, .limited(16 << 20));
         try contents.append(arena, text);
-        hasher.update(path[directory.len..]);
-        hasher.update(text);
         try kubernetes.images_note(arena, text, &images);
     }
     // The launch's own (Antithesis's `images`): an operator's, named in a custom resource.
@@ -759,6 +752,7 @@ fn kubernetes_describe(context: Context, directory: []const u8, extra_images: ?[
     // its test templates' files: test templates may be in any of them.
     var executables: std.ArrayList([]const u8) = .empty;
     var owners: std.ArrayList([]const u8) = .empty; // The image of each file.
+    var ids: std.ArrayList([]const u8) = .empty;
     for (images.items) |image| {
         if (!kubernetes.qualified(image)) {
             std.debug.print("[determinismo] {s}: images in Kubernetes manifests are fully qualified " ++
@@ -766,13 +760,13 @@ fn kubernetes_describe(context: Context, directory: []const u8, extra_images: ?[
             return error.ImageNotQualified;
         }
         const id = try image_id(context, image);
-        hasher.update(id);
+        try ids.append(arena, id);
         for (try image_templates(context, image, id)) |path| {
             try executables.append(arena, path);
             try owners.append(arena, image);
         }
     }
-    const hash = hasher.final();
+    const hash = node_hash(directory.len, files.items, contents.items, images.items, ids.items);
     const build = try path_join(context, &.{ context.cache, "kubernetes", try std.fmt.allocPrint(arena, "{x:0>16}", .{hash}) });
     var scenarios: std.ArrayList(schema.Scenario) = .empty;
     try compose.templates(arena, kubernetes.node_name, executables.items, &scenarios);
@@ -805,6 +799,37 @@ fn kubernetes_describe(context: Context, directory: []const u8, extra_images: ?[
     const profiles = try arena.alloc(schema.Profile, 1);
     profiles[0] = .{ .name = "kubernetes", .nodes = nodes };
     return .{ .profiles = profiles, .scenarios = scenarios.items };
+}
+
+/// The K3s node's build context's name: what it is made of (the scripts and K3s, the images'
+/// format, the manifests, each image's archive name and ID), so that another of any makes
+/// another context.
+fn node_hash(directory_len: usize, files: []const []const u8, contents: []const []const u8, images: []const []const u8, ids: []const []const u8) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    for ([_][]const u8{ kubernetes.ready_script, kubernetes.exec_script, kubernetes.start_script, kubernetes.containerd_dropin, kubernetes.k3s_image, kubernetes.images_format }) |part| {
+        hasher.update(part);
+    }
+    for (files, contents) |path, text| {
+        hasher.update(path[directory_len..]);
+        hasher.update(text);
+    }
+    for (images, ids) |image, id| {
+        hasher.update(image); // Its archive's name, as K3s imports it (kubernetes.normalized).
+        hasher.update(id);
+    }
+    return hasher.final();
+}
+
+test node_hash {
+    const files = [_][]const u8{"manifests/publisher.yaml"};
+    const contents = [_][]const u8{"image: docker.io/postgres:18\n"};
+    const ids = [_][]const u8{"0123456789abcdef"};
+    const hash = node_hash("manifests".len, &files, &contents, &.{"docker.io/library/postgres:18"}, &ids);
+    try std.testing.expectEqual(hash, node_hash("manifests".len, &files, &contents, &.{"docker.io/library/postgres:18"}, &ids));
+    // One image's archive named otherwise (its manifests and ID the same: the names' rule
+    // changed, kubernetes.normalized): another context, not the archive named before.
+    try std.testing.expect(hash != node_hash("manifests".len, &files, &contents, &.{"docker.io/postgres:18"}, &ids));
+    try std.testing.expect(hash != node_hash("manifests".len, &files, &contents, &.{"docker.io/library/postgres:18"}, &.{"fedcba9876543210"}));
 }
 
 /// The K3s node's build context (kubernetes_describe), written whole into a staging directory
