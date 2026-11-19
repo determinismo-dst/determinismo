@@ -1903,10 +1903,14 @@ fn check_wasm_misbehaving(context: *Context) !void {
         std.mem.indexOf(u8, trapped, "answered with the defaults") != null;
     const loop_said = std.mem.indexOf(u8, looped, "instruction") != null and
         std.mem.indexOf(u8, looped, "answered with the defaults") != null;
+    // Its own failures, never the host's (a stack bound WAMR found wrong failed every call).
+    const host_failed = std.mem.indexOf(u8, trapped, "native stack") != null or
+        std.mem.indexOf(u8, looped, "native stack") != null;
     expect_all(context, &.{
         .{ "a trapping module's run ends both timelines", trap_ran },
         .{ "and says its calls answered the defaults", trap_said },
         .{ "a module looping past its budget: the same", loop_ran and loop_said },
+        .{ "no call failed for the host's reasons", !host_failed },
     }, "wasm misbehaving: a module's failure is its answer's", .{});
     if (!trap_said or !loop_said) std.debug.print("{s}\n", .{lines_with(arena, looped, &.{"wasm plugin"}) catch ""});
 }

@@ -34,6 +34,12 @@ const module_size_max = 64 << 20;
 const instructions_per_call_max = 2_000_000_000;
 /// The module's operand stack and its host-managed heap (none: it has its own memory).
 const stack_size = 256 << 10;
+/// The native stack a call may take below its caller's frame: WAMR checks it in software (no
+/// guard pages, no signal handlers here). Set at each call: what it finds itself (musl's
+/// pthread_getattr_np: the main thread's stack as mapped so far) put the boundary above the
+/// frames a deeper caller had, every call from the setup's decisions a "native stack overflow".
+/// The explorer's callers are its main thread's (8 MiB): room for this below any of them.
+const native_stack_budget = 512 << 10;
 const error_size_max = 256;
 
 const Module = opaque {};
@@ -60,6 +66,7 @@ extern fn wasm_runtime_call_wasm(env: *ExecEnv, function: *Function, argc: u32, 
 extern fn wasm_runtime_get_exception(instance: *Instance) ?[*:0]const u8;
 extern fn wasm_runtime_clear_exception(instance: *Instance) void;
 extern fn wasm_runtime_set_instruction_count_limit(env: *ExecEnv, count: c_int) void;
+extern fn wasm_runtime_set_native_stack_boundary(env: *ExecEnv, boundary: [*]u8) void;
 
 /// The call in progress (the explorer is one thread: one at a time), for the host functions.
 const Call = struct {
@@ -135,6 +142,7 @@ pub const Plugin = struct {
         current = &state;
         defer current = null;
         wasm_runtime_set_instruction_count_limit(plugin.env, instructions_per_call_max);
+        wasm_runtime_set_native_stack_boundary(plugin.env, @ptrFromInt(@frameAddress() - native_stack_budget));
         var argv = [1]u32{@intCast(request.len)};
         const ran = wasm_runtime_call_wasm(plugin.env, plugin.call_function, 1, &argv);
         if (ran and argv[0] == 0 and !state.overflow and state.written > 0) return reply[0..state.written];
