@@ -246,6 +246,7 @@ fn connect(strategy: *Strategy, address_text: []const u8) !void {
         return error.PluginUnreachable;
     };
     strategy.pid = 0;
+    strategy.wasm = null; // Its own fields all set here: a test connects without start.
     strategy.to_plugin = fd;
     strategy.from_plugin = @intCast(linux.dup(fd)); // Closed separately, as pipes would be.
     strategy.response_start = 0;
