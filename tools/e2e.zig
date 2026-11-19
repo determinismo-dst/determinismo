@@ -1691,7 +1691,9 @@ fn check_plugin_checks(context: *Context) !void {
 
 /// Two plugins in one run (`--strategy` twice: strategies.zig): decide_named.py answers the
 /// setup's node.start_draw and count_check.py judges each timeline; both take effect, the run
-/// says both names, and a timeline replays from its tape without either.
+/// both said hello, and a timeline replays from its tape without either: the guest's history the
+/// same (its events but the checker's verdicts, which a replay without it cannot have: the
+/// plugin-checks check's comparison).
 fn check_plugins_many(context: *Context) !void {
     const arena = context.arena;
     const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
@@ -1719,15 +1721,15 @@ fn check_plugins_many(context: *Context) !void {
     const named = std.mem.indexOf(u8, report, "[determinismo] strategy: decide-named") != null and
         std.mem.indexOf(u8, report, "[determinismo] strategy: count-check") != null;
     const replay = try explore(context, &(common ++ [_][]const u8{ "--tape", try std.fs.path.join(arena, &.{ tapes, "branch-1.jsonl" }) }));
-    var replayed: [1]Branch = undefined;
-    const replays = count == 4 and parse_branches(replay, &replayed) == 1 and
-        std.mem.eql(u8, replayed[0].events_hash, hash_of(branches[0..count], 1));
+    const recorded = guest_hash_of(report, 1) orelse "";
+    const replayed = guest_hash_of(replay, 1) orelse "none";
+    const replays = count == 4 and recorded.len > 0 and std.mem.eql(u8, recorded, replayed);
     expect_all(context, &.{
         .{ "the first plugin answers the setup's node.start_draw (7)", answered },
         .{ "the second judges each timeline", count == 4 and asked == 4 and most.len > 0 },
         .{ "both plugins said hello", named },
-        .{ "a timeline replays alone from its tape", replays },
-    }, "plugins many: {d} timelines, checked {d} times, at most 0 faults: {s}", .{ count, asked, most });
+        .{ "a timeline replays alone from its tape: its guest hash", replays },
+    }, "plugins many: {d} timelines, checked {d} times, at most 0 faults: {s}; guest {s} replayed {s}", .{ count, asked, most, recorded, replayed });
 }
 
 /// A checker plugin over a history: history_check.py is given det-selftest's `squares` records
