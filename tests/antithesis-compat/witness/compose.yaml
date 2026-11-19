@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MIT
+# Two nodes the fault injector restarts and crashes, and a property only a fault on one of them
+# breaks: the witness, at each start after its first (a marker on its disk, synced), says it
+# started again ("the witness is never started again", an always). The client's driver waits
+# through the faults. The e2e shrink-plugin check's system: a failing timeline's script, shrunk
+# with plugins/python/shrink_by_node.py's cuts first, keeps faults on the witness alone.
+#   determinismo explore ... --compose tests/antithesis-compat/witness/compose.yaml \
+#     --scenario wait --faults +restart,+crash --no-faults client
+services:
+  witness:
+    build: ./node
+    command: [/usr/local/bin/start, witness]
+  echo:
+    build: ./node
+    command: [/usr/local/bin/start, echo]
+  client:
+    build: ./client
+    command: [/usr/local/bin/ready]

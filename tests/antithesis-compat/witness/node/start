@@ -1,0 +1,16 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# A node's start: the first leaves a marker on its disk (synced: a crash keeps it); each later
+# one finds it. The witness says so, an always assertion through the node's output sink.
+name=$1
+say() {
+  printf '{"antithesis_assert":{"hit":true,"must_hit":true,"assert_type":"always","display_type":"Always","message":"the witness is never started again","condition":%s,"details":null}}\n' \
+    "$1" >> "$ANTITHESIS_OUTPUT_DIR/sdk.jsonl"
+}
+if [ -f /data/started ]; then
+  [ "$name" = witness ] && say false
+else
+  mkdir -p /data && echo started > /data/started && sync
+  [ "$name" = witness ] && say true
+fi
+exec sleep infinity

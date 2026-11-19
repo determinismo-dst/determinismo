@@ -23,9 +23,6 @@
 //!              graceful stop and a one-way partition, each taking the node away and giving it
 //!              back; a clock skew, the node's realtime clock 5 s behind while it lasts
 //!   hang       a driver that never ends: the timeline's ceiling of virtual time ends it, hung
-//!   witness_kept (profile "restarts") a property only a fault breaks: the witness node is never
-//!              started again while the injector restarts and crashes both nodes (e2e shrink:
-//!              a failing timeline needs a fault on the witness, shrink_by_node.py's cut)
 //!   readdress  (profile "movable") restarts the scenario asks for: the node answers at its
 //!              name each time, and sometimes came back at a new address
 //!   file_error (profile "durable") write errors the scenario asks for on the echo node's disk:
@@ -133,7 +130,6 @@ pub fn main(init: std.process.Init) !void {
             .interleave = interleave_scenario,
             .inject = inject,
             .readdress = readdress,
-            .witness_kept = witness_kept,
             .unlist = unlist,
             .signal = signal_scenario,
             .cache = cache_scenario,
@@ -2204,19 +2200,6 @@ fn hang(s: *System.Scenario) void {
 /// A driver that never ends (an hour of sleep): the timeline's ceiling ends it as hung.
 fn forever(_: *System.Context) !void {
     sdk.sleep_ms(std.time.ms_per_hour);
-}
-
-fn witness_kept(s: *System.Scenario) void {
-    s.singleton_driver("witness_kept", witness_kept_driver);
-}
-
-/// The witness's main process from the driver's start to its end, faults restarting and
-/// crashing both nodes meanwhile: the same one unless a fault hit the witness.
-fn witness_kept_driver(_: *System.Context) !void {
-    const before = nodes_pid_of("witness") orelse return;
-    sdk.sleep_ms(20 * std.time.ms_per_s);
-    const after = nodes_pid_of("witness");
-    sdk.always(after != null and after.? == before, "the witness is never started again", .{});
 }
 
 fn readdress(s: *System.Scenario) void {

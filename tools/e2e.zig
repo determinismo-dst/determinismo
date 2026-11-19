@@ -7462,15 +7462,18 @@ fn check_shrink(context: *Context) !void {
     });
 }
 
-/// Shrinking with a plugin's cuts first (shrink --strategy, Strategy.shrink): the selftest's
-/// witness_kept fails only when a fault hit the witness node, while the injector restarts and
-/// crashes both nodes. A failing timeline's script, shrunk with shrink_by_node.py: its cuts are
-/// judged (the witness's faults alone among them), and what is kept fails as the rule asks and
-/// hits the witness only.
+/// Shrinking with a plugin's cuts first (shrink --strategy, Strategy.shrink): the witness
+/// project (tests/antithesis-compat/witness) fails only when a fault hit its witness node, while
+/// the injector restarts and crashes both nodes; its driver is a composer command, so a script
+/// replays it (the selftest's own runner is not one). A failing timeline's script, shrunk with
+/// shrink_by_node.py: its cuts are judged (the witness's faults alone among them), and what is
+/// kept fails as the rule asks and hits the witness only.
 fn check_shrink_plugin(context: *Context) !void {
     const arena = context.arena;
-    const program = try std.fs.path.join(arena, &.{ context.bin, "det-selftest" });
-    const common = [_][]const u8{ "--program", program, "--profile", "restarts", "--scenario", "witness_kept" };
+    const common = [_][]const u8{
+        "--compose", "tests/antithesis-compat/witness/compose.yaml", "--scenario",  "wait",
+        "--faults",  "+restart,+crash",                              "--no-faults", "client",
+    };
     var branches: [branches_max]Branch = undefined;
     const count = parse_branches(try explore(context, &(common ++ [_][]const u8{ "--seed", "1", "--branches", "8" })), &branches);
     const failing = for (branches[0..count]) |branch| {
