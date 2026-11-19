@@ -15,9 +15,12 @@
 //!                                table (/symbols/<name>) says
 //!   __sanitizer_cov_trace_pc_guard[_init]
 //!                                clang's trace-pc-guard callbacks (C, C++ and Rust built for
-//!                                Antithesis link against this library): each edge's source line
-//!                                ("line <file>:<n>") when the image's /symbols has the module's
-//!                                DWARF (a table the host made: src/lines.zig), else "edge <n>"
+//!                                Antithesis link against this library): each edge, the first
+//!                                time the timeline runs it (a bitmap per module by its build
+//!                                ID, shared by every process, as above: GuardModule), as its
+//!                                source line ("line <file>:<n>") when the image's /symbols has
+//!                                the module's DWARF (a table the host made: src/lines.zig),
+//!                                else "edge <module's file>:<n>"
 //!
 //! Every pass through an edge, in both, is a point where thread pausing may pause the thread, as
 //! determinismo's own SDKs do (sdk/c/determinismo.h, det_pausing_at): projects built for
@@ -309,6 +312,80 @@ export fn __sanitizer_cov_trace_pc_guard_init(start: [*]u32, stop: [*]u32) void 
     const count: u32 = @intCast(stop - start);
     const first = guard_next.fetchAdd(count, .monotonic);
     for (start[0..count], 0..) |*guard, index| guard.* = first + @as(u32, @intCast(index));
+    // The module's own code called this (its constructor; for a program numbered at a first
+    // call, ours, linked into it): its guards may be in memory no file names (.bss).
+    guard_module_add(@returnAddress(), first, count);
+}
+
+/// A module's guards, numbered from `first` in this process, and the timeline's reported edges
+/// of it, a bit each shared by every process of every node (/opt/determinismo/coverage/
+/// guards-<build ID>, a tmpfs in the snapshot), as Antithesis's instrumentors' modules have
+/// (bitmap_open) and the C SDK's: an edge is one event a timeline, not one a process. Reported
+/// per process, every short-lived process reported all it ran again: Turso's composer drivers,
+/// a python3 each importing Turso's module, 2,423,410 coverage events for 19,670 edges in one
+/// timeline (trial 2085 on srv4, 1,087 times each). A module without a build ID (two builds
+/// could share its name) or outside determinismo: each process reports its own.
+const GuardModule = struct {
+    first: u32,
+    count: u32,
+    reported: []u8 = &.{},
+    /// Its file's name: an edge with no source line known is "edge <file>:<its index>", the
+    /// same in every process (the process's numbering depends on what it loaded before).
+    name_buffer: [128]u8 = undefined,
+    name_size: u8 = 0,
+
+    fn name(module: *const GuardModule) []const u8 {
+        return module.name_buffer[0..module.name_size];
+    }
+
+    /// Whether a process of the timeline reported the edge (read only: every first pass in a
+    /// process comes here).
+    fn reported_before(module: *const GuardModule, edge: u32) bool {
+        if (module.reported.len == 0) return false;
+        const index = edge - module.first;
+        const bit: u8 = @as(u8, 1) << @intCast(index % 8);
+        return @atomicLoad(u8, &module.reported[index / 8], .monotonic) & bit != 0;
+    }
+
+    /// Marks the edge reported for the timeline: whether this process is the first.
+    fn report(module: *const GuardModule, edge: u32) bool {
+        if (module.reported.len == 0) return true;
+        const index = edge - module.first;
+        const bit: u8 = @as(u8, 1) << @intCast(index % 8);
+        return @atomicRmw(u8, &module.reported[index / 8], .Or, bit, .monotonic) & bit == 0;
+    }
+};
+
+const guard_modules_max = 64;
+var guard_modules: [guard_modules_max]GuardModule = undefined;
+var guard_module_count = std.atomic.Value(u32).init(0);
+var guard_modules_lock = std.atomic.Value(bool).init(false);
+
+fn guard_module_add(code: usize, first: u32, count: u32) void {
+    while (guard_modules_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+    defer guard_modules_lock.store(false, .release);
+    const index = guard_module_count.load(.acquire);
+    if (index == guard_modules_max) return;
+    var module: GuardModule = .{ .first = first, .count = count };
+    if (module_file(code)) |file| {
+        module.name_size = file.name_size;
+        @memcpy(module.name_buffer[0..file.name_size], file.name());
+        if (file.built and device_fd() != null) {
+            var name_buffer: [160]u8 = undefined;
+            if (std.fmt.bufPrint(&name_buffer, "guards-{s}", .{file.key()})) |bitmap_name| {
+                module.reported = bitmap_open(bitmap_name, count);
+            } else |_| {}
+        }
+    }
+    guard_modules[index] = module;
+    guard_module_count.store(index + 1, .release);
+}
+
+fn guard_module_of(edge: u32) ?*const GuardModule {
+    for (guard_modules[0..guard_module_count.load(.acquire)]) |*module| {
+        if (edge >= module.first and edge - module.first < module.count) return module;
+    }
+    return null;
 }
 
 /// A guard's top bit, set once its edge was reported: the rest keeps the edge's number, for
@@ -327,6 +404,13 @@ export fn __sanitizer_cov_trace_pc_guard(guard: *u32) void {
         if (seen == 0) return;
     }
     if (seen & edge_reported != 0) return pausing_at(seen & ~edge_reported);
+    const module = guard_module_of(seen);
+    // Reported by another process of the timeline, and no coverage set to ask (a node's own,
+    // which may leave it out here): known, without looking up its line.
+    if (module) |found| if (coverage_set() == null and found.reported_before(seen)) {
+        _ = @atomicRmw(u32, guard, .Or, edge_reported, .monotonic);
+        return pausing_at(seen);
+    };
     const place_known = native_place(@returnAddress());
     if (!coverage_holds(if (place_known) |place| place.file else "")) {
         @atomicStore(u32, guard, 0, .monotonic); // Left out: never again.
@@ -335,6 +419,7 @@ export fn __sanitizer_cov_trace_pc_guard(guard: *u32) void {
     const edge = @atomicRmw(u32, guard, .Or, edge_reported, .monotonic);
     if (edge & edge_reported != 0) return pausing_at(edge & ~edge_reported); // Another thread's.
     defer pausing_at(edge);
+    if (module) |found| if (!found.report(edge)) return; // Another process's, for the timeline.
     if (place_known) |place| {
         var line_buffer: [512]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&line_buffer);
@@ -344,13 +429,17 @@ export fn __sanitizer_cov_trace_pc_guard(guard: *u32) void {
         emit(writer.buffered());
         return;
     }
-    var buffer: [80]u8 = undefined;
-    const message = std.fmt.bufPrint(
-        &buffer,
-        "{{\"event\":\"coverage\",\"details\":{{\"name\":\"edge {d}\"}}}}",
-        .{edge},
-    ) catch return;
-    emit(message);
+    var buffer: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    writer.writeAll("{\"event\":\"coverage\",\"details\":{\"name\":\"edge ") catch return;
+    if (module) |found| if (found.name_size > 0) {
+        json_escaped(&writer, found.name()) catch return;
+        writer.print(":{d}\"}}}}", .{edge - found.first}) catch return;
+        emit(writer.buffered());
+        return;
+    };
+    writer.print("{d}\"}}}}", .{edge}) catch return;
+    emit(writer.buffered());
 }
 
 // The coverage set ---------------------------------------------------------------------------
@@ -549,6 +638,33 @@ fn find_native(count: u32, pc: usize) ?*const Native {
 
 /// The mapped file holding `pc`: its range, load bias and table (none for an anonymous range).
 fn native_load(pc: usize) ?Native {
+    var file = module_file(pc) orelse return null;
+    if (file.key_size > 0) lines_table_load(&file.native, file.key());
+    return file.native;
+}
+
+/// The mapped file holding `pc`: its range and load bias, its file's name, and its key, the
+/// symbol tables' name for it (src/lines.zig): its GNU build ID in hex, else "name-<file>"
+/// (none for anonymous code or a file without its ELF header mapped).
+const ModuleFile = struct {
+    native: Native,
+    key_buffer: [128]u8 = undefined,
+    key_size: u8 = 0,
+    name_buffer: [128]u8 = undefined,
+    name_size: u8 = 0,
+    /// Whether the key is a build ID (two builds of one file name share a "name-" key).
+    built: bool = false,
+
+    fn key(file: *const ModuleFile) []const u8 {
+        return file.key_buffer[0..file.key_size];
+    }
+
+    fn name(file: *const ModuleFile) []const u8 {
+        return file.name_buffer[0..file.name_size];
+    }
+};
+
+fn module_file(pc: usize) ?ModuleFile {
     var path_buffer: [256]u8 = undefined;
     var path: []const u8 = "";
     var native: Native = .{ .low = 0, .high = 0 };
@@ -563,10 +679,11 @@ fn native_load(pc: usize) ?Native {
     }
     maps.close();
     if (native.high == 0) return null;
-    if (path.len == 0) return native; // Anonymous (JIT) code: remembered, so not looked up again.
+    // Anonymous (JIT) code: remembered, so not looked up again.
+    if (path.len == 0) return .{ .native = native };
     // All of the file's mappings, and the one with its start (its ELF header).
     var header: ?usize = null;
-    maps = Maps.open() orelse return native;
+    maps = Maps.open() orelse return .{ .native = native };
     while (maps.next()) |mapping| {
         if (!std.mem.eql(u8, mapping.path, path)) continue;
         native.low = @min(native.low, mapping.start);
@@ -574,16 +691,20 @@ fn native_load(pc: usize) ?Native {
         if (mapping.offset == 0 and header == null) header = mapping.start;
     }
     maps.close();
-    const start = header orelse return native;
-    const elf = elf_of(start, native) orelse return native;
-    native.bias = elf.bias;
-    var name_buffer: [128]u8 = undefined;
-    const name = if (elf.build_id.len > 0 and elf.build_id.len * 2 <= name_buffer.len)
-        std.fmt.bufPrint(&name_buffer, "{x}", .{elf.build_id}) catch return native
+    var file: ModuleFile = .{ .native = native };
+    const base = std.fs.path.basename(path);
+    file.name_size = @intCast(@min(base.len, file.name_buffer.len));
+    @memcpy(file.name_buffer[0..file.name_size], base[0..file.name_size]);
+    const start = header orelse return file;
+    const elf = elf_of(start, native) orelse return file;
+    file.native.bias = elf.bias;
+    file.built = elf.build_id.len > 0 and elf.build_id.len * 2 <= file.key_buffer.len;
+    const key = if (file.built)
+        std.fmt.bufPrint(&file.key_buffer, "{x}", .{elf.build_id}) catch return file
     else
-        std.fmt.bufPrint(&name_buffer, "name-{s}", .{std.fs.path.basename(path)}) catch return native;
-    lines_table_load(&native, name);
-    return native;
+        std.fmt.bufPrint(&file.key_buffer, "name-{s}", .{base}) catch return file;
+    file.key_size = @intCast(key.len);
+    return file;
 }
 
 const Elf = struct { bias: usize, build_id: []const u8 };
