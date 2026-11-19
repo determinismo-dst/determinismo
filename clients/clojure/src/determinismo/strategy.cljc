@@ -16,7 +16,11 @@
 ;;   :event   (fn [state request]) -> end-timeline to end the timeline there, else anything
 ;;   :decide  (fn [state request]) -> {:hex "<bytes>"} to answer a randomness pull, nil the default
 ;;   :branch  (fn [state request]) and :end (fn [state request]): a timeline's start and end
-;; :wants (["behaviors"], ["labeled"], ...) and :decide make the hello's answer. `state` is an atom
+;;   :machine (fn [request]) -> the machine the run boots, before it does: {:epoch_seconds ...
+;;            :timer_slack_us ... :tsc_jitter_seed "<hex>" :modulation_stretch_us [low high]}, any
+;;            of them (docs/PLUGINS.md's machine)
+;; :wants (["behaviors"], ["labeled"], ["setup"]: the setup's decisions too, ...) and :decide make
+;; the hello's answer. `state` is an atom
 ;; per connection: one exploration worker's timelines, reset at each branch. Every answer a
 ;; strategy gives is on the timeline's tape, so the timeline replays without it.
 (ns determinismo.strategy
@@ -284,7 +288,8 @@ std::string determinismo_close(std::string const &fd_text) {
         {:name (str #?(:jank "jank/" :default "clojure/") (name @current)
                     (when (seq @by-source) (str " +" (count @by-source) " per source")))
          :decides (boolean (some :decide all))
-         :wants (vec (distinct (mapcat (fn [one] (or (:wants one) ["behaviors"])) all)))
+         :wants (vec (distinct (concat (mapcat (fn [one] (or (:wants one) ["behaviors"])) all)
+                                       (when (some :machine all) ["machine"]))))
          :ring ring-supported?})
       (= method "branch")
       (do (reset! state {})
@@ -298,6 +303,8 @@ std::string determinismo_close(std::string const &fd_text) {
                                   (and f (= end-timeline (f state (assoc e :method "event"))))))
                         (:events request))]
         (if ended {:end true} {}))
+      (= method "machine")
+      (or (when-let [f (:machine chosen)] (f request)) {})
       (= method "random")
       (or (when-let [f (:decide (strategy-for (:source request)))] (f state request)) {})
       (= method "branch_end")

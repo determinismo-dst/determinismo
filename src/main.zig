@@ -450,6 +450,9 @@ const Arguments = struct {
     drive_steered_max_ms: ?u64 = null,
     /// `--epoch`: the guest's wall clock at boot, over the profile's.
     epoch_seconds: ?u64 = null,
+    /// The machine a strategy decided, adopted by a replay from its tape or a resume from its
+    /// record (its wall clock, timer slack and CPU modulation's stretches set from it).
+    machine_adopted: ?tape.Machine = null,
     /// `--trace-errno`: system calls failing with this errno, as syscall_error events.
     trace_errno: ?u16 = null,
     min_drive_text: ?[]const u8 = null,
@@ -953,10 +956,12 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
     // inputs), unless one is given: drawn only for a new run, it was 0 here, and every replay of
     // a run's tape was refused as other inputs (the e2e python check, 2026-11-07).
     // A tape's 0: one from before the jitter, the exact clock.
-    if (arguments.tsc_jitter_seed == null) if (arguments.tape_path) |path| {
+    if (arguments.tape_path) |path| {
         const source = try cwd.readFileAlloc(init.io, path, arena, .unlimited);
-        arguments.tsc_jitter_seed = try tape.jitter_seed(source, try arena.alloc(u8, 64 * 1024));
-    };
+        if (arguments.tsc_jitter_seed == null) arguments.tsc_jitter_seed = try tape.jitter_seed(source, try arena.alloc(u8, 64 * 1024));
+        // And the machine its run's strategy decided, if one did.
+        if (try tape.machine_of(source, try arena.alloc(u8, 64 * 1024))) |machine| machine_adopt(&arguments, machine);
+    }
     // Otherwise from the seed, as a run's: a replay by seed and branch alone (no run, no tape)
     // reads the clock its run read (it ran exact, and parted from the run's own timelines: the
     // setup's e2e bank check on the jittering KVM, 2026-11-07).
@@ -1778,6 +1783,9 @@ const Exploration = struct {
     /// The clock's jitter (VM.Options.tsc_jitter_seed, in `inputs`): recorded in tapes, whose
     /// replays boot with it.
     tsc_jitter_seed: u64 = 0,
+    /// The machine a strategy decided for the run (Strategy.machine), on every tape: null for
+    /// the run's options as given.
+    machine: ?tape.Machine = null,
     /// This build of determinismo (a hash of its executable): recorded in tapes and the run's
     /// record, so that a replay by another build says so.
     host: u64 = 0,
@@ -1889,7 +1897,7 @@ fn resume_settings_adopt(arena: std.mem.Allocator, io: std.Io, arguments: *Argum
     const path = arguments.record_path orelse return;
     const source = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch return;
     const first = source[0 .. std.mem.indexOfScalar(u8, source, '\n') orelse source.len];
-    const Line = struct { run: ?struct { pipeline: ?u32 = null, archive: ?bool = null, prefer_sometimes: ?bool = null, prefer_severe: ?bool = null, ranges: ?bool = null, memory_objective: ?bool = null, objective_extend: ?bool = null, tsc_jitter_seed: ?[]const u8 = null } = null };
+    const Line = struct { run: ?struct { pipeline: ?u32 = null, archive: ?bool = null, prefer_sometimes: ?bool = null, prefer_severe: ?bool = null, ranges: ?bool = null, memory_objective: ?bool = null, objective_extend: ?bool = null, tsc_jitter_seed: ?[]const u8 = null, machine: ?tape.Machine = null } = null };
     const line = std.json.parseFromSliceLeaky(Line, arena, first, .{ .ignore_unknown_fields = true }) catch return;
     const run = line.run orelse return;
     if (!arguments.archive_given) if (run.archive) |archive| {
@@ -1913,6 +1921,18 @@ fn resume_settings_adopt(arena: std.mem.Allocator, io: std.Io, arguments: *Argum
         std.fmt.parseInt(u64, hex, 16) catch return error.Usage
     else
         0;
+    // The machine its strategy decided, if one did: a resume is not asked again (its first
+    // timelines had this one).
+    if (run.machine) |machine| machine_adopt(arguments, machine);
+}
+
+/// A machine a strategy decided, as the run's options: a replay's (from its tape) or a resume's
+/// (from its record).
+fn machine_adopt(arguments: *Arguments, machine: tape.Machine) void {
+    arguments.epoch_seconds = machine.epoch_seconds;
+    arguments.timer_slack_us = machine.timer_slack_ns / std.time.ns_per_us;
+    arguments.cpu_modulation_stretch_ns = machine.modulation_stretch_ns;
+    arguments.machine_adopted = machine;
 }
 
 const jitter_from_seed = VM.jitter_from_seed;
@@ -2265,6 +2285,36 @@ fn command_explore(
     if (arguments.tape_directory) |directory| {
         try std.Io.Dir.cwd().createDirPath(context.io, directory);
     }
+    // A strategy decides the machine the run boots too, when it wants (Strategy.machine: the
+    // guest's wall clock, where timer interrupts land in their slack, the clock's jitter, CPU
+    // modulation's stretches), asked before the inputs are known; on every tape and in the
+    // record, which a replay or a resume boots with (not asked again). Not a run from a
+    // snapshot: its machine is the snapshot's.
+    const fresh_setup = arguments.from_snapshot == null and arguments.tape_snapshot == null;
+    if (arguments.machine_adopted) |machine| {
+        exploration.machine = machine;
+    } else if (arguments.strategy_command != null and arguments.tape_path == null and !arguments.resume_run and fresh_setup) {
+        try strategy_start(context, arguments, &exploration);
+        if (exploration.strategy.?.wants_machine) {
+            const decided = try exploration.strategy.?.machine(.{
+                .machine = .{
+                    .epoch_seconds = options.epoch_seconds,
+                    .timer_slack_ns = options.timer_slack_ns,
+                    .modulation_stretch_ns = options.modulation_stretch_ns,
+                },
+                .tsc_jitter_seed = options.tsc_jitter_seed,
+            });
+            options.epoch_seconds = decided.machine.epoch_seconds;
+            options.timer_slack_ns = decided.machine.timer_slack_ns;
+            options.modulation_stretch_ns = decided.machine.modulation_stretch_ns;
+            options.tsc_jitter_seed = decided.tsc_jitter_seed;
+            exploration.machine = decided.machine;
+            std.debug.print("[determinismo] the machine its strategy decided: wall clock {d}, timer slack {d} us, jitter {x:0>16}, stretches {d}-{d} us\n", .{
+                decided.machine.epoch_seconds, decided.machine.timer_slack_ns / std.time.ns_per_us, decided.tsc_jitter_seed,
+                decided.machine.modulation_stretch_ns[0] / std.time.ns_per_us, decided.machine.modulation_stretch_ns[1] / std.time.ns_per_us,
+            });
+        }
+    }
     exploration.inputs = inputs_hash(options, arguments);
     exploration.tsc_jitter_seed = options.tsc_jitter_seed;
     exploration.host = host_build();
@@ -2319,6 +2369,8 @@ fn command_explore(
                 .host = &hex16(exploration.host),
                 // The clock's jitter it ran with (part of its inputs): a resume runs with it.
                 .tsc_jitter_seed = if (exploration.tsc_jitter_seed != 0) &jitter_hex else null,
+                // The machine its strategy decided: a resume boots it, not asked again.
+                .machine = exploration.machine,
                 // A tree's generations are the timelines that finished together, recorded as
                 // judged (explore_tree): a record without them is not one to resume.
                 .queue = true,
@@ -2449,14 +2501,11 @@ fn command_explore(
         collected.* = .{ .allocator = context.arena };
         // The setup's named draws (a node's knobs as it first starts, the swarm's seed), shared by
         // every timeline from its snapshot: noted as a timeline's are (draws.zig).
-        // The setup's decisions are a strategy's too: asked here, recorded on the setup's tape
+        // The setup's decisions are a strategy's too when it wants them: asked here, recorded on the setup's tape
         // (setup.jsonl, beside the timelines'), which a replay's setup applies (a timeline's
         // pulls count from boot, after the setup's: the two tapes never meet).
-        const recording = arguments.strategy_command != null and exploration.replay == null;
-        if (recording) {
-            try strategy_start(context, arguments, &exploration);
-            try exploration.strategy.?.setup(exploration.exploration_seed);
-        }
+        const recording = if (exploration.strategy) |strategy| strategy.wants_setup and exploration.replay == null else false;
+        if (recording) try exploration.strategy.?.setup(exploration.exploration_seed);
         const setup_tape: ?linux.fd_t = if (recording) if (exploration.tape_directory) |directory| tape_fd: {
             const fd = try open_for_writing(context.arena, try std.fs.path.join(context.arena, &.{ directory, setup_tape_name }));
             tape.write_header(fd, .{
@@ -2468,6 +2517,7 @@ fn command_explore(
                 .chain = &.{},
                 .host = exploration.host,
                 .tsc_jitter_seed = exploration.tsc_jitter_seed,
+                .machine = exploration.machine,
             });
             break :tape_fd fd;
         } else null else null;
@@ -2477,7 +2527,7 @@ fn command_explore(
         else
             null;
         var setup_advice: advisor_zig.Explorer = .{
-            .strategy = exploration.strategy,
+            .strategy = if (recording) exploration.strategy else null,
             .learned = null,
             .draws = if (arguments.events_directory != null) try context.arena.create(draws_zig.Draws) else null,
             .fixed = arguments.decide,
@@ -3501,6 +3551,7 @@ fn branch_announce(
             .chain = place.path,
             .host = exploration.host,
             .tsc_jitter_seed = exploration.tsc_jitter_seed,
+            .machine = exploration.machine,
         });
     }
 }

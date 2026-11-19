@@ -119,6 +119,11 @@ ended: bool = false,
 /// high, weight], ...]}`), the default where it gives none: no round trip per decision. Told of
 /// each decision's announcement, and of each value a plan drew (`{"event":"planned",...}`).
 wants_plans: bool = false,
+/// `"wants": ["setup"]`: the setup's decisions are its too (announced with `setup`, then asked
+/// as a timeline's; on the setup's tape), not only the timelines'.
+wants_setup: bool = false,
+/// `"wants": ["machine"]`: asked for the machine a run boots before it does (`machine`).
+wants_machine: bool = false,
 plan: [plan_labels_max]Planned = undefined,
 plan_count: u8 = 0,
 /// When the last batch went (virtual time): a plan older than `plan_refresh_ns` is refreshed.
@@ -288,6 +293,8 @@ pub fn hello(strategy: *Strategy, exploration_seed: u64, run_url: ?[]const u8) !
     // from undefined memory (a batch_size of garbage panicked the first batched run).
     strategy.wants_batched = false;
     strategy.wants_plans = false;
+    strategy.wants_setup = false;
+    strategy.wants_machine = false;
     strategy.plan_count = 0;
     strategy.flushed_ns = 0;
     strategy.batch_count = 0;
@@ -305,6 +312,8 @@ pub fn hello(strategy: *Strategy, exploration_seed: u64, run_url: ?[]const u8) !
         if (std.mem.eql(u8, item.string, "coverage")) strategy.wants_coverage = true;
         if (std.mem.eql(u8, item.string, "batched")) strategy.wants_batched = true;
         if (std.mem.eql(u8, item.string, "plans")) strategy.wants_plans = true;
+        if (std.mem.eql(u8, item.string, "setup")) strategy.wants_setup = true;
+        if (std.mem.eql(u8, item.string, "machine")) strategy.wants_machine = true;
     };
     // A plan comes with a batch's reply: plans need batches.
     if (strategy.wants_plans) strategy.wants_batched = true;
@@ -430,6 +439,56 @@ pub fn branch(strategy: *Strategy, index: u32, seed: u64, from: ?From) !void {
     }
     try writer.writeAll("}");
     _ = try strategy.call(writer.buffered());
+}
+
+/// What a run's machine may be: the guest's wall clock no later than 2100, a timer's slack at
+/// most a second, CPU modulation's stretches from a microsecond to ten seconds.
+const epoch_seconds_max = 4102444800;
+const timer_slack_us_max = std.time.us_per_s;
+const stretch_us_min = 1;
+const stretch_us_max = 10 * std.time.us_per_s;
+
+/// The machine a run boots, a strategy's to decide when it wants (`"wants":["machine"]`):
+/// `{"method":"machine","epoch_seconds":E,"timer_slack_us":S,"tsc_jitter_seed":"<hex>",
+/// "modulation_stretch_us":[low,high]}`, the run's own, and the reply's fields replace them
+/// (each within its bounds, else BadPluginReply). Asked once, before the machine is made.
+pub const MachineChoice = struct { machine: tape.Machine, tsc_jitter_seed: u64 };
+
+pub fn machine(strategy: *Strategy, given: MachineChoice) !MachineChoice {
+    assert(strategy.wants_machine);
+    var writer: std.Io.Writer = .fixed(&strategy.request);
+    try writer.print("{{\"method\":\"machine\",\"epoch_seconds\":{d},\"timer_slack_us\":{d},\"tsc_jitter_seed\":\"{x:0>16}\",\"modulation_stretch_us\":[{d},{d}]}}", .{
+        given.machine.epoch_seconds,
+        given.machine.timer_slack_ns / std.time.ns_per_us,
+        given.tsc_jitter_seed,
+        given.machine.modulation_stretch_ns[0] / std.time.ns_per_us,
+        given.machine.modulation_stretch_ns[1] / std.time.ns_per_us,
+    });
+    const reply = try strategy.call(writer.buffered());
+    var chosen = given;
+    if (reply.get("epoch_seconds")) |value| {
+        if (value != .integer or value.integer <= 0 or value.integer > epoch_seconds_max) return error.BadPluginReply;
+        chosen.machine.epoch_seconds = @intCast(value.integer);
+    }
+    if (reply.get("timer_slack_us")) |value| {
+        if (value != .integer or value.integer < 0 or value.integer > timer_slack_us_max) return error.BadPluginReply;
+        chosen.machine.timer_slack_ns = @as(u64, @intCast(value.integer)) * std.time.ns_per_us;
+    }
+    if (reply.get("tsc_jitter_seed")) |value| {
+        if (value != .string or value.string.len != 16) return error.BadPluginReply;
+        chosen.tsc_jitter_seed = std.fmt.parseInt(u64, value.string, 16) catch return error.BadPluginReply;
+    }
+    if (reply.get("modulation_stretch_us")) |value| {
+        if (value != .array or value.array.items.len != 2) return error.BadPluginReply;
+        var stretch: [2]u64 = undefined;
+        for (value.array.items, &stretch) |item, *bound| {
+            if (item != .integer or item.integer < stretch_us_min or item.integer > stretch_us_max) return error.BadPluginReply;
+            bound.* = @as(u64, @intCast(item.integer)) * std.time.ns_per_us;
+        }
+        if (stretch[0] >= stretch[1]) return error.BadPluginReply;
+        chosen.machine.modulation_stretch_ns = stretch;
+    }
+    return chosen;
 }
 
 /// The setup's start, before the snapshot every timeline starts from: its decisions are the

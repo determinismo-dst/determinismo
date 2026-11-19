@@ -14,6 +14,9 @@ A strategy is an object with any of these methods; missing ones answer the defau
                                               `decision` is its label when the guest named it
                                               ({"name", "options"} or {"name", "range"})
     event(event, source, moment)              a guest event (a dict); True ends the timeline here
+    machine(request)                          with wants "machine": the run's machine before it boots
+                                              ({"epoch_seconds", "timer_slack_us", "tsc_jitter_seed",
+                                              "modulation_stretch_us"}), the fields to change
     plan()                                    with wants "plans": {"<decision name>": [[low, high,
                                               weight], ...]}, drawn from by the explorer
     branch_end(index, outcome, events, failing)   return True to stop the exploration
@@ -114,6 +117,10 @@ def _dispatch(strategy, name, request):
         if plan:
             reply["plan"] = plan
         return reply
+    if method == "machine":
+        # With `wants = ["machine", ...]`: the machine the run boots, asked before it does
+        # (the run's own as the request); the fields the reply gives replace them.
+        return strategy.machine(request) if hasattr(strategy, "machine") else {}
     if method == "branch_end":
         stop = False
         if hasattr(strategy, "branch_end"):

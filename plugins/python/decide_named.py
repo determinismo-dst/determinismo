@@ -13,7 +13,7 @@ from determinismo_strategy import serve  # noqa: E402
 
 
 class DecideNamed:
-    wants = ["labeled"]
+    wants = ["labeled", "setup"]
 
     def __init__(self, name, value):
         self.name = name

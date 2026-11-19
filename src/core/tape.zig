@@ -25,6 +25,10 @@ pub const Header = struct {
     /// The clock's jitter it ran with (VM.Options.tsc_jitter_seed, part of `inputs`): a replay
     /// from the tape boots with it (0: none, as every tape before 2026-11-07).
     tsc_jitter_seed: u64 = 0,
+    /// The machine a strategy decided for its run (its `machine` request: the guest's wall clock
+    /// at boot, where timer interrupts land in their slack, CPU modulation's stretches; part of
+    /// `inputs`): a replay from the tape boots it. Null: the run's options as given.
+    machine: ?Machine = null,
     /// Set for a timeline that goes on from a moment of another of its run (explore --extend:
     /// a session's): that timeline and the moment. Its tape is whole (what the other's gave it
     /// up to the moment, then its own), under a number of its own (claim_next).
@@ -32,6 +36,7 @@ pub const Header = struct {
 };
 
 pub const Extends = struct { branch: u32, vtime_ns: u64 };
+pub const Machine = struct { epoch_seconds: u64, timer_slack_ns: u64, modulation_stretch_ns: [2]u64 };
 
 /// One step of a path: branch `branch` (seed `seed`) ran from the previous step's moment to
 /// `vtime_ns`, where the next one branched from it.
@@ -246,6 +251,11 @@ pub fn write_header(fd: linux.fd_t, header: Header) void {
     if (header.tsc_jitter_seed != 0) {
         writer.print(",\"tsc_jitter_seed\":\"{x:0>16}\"", .{header.tsc_jitter_seed}) catch unreachable;
     }
+    if (header.machine) |machine| {
+        writer.print(",\"machine\":{{\"epoch_seconds\":{d},\"timer_slack_ns\":{d},\"modulation_stretch_ns\":[{d},{d}]}}", .{
+            machine.epoch_seconds, machine.timer_slack_ns, machine.modulation_stretch_ns[0], machine.modulation_stretch_ns[1],
+        }) catch unreachable;
+    }
     if (header.fork) |fork| {
         writer.print(",\"from_branch\":{d},\"from_vtime_ns\":{d}", .{
             fork.branch, fork.vtime_ns,
@@ -416,6 +426,7 @@ fn header_take(header_line: []const u8, fba: *std.heap.FixedBufferAllocator) !He
             try hex_field(header.object, "tsc_jitter_seed")
         else
             0,
+        .machine = if (header.object.get("machine")) |machine| try machine_parse(machine) else null,
     };
     if (header.object.get("chain")) |chain| {
         if (chain != .array or chain.array.items.len > chain_length_max) return error.BadTape;
@@ -559,6 +570,32 @@ pub fn write_checkpoint(fd: linux.fd_t, checkpoint: Checkpoint) void {
         checkpoint.events, checkpoint.branches, checkpoint.events_hash,
     }) catch unreachable;
     write_all(fd, line);
+}
+
+fn machine_parse(value: std.json.Value) !Machine {
+    if (value != .object) return error.BadTape;
+    const epoch = value.object.get("epoch_seconds") orelse return error.BadTape;
+    const slack = value.object.get("timer_slack_ns") orelse return error.BadTape;
+    const stretch = value.object.get("modulation_stretch_ns") orelse return error.BadTape;
+    if (epoch != .integer or slack != .integer or stretch != .array or stretch.array.items.len != 2) return error.BadTape;
+    for (stretch.array.items) |item| if (item != .integer or item.integer < 0) return error.BadTape;
+    if (epoch.integer < 0 or slack.integer < 0) return error.BadTape;
+    return .{
+        .epoch_seconds = @intCast(epoch.integer),
+        .timer_slack_ns = @intCast(slack.integer),
+        .modulation_stretch_ns = .{ @intCast(stretch.array.items[0].integer), @intCast(stretch.array.items[1].integer) },
+    };
+}
+
+/// The machine a strategy decided for a tape's run (its header's), null for none: read before the
+/// machine is made, which boots with it.
+pub fn machine_of(source: []const u8, scratch: []u8) !?Machine {
+    const line_end = std.mem.indexOfScalar(u8, source, '\n') orelse source.len;
+    var fba = std.heap.FixedBufferAllocator.init(scratch);
+    const header = try std.json.parseFromSliceLeaky(std.json.Value, fba.allocator(), source[0..line_end], .{});
+    if (header != .object) return error.BadTape;
+    const machine = header.object.get("machine") orelse return null;
+    return try machine_parse(machine);
 }
 
 /// The clock's jitter a tape ran with (its header's), 0 for none: read before the machine is
@@ -812,4 +849,24 @@ test "a path round-trips through the header" {
     try std.testing.expectEqual(@as(usize, 2), header.chain.len);
     try std.testing.expectEqual(chain[1], header.chain[1]);
     try std.testing.expectEqual(@as(?u64, 0xfeed), header.host);
+}
+
+test "a tape keeps the machine a strategy decided for its run" {
+    const allocator = std.testing.allocator;
+    var pipe: [2]linux.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&pipe, .{})));
+    const machine: Machine = .{ .epoch_seconds = 951782400, .timer_slack_ns = 250_000, .modulation_stretch_ns = .{ 5_000_000, 90_000_000 } };
+    write_header(pipe[1], .{ .inputs = 0xaa, .exploration_seed = 3, .branch = 1, .branch_seed = 9, .machine = machine });
+    _ = linux.close(pipe[1]);
+    var buffer: [4096]u8 = undefined;
+    const size = linux.read(pipe[0], &buffer, buffer.len);
+    _ = linux.close(pipe[0]);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(size));
+    const scratch = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(scratch);
+    try std.testing.expectEqual(machine, (try machine_of(buffer[0..size], scratch)).?);
+    const overrides = try allocator.create(Overrides);
+    defer allocator.destroy(overrides);
+    const header = try parse(buffer[0..size], scratch, overrides);
+    try std.testing.expectEqual(machine, header.machine.?);
 }
