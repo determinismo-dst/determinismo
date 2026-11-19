@@ -2025,7 +2025,6 @@ fn explore_arguments(
     if (!asked.ranges) try argv.append(server.arena, "--no-ranges");
     if (!asked.memory_objective) try argv.append(server.arena, "--no-memory-objective");
     if (!asked.objective_extend) try argv.append(server.arena, "--no-objective-extend");
-    if (!asked.swarm) try argv.append(server.arena, "--no-swarm");
     if (asked.pipeline) |depth| {
         try argv.appendSlice(server.arena, &.{ "--pipeline", try print(server, "{d}", .{depth}) });
     }
@@ -5247,6 +5246,9 @@ pub fn system_arguments(
     if (asked.coverage) |set| try argv.appendSlice(arena, &.{ "--coverage", set });
     // Part of the inputs (the guest's command line): replays need it too.
     if (asked.timeline) |length| try argv.appendSlice(arena, &.{ "--timeline", length });
+    // `det.swarm=0`, as the run had it: given to the run alone, every replay and session of a
+    // swarm-less run was refused (TapeInputsDiffer, a session from the REPL on a demo run).
+    if (!asked.swarm) try argv.append(arena, "--no-swarm");
     if (asked.min_drive) |length| try argv.appendSlice(arena, &.{ "--min-drive", length });
     if (asked.drivers_cpu_weight) |weight| try argv.appendSlice(arena, &.{ "--drivers-cpu-weight", weight });
     if (asked.fault_weights) |weights| try argv.appendSlice(arena, &.{ "--fault-weights", weights });
