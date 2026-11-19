@@ -2605,8 +2605,12 @@ fn command_explore(
             undefined;
         // From a snapshot of the branch itself (--tape-snapshot): its ancestors are behind it.
         const chain = if (arguments.tape_snapshot != null) &.{} else replay.header.chain;
+        // Its ancestors on its clock (the header's): a tree's child keeps its root's, which the
+        // exploration ran them on; the run's would replay another prefix.
+        var lineage = options.*;
+        if (replay.header.clock_jitter_seed) |jitter| lineage.tsc_jitter_seed = jitter;
         var failure: ?node_core.ChainFailure = null;
-        start = try node_core.chain(context.arena, vm, options, start, chain, directory, ancestor, &failure);
+        start = try node_core.chain(context.arena, vm, &lineage, start, chain, directory, ancestor, &failure);
         // Futures from a moment of the taped branch (`--tape ... --from-vtime-ms`, causality
         // analysis): the branch itself replayed to the moment, then new branches from there,
         // with their own seeds.
@@ -2615,7 +2619,7 @@ fn command_explore(
             const recorded = try Recorded.load(context.arena, directory, replay.header.branch, replay.header.branch_seed, own);
             const at = ms * std.time.ns_per_ms;
             const branch_point = replay.header.chain.len > 0;
-            start = try node_make(context.arena, vm, options, start, recorded, at, branch_point);
+            start = try node_make(context.arena, vm, &lineage, start, recorded, at, branch_point);
             exploration.replay = null;
             exploration.exploration_seed = futures_seed(exploration.exploration_seed, start);
         }
