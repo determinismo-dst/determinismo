@@ -246,6 +246,13 @@ Two hooks before the timelines, each for a plugin that asks for it in its hello'
   failover, a compaction). The machine is in every tape's header and the run's record: a
   replay and a resume boot it, never asking again. `plugins/python/machine_date.py` sets the
   wall clock; `plugins/python/plugin_faults.py` adds a fault.
+  And `"fault_poll_ms":N` (1 to 1000) for faults at moments it chooses: the injector sleeps its
+  waits between faults in slices of N ms, each asking the named decision `fault.now`, whose
+  answer 0 ends the wait (any other value, as a draw nearly always is, waits on). A plugin told
+  the timeline's events answers it 0 just after the one it waits for, and the fault lands within
+  a slice of it (`plugins/wasm/react.zig`: after an event of a given name; the e2e
+  `reactive-faults` check). On every tape's machine and the guest's command line
+  (`det.fault_poll_ms=`): replays repeat it.
 - `"check"`: a checker. Each timeline that ended (not one cut short at a moment) is judged by it
   at its end, its events told first: `{"method":"check","index":I,"histories":[{"name","records"},...]}`
   (`histories`: what the timeline's commands recorded for the program's host checks with

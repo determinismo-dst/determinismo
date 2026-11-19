@@ -380,6 +380,8 @@ const Arguments = struct {
     /// A plugin's own faults for the guest (`det.custom_faults=`, hex), adopted from a tape or a
     /// record (tape.Machine.custom_faults).
     custom_faults: ?[]const u8 = null,
+    /// The fault injector's poll (`det.fault_poll_ms=`, tape.Machine.fault_poll_ms): 0, none.
+    fault_poll_ms: u32 = 0,
     /// The raw PMU event that is the guest's clock (see VM.Options.branch_event).
     branch_event: u64 = VM.branch_event_default,
     /// Another host's guest CPUID table (`determinismo cpuid`'s), to replay its runs here.
@@ -1756,6 +1758,10 @@ fn cmdline_build(
         parts[count] = try std.fmt.allocPrint(arena, "det.custom_faults={s}", .{hex});
         count += 1;
     }
+    if (arguments.fault_poll_ms > 0) { // det-faults': its waits polled (tape.Machine).
+        parts[count] = try std.fmt.allocPrint(arena, "det.fault_poll_ms={d}", .{arguments.fault_poll_ms});
+        count += 1;
+    }
     return std.mem.join(arena, " ", parts[0..count]);
 }
 
@@ -1951,6 +1957,7 @@ fn machine_adopt(arguments: *Arguments, machine: tape.Machine) void {
     arguments.cpu_modulation_stretch_ns = machine.modulation_stretch_ns;
     arguments.timer_delay_permille = machine.timer_delay_permille;
     arguments.custom_faults = if (machine.custom_faults.len > 0) machine.custom_faults else null;
+    arguments.fault_poll_ms = machine.fault_poll_ms;
     arguments.machine_adopted = machine;
 }
 
@@ -2339,6 +2346,10 @@ fn command_explore(
             // Its own faults, to the guest's injector on its command line (in the inputs).
             if (decided.machine.custom_faults.len > 0) {
                 options.cmdline = try std.fmt.allocPrint(context.arena, "{s} det.custom_faults={s}", .{ options.cmdline, decided.machine.custom_faults });
+            }
+            // And its poll of the injector's waits (after it, as cmdline_build puts it).
+            if (decided.machine.fault_poll_ms > 0) {
+                options.cmdline = try std.fmt.allocPrint(context.arena, "{s} det.fault_poll_ms={d}", .{ options.cmdline, decided.machine.fault_poll_ms });
             }
             exploration.machine = decided.machine;
             say("[determinismo] the machine its strategy decided: wall clock {d}, timer slack {d} us landing at {d}/1000 of it, jitter {x:0>16}, stretches {d}-{d} us\n", .{

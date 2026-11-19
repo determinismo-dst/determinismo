@@ -561,6 +561,20 @@ pub fn build(b: *std.Build) void {
     wasm_misbehave.shared_memory = true;
     wasm_misbehave.max_memory = wasm_memory_max;
     phases.install(b, phases.selftest, wasm_misbehave);
+    // And the `reactive-faults` check's: faults at an event's moment (the injector's polled waits).
+    const wasm_react = b.addExecutable(.{
+        .name = "react",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("plugins/wasm/react.zig"),
+            .target = wasm_decide_named.root_module.resolved_target,
+            .optimize = .ReleaseSmall,
+        }),
+    });
+    wasm_react.entry = .disabled;
+    wasm_react.rdynamic = true;
+    wasm_react.shared_memory = true;
+    wasm_react.max_memory = wasm_memory_max;
+    phases.install(b, phases.selftest, wasm_react);
     // And the `wasm-reach` check's: a WASI module (its arguments, the clock, /state) that fetches
     // a URL with the `http` host function.
     const wasm_reach = b.addExecutable(.{

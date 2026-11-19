@@ -370,7 +370,7 @@ pub fn main(init: std.process.Init) !void {
             rerandomize_schedule();
             regime_until_ns = monotonic_ns() + regime.stretch_ns;
         }
-        sleep_ns(regime_wait_ns());
+        wait_or_poll(regime_wait_ns());
         if (stopping.load(.acquire)) break;
         if (monotonic_ns() >= active_until_ns) {
             // A quiet stretch (healing what is under way), then the next stretch of faults.
@@ -1231,6 +1231,40 @@ fn rerandomize_due(now_ns: u64) void {
     nodes.kernel_reseed();
     sdk.event("entropy_rerandomized", .{ .every_ms = regime.rerandomize_ns / std.time.ns_per_ms });
     rerandomize_next_ns = if (regime.rerandomize_ns == 0) std.math.maxInt(u64) else now_ns + regime.rerandomize_ns;
+}
+
+/// A strategy's poll of the wait between faults (the machine it decided: explore's
+/// `det.fault_poll_ms=`), read once; 0: none.
+var fault_poll_read = false;
+var fault_poll_ns: u64 = 0;
+
+fn fault_poll() u64 {
+    if (fault_poll_read) return fault_poll_ns;
+    fault_poll_read = true;
+    var buffer: [16]u8 = undefined;
+    const text = cmdline_word("det.fault_poll_ms=", &buffer) orelse return 0;
+    const ms = std.fmt.parseInt(u32, text, 10) catch return 0;
+    fault_poll_ns = @as(u64, @min(ms, 1000)) * std.time.ns_per_ms;
+    return fault_poll_ns;
+}
+
+/// The wait before the next fault, slept; polled when a strategy asked (fault_poll): in slices,
+/// each asking "fault.now", whose answer 0 ends it (the strategy's moment: it has seen the
+/// timeline's events so far), any other value, as a draw nearly always is, waits on.
+fn wait_or_poll(wait_ns: u64) void {
+    const poll_ns = fault_poll();
+    if (poll_ns == 0) return sleep_ns(wait_ns);
+    const deadline_ns = monotonic_ns() + wait_ns;
+    while (true) {
+        const now_ns = monotonic_ns();
+        if (now_ns >= deadline_ns) return;
+        sleep_ns(@min(poll_ns, deadline_ns - now_ns));
+        if (stopping.load(.acquire)) return;
+        if (sdk.random_below_named("fault.now", 1 << 32) == 0) {
+            sdk.event("fault_now", .{ .poll_ms = poll_ns / std.time.ns_per_ms });
+            return;
+        }
+    }
 }
 
 /// The wait before the next fault: uniform up to twice the regime's mean gap, or the fixed

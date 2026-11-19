@@ -557,6 +557,10 @@ pub fn machine(strategy: *Strategy, arena: std.mem.Allocator, given: MachineChoi
         if (value != .integer or value.integer < 0 or value.integer > timer_slack_us_max) return error.BadPluginReply;
         chosen.machine.timer_slack_ns = @as(u64, @intCast(value.integer)) * std.time.ns_per_us;
     }
+    if (reply.get("fault_poll_ms")) |value| {
+        if (value != .integer or value.integer < 0 or value.integer > tape.fault_poll_ms_max) return error.BadPluginReply;
+        chosen.machine.fault_poll_ms = @intCast(value.integer);
+    }
     if (reply.get("timer_delay_permille")) |value| {
         if (value != .integer or value.integer < 0 or value.integer > 1000) return error.BadPluginReply;
         chosen.machine.timer_delay_permille = @intCast(value.integer);

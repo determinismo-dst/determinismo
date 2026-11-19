@@ -57,7 +57,13 @@ pub const Machine = struct {
     /// A plugin's own faults as the guest's command line gives them (`det.custom_faults=`: hex
     /// of [{"node","command"},...]); empty: none.
     custom_faults: []const u8 = "",
+    /// The fault injector's wait sliced in polls of this many milliseconds, each asking
+    /// "fault.now" (`det.fault_poll_ms=`): a plugin faults at moments it chooses. 0: no poll.
+    fault_poll_ms: u32 = 0,
 };
+
+/// A poll at most a second apart.
+pub const fault_poll_ms_max = 1000;
 
 /// One step of a path: branch `branch` (seed `seed`) ran from the previous step's moment to
 /// `vtime_ns`, where the next one branched from it.
@@ -283,7 +289,7 @@ pub fn write_header(fd: linux.fd_t, header: Header) void {
     }
     if (header.clock_jitter_seed) |seed| writer.print(",\"clock_jitter_seed\":\"{x:0>16}\"", .{seed}) catch unreachable;
     if (header.machine) |machine| {
-        writer.print(",\"machine\":{{\"epoch_seconds\":{d},\"timer_slack_ns\":{d},\"modulation_stretch_ns\":[{d},{d}],\"timer_delay_permille\":{d},\"custom_faults\":\"{s}\"}}", .{
+        writer.print(",\"machine\":{{\"epoch_seconds\":{d},\"timer_slack_ns\":{d},\"modulation_stretch_ns\":[{d},{d}],\"timer_delay_permille\":{d},\"custom_faults\":\"{s}\"", .{
             machine.epoch_seconds,
             machine.timer_slack_ns,
             machine.modulation_stretch_ns[0],
@@ -291,6 +297,8 @@ pub fn write_header(fd: linux.fd_t, header: Header) void {
             machine.timer_delay_permille,
             machine.custom_faults,
         }) catch unreachable;
+        if (machine.fault_poll_ms > 0) writer.print(",\"fault_poll_ms\":{d}", .{machine.fault_poll_ms}) catch unreachable;
+        writer.writeAll("}") catch unreachable;
     }
     if (header.margin_branches) |margin| writer.print(",\"margin_branches\":{d}", .{margin}) catch unreachable;
     if (header.strategy) |text| {
@@ -642,12 +650,15 @@ fn machine_parse(value: std.json.Value) !Machine {
     if (delay < 0 or delay > 1000) return error.BadTape;
     const custom: []const u8 = if (value.object.get("custom_faults")) |given| if (given == .string) given.string else return error.BadTape else "";
     for (custom) |c| if (!std.ascii.isHex(c)) return error.BadTape;
+    const poll: i64 = if (value.object.get("fault_poll_ms")) |given| if (given == .integer) given.integer else return error.BadTape else 0;
+    if (poll < 0 or poll > fault_poll_ms_max) return error.BadTape;
     return .{
         .epoch_seconds = @intCast(epoch.integer),
         .timer_slack_ns = @intCast(slack.integer),
         .modulation_stretch_ns = .{ @intCast(stretch.array.items[0].integer), @intCast(stretch.array.items[1].integer) },
         .timer_delay_permille = @intCast(delay),
         .custom_faults = custom,
+        .fault_poll_ms = @intCast(poll),
     };
 }
 
