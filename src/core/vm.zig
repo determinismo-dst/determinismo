@@ -150,7 +150,10 @@ steps_fd: ?linux.fd_t = null,
 /// comes and run at a moment 1 ms of virtual time later (printed: "at moment vtime=..."), so a
 /// live session replays as its steps at those moments. One at a time.
 steps_live: bool = false,
-/// The session's input ended: the run stops at once (.command_done), its timeline cut short.
+/// A live session's input ended: it ends at the moment armed then (session_end there).
+live_ending: bool = false,
+/// The session's input ended: the run stops (.command_done), its timeline cut short; a live
+/// one's 1 ms of virtual time on (live_ending), where its replay stops too.
 /// What came after a person's last step is nobody's: going on to the scenario's end held the
 /// machine (a paused scenario never ends; a live one, paced to the wall clock, for minutes).
 session_over: bool = false,
@@ -1811,6 +1814,11 @@ fn moment_arrive(vm: *VM) !?Outcome {
     }
     if (vm.stepping) {
         vm.stepping = false;
+        if (vm.live_ending) {
+            vm.live_ending = false;
+            try vm.session_end();
+            return null;
+        }
         if (vm.checkpoint_asked) |name| if (try vm.session_checkpoint(name)) return null;
         return vm.steps_next();
     }
@@ -2152,8 +2160,13 @@ fn steps_poll(vm: *VM) !void {
             // The release is the platform's, not a step: no "step done" for it. Its moment is
             // on the tape (det:over), so a replay runs the live stretch after the last step too,
             // what came from outside meanwhile (an ingress connection) from the tape.
+            // It ends at a moment reached by the clock, 1 ms on, as a replay reaches det:over's:
+            // ended at the exit where the input's end was seen, a replay stopped by its clock a
+            // few instructions short of it, one guest event fewer (e2e session, now and then).
             vm.live_busy = false;
-            try vm.session_end();
+            vm.steps_fd = null;
+            vm.live_ending = true;
+            try vm.step_arm_at((try vm.moment()).vtime_ns + std.time.ns_per_ms, null);
             return;
         }
         try vm.live_line.appendSlice(allocator, chunk[0..result]);
