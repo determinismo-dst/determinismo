@@ -880,9 +880,12 @@ fn wamr_link(b: *std.Build, module: *std.Build.Module) void {
         "-DWASM_DISABLE_WAKEUP_BLOCKING_OP=1", "-DWASM_ENABLE_LOG=0",
         "-DWASM_HAVE_MREMAP=1",                "-D_GNU_SOURCE",
         "-DNDEBUG",
-        // Its loaders read and write words at any address (x86-64 allows it): by design, so the
-        // sanitizer's alignment check is off for it alone, every other one kept.
+        // Its loaders read and write words at any address (x86-64 allows it), and it calls a
+        // module's compiled code through C function pointers (aot_runtime.c: no type prefix
+        // before machine code it loaded): both by design, so the sanitizer's alignment and
+        // function checks are off for it alone, every other one kept.
                                    "-fno-sanitize=alignment",
+        "-fno-sanitize=function",
     };
     module.addCSourceFiles(.{
         .root = wamr.path("core"),
