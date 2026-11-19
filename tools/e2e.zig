@@ -1635,10 +1635,10 @@ fn check_plugin_faults(context: *Context) !void {
     _ = try explore(context, &(common ++ [_][]const u8{ "--branches", "4", "--jobs", "2", "--events-dir", plain_events }));
     var branches: [4]Branch = undefined;
     const count = parse_branches(report, &branches);
-    const listed = try query_count(context, &.{ events, "event=custom_faults", "details.count=1" });
-    const drawn = try query_count(context, &.{ events, "event=fault", "details.kind=custom" });
+    const listed = try query_count(context, &.{ events, "event=custom_faults details.count=1" });
+    const drawn = try query_count(context, &.{ events, "event=fault details.kind=custom" });
     const ran = try query_count(context, &.{ events, "event=fault_custom_done" });
-    const without = try query_count(context, &.{ plain_events, "event=fault", "details.kind=custom" });
+    const without = try query_count(context, &.{ plain_events, "event=fault details.kind=custom" });
     const replay = try explore(context, &(common ++ [_][]const u8{ "--tape", try std.fs.path.join(arena, &.{ tapes, "branch-1.jsonl" }) }));
     var replayed: [1]Branch = undefined;
     const replays = count == 4 and parse_branches(replay, &replayed) == 1 and

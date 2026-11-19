@@ -554,6 +554,9 @@ const platform_events = std.StaticStringMap(void).initComptime(.{
     .{"explore_here_held"},
     .{"explore_here_ready"},
     .{"fault"},
+    .{"custom_faults"}, // A strategy's own faults det-faults read (strategy.zig's machine).
+    .{"custom_faults_invalid"},
+    .{"strategy_check"}, // How many assertions a checker plugin made (main.zig's StrategyCheck).
     .{"fault_custom_done"},
     .{"fault_exclusions"},
     .{"fault_exclusions_invalid"},
