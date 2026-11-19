@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 # Installs the pinned toolchain into ~/opt, checked against its published checksums: Zig, babashka
-# (notebooks), DuckDB (the events database), the TLA+ tools (`determinismo tla`), jank (test
-# programs in jank: their --describe on the host) and a JDK 25 (the guest's JVM coverage agent).
+# (notebooks), DuckDB (the events database), the TLA+ tools (`determinismo tla`), WAMR's wamrc
+# (wasm plugins compiled to native code), jank (test programs in jank: their --describe on the
+# host) and a JDK 25 (the guest's JVM coverage agent).
 # Idempotent.
 # Runs on the host as the user.
 # Usage: infra/host/tools.sh
@@ -61,6 +62,19 @@ mkdir -p "$opt/tla"
 # (2026-10-26, 2026-10-30), each time failing the checksum.
 fetch https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar \
   936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88 "$opt/tla/tla2tools.jar"
+
+# WAMR's ahead-of-time compiler, wamrc (2.4.4, its release's x86-64 Linux build): the explorer
+# compiles a wasm plugin with it to native code before it runs (src/wasm_plugin.zig finds it in
+# ~/opt/wamrc), the runtime compiled into determinismo of the same version.
+wamrc=$opt/wamrc-2.4.4
+if ! "$wamrc/wamrc" --version 2>/dev/null | grep -q 'wamrc 2.4.4'; then
+  mkdir -p "$wamrc"
+  fetch "https://github.com/bytecodealliance/wasm-micro-runtime/releases/download/WAMR-2.4.4/wamrc-2.4.4-x86_64-ubuntu-22.04.tar.gz" \
+    71cb2a47ec5df45e9221511ddbf6f3cfb5bcee530b3889cae5d5c3a6526056e8 "$opt/wamrc-2.4.4.tar.gz"
+  tar -xzf "$opt/wamrc-2.4.4.tar.gz" -C "$wamrc"
+  rm "$opt/wamrc-2.4.4.tar.gz"
+fi
+ln -sfn "$wamrc" "$opt/wamrc"
 
 # A JDK 25 (Temurin), for the guest's JVM coverage agent (build.zig: java.lang.classfile needs
 # JDK 24+ to compile, its entry point built for Java 8): ~/opt/jdk-25.

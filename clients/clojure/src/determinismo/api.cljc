@@ -446,13 +446,16 @@
 (defn wasm-build
   "Compiles a strategy plugin's source into a WebAssembly module that runs inside the explorer
   (docs/PLUGINS.md's `wasm:`, its ABI determinismo_1): a Zig file, built by zig on this
-  machine for wasm32 (no entry point, det_call exported). The module goes beside the source
-  (`.wasm` for `.zig`). -> {:module path :bytes n}; a build that fails throws its output."
+  machine for wasm32 (no entry point, det_call exported; shared memory, which the explorer
+  requires: compiled to native code, a call past its deadline is stopped). The module goes
+  beside the source (`.wasm` for `.zig`). -> {:module path :bytes n}; a build that fails
+  throws its output."
   [source]
   (let [module (str (str/replace source #"\.zig$" "") ".wasm")
         [status output] (http/run ["zig" "build-exe" source "-target" "wasm32-freestanding"
-                                   "-mcpu=mvp+bulk_memory+sign_ext+mutable_globals+nontrapping_fptoint"
+                                   "-mcpu=mvp+atomics+bulk_memory+sign_ext+mutable_globals+nontrapping_fptoint"
                                    "-O" "ReleaseSmall" "-fno-entry" "-rdynamic"
+                                   "--shared-memory" "--max-memory=268435456"
                                    (str "-femit-bin=" module)])]
     (when-not (zero? status)
       (throw (ex-info (str "determinismo: zig build-exe " source ": " output) {:source source :status status})))

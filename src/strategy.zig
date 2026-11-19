@@ -166,7 +166,7 @@ pub fn start(
     assert(command.len > 0);
     strategy.wasm = null;
     if (std.mem.startsWith(u8, command, wasm_plugin.prefix)) {
-        strategy.wasm = try wasm_plugin.load(arena, command[wasm_plugin.prefix.len..]);
+        strategy.wasm = try wasm_plugin.load(arena, command[wasm_plugin.prefix.len..], environ);
         strategy.pid = 0;
         strategy.to_plugin = -1;
         strategy.from_plugin = -1;

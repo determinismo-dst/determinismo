@@ -60,11 +60,15 @@ localhost/determinismo-strategy-extremes:1 --file plugins/python/Dockerfile .`);
 name images the same way.
 
 A plugin can be a WebAssembly module the explorer runs inside itself: `wasm:<module.wasm>
-[arguments]` (src/wasm_plugin.zig: WAMR's fast interpreter, compiled into determinismo). Each
-message is a direct call, no process, pipe or ring: a module answers in about a microsecond
-where a process takes tens. Its arguments come in the hello (`"arguments":[...]`), a module
-having no argv. The ABI `determinismo_1` (the import module's name; a module built for another
-is refused at load):
+[arguments]` (src/wasm_plugin.zig). The explorer compiles the module to native x86-64 code
+once, with WAMR's compiler `wamrc` (on PATH, or `$DETERMINISMO_WAMRC`; the result cached by
+the module's content under `~/.cache/determinismo/wasm`), and WAMR's runtime, compiled into
+determinismo, loads it. Each message is then a direct call, no process, pipe or ring. Measured
+on an x86-64 host, a decision answered by `plugins/wasm/all_hooks.zig` (std.json parsing its
+request) took 5 µs a call; the same message to a program took about 43 µs over the ring and
+80 to 170 µs over pipes. Its arguments come in the hello (`"arguments":[...]`), a module having
+no argv. The ABI `determinismo_1` (the import module's name; a module built for another is
+refused at load):
 
 | | |
 |---|---|
@@ -75,15 +79,17 @@ is refused at load):
 
 The host owns the request and the reply: a module exports no allocator, and reads a large
 request (a history) in parts.
-A call has an instruction budget (2 billion, WAMR's metering): a module that traps, loops past
-it, returns nonzero or outgrows the reply answers `{}` (the defaults), said on standard error,
-and the exploration goes on. The module's memory is the explorer's: it forks with it, each
+A module declares shared memory (it is compiled so that its loops and calls check a terminate
+flag); one without it is refused at load. A call has a deadline (2 s): a module that traps,
+runs past it, returns nonzero or outgrows the reply answers `{}` (the defaults), said on
+standard error, and the exploration goes on. The module's memory is the explorer's: it forks with it, each
 timeline's process carrying the plugin's state as of its start, as a holder carries the
 machine's. It imports nothing else (no clock, no files, no randomness of its own): its answers
 are a function of the messages it was sent, and its overrides are on the tapes as any plugin's.
-Zig builds one with `-target wasm32-freestanding -fno-entry -rdynamic`
-(`plugins/wasm/decide_named.zig`, built and installed with the self-tests); Rust, C and TinyGo
-target wasm32 too. From a REPL, the Clojure client builds one from its source and uploads it to
+Zig builds one with `-target wasm32-freestanding
+-mcpu=mvp+atomics+bulk_memory+sign_ext+mutable_globals+nontrapping_fptoint -fno-entry -rdynamic
+--shared-memory --max-memory=268435456` (`plugins/wasm/decide_named.zig`, built and installed
+with the self-tests); Rust, C and TinyGo target wasm32 too, with shared memory. From a REPL, the Clojure client builds one from its source and uploads it to
 serve, where a run names it:
 
 ```clojure

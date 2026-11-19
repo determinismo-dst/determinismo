@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! A WebAssembly plugin that fails on purpose when asked for a decision: it traps (`trap`) or
-//! loops past its instruction budget once (`loop`), its argument in the hello. The explorer answers
+//! loops past its call's deadline once (`loop`), its argument in the hello. The explorer answers
 //! those calls with the defaults and goes on: a module's failure is its answer's, never the
 //! exploration's. The e2e `wasm-misbehaving` check's plugin (src/wasm_plugin.zig).
 const std = @import("std");
@@ -10,7 +10,7 @@ extern "determinismo_1" fn reply_write(bytes: [*]const u8, length: usize) i32;
 
 var request: [1 << 20]u8 = undefined;
 var looping = false;
-/// Looped already: once is the test (each loop is the budget's 2 billion instructions).
+/// Looped already: once is the test (each loop takes the call's deadline, 2 s).
 var looped = false;
 
 export fn det_call(size: u32) i32 {
@@ -31,7 +31,7 @@ export fn det_call(size: u32) i32 {
         if (!looping) @trap();
         // Volatile, both ways: its only write is on a path that never returns, so a plain
         // read may be folded to false and a plain store sunk past the loop, never made. The
-        // module's memory outlives the call its budget ended: the flag is kept.
+        // module's memory outlives the call its deadline ended: the flag is kept.
         const flag: *volatile bool = &looped;
         if (!flag.*) {
             flag.* = true;

@@ -1887,7 +1887,8 @@ fn check_wasm_upload(context: *Context) !void {
 }
 
 /// A wasm plugin's failure is its answer's, never the exploration's: misbehave.wasm traps, then
-/// loops past its instruction budget, when asked for a decision; each run ends its timelines
+/// loops past its call's deadline (compiled code stopped by its terminate flag), when asked for
+/// a decision; each run ends its timelines
 /// with the defaults and says why.
 fn check_wasm_misbehaving(context: *Context) !void {
     const arena = context.arena;
@@ -1901,7 +1902,7 @@ fn check_wasm_misbehaving(context: *Context) !void {
     const loop_ran = parse_branches(looped, &branches) == 2;
     const trap_said = std.mem.indexOf(u8, trapped, "wasm plugin misbehave.wasm: ") != null and
         std.mem.indexOf(u8, trapped, "answered with the defaults") != null;
-    const loop_said = std.mem.indexOf(u8, looped, "instruction") != null and
+    const loop_said = std.mem.indexOf(u8, looped, "past its deadline") != null and
         std.mem.indexOf(u8, looped, "answered with the defaults") != null;
     // Its own failures, never the host's (a stack bound WAMR found wrong failed every call).
     const host_failed = std.mem.indexOf(u8, trapped, "native stack") != null or
@@ -1909,7 +1910,7 @@ fn check_wasm_misbehaving(context: *Context) !void {
     expect_all(context, &.{
         .{ "a trapping module's run ends both timelines", trap_ran },
         .{ "and says its calls answered the defaults", trap_said },
-        .{ "a module looping past its budget: the same", loop_ran and loop_said },
+        .{ "a module looping past its deadline: the same", loop_ran and loop_said },
         .{ "no call failed for the host's reasons", !host_failed },
     }, "wasm misbehaving: a module's failure is its answer's", .{});
     if (!trap_said or !loop_said) std.debug.print("{s}\n", .{lines_with(arena, looped, &.{"wasm plugin"}) catch ""});

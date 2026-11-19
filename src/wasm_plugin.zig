@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! Plugins as WebAssembly modules, run inside the explorer (`--strategy "wasm:<module.wasm>
-//! [arguments]"`): WAMR's fast interpreter compiled into it (build.zig's wamr_link), each
-//! hook a direct call, no process, pipe or ring between them. The messages are the other
+//! [arguments]"`) as native code: each module compiled ahead of time by WAMR's compiler
+//! (wamrc, once a module: cached by its content), loaded by WAMR's runtime compiled into the
+//! explorer (build.zig's wamr_link), each hook a direct call, no process, pipe or ring. The messages are the other
 //! transports' (docs/PLUGINS.md), so every hook a plugin can want is a wasm module's too.
 //!
 //! The module's side, the ABI `determinismo_1` (its imports' module name: a module built for
@@ -14,7 +15,9 @@
 //!
 //! The host owns the request and the reply: a module needs no allocator of its own exported,
 //! and reads a large request (a history) in parts.
-//! Each call has an instruction budget (WAMR's metering): a module that loops, traps or
+//! A module declares shared memory (Zig: --shared-memory, with atomics; the Clojure client's
+//! wasm-build does it): compiled so, its loops and calls check a terminate flag, which each
+//! call's deadline sets (SIGALRM: src/wasm_interrupt.c). A module that loops past it, traps or
 //! fails answers `{}` (the defaults), said on standard error; the explorer goes on.
 //!
 //! The module's memory is a plain mapping of the explorer's: it forks with it, a timeline's
@@ -29,9 +32,16 @@ pub const prefix = "wasm:";
 pub const abi = "determinismo_1";
 /// A module's file at most this large.
 const module_size_max = 64 << 20;
-/// One call's instructions at most (a decision's answer takes thousands; a history's check
-/// millions): past it, the call ends and its answer is the defaults.
-const instructions_per_call_max = 2_000_000_000;
+/// One call's time at most, whole seconds (a decision's answer takes microseconds; a history's
+/// check milliseconds): past it, the call is stopped and its answer is the defaults.
+const deadline_seconds = 2;
+/// How wamrc compiles a module: for any x86-64 host from 2009 on (srv4's Skylake, a Coffee
+/// Lake), software bounds checks (the runtime has no guard pages), the terminate flag checked
+/// (--enable-multi-thread: with shared memory, at every loop and call), no SIMD.
+const wamrc_flags = [_][]const u8{
+    "--target=x86_64",         "--cpu=x86-64-v2",       "--bounds-checks=1",
+    "--stack-bounds-checks=1", "--enable-multi-thread", "--disable-simd",
+};
 /// The module's operand stack and its host-managed heap (none: it has its own memory).
 const stack_size = 256 << 10;
 /// The native stack a call may take below its caller's frame: WAMR checks it in software (no
@@ -65,7 +75,8 @@ extern fn wasm_runtime_create_exec_env(instance: *Instance, stack: u32) ?*ExecEn
 extern fn wasm_runtime_call_wasm(env: *ExecEnv, function: *Function, argc: u32, argv: [*]u32) bool;
 extern fn wasm_runtime_get_exception(instance: *Instance) ?[*:0]const u8;
 extern fn wasm_runtime_clear_exception(instance: *Instance) void;
-extern fn wasm_runtime_set_instruction_count_limit(env: *ExecEnv, count: c_int) void;
+extern fn det_wasm_interrupt(env: *ExecEnv) void;
+extern fn det_wasm_interrupt_clear(env: *ExecEnv) void;
 extern fn wasm_runtime_set_native_stack_boundary(env: *ExecEnv, boundary: [*]u8) void;
 
 /// The call in progress (the explorer is one thread: one at a time), for the host functions.
@@ -141,13 +152,17 @@ pub const Plugin = struct {
         var state: Call = .{ .request = request, .reply = reply, .name = plugin.name };
         current = &state;
         defer current = null;
-        wasm_runtime_set_instruction_count_limit(plugin.env, instructions_per_call_max);
+        deadline_arm(plugin.env);
+        defer deadline_disarm(plugin.env);
         wasm_runtime_set_native_stack_boundary(plugin.env, @ptrFromInt(@frameAddress() - native_stack_budget));
         var argv = [1]u32{@intCast(request.len)};
         const ran = wasm_runtime_call_wasm(plugin.env, plugin.call_function, 1, &argv);
-        if (ran and argv[0] == 0 and !state.overflow and state.written > 0) return reply[0..state.written];
+        const late = deadline_expired;
+        if (ran and !late and argv[0] == 0 and !state.overflow and state.written > 0) return reply[0..state.written];
         plugin.failures += 1;
-        const why: []const u8 = if (!ran)
+        const why: []const u8 = if (late)
+            "past its deadline (" ++ std.fmt.comptimePrint("{d}", .{deadline_seconds}) ++ " s)"
+        else if (!ran)
             std.mem.span(wasm_runtime_get_exception(plugin.instance) orelse "it trapped")
         else if (state.overflow)
             "its reply outgrew the reply's room"
@@ -164,13 +179,18 @@ pub const Plugin = struct {
 };
 
 /// `command` is `<module.wasm> [arguments]`, after the `wasm:` prefix.
-pub fn load(arena: std.mem.Allocator, command: []const u8) !*Plugin {
+pub fn load(arena: std.mem.Allocator, command: []const u8, environ: [:null]const ?[*:0]const u8) !*Plugin {
     var words = std.mem.tokenizeScalar(u8, command, ' ');
     const path = words.next() orelse return error.NoWasmModule;
     var arguments: std.ArrayList([]const u8) = .empty;
     while (words.next()) |word| try arguments.append(arena, word);
     try runtime_init();
-    const bytes = try file_read(arena, path);
+    const wasm = try file_read(arena, path);
+    if (!memory_shared(wasm)) {
+        std.debug.print("[determinismo] wasm plugin {s}: its memory is not shared: build it with shared memory (Zig: --shared-memory with the atomics feature; the client's wasm-build does), so that its calls can be stopped at their deadline\n", .{path});
+        return error.WasmMemoryNotShared;
+    }
+    const bytes = try compiled(arena, path, wasm, environ);
     var error_buffer: [error_size_max]u8 = @splat(0);
     const module = wasm_runtime_load(bytes.ptr, @intCast(bytes.len), &error_buffer, error_buffer.len) orelse {
         std.debug.print("[determinismo] wasm plugin {s}: {s}\n", .{ path, std.mem.sliceTo(&error_buffer, 0) });
@@ -198,6 +218,194 @@ pub fn load(arena: std.mem.Allocator, command: []const u8) !*Plugin {
     return plugin;
 }
 
+/// The call in progress's environment, for the deadline's signal; and whether it fired.
+var deadline_env: ?*ExecEnv = null;
+var deadline_expired = false;
+var deadline_handler_set = false;
+
+fn on_deadline(_: linux.SIG) callconv(.c) void {
+    deadline_expired = true;
+    if (deadline_env) |env| det_wasm_interrupt(env);
+}
+
+/// SIGALRM in `deadline_seconds` (the kernel's itimerval: seconds and microseconds, the
+/// microseconds left 0), the terminate flag set when it fires. Timers are not inherited across a
+/// fork: each timeline's process arms its own.
+fn deadline_arm(env: *ExecEnv) void {
+    if (!deadline_handler_set) {
+        const action: linux.Sigaction = .{ .handler = .{ .handler = on_deadline }, .mask = linux.sigemptyset(), .flags = linux.SA.RESTART };
+        _ = linux.sigaction(linux.SIG.ALRM, &action, null);
+        deadline_handler_set = true;
+    }
+    det_wasm_interrupt_clear(env);
+    deadline_expired = false;
+    deadline_env = env;
+    const value: linux.itimerspec = .{ .it_interval = .{ .sec = 0, .nsec = 0 }, .it_value = .{ .sec = deadline_seconds, .nsec = 0 } };
+    _ = linux.setitimer(@backingInt(linux.ITIMER.REAL), &value, null);
+}
+
+fn deadline_disarm(env: *ExecEnv) void {
+    const off: linux.itimerspec = .{ .it_interval = .{ .sec = 0, .nsec = 0 }, .it_value = .{ .sec = 0, .nsec = 0 } };
+    _ = linux.setitimer(@backingInt(linux.ITIMER.REAL), &off, null);
+    deadline_env = null;
+    det_wasm_interrupt_clear(env);
+}
+
+/// Whether a module's memory (defined or imported) is shared: its limits' flags bit 1.
+fn memory_shared(wasm: []const u8) bool {
+    if (wasm.len < 8 or !std.mem.eql(u8, wasm[0..4], "\x00asm")) return false;
+    var at: usize = 8;
+    while (at < wasm.len) {
+        const id = wasm[at];
+        at += 1;
+        const size = leb(wasm, &at) orelse return false;
+        const end = at + size;
+        if (end > wasm.len) return false;
+        if (id == 5) { // Memory: count, then each one's limits flags.
+            var p = at;
+            const count = leb(wasm, &p) orelse return false;
+            return count > 0 and p < end and wasm[p] & 2 != 0;
+        }
+        if (id == 2) { // Imports: a memory import's limits flags.
+            var p = at;
+            const count = leb(wasm, &p) orelse return false;
+            for (0..count) |_| {
+                const module_size = leb(wasm, &p) orelse return false;
+                p += module_size;
+                const name_size = leb(wasm, &p) orelse return false;
+                p += name_size;
+                if (p >= end) return false;
+                const kind = wasm[p];
+                p += 1;
+                switch (kind) {
+                    0 => _ = leb(wasm, &p) orelse return false, // A function: its type.
+                    1 => { // A table: its type, its limits.
+                        p += 1;
+                        const flags = wasm[p];
+                        p += 1;
+                        _ = leb(wasm, &p) orelse return false;
+                        if (flags & 1 != 0) _ = leb(wasm, &p) orelse return false;
+                    },
+                    2 => return wasm[p] & 2 != 0, // A memory.
+                    3 => p += 2, // A global: its type and mutability.
+                    else => return false,
+                }
+            }
+        }
+        at = end;
+    }
+    return false;
+}
+
+fn leb(bytes: []const u8, at: *usize) ?usize {
+    var result: usize = 0;
+    var shift: u6 = 0;
+    while (at.* < bytes.len) {
+        const byte = bytes[at.*];
+        at.* += 1;
+        result |= @as(usize, byte & 0x7f) << shift;
+        if (byte & 0x80 == 0) return result;
+        if (shift >= 56) return null;
+        shift += 7;
+    }
+    return null;
+}
+
+/// The module compiled to native code by wamrc, once: cached by the module's content and the
+/// flags, under $HOME/.cache/determinismo/wasm (written whole, then renamed: workers compiling
+/// the same module at once agree). wamrc: $DETERMINISMO_WAMRC, else ~/opt/wamrc/wamrc (the
+/// host's tools: infra/host/tools.sh; serve's runs have a fixed PATH), else on PATH.
+fn compiled(arena: std.mem.Allocator, path: []const u8, wasm: []const u8, environ: [:null]const ?[*:0]const u8) ![]u8 {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(wasm);
+    for (wamrc_flags) |flag| hasher.update(flag);
+    const home = environ_value(environ, "HOME") orelse "/tmp";
+    const directory = try std.fmt.allocPrint(arena, "{s}/.cache/determinismo/wasm", .{home});
+    try directory_make(arena, directory);
+    const aot = try std.fmt.allocPrint(arena, "{s}/{x:0>16}.aot", .{ directory, hasher.final() });
+    if (file_read(arena, aot)) |bytes| return bytes else |_| {}
+    const tools = try std.fmt.allocPrintSentinel(arena, "{s}/opt/wamrc/wamrc", .{home}, 0);
+    const tools_wamrc: ?[]const u8 = if (linux.errno(linux.access(tools, linux.X_OK)) == .SUCCESS) tools else null;
+    const wamrc = environ_value(environ, "DETERMINISMO_WAMRC") orelse tools_wamrc orelse try path_find(arena, "wamrc", environ) orelse {
+        std.debug.print("[determinismo] wasm plugin {s}: no wamrc (WAMR's compiler: $DETERMINISMO_WAMRC, ~/opt/wamrc/wamrc or on PATH; infra/host/tools.sh installs it): it compiles a module before it runs\n", .{path});
+        return error.WamrcMissing;
+    };
+    const wasm_copy = try std.fmt.allocPrint(arena, "{s}.{d}.wasm", .{ aot, linux.getpid() });
+    const output = try std.fmt.allocPrint(arena, "{s}.{d}", .{ aot, linux.getpid() });
+    const wasm_copy_z = try arena.dupeSentinel(u8, wasm_copy, 0);
+    try file_write(arena, wasm_copy, wasm);
+    defer _ = linux.unlink(wasm_copy_z);
+    var argv: [wamrc_flags.len + 5:null]?[*:0]const u8 = @splat(null);
+    argv[0] = try arena.dupeSentinel(u8, wamrc, 0);
+    for (wamrc_flags, 1..) |flag, index| argv[index] = try arena.dupeSentinel(u8, flag, 0);
+    argv[wamrc_flags.len + 1] = "-o";
+    argv[wamrc_flags.len + 2] = try arena.dupeSentinel(u8, output, 0);
+    argv[wamrc_flags.len + 3] = wasm_copy_z;
+    const pid = linux.fork();
+    if (linux.errno(pid) != .SUCCESS) return error.Fork;
+    if (pid == 0) {
+        _ = linux.dup2(2, 1); // Its words on standard error, as the explorer's own.
+        _ = linux.execve(argv[0].?, &argv, environ.ptr);
+        linux.exit_group(127);
+    }
+    var status: i32 = 0;
+    while (true) {
+        const waited = linux.wait4(@intCast(pid), &status, 0, null);
+        if (linux.errno(waited) != .INTR) break;
+    }
+    if (status != 0) {
+        std.debug.print("[determinismo] wasm plugin {s}: wamrc could not compile it (status {d})\n", .{ path, status });
+        return error.WasmCompile;
+    }
+    const output_z = try arena.dupeSentinel(u8, output, 0);
+    const aot_z = try arena.dupeSentinel(u8, aot, 0);
+    if (linux.errno(linux.rename(output_z, aot_z)) != .SUCCESS) return error.WasmCompile;
+    std.debug.print("[determinismo] wasm plugin {s}: compiled to native code ({s})\n", .{ path, aot });
+    return file_read(arena, aot);
+}
+
+fn environ_value(environ: [:null]const ?[*:0]const u8, name: []const u8) ?[]const u8 {
+    for (environ) |entry| {
+        const text = std.mem.span(entry orelse continue);
+        if (text.len > name.len and std.mem.startsWith(u8, text, name) and text[name.len] == '=') return text[name.len + 1 ..];
+    }
+    return null;
+}
+
+fn path_find(arena: std.mem.Allocator, name: []const u8, environ: [:null]const ?[*:0]const u8) !?[]const u8 {
+    var directories = std.mem.tokenizeScalar(u8, environ_value(environ, "PATH") orelse "/usr/local/bin:/usr/bin:/bin", ':');
+    while (directories.next()) |directory| {
+        const candidate = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ directory, name }, 0);
+        if (linux.errno(linux.access(candidate, linux.X_OK)) == .SUCCESS) return candidate;
+    }
+    return null;
+}
+
+fn directory_make(arena: std.mem.Allocator, directory: []const u8) !void {
+    var at: usize = 1;
+    while (at <= directory.len) : (at += 1) {
+        if (at < directory.len and directory[at] != '/') continue;
+        const part = try arena.dupeSentinel(u8, directory[0..at], 0);
+        const made = linux.mkdir(part, 0o755);
+        if (linux.errno(made) != .SUCCESS and linux.errno(made) != .EXIST) return error.CacheDirectory;
+    }
+}
+
+fn file_write(arena: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {
+    const path_z = try arena.dupeSentinel(u8, path, 0);
+    const opened = linux.open(path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);
+    if (linux.errno(opened) != .SUCCESS) return error.CacheWrite;
+    const fd: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(fd);
+    var written: usize = 0;
+    while (written < bytes.len) {
+        const result = linux.write(fd, bytes[written..].ptr, bytes.len - written);
+        if (linux.errno(result) == .INTR) continue;
+        if (linux.errno(result) != .SUCCESS) return error.CacheWrite;
+        written += result;
+    }
+}
+
 fn file_read(arena: std.mem.Allocator, path: []const u8) ![]u8 {
     const path_z = try arena.dupeSentinel(u8, path, 0);
     const opened = linux.open(path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
@@ -219,4 +427,21 @@ fn file_read(arena: std.mem.Allocator, path: []const u8) ![]u8 {
         if (bytes.items.len > module_size_max) return error.WasmModuleTooLarge;
     }
     return bytes.items;
+}
+
+test "a module's memory is shared only when its limits say so, defined or imported" {
+    // A memory section: one memory, its limits' flags (bit 1 shared), least and most pages.
+    const defined_shared = "\x00asm\x01\x00\x00\x00" ++ "\x05\x04\x01\x03\x01\x02";
+    const defined_plain = "\x00asm\x01\x00\x00\x00" ++ "\x05\x04\x01\x01\x01\x02";
+    // An import section: "m" "f" a function (type 0), then "m" "mem" a shared memory.
+    const imported_shared = "\x00asm\x01\x00\x00\x00" ++
+        "\x02\x10\x02" ++ "\x01m\x01f\x00\x00" ++ "\x01m\x03mem\x02\x03\x01\x02";
+    try std.testing.expect(memory_shared(defined_shared));
+    try std.testing.expect(!memory_shared(defined_plain));
+    try std.testing.expect(memory_shared(imported_shared));
+    try std.testing.expect(!memory_shared("\x00asm\x01\x00\x00\x00"));
+    try std.testing.expect(!memory_shared("not a module"));
+    // Cut short anywhere: never past its end.
+    for (0..defined_shared.len) |length| _ = memory_shared(defined_shared[0..length]);
+    for (0..imported_shared.len) |length| _ = memory_shared(imported_shared[0..length]);
 }

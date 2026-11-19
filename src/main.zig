@@ -8828,6 +8828,7 @@ test branch_seed {
 
 test {
     _ = @import("strategy.zig");
+    _ = @import("wasm_plugin.zig");
     _ = @import("core").kvm;
     _ = @import("core").rtc;
     _ = @import("core").pit;
