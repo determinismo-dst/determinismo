@@ -12,17 +12,27 @@
 //!
 //!   determinismo shrink <explore options> --property '<message>'
 //!     (--script <script.json> | --seed <s> --branch <n> | --tape <branch.jsonl>)
-//!     [--timelines <n>] [--out <path>] [--json]
+//!     [--timelines <n>] [--out <path>] [--json] [--strategy <plugin>]...
+//!
+//! With `--strategy`, a plugin that wants "shrink" proposes cuts first (Strategy.shrink: by
+//! node, by time window, whatever it knows of the system): its candidates judged round after
+//! round, each result told back, and ddmin starts from the smallest that reproduces the
+//! failure. A failure needing several faults on one node is found in a few explorations where
+//! ddmin's halves split them.
 //!
 //! From a branch (or a tape), its script is made first: the branch replayed with its events,
 //! then `determinismo script`.
 const std = @import("std");
 const assert = std.debug.assert;
+const Strategies = @import("strategies.zig");
 
 const timelines_default = 16;
 const timelines_max = 256;
 /// Faults a script may have: ddmin's candidates grow with their square at worst.
 const faults_max = 512;
+/// A plugin's rounds at most, and its candidates judged at most: each one an exploration.
+const plugin_rounds_max = 16;
+const plugin_candidates_max = 128;
 
 const Request = struct {
     script: []const u8 = "",
@@ -35,6 +45,8 @@ const Request = struct {
     timelines: u32 = timelines_default,
     out: ?[]const u8 = null,
     json: bool = false,
+    /// Plugins proposing cuts (`--strategy`, one a line): explore never gets them.
+    strategy: ?[]const u8 = null,
     /// The explore options: the system, its scenario and profile.
     rest: []const []const u8 = &.{},
 };
@@ -98,6 +110,7 @@ pub fn run(
     arena: std.mem.Allocator,
     io: std.Io,
     self: []const u8,
+    environ: [:null]const ?[*:0]const u8,
     arguments: []const [:0]const u8,
 ) !u8 {
     var request = try arguments_parse(arena, arguments);
@@ -149,7 +162,12 @@ pub fn run(
     }
     const needed = @max(1, (whole + 1) / 2);
     const none = try shrinker.failing(&.{});
-    const kept = if (none >= needed) &[_]u32{} else try ddmin(arena, &shrinker, all, needed);
+    const start = if (request.strategy) |commands| if (none >= needed) all else try plugin_cuts(arena, environ, &shrinker, commands, all, .{
+        .whole = whole,
+        .none = none,
+        .needed = needed,
+    }) else all;
+    const kept = if (none >= needed) &[_]u32{} else try ddmin(arena, &shrinker, start, needed);
     const with_kept = if (kept.len == 0) none else if (kept.len == faults.len) whole else try shrinker.failing(kept);
 
     const out_path = request.out orelse try std.fmt.allocPrint(arena, "{s}.shrunk.json", .{request.script});
@@ -228,6 +246,48 @@ fn script_make(arena: std.mem.Allocator, io: std.Io, self: []const u8, request: 
 
 /// ddmin: the smallest subset of `items` found that still fails in `needed` timelines or more
 /// (`judge.failing(subset)`), each element of it needed (removing any one fails fewer).
+const Judged = struct { whole: u32, none: u32, needed: u32 };
+const Tried = struct { kept: []const u32, failing: u32 };
+
+/// A plugin's cuts (Strategy.shrink), before ddmin: asked with every result so far, its
+/// candidates judged in turn; the smallest that reproduces the failure is ddmin's start.
+fn plugin_cuts(
+    arena: std.mem.Allocator,
+    environ: [:null]const ?[*:0]const u8,
+    shrinker: *Shrinker,
+    commands: []const u8,
+    all: []const u32,
+    judged: Judged,
+) ![]const u32 {
+    var strategies: Strategies = undefined;
+    try strategies.start(arena, commands, environ, null);
+    defer strategies.stop();
+    try strategies.hello(0, null);
+    var tried: std.ArrayList(Tried) = .empty;
+    try tried.append(arena, .{ .kept = all, .failing = judged.whole });
+    try tried.append(arena, .{ .kept = &.{}, .failing = judged.none });
+    var best = all;
+    var count: u32 = 0;
+    rounds: for (0..plugin_rounds_max) |_| {
+        var request: std.Io.Writer.Allocating = .init(arena);
+        try request.writer.print("{{\"method\":\"shrink\",\"property\":{f},\"needed\":{d},\"timelines\":{d},\"faults\":{f},\"tried\":{f}}}", .{
+            std.json.fmt(shrinker.request.property, .{}), judged.needed,                  shrinker.request.timelines,
+            std.json.fmt(shrinker.faults, .{}),           std.json.fmt(tried.items, .{}),
+        });
+        const candidates = try strategies.shrink(arena, request.written(), shrinker.faults.len);
+        if (candidates.len == 0) break;
+        for (candidates) |candidate| {
+            if (count == plugin_candidates_max) break :rounds;
+            const failing = try shrinker.failing(candidate);
+            count += 1;
+            try tried.append(arena, .{ .kept = candidate, .failing = failing });
+            if (failing >= judged.needed and candidate.len < best.len) best = candidate;
+        }
+    }
+    std.debug.print("[determinismo] shrink: the plugin's {d} candidates judged; ddmin starts from {d} faults\n", .{ count, best.len });
+    return best;
+}
+
 fn ddmin(arena: std.mem.Allocator, judge: anytype, items: []const u32, needed: u32) ![]const u32 {
     var current = items;
     var granularity: usize = 2;
@@ -308,7 +368,7 @@ fn arguments_parse(arena: std.mem.Allocator, arguments: []const [:0]const u8) !R
         }
         const ours = eql(u8, flag, "--script") or eql(u8, flag, "--property") or
             eql(u8, flag, "--timelines") or eql(u8, flag, "--out") or eql(u8, flag, "--seed") or
-            eql(u8, flag, "--branch") or eql(u8, flag, "--tape");
+            eql(u8, flag, "--branch") or eql(u8, flag, "--tape") or eql(u8, flag, "--strategy");
         if (!ours) {
             if (eql(u8, flag, "--branches") or eql(u8, flag, "--branching")) {
                 std.debug.print("[determinismo] shrink: {s} is its own (the same timelines for every candidate)\n", .{flag});
@@ -320,7 +380,9 @@ fn arguments_parse(arena: std.mem.Allocator, arguments: []const [:0]const u8) !R
         index += 1;
         if (index == arguments.len) return error.Usage;
         const value = arguments[index];
-        if (eql(u8, flag, "--script")) {
+        if (eql(u8, flag, "--strategy")) {
+            request.strategy = if (request.strategy) |earlier| try std.fmt.allocPrint(arena, "{s}\n{s}", .{ earlier, value }) else value;
+        } else if (eql(u8, flag, "--script")) {
             request.script = value;
         } else if (eql(u8, flag, "--property")) {
             request.property = value;

@@ -128,6 +128,8 @@ wants_machine: bool = false,
 /// `"wants": ["check"]`: asked to judge each timeline that ended (`check`, at its end moment):
 /// its assertions are the timeline's, as a host check's (checks.zig).
 wants_check: bool = false,
+/// Proposes a shrink's cuts (`shrink`): determinismo shrink asks it before its own search.
+wants_shrink: bool = false,
 plan: [plan_labels_max]Planned = undefined,
 plan_count: u8 = 0,
 /// When the last batch went (virtual time): a plan older than `plan_refresh_ns` is refreshed.
@@ -323,6 +325,7 @@ pub fn hello(strategy: *Strategy, exploration_seed: u64, run_url: ?[]const u8) !
     strategy.wants_setup = false;
     strategy.wants_machine = false;
     strategy.wants_check = false;
+    strategy.wants_shrink = false;
     strategy.plan_count = 0;
     strategy.flushed_ns = 0;
     strategy.batch_count = 0;
@@ -343,6 +346,7 @@ pub fn hello(strategy: *Strategy, exploration_seed: u64, run_url: ?[]const u8) !
         if (std.mem.eql(u8, item.string, "setup")) strategy.wants_setup = true;
         if (std.mem.eql(u8, item.string, "machine")) strategy.wants_machine = true;
         if (std.mem.eql(u8, item.string, "check")) strategy.wants_check = true;
+        if (std.mem.eql(u8, item.string, "shrink")) strategy.wants_shrink = true;
     };
     // A plan comes with a batch's reply: plans need batches.
     if (strategy.wants_plans) strategy.wants_batched = true;
@@ -1114,6 +1118,41 @@ pub fn branch_end(strategy: *Strategy, end: BranchEnd) !bool {
     const reply = try strategy.call(writer.buffered());
     const stop_value = reply.get("stop") orelse return false;
     return stop_value == .bool and stop_value.bool;
+}
+
+/// Candidates a plugin proposes in one answer, at most (its reply fits line_size_max).
+pub const shrink_candidates_max = 64;
+
+/// A shrink's next cuts (determinismo shrink, a plugin that wants "shrink"):
+/// `{"method":"shrink","property":"...","faults":[<the script's entries>],"needed":N,
+/// "timelines":T,"tried":[{"kept":[i,...],"failing":n},...]}`, the reply
+/// `{"candidates":[[i,...],...]}`: subsets of the faults (their indexes) to judge next, each
+/// over the same T timelines (reproduced: failing in at least N); none, or no reply, when it has
+/// no more. Read into `arena`.
+pub fn shrink(strategy: *Strategy, arena: std.mem.Allocator, request: []const u8, faults_count: usize) ![]const []const u32 {
+    const reply = try strategy.call_long(request);
+    const candidates = reply.get("candidates") orelse return &.{};
+    if (candidates != .array) return error.BadReply;
+    var out: std.ArrayList([]const u32) = .empty;
+    for (candidates.array.items) |candidate| {
+        if (out.items.len == shrink_candidates_max) break;
+        if (candidate != .array) return error.BadReply;
+        const indexes = try arena.alloc(u32, candidate.array.items.len);
+        for (candidate.array.items, indexes) |item, *index| {
+            if (item != .integer or item.integer < 0 or item.integer >= faults_count) return error.BadReply;
+            index.* = @intCast(item.integer);
+        }
+        // In the script's order, each once: a script's entries are its faults in time.
+        std.mem.sort(u32, indexes, {}, std.sort.asc(u32));
+        var unique: usize = 0;
+        for (indexes) |index| {
+            if (unique > 0 and indexes[unique - 1] == index) continue;
+            indexes[unique] = index;
+            unique += 1;
+        }
+        try out.append(arena, indexes[0..unique]);
+    }
+    return out.items;
 }
 
 /// A history the timeline's commands recorded for one of the program's host checks

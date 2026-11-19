@@ -24,6 +24,10 @@ A strategy is an object with any of these methods; missing ones answer the defau
                                               [{"type": "always"|"sometimes"|..., "message",
                                               "condition", "details"}, ...], the timeline's
     branch_end(index, outcome, events, failing)   return True to stop the exploration
+    shrink(faults, tried, needed)             with wants "shrink" (determinismo shrink): the next
+                                              cuts, [[fault index, ...], ...]; [] when done.
+                                              `tried`: [{"kept", "failing"}], `needed` the
+                                              failures that reproduce it
 
 `default` is the bytes the branch would get; `source` is the asking process's name; `moment`
 is (vtime_ns, branches). Run it with `serve(strategy)`; anything printed to stderr reaches the
@@ -150,6 +154,12 @@ def _dispatch(strategy, name, request):
         if "histories" in inspect.signature(strategy.check).parameters:
             arguments.append(request.get("histories", []))
         return {"assertions": list(strategy.check(*arguments) or [])}
+    if method == "shrink":
+        # With `wants = ["shrink", ...]`: a shrink's next cuts (subsets of the faults by index).
+        if not hasattr(strategy, "shrink"):
+            return {}
+        return {"candidates": list(strategy.shrink(request["faults"], request["tried"],
+                                                   request["needed"]) or [])}
     if method == "branch_end":
         stop = False
         if hasattr(strategy, "branch_end"):

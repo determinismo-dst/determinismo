@@ -261,6 +261,14 @@ pub fn judge(strategies: *Strategies, index: u32, histories: []const Strategy.Hi
     return count;
 }
 
+/// A shrink's next cuts: the first plugin that wants "shrink" proposes them (Strategy.shrink).
+pub fn shrink(strategies: *Strategies, arena: std.mem.Allocator, request: []const u8, faults_count: usize) ![]const []const u32 {
+    for (strategies.plugins) |plugin| {
+        if (plugin.wants_shrink) return plugin.shrink(arena, request, faults_count);
+    }
+    return &.{};
+}
+
 /// Where the tree returns: each is told the generation (a plugin that only chooses returns
 /// decides nothing else: `decides` false); the first that names returns gives them (and its fill).
 pub fn returns(

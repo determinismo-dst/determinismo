@@ -847,7 +847,7 @@ fn command_tool(
     else if (eql(u8, name, "explain"))
         explain.run(arena, io, argv[0], rest)
     else if (eql(u8, name, "shrink"))
-        shrink.run(arena, io, argv[0], rest)
+        shrink.run(arena, io, argv[0], environ, rest)
     else if (eql(u8, name, "mutate"))
         mutate.run(arena, io, argv[0], rest)
     else if (eql(u8, name, "verify"))

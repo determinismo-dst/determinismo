@@ -339,8 +339,10 @@
 
 ;; Shrinking and explaining, beside causality: started, listed, stopped as it is.
 (defn shrink-start
-  "Starts shrinking a failing timeline: {:branch :property :timelines}: the fewest of its faults
-  its property's failure still needs (each tried in `timelines` futures). Its {:id}."
+  "Starts shrinking a failing timeline: {:branch :property :timelines :strategy}: the fewest of
+  its faults its property's failure still needs (each tried in `timelines` futures). `strategy`:
+  a plugin proposing cuts before ddmin's (\"@<name>\" or a command; plugins/python/
+  shrink_by_node.py). Its {:id}."
   [id request-map]
   (parse (request :post (str "/runs/" id "/shrink") request-map)))
 

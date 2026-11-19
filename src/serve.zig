@@ -44,7 +44,7 @@
 //!   POST /runs/<id>/causality {branch, property, points?, futures?, refine?, moments_max?,
 //!                            jump_min?, gap_min_ms?, planner?, verdict?, explain_exec?} -> {id} (in the background:
 //!                            causality.zig; its snapshots kept in the run's snapshots/)
-//!   POST /runs/<id>/shrink {branch, property, timelines?}  the fewest faults that failing
+//!   POST /runs/<id>/shrink {branch, property, timelines?, strategy?}  the fewest faults that failing
 //!                            timeline needs (`determinismo shrink`, in the background): {id}
 //!   GET  /runs/<id>/shrink    every shrinking: [{id, of, done, result, progress}]
 //!   POST /runs/<id>/shrink/<n>/stop
@@ -4499,6 +4499,9 @@ const ShrinkRequest = struct {
     property: []const u8,
     /// Timelines each candidate is judged over (shrink's --timelines).
     timelines: u32 = 16,
+    /// Plugins proposing cuts before ddmin (shrink's --strategy, one a line; uploads as
+    /// `@<name>`, kept by content as a run's).
+    strategy: ?[]const u8 = null,
 };
 
 /// Starts shrinking a failing timeline of the run, in the background (`shrink-<n>.jsonl` its
@@ -4543,6 +4546,10 @@ fn shrink_start(server: *Server, run: *const Run, body: []const u8, out: *std.Io
         "--out",       try std.fs.path.join(server.arena, &.{ directory, try print(server, "shrink-{d}.script.json", .{index}) }),
         "--json",
     });
+    if (asked.strategy) |given| {
+        var lines = std.mem.tokenizeScalar(u8, try strategy_resolve(server, given), '\n');
+        while (lines.next()) |line| try argv.appendSlice(server.arena, &.{ "--strategy", line });
+    }
     try std.Io.Dir.cwd().writeFile(server.io, .{
         .sub_path = try std.fs.path.join(server.arena, &.{ directory, try print(server, "shrink-{d}.request.json", .{index}) }),
         .data = try print(server, "{f}\n", .{std.json.fmt(asked, .{})}),
