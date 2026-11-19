@@ -8,6 +8,10 @@
             .url = "https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz",
             .hash = "N-V-__8AAPZ7fwBg4JoCzM_0o2A8wxH2hsUUeiU1iuZv53L5",
         },
+        .wamr = .{
+            .url = "https://github.com/bytecodealliance/wasm-micro-runtime/archive/refs/tags/WAMR-2.4.4.tar.gz",
+            .hash = "N-V-__8AAHQiMQFl9RnB-2ZP-tXIBf_6qzzPno9N39KSrWaM",
+        },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "sdk", "guest", "tools", "examples", "tests", "workload", "workloads.zig" },
 }

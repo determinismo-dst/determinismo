@@ -7,6 +7,7 @@ const assert = std.debug.assert;
 const linux = std.os.linux;
 const Events = @import("core").events;
 const tape = @import("core").tape;
+const wasm_plugin = @import("wasm_plugin.zig");
 
 pub const override_size_max = tape.override_size_max;
 pub const reason_size_max = tape.reason_size_max;
@@ -135,6 +136,8 @@ flushed_ns: u64 = 0,
 loopback: bool = false,
 /// The shared mapping the calls go through, once the plugin took it (`Ring` at its start).
 ring: ?[]align(std.heap.page_size_min) u8 = null,
+/// A module loaded into the explorer (`wasm:`, wasm_plugin.zig): calls are direct, no fds.
+wasm: ?*wasm_plugin.Plugin = null,
 
 const Strategy = @This();
 
@@ -161,6 +164,18 @@ pub fn start(
     environ: [:null]const ?[*:0]const u8,
 ) !void {
     assert(command.len > 0);
+    strategy.wasm = null;
+    if (std.mem.startsWith(u8, command, wasm_plugin.prefix)) {
+        strategy.wasm = try wasm_plugin.load(arena, command[wasm_plugin.prefix.len..]);
+        strategy.pid = 0;
+        strategy.to_plugin = -1;
+        strategy.from_plugin = -1;
+        strategy.response_start = 0;
+        strategy.response_end = 0;
+        strategy.loopback = false;
+        strategy.ring = null;
+        return;
+    }
     if (std.mem.startsWith(u8, command, "tcp://")) return strategy.connect(command["tcp://".len..]);
     var argv: [argument_count_max + 1:null]?[*:0]const u8 = @splat(null);
     var count: u32 = 0;
@@ -263,12 +278,14 @@ fn program_find(
 /// the end of its input when its owner stops it, and the owner would wait forever (a Tetris
 /// tree with a returns-only strategy, srv3 2026-10-29: every timeline stuck at its end).
 pub fn forget(strategy: *Strategy) void {
+    if (strategy.wasm != null) return; // In this process: nothing held for another.
     strategy.ring_unmap();
     _ = linux.close(strategy.to_plugin);
     _ = linux.close(strategy.from_plugin);
 }
 
 pub fn stop(strategy: *Strategy) void {
+    if (strategy.wasm != null) return; // In this process: gone with it.
     strategy.ring_unmap();
     _ = linux.close(strategy.to_plugin); // The plugin sees end of input and exits.
     _ = linux.close(strategy.from_plugin);
@@ -281,9 +298,12 @@ pub fn stop(strategy: *Strategy) void {
 /// a strategy that wants more than the events it is sent; null outside serve.
 pub fn hello(strategy: *Strategy, exploration_seed: u64, run_url: ?[]const u8) !void {
     var writer: std.Io.Writer = .fixed(&strategy.request);
-    try writer.print("{{\"method\":\"hello\",\"protocol\":1,\"exploration_seed\":\"{x:0>16}\",\"run_url\":{f}}}", .{
+    try writer.print("{{\"method\":\"hello\",\"protocol\":1,\"exploration_seed\":\"{x:0>16}\",\"run_url\":{f}", .{
         exploration_seed, std.json.fmt(run_url, .{}),
     });
+    // A module has no argv: what followed its path, here.
+    if (strategy.wasm) |plugin| try writer.print(",\"arguments\":{f}", .{std.json.fmt(plugin.arguments, .{})});
+    try writer.writeAll("}");
     const reply = try strategy.call(writer.buffered());
     const name = reply.get("name") orelse return error.BadPluginReply;
     if (name != .string) return error.BadPluginReply;
@@ -1129,7 +1149,7 @@ fn call(strategy: *Strategy, request: []const u8) !std.json.ObjectMap {
 /// `call` for a request of any size (the reply still fits the fixed buffers).
 fn call_long(strategy: *Strategy, request: []const u8) !std.json.ObjectMap {
     assert(request.len > 0);
-    const line = if (strategy.ring) |memory| try strategy.ring_call(memory, request) else line: {
+    const line = if (strategy.wasm) |plugin| plugin.call(request, &strategy.response) else if (strategy.ring) |memory| try strategy.ring_call(memory, request) else line: {
         try write_all(strategy.to_plugin, request);
         try write_all(strategy.to_plugin, "\n");
         break :line try strategy.read_line();

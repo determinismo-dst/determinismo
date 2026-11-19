@@ -106,6 +106,7 @@ pub fn build(b: *std.Build) void {
     });
     duckdb_link(b, exe.root_module, duckdb);
     zstd_link(b, exe.root_module);
+    wamr_link(b, exe.root_module);
     // Compiled, not linked: no DuckDB needed (its functions are declared in src/duckdb.zig), so
     // any machine checks the code in seconds (`zig build check`), a Mac included.
     const check_exe = b.addExecutable(.{
@@ -525,6 +526,36 @@ pub fn build(b: *std.Build) void {
     // Installed with the self-tests: a machine that builds them ships it to the host that runs
     // the checks (infra/host/check.sh).
     phases.install(b, phases.selftest, e2e);
+    // The e2e `wasm-plugin` check's plugin: a WebAssembly module (zig-out/bin/decide_named.wasm)
+    // the explorer runs inside itself (src/wasm_plugin.zig), shipped with the self-tests.
+    const wasm_decide_named = b.addExecutable(.{
+        .name = "decide_named",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("plugins/wasm/decide_named.zig"),
+            .target = b.resolveTargetQuery(.{
+                .cpu_arch = .wasm32,
+                .os_tag = .freestanding,
+                .cpu_model = .{ .explicit = &std.Target.wasm.cpu.mvp },
+                .cpu_features_add = std.Target.wasm.featureSet(&.{ .bulk_memory, .sign_ext, .mutable_globals, .nontrapping_fptoint }),
+            }),
+            .optimize = .ReleaseSmall,
+        }),
+    });
+    wasm_decide_named.entry = .disabled;
+    wasm_decide_named.rdynamic = true;
+    phases.install(b, phases.selftest, wasm_decide_named);
+    // And the `wasm-misbehaving` check's: one that traps or loops when asked for a decision.
+    const wasm_misbehave = b.addExecutable(.{
+        .name = "misbehave",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("plugins/wasm/misbehave.zig"),
+            .target = wasm_decide_named.root_module.resolved_target,
+            .optimize = .ReleaseSmall,
+        }),
+    });
+    wasm_misbehave.entry = .disabled;
+    wasm_misbehave.rdynamic = true;
+    phases.install(b, phases.selftest, wasm_misbehave);
     const e2e_run = b.addRunArtifact(e2e);
     // What it runs: determinismo, the guest, the self-tests and the workloads its checks name.
     for ([_]*std.Build.Step{ phases.determinismo, phases.guest, phases.selftest }) |phase| e2e_run.step.dependOn(phase);
@@ -624,6 +655,7 @@ pub fn build(b: *std.Build) void {
             unit_tests.root_module.addImport("regex", regex_module);
             duckdb_link(b, unit_tests.root_module, duckdb);
             zstd_link(b, unit_tests.root_module);
+            wamr_link(b, unit_tests.root_module);
             // Its tests compiled by `check` too, not linked (no DuckDB): a Mac checks them.
             const check_tests = b.addTest(.{ .root_module = b.createModule(.{
                 .root_source_file = b.path(root),
@@ -789,6 +821,56 @@ fn zstd_link(b: *std.Build, module: *std.Build.Module) void {
             "compress/zstd_preSplit.c",            "compress/zstdmt_compress.c",
         },
         .flags = &.{ "-DZSTD_DISABLE_ASM", "-DZSTD_LEGACY_SUPPORT=0" },
+    });
+    module.link_libc = true;
+}
+
+/// WAMR (the WebAssembly Micro Runtime, 2.4.4: its fast interpreter, C, no JIT, AOT or WASI,
+/// software bounds checks: no signal handlers in the explorer, instruction metering on): wasm
+/// plugins run inside the explorer (src/wasm_plugin.zig declares its functions: `check`
+/// compiles without it).
+fn wamr_link(b: *std.Build, module: *std.Build.Module) void {
+    const wamr = b.dependency("wamr", .{});
+    const includes = [_][]const u8{
+        "core",                   "core/iwasm/include",         "core/iwasm/common",
+        "core/iwasm/interpreter", "core/shared/platform/linux", "core/shared/platform/include",
+        "core/shared/utils",      "core/shared/mem-alloc",
+    };
+    for (includes) |directory| module.addIncludePath(wamr.path(directory));
+    module.addCSourceFiles(.{
+        .root = wamr.path("core"),
+        .files = &.{
+            "iwasm/common/wasm_application.c",             "iwasm/common/wasm_blocking_op.c",
+            "iwasm/common/wasm_exec_env.c",                "iwasm/common/wasm_loader_common.c",
+            "iwasm/common/wasm_memory.c",                  "iwasm/common/wasm_native.c",
+            "iwasm/common/wasm_runtime_common.c",          "iwasm/common/wasm_shared_memory.c",
+            "iwasm/common/arch/invokeNative_em64.s",       "iwasm/interpreter/wasm_interp_fast.c",
+            "iwasm/interpreter/wasm_loader.c",             "iwasm/interpreter/wasm_runtime.c",
+            "shared/platform/linux/platform_init.c",       "shared/platform/common/posix/posix_blocking_op.c",
+            "shared/platform/common/posix/posix_malloc.c", "shared/platform/common/posix/posix_memmap.c",
+            "shared/platform/common/posix/posix_sleep.c",  "shared/platform/common/posix/posix_thread.c",
+            "shared/platform/common/posix/posix_time.c",   "shared/utils/bh_assert.c",
+            "shared/utils/bh_bitmap.c",                    "shared/utils/bh_common.c",
+            "shared/utils/bh_hashmap.c",                   "shared/utils/bh_leb128.c",
+            "shared/utils/bh_list.c",                      "shared/utils/bh_log.c",
+            "shared/utils/bh_queue.c",                     "shared/utils/bh_vector.c",
+            "shared/utils/runtime_timer.c",                "shared/mem-alloc/mem_alloc.c",
+            "shared/mem-alloc/ems/ems_alloc.c",            "shared/mem-alloc/ems/ems_gc.c",
+            "shared/mem-alloc/ems/ems_hmu.c",              "shared/mem-alloc/ems/ems_kfc.c",
+        },
+        .flags = &.{
+            "-DBH_PLATFORM_LINUX",                   "-DBUILD_TARGET_X86_64",
+            "-DBH_MALLOC=wasm_runtime_malloc",       "-DBH_FREE=wasm_runtime_free",
+            "-DWASM_ENABLE_INTERP=1",                "-DWASM_ENABLE_FAST_INTERP=1",
+            "-DWASM_ENABLE_LABELS_AS_VALUES=1",      "-DWASM_ENABLE_AOT=0",
+            "-DWASM_ENABLE_JIT=0",                   "-DWASM_ENABLE_LIBC_BUILTIN=0",
+            "-DWASM_ENABLE_LIBC_WASI=0",             "-DWASM_ENABLE_BULK_MEMORY=1",
+            "-DWASM_ENABLE_REF_TYPES=1",             "-DWASM_DISABLE_HW_BOUND_CHECK=1",
+            "-DWASM_DISABLE_STACK_HW_BOUND_CHECK=1", "-DWASM_DISABLE_WAKEUP_BLOCKING_OP=1",
+            "-DWASM_ENABLE_INSTRUCTION_METERING=1",  "-DWASM_ENABLE_LOG=0",
+            "-DWASM_HAVE_MREMAP=1",                  "-D_GNU_SOURCE",
+            "-DNDEBUG",
+        },
     });
     module.link_libc = true;
 }

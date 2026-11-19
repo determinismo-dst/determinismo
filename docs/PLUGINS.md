@@ -17,6 +17,7 @@ determinismo explore ... --strategy "python3 plugins/python/llm.py"     # Claude
 determinismo explore ... --strategy tcp://127.0.0.1:9100                # plugins/clojure/strategies.clj
 determinismo explore ... --strategy tcp://127.0.0.1:9000                # a plugin elsewhere
 determinismo explore ... --strategy image:localhost/determinismo-strategy-extremes:1  # in a container
+determinismo explore ... --strategy "wasm:zig-out/bin/decide_named.wasm node.start_draw 7"  # inside the explorer
 ```
 
 What a strategy decides, and what it sees (each detailed below):
@@ -57,6 +58,32 @@ host's network, so its `run_url` and the services a command would reach are ther
 `plugins/python/Dockerfile` packages extremes.py so (`podman build --tag
 localhost/determinismo-strategy-extremes:1 --file plugins/python/Dockerfile .`); serve's runs
 name images the same way.
+
+A plugin can be a WebAssembly module the explorer runs inside itself: `wasm:<module.wasm>
+[arguments]` (src/wasm_plugin.zig: WAMR's fast interpreter, compiled into determinismo). Each
+message is a direct call, no process, pipe or ring: a module answers in about a microsecond
+where a process takes tens. Its arguments come in the hello (`"arguments":[...]`), a module
+having no argv. The ABI `determinismo_1` (the import module's name; a module built for another
+is refused at load):
+
+| | |
+|---|---|
+| `export fn det_call(request_size: u32) i32` | One message: 0 once its reply is written. |
+| `import request_read(buffer, length) i32` | Copies the request's next bytes into the module's memory; 0 at its end. |
+| `import reply_write(bytes, length) i32` | Appends to the reply (16 KiB at most); nonzero past its room. |
+| `import log(level, bytes, length)` | A line on determinismo's standard error (0 error, 1 warn, 2 info, 3 debug). |
+
+The host owns the request and the reply: a module exports no allocator, and reads a large
+request (a history) in parts.
+A call has an instruction budget (2 billion, WAMR's metering): a module that traps, loops past
+it, returns nonzero or outgrows the reply answers `{}` (the defaults), said on standard error,
+and the exploration goes on. The module's memory is the explorer's: it forks with it, each
+timeline's process carrying the plugin's state as of its start, as a holder carries the
+machine's. It imports nothing else (no clock, no files, no randomness of its own): its answers
+are a function of the messages it was sent, and its overrides are on the tapes as any plugin's.
+Zig builds one with `-target wasm32-freestanding -fno-entry -rdynamic`
+(`plugins/wasm/decide_named.zig`, built and installed with the self-tests); Rust, C and TinyGo
+target wasm32 too.
 
 A plugin can run anywhere: `tcp://<address>:<port>` connects to one already listening (one
 connection per exploration worker). `plugins/python/serve_tcp.py <port> <command>` serves any

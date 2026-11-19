@@ -217,6 +217,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "machine-decisions", check_machine_decisions }, .{ "branch-seeds", check_branch_seeds },
         .{ "plugin-faults", check_plugin_faults },         .{ "plugin-checks", check_plugin_checks },
         .{ "device-models", check_device_models },         .{ "plugin-histories", check_plugin_histories },
+        .{ "wasm-plugin", check_wasm_plugin },             .{ "wasm-misbehaving", check_wasm_misbehaving },
         .{ "egress", check_egress },                       .{ "ingress", check_ingress },
         .{ "ingress-session", check_ingress_session },     .{ "moments", check_moments },
         .{ "properties", check_builtin_properties },       .{ "entropy", check_kernel_entropy },
@@ -1831,14 +1832,52 @@ fn check_machine_decisions(context: *Context) !void {
 /// alone from its tapes (the setup's tape applied as the setup runs again), and without the
 /// setup's tape the same replay parts from its recording.
 fn check_setup_decisions(context: *Context) !void {
+    try setup_decisions_by(context, "python3 plugins/python/decide_named.py node.start_draw 7", "setup");
+}
+
+/// The same with decide_named as a WebAssembly module run inside the explorer (`wasm:`,
+/// src/wasm_plugin.zig; plugins/wasm/decide_named.zig): the protocol's hooks, the setup's
+/// included, through direct calls.
+fn check_wasm_plugin(context: *Context) !void {
+    const module = try std.fs.path.join(context.arena, &.{ context.bin, "decide_named.wasm" });
+    const strategy = try std.fmt.allocPrint(context.arena, "wasm:{s} node.start_draw 7", .{module});
+    try setup_decisions_by(context, strategy, "wasm");
+}
+
+/// A wasm plugin's failure is its answer's, never the exploration's: misbehave.wasm traps, then
+/// loops past its instruction budget, when asked for a decision; each run ends its timelines
+/// with the defaults and says why.
+fn check_wasm_misbehaving(context: *Context) !void {
     const arena = context.arena;
     const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
-    const tapes = try std.fs.path.join(arena, &.{ context.scratch, "setup-tapes" });
-    const events = try std.fs.path.join(arena, &.{ context.scratch, "setup-events" });
+    const module = try std.fs.path.join(arena, &.{ context.bin, "misbehave.wasm" });
+    const common = [_][]const u8{ "--program", program, "--scenario", "bank", "--seed", "3", "--branches", "2", "--jobs", "1" };
+    const trapped = try explore(context, &(common ++ [_][]const u8{ "--strategy", try std.fmt.allocPrint(arena, "wasm:{s} trap", .{module}) }));
+    const looped = try explore(context, &(common ++ [_][]const u8{ "--strategy", try std.fmt.allocPrint(arena, "wasm:{s} loop", .{module}) }));
+    var branches: [2]Branch = undefined;
+    const trap_ran = parse_branches(trapped, &branches) == 2;
+    const loop_ran = parse_branches(looped, &branches) == 2;
+    const trap_said = std.mem.indexOf(u8, trapped, "wasm plugin misbehave.wasm: ") != null and
+        std.mem.indexOf(u8, trapped, "answered with the defaults") != null;
+    const loop_said = std.mem.indexOf(u8, looped, "instruction") != null and
+        std.mem.indexOf(u8, looped, "answered with the defaults") != null;
+    expect_all(context, &.{
+        .{ "a trapping module's run ends both timelines", trap_ran },
+        .{ "and says its calls answered the defaults", trap_said },
+        .{ "a module looping past its budget: the same", loop_ran and loop_said },
+    }, "wasm misbehaving: a module's failure is its answer's", .{});
+    if (!trap_said or !loop_said) std.debug.print("{s}\n", .{lines_with(arena, looped, &.{"wasm plugin"}) catch ""});
+}
+
+fn setup_decisions_by(context: *Context, strategy: []const u8, label: []const u8) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
+    const tapes = try std.fs.path.join(arena, &.{ context.scratch, try std.fmt.allocPrint(arena, "{s}-tapes", .{label}) });
+    const events = try std.fs.path.join(arena, &.{ context.scratch, try std.fmt.allocPrint(arena, "{s}-events", .{label}) });
     const common = [_][]const u8{ "--program", program, "--scenario", "bank", "--seed", "3" };
     const report = try explore(context, &(common ++ [_][]const u8{
-        "--branches",   "4",                                                        "--jobs",     "2",
-        "--strategy",   "python3 plugins/python/decide_named.py node.start_draw 7", "--tape-dir", tapes,
+        "--branches",   "4",      "--jobs",     "2",
+        "--strategy",   strategy, "--tape-dir", tapes,
         "--events-dir", events,
     }));
     var branches: [4]Branch = undefined;
@@ -1865,7 +1904,7 @@ fn check_setup_decisions(context: *Context) !void {
     const replays = count == 4 and parse_branches(replay, &replayed) == 1 and
         std.mem.eql(u8, replayed[0].events_hash, hash_of(branches[0..count], 1));
     // The same tapes without the setup's.
-    const bare = try std.fs.path.join(arena, &.{ context.scratch, "setup-tapes-bare" });
+    const bare = try std.fs.path.join(arena, &.{ context.scratch, try std.fmt.allocPrint(arena, "{s}-tapes-bare", .{label}) });
     _ = try run_kept(context, &.{ "cp", "-r", tapes, bare });
     _ = try run_kept(context, &.{ "rm", "-f", try std.fs.path.join(arena, &.{ bare, "setup.jsonl" }) });
     const bare_replay = try explore(context, &(common ++ [_][]const u8{ "--tape", try std.fs.path.join(arena, &.{ bare, "branch-1.jsonl" }) }));
@@ -1876,7 +1915,7 @@ fn check_setup_decisions(context: *Context) !void {
         .{ "the setup's node.start_draw answered by the strategy, every draw of it (7)", answered },
         .{ "a timeline replays alone from its tapes, the setup's included", replays },
         .{ "without the setup's tape the same replay parts from its recording", parted },
-    }, "setup decisions: {d} timelines; {s}", .{ count, draws_line[0..@min(draws_line.len, 300)] });
+    }, "setup decisions ({s}): {d} timelines; {s}", .{ label, count, draws_line[0..@min(draws_line.len, 300)] });
 }
 
 /// A strategy written in Python (found through PATH, as a shell would) steers decisions, and a
