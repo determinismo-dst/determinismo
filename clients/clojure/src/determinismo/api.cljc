@@ -469,7 +469,8 @@
   "Uploads a strategy plugin to serve from a local file, as `name`: an executable (run on
   serve's host) or a WebAssembly module (run inside the explorer, sandboxed). A run names it
   as \"@<name> [arguments]\". Sent in base64, so any client's text request carries it.
-  Answers {:strategy \"@<name>\" :bytes n :kind \"wasm\"|\"executable\"}."
+  Answers {:strategy \"@<name>\" :bytes n :kind \"wasm\"|\"executable\" :hash h}: a run
+  naming it keeps these bytes (artifacts/<h>-<name>), whatever is uploaded under the name after."
   [name path]
   (parse (request :put (str "/strategies/" name "?encoding=base64") (http/file-base64 path))))
 
