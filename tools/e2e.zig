@@ -1951,8 +1951,9 @@ fn check_wasm_upload(context: *Context) !void {
     _ = std.base64.standard.Encoder.encode(encoded, module);
     const uploaded = curl(context, &.{ "-X", "PUT", "-d", encoded, url ++ "/strategies/decide_named?encoding=base64" }) catch "";
     const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
+    // Without swarm (`det.swarm=0` on the guest's command line), which its replays need too.
     const body = try std.fmt.allocPrint(arena, "{{\"program\":{f},\"scenario\":\"bank\",\"coverage\":\"off\"," ++
-        "\"seed\":3,\"branches\":2,\"strategy\":\"@decide_named node.start_draw 7\"}}", .{std.json.fmt(program, .{})});
+        "\"swarm\":false,\"seed\":3,\"branches\":2,\"strategy\":\"@decide_named node.start_draw 7\"}}", .{std.json.fmt(program, .{})});
     _ = curl(context, &.{ "-X", "POST", "-d", body, url ++ "/runs" }) catch "";
     var run: []const u8 = "";
     for (0..600) |_| {
@@ -1963,6 +1964,9 @@ fn check_wasm_upload(context: *Context) !void {
         if (run.len > 0 and !going) break;
         sleep_ms(200);
     }
+    // A timeline of it replayed through serve (a session's way there): no plugin, the run's inputs.
+    const replayed: []const u8 = curl(context, &.{ "-X", "POST", "-d", "{\"branch\":0}", url ++ "/runs/1/replay" }) catch "";
+    const replays = std.mem.indexOf(u8, replayed, "[branch    0]") != null and std.mem.indexOf(u8, replayed, "TapeInputsDiffer") == null;
     // The run keeps the upload by content: its request names the kept copy (its hash) and the
     // name as asked, whatever is uploaded under the name after.
     const hash = try std.fmt.allocPrint(arena, "{x:0>16}", .{std.hash.Wyhash.hash(0, module)});
@@ -1974,7 +1978,8 @@ fn check_wasm_upload(context: *Context) !void {
         .{ "the run's strategy is the module, run inside the explorer", std.mem.indexOf(u8, run, "\"strategy_name\":\"wasm/decide-named\"") != null },
         .{ "its request names the kept copy by that hash", std.mem.indexOf(u8, run, kept_said) != null },
         .{ "and the name as asked", std.mem.indexOf(u8, run, "\"strategy_asked\":\"@decide_named node.start_draw 7\"") != null },
-    }, "wasm upload: {s}; run {s}", .{ std.mem.trim(u8, uploaded, "\n"), run[0..@min(run.len, 1200)] });
+        .{ "a timeline of it (swarm off) replays through serve", replays },
+    }, "wasm upload: {s}; run {s}; replay {s}", .{ std.mem.trim(u8, uploaded, "\n"), run[0..@min(run.len, 1200)], replayed[0..@min(replayed.len, 600)] });
 }
 
 /// A wasm plugin reaches outside its messages: reach.wasm (WASI) reads its arguments and the wall
