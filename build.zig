@@ -174,6 +174,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "det-stop-faults", .path = "guest/runtime/stop_faults.zig" },
         .{ .name = "det-nrepl-relay", .path = "guest/runtime/nrepl_relay.zig" },
         .{ .name = "det-assert", .path = "guest/runtime/assert_main.zig" },
+        .{ .name = "det-sdk", .path = "guest/runtime/sdk_main.zig" },
         .{ .name = "det-egress", .path = "guest/runtime/egress.zig" },
         .{ .name = "det-ingress", .path = "guest/runtime/ingress.zig" },
         .{ .name = "det-runner", .path = "guest/runtime/runner.zig" },

@@ -557,6 +557,7 @@ const platform_events = std.StaticStringMap(void).initComptime(.{
     .{"custom_faults"}, // A strategy's own faults det-faults read (strategy.zig's machine).
     .{"custom_faults_invalid"},
     .{"fault_now"}, // A plugin's "fault.now" ended the injector's wait (det.fault_poll_ms).
+    .{"fault_injector"}, // The timeline's fault injector, a run's own (composer.zig's injector_choose).
     .{"strategy_check"}, // How many assertions a checker plugin made (main.zig's StrategyCheck).
     .{"fault_custom_done"},
     .{"fault_exclusions"},

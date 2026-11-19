@@ -313,7 +313,7 @@ const usage =
     \\  [--images <ref,...>]   (with --kubernetes: images loaded beside those the manifests name,
     \\                         fully qualified, as Antithesis's launch lists them: an operator's)
     \\  [--profile <name>|<a,b,..>|all]
-    \\  [--scenario <name>|all] [--cache <dir>] [--script <script.json>]
+    \\  [--scenario <name>|all] [--cache <dir>] [--script <script.json>] [--injector <executable>]...
     \\  [--faults +restart,+crash,-interleave,...]   (fault kinds every node also allows, or none
     \\                            does: -)
     \\  [--no-faults <node>,...]   (nodes that get no faults: a client, a monitor)
@@ -680,6 +680,9 @@ const Arguments = struct {
     kubernetes_images: ?[]const u8 = null,
     /// Commands and faults follow this script (determinismo script) instead of choosing.
     script_path: ?[]const u8 = null,
+    /// Fault injectors of the run's own (`--injector <executable>`, again for each): each
+    /// timeline's injector a named decision among det-faults and them (prepare.zig, composer.zig).
+    injectors: []const []const u8 = &.{},
     profile: ?[]const u8 = null,
     scenario: ?[]const u8 = null,
     cache_directory: []const u8 = ".determinismo-cache",
@@ -1558,6 +1561,7 @@ fn system_prepare(
         .kubernetes = arguments.kubernetes_path,
         .kubernetes_images = arguments.kubernetes_images,
         .script = arguments.script_path,
+        .injectors = arguments.injectors,
         .profile = arguments.profile,
         .cache_directory = arguments.cache_directory,
         .mutant = arguments.mutant,
@@ -8316,6 +8320,11 @@ fn parse_option(
         arguments.disk_count += 1;
     } else if (eql(u8, flag, "--program")) {
         arguments.program_path = value;
+    } else if (eql(u8, flag, "--injector")) {
+        const injectors = try arena.alloc([]const u8, arguments.injectors.len + 1);
+        @memcpy(injectors[0..arguments.injectors.len], arguments.injectors);
+        injectors[arguments.injectors.len] = value;
+        arguments.injectors = injectors;
     } else if (eql(u8, flag, "--script")) {
         arguments.script_path = value;
     } else if (eql(u8, flag, "--compose")) {

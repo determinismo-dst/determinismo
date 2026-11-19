@@ -32,6 +32,9 @@ pub const Options = struct {
     kubernetes_images: ?[]const u8 = null,
     /// A script for the composer and the fault injector (/det/script.json on the system disk).
     script: ?[]const u8 = null,
+    /// Fault injectors of the run's own (/det/injectors/<name> on the system disk, by its file's
+    /// name): each timeline's injector a named decision among det-faults and them (composer.zig).
+    injectors: []const []const u8 = &.{},
     /// The profile to resolve; null takes the first one.
     profile: ?[]const u8 = null,
     cache_directory: []const u8,
@@ -189,6 +192,11 @@ fn system_finish(
     // A program's disk has its table of lines (below): one made without it is another disk.
     if (options.program != null) hasher.update(std.fmt.comptimePrint("lines-{d}", .{source_lines.format_version}));
     if (script) |text| hasher.update(text);
+    // Its injectors, by name and content: another set is another disk.
+    for (options.injectors) |path| {
+        hasher.update(std.fs.path.basename(path));
+        hasher.update(try cwd.readFileAlloc(context.io, path, context.arena, .limited(64 << 20)));
+    }
     const hash = hasher.final();
     const program_lines = if (options.program) |path| try program_lines_make(context, path, program) else null;
     disk_paths[0] = try system_disk(context, .{
@@ -196,6 +204,7 @@ fn system_finish(
         .program = options.program,
         .program_lines = program_lines,
         .script = script,
+        .injectors = options.injectors,
         .hash = hash,
     });
     // The pin names the node disks by absolute path: it is valid wherever it is copied to on
@@ -1253,6 +1262,7 @@ const SystemFiles = struct {
     program: ?[]const u8,
     program_lines: ?ProgramLines = null,
     script: ?[]const u8,
+    injectors: []const []const u8 = &.{},
     hash: u64,
 };
 
@@ -1288,6 +1298,16 @@ fn system_disk(context: Context, files: SystemFiles) ![]const u8 {
             .sub_path = try path_join(context, &.{ staging, "script.json" }),
             .data = text,
         });
+    }
+    if (files.injectors.len > 0) {
+        const directory = try path_join(context, &.{ staging, "injectors" });
+        try cwd.createDirPath(io, directory);
+        for (files.injectors) |path| {
+            const target = try path_join(context, &.{ directory, std.fs.path.basename(path) });
+            try cwd.copyFile(path, cwd, target, io, .{});
+            const target_z = try context.arena.dupeSentinel(u8, target, 0);
+            if (std.os.linux.errno(std.os.linux.fchmodat(std.os.linux.AT.FDCWD, target_z, 0o755)) != .SUCCESS) return error.ChmodFailed;
+        }
     }
     try erofs_build(context, disk, &.{ "--all-root", "--ignore-mtime", staging });
     return disk;

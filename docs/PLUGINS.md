@@ -135,6 +135,19 @@ determinismo explore ... --strategy "python3 plugins/python/decide_named.py node
                          --strategy "python3 plugins/python/count_check.py fault 0"
 ```
 
+A run can bring fault injectors of its own: `--injector <executable>`, again for each (serve's
+`injectors`: uploads by `@<name>` or files, kept by content as its program is). They go on the
+system disk (`/det/injectors/<name>`, part of the run's inputs), and each timeline's injector is
+a named decision, `faults.injector`, among det-faults and them: a plugin steers it, the tape
+replays it, and the timeline says which ran (event `fault_injector`). An injector is any
+executable the guest runs, a busybox script included: the composer starts it as det-faults with
+`--scenario <name>` when the drivers start, and stops it with SIGTERM, when it undoes its faults.
+It injects through `det-nodes` (`kill`, `crash`, `wipe`, `pause`, `resume`, `link <a> <b>
+up|down`, `exec <node> <command>`, `list`) and draws and reports through `det-sdk` (`decide
+<name> <option>...`, `random <name> <range>`, `event <name> [details]`), so its choices are
+named decisions as det-faults' are. Inside the VM, it is as deterministic as the system it
+injects into (`plugins/injectors/pause_one.sh`; the e2e `injectors` check).
+
 A plugin can run anywhere: `tcp://<address>:<port>` connects to one already listening (one
 connection per exploration worker). `plugins/python/serve_tcp.py <port> <command>` serves any
 plugin command that way, and an SSH tunnel brings it to the host from a laptop:

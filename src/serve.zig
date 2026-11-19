@@ -1576,6 +1576,10 @@ pub const RunRequest = struct {
     /// the upload's bytes by content (strategy_resolve), a later upload of the name never this
     /// run's.
     strategy_asked: ?[]const u8 = null,
+    /// Fault injectors of its own: uploads (`@<name>`) or files of this host, kept by content
+    /// as its program is (explore --injector each): each timeline's injector a named decision
+    /// among det-faults and them ("faults.injector").
+    injectors: ?[]const []const u8 = null,
     /// Its uploads followed: a new upload under a name it runs reaches its next timelines,
     /// each tape saying the bytes it ran with (explore --strategy-follow, strategies.zig).
     /// Otherwise the bytes uploaded when it started, all run long.
@@ -1948,6 +1952,19 @@ fn run_start(server: *Server, asked_as_given: RunRequest, out: *std.Io.Writer) !
         if (asked.program_asked == null) asked.program_asked = path;
         asked.program = try artifact_keep(server, asked.program_asked.?);
     };
+    // Its injectors kept by content too (an upload's by its name): replays boot the same disk.
+    if (asked.injectors) |given| {
+        const kept = try server.arena.alloc([]const u8, given.len);
+        for (given, kept) |entry, *copy| {
+            const path = if (std.mem.startsWith(u8, entry, "@")) path: {
+                const name = entry[1..];
+                if (!strategy_name_valid(name)) return error.BadRequest;
+                break :path try print(server, "{s}/strategies/{s}", .{ server.options.data_directory, name });
+            } else entry;
+            copy.* = try artifact_keep(server, path);
+        }
+        asked.injectors = kept;
+    }
     // An uploaded strategy kept by content as the program is: its record says which bytes
     // answered, and a resume runs them, whatever was uploaded under its name since.
     if (asked.strategy) |strategy| if (uploads_named(strategy)) {
@@ -5299,6 +5316,8 @@ pub fn system_arguments(
     if (asked.coverage) |set| try argv.appendSlice(arena, &.{ "--coverage", set });
     // Part of the inputs (the guest's command line): replays need it too.
     if (asked.timeline) |length| try argv.appendSlice(arena, &.{ "--timeline", length });
+    // Its injectors, on the system disk: the same disk for its replays.
+    if (asked.injectors) |list| for (list) |path| try argv.appendSlice(arena, &.{ "--injector", path });
     // `det.swarm=0`, as the run had it: given to the run alone, every replay and session of a
     // swarm-less run was refused (TapeInputsDiffer, a session from the REPL on a demo run).
     if (!asked.swarm) try argv.append(arena, "--no-swarm");

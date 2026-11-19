@@ -34,6 +34,51 @@ const min_drive_ms_default = 10_000;
 /// How often the composer looks for drivers ended on their own during that minimum.
 const min_drive_poll_ns = 50 * std.time.ns_per_ms;
 const faults_path = "/opt/determinismo/bin/det-faults";
+/// A run's own fault injectors (explore --injector: the system disk's injectors/, each an
+/// executable taking `--scenario <name>` and SIGTERM as det-faults does): with any, each
+/// timeline's injector is a named decision among det-faults and them ("faults.injector").
+const injectors_directory = "/det/injectors";
+const injectors_max = 8;
+var injector_names: [injectors_max + 1][]const u8 = undefined;
+var injector_name_buffer: [injectors_max][128]u8 = undefined;
+var injector_path_buffer: [192:0]u8 = undefined;
+
+/// This timeline's injector: det-faults, or one of the run's own the decision picks (said in
+/// an event, `fault_injector`, with its name: a kept copy's carries its content's hash).
+fn injector_choose() [*:0]const u8 {
+    var count: usize = 0;
+    injector_names[0] = "det-faults";
+    const opened = linux.open(injectors_directory, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+    if (linux.errno(opened) == .SUCCESS) {
+        const fd: linux.fd_t = @intCast(opened);
+        defer _ = linux.close(fd);
+        var buffer: [4096]u8 align(8) = undefined;
+        const size = linux.getdents64(fd, &buffer, buffer.len);
+        if (linux.errno(size) == .SUCCESS) {
+            var at: usize = 0;
+            while (at < size and count < injectors_max) {
+                const entry: *align(1) const linux.dirent64 = @ptrCast(&buffer[at]);
+                at += entry.reclen;
+                const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&entry.name)), 0);
+                if (name.len == 0 or name[0] == '.' or name.len > injector_name_buffer[0].len) continue;
+                @memcpy(injector_name_buffer[count][0..name.len], name);
+                injector_names[count + 1] = injector_name_buffer[count][0..name.len];
+                count += 1;
+            }
+        }
+    }
+    if (count == 0) return faults_path; // None of its own: no decision, runs as they were.
+    // Sorted: the options' order is the directory's content, not its listing order.
+    std.mem.sort([]const u8, injector_names[1 .. count + 1], {}, struct {
+        fn less(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.less);
+    const chosen = sdk.decide("faults.injector", injector_names[0 .. count + 1]);
+    sdk.event("fault_injector", .{ .name = injector_names[chosen] });
+    if (chosen == 0) return faults_path;
+    return std.fmt.bufPrintSentinel(&injector_path_buffer, "{s}/{s}", .{ injectors_directory, injector_names[chosen] }, 0) catch faults_path;
+}
 /// The test commands' cgroup (drivers_cpu_draw), beside the nodes' (nodes.cgroup_root).
 const drivers_cgroup = "/sys/fs/cgroup/drivers";
 /// The commands' CPU weight drawn per timeline ("composer.drivers_cpu"), 0 flat: no cgroup of
@@ -300,7 +345,7 @@ const Composer = struct {
         const flags: linux.O = .{ .ACCMODE = .RDWR, .NONBLOCK = true, .CLOEXEC = true };
         const control = linux.open(faults_control_path, flags, 0);
         if (linux.errno(control) == .SUCCESS) composer.faults_control = @intCast(control);
-        composer.faults_pid = spawn(&.{ faults_path, "--scenario", composer.scenario });
+        composer.faults_pid = spawn(&.{ injector_choose(), "--scenario", composer.scenario });
         // Declared only when the scenario has faults (commands_declare): not in the catalog.
         sdk.assert_computed(.reachable, true, faults_property, .{});
     }
