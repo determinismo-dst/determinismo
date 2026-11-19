@@ -25,8 +25,8 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 pub const node_name = "kubernetes";
-pub const k3s_image = "docker.io/rancher/k3s:v1.36.5-k3s1";
-const airgap_url = "https://github.com/k3s-io/k3s/releases/download/v1.36.5%2Bk3s1/" ++
+pub const k3s_image = "docker.io/rancher/k3s:v1.36.6-k3s1";
+const airgap_url = "https://github.com/k3s-io/k3s/releases/download/v1.36.6%2Bk3s1/" ++
     "k3s-airgap-images-amd64.tar.zst";
 /// Outside /opt/determinismo, which a node gets from the runner (read-only, over the image's).
 pub const tools_directory = "/opt/determinismo-kubernetes";
