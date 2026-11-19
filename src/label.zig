@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
-//! `determinismo triage`: checker plugins over a run that ended, from its stored events. Each
+//! `determinismo label`: checker plugins over a run that ended, from its stored events. Each
 //! timeline is told to the plugins as a run tells it (`branch`, its own events as they were
 //! logged, `branch_end` with the properties it failed, `check`), and the verdicts they give are
-//! the triage's: what a checker labels a timeline with ("known bug: #3217 via
+//! its labels: what a checker labels a timeline with ("known bug: #3217 via
 //! core/io/mod.rs:278", a sometimes) once the bug is known, for runs made before it was, without
 //! running them again. The calibrations' signature scripts (infra/calibrations/*.py), as plugins.
 //!
-//!   determinismo triage --events <dir> --strategy <plugin> [--strategy <plugin>]...
+//!   determinismo label --events <dir> --strategy <plugin> [--strategy <plugin>]...
 //!                       [--failing <file>] [--out <file>] [--json]
 //!
 //! `--events`: a run's events directory (its ended timelines, `branch-<n>.jsonl.zst`).
@@ -14,8 +14,8 @@
 //! (serve's, from its store's timeline_failures: the store is one process's at a time); none
 //! given, each `branch_end` says none. `--out`: the verdicts, a JSON line each
 //! (`{"branch":N,"assert":{...}}`); standard output without it. `--json`: then, on standard
-//! output, `{"triage":{"timelines":N,"verdicts":M,"labels":[{"type","message","held":[branch,
-//! ...],"failed":[...]},...]}}`, the verdicts by message (serve's triage job's result).
+//! output, `{"label":{"timelines":N,"verdicts":M,"labels":[{"type","message","held":[branch,
+//! ...],"failed":[...]},...]}}`, the verdicts by message (serve's label job's result).
 //!
 //! What differs from a run's telling: an event's `source` (the guest process that emitted it)
 //! is not stored, so it is ""; a timeline's events are its own (a tree child's from its branch
@@ -27,7 +27,7 @@ const Strategies = @import("strategies.zig");
 const event_files = @import("event_files.zig");
 const Events = @import("core").events;
 
-/// Timelines a triage reads at most (a run's: serve's largest are tens of thousands).
+/// Timelines a labeling reads at most (a run's: serve's largest are tens of thousands).
 const timelines_max = 1 << 20;
 /// A timeline's stored events read at most (a TiDB timeline's were 28 MB).
 const timeline_size_max = 1 << 30;
@@ -35,7 +35,7 @@ const timeline_size_max = 1 << 30;
 const failing_max = 64;
 
 const usage =
-    \\usage: determinismo triage --events <dir> --strategy <plugin> [--strategy <plugin>]...
+    \\usage: determinismo label --events <dir> --strategy <plugin> [--strategy <plugin>]...
     \\                           [--failing <file>] [--out <file>] [--json]
     \\
 ;
@@ -127,11 +127,11 @@ pub fn run(
         });
     }
     try writer.interface.flush();
-    std.debug.print("[determinismo] triage: {d} timelines, {d} verdicts\n", .{ branches.len, verdicts });
+    std.debug.print("[determinismo] label: {d} timelines, {d} verdicts\n", .{ branches.len, verdicts });
     if (json) {
         var summary_buffer: [64 * 1024]u8 = undefined;
         var summary = std.Io.File.stdout().writer(io, &summary_buffer);
-        try summary.interface.print("{{\"triage\":{{\"timelines\":{d},\"verdicts\":{d},\"labels\":[", .{ branches.len, verdicts });
+        try summary.interface.print("{{\"label\":{{\"timelines\":{d},\"verdicts\":{d},\"labels\":[", .{ branches.len, verdicts });
         for (labels.list.items, 0..) |label, position| {
             if (position > 0) try summary.interface.writeAll(",");
             try summary.interface.print("{{\"type\":{f},\"message\":{f},\"held\":{f},\"failed\":{f}}}", .{

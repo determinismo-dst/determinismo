@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
-"""A triage checker: labels each timeline by the signatures its events show, a known bug's text
+"""A checker that labels each timeline by the signatures its events show, a known bug's text
 each (`<label>=<regex>`, matched against each event as JSON): a sometimes assertion "known:
 <label>" for every signature a timeline matched, with the first match's moment and text; an
 argument `@<file>` gives them a line each (a plugin's command is split at spaces). Live
-(a run's --strategy) or over a run that ended (determinismo triage), as the calibrations'
-signature scripts (infra/calibrations/*-signatures.py) are; the e2e `triage` check's plugin.
+(a run's --strategy) or over a run that ended (determinismo label), as the calibrations'
+signature scripts (infra/calibrations/*-signatures.py) are; the e2e `labels` check's plugin.
 
-    determinismo triage --events <run>/events \\
+    determinismo label --events <run>/events \\
         --strategy "python3 plugins/python/signatures.py '#3217=result must be set only once'"
 """
 import json

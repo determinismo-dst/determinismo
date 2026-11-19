@@ -48,6 +48,11 @@
 //!                            timeline needs (`determinismo shrink`, in the background): {id}
 //!   GET  /runs/<id>/shrink    every shrinking: [{id, of, done, result, progress}]
 //!   POST /runs/<id>/shrink/<n>/stop
+//!   POST /runs/<id>/label {strategy}  checker plugins over the run's stored timelines
+//!                            (`determinismo label`, in the background): {id}
+//!   GET  /runs/<id>/label     every labeling: [{id, of, done, result, progress}], its result
+//!                            the verdicts by message
+//!   POST /runs/<id>/label/<n>/stop
 //!   GET  /samples.json        the samples this host offers on the learn page (samples.json in
 //!                            its data directory), 404 without
 //!   POST /runs/<id>/explain {branch, property, faults?, variants?}  which details of a failing
@@ -211,7 +216,7 @@ const Job = struct {
     index: u32,
     pid: linux.pid_t,
     done: bool = false,
-    kind: enum { causality, snapshot, shrink, explain, triage } = .causality,
+    kind: enum { causality, snapshot, shrink, explain, label } = .causality,
 };
 
 /// What the threads share: runs and jobs (under `mutex`), and the runs' databases.
@@ -1439,11 +1444,11 @@ fn run_route(
         }
         return causality_show(server, run, index, out);
     }
-    if (eql(u8, action, "shrink") or eql(u8, action, "explain") or eql(u8, action, "triage")) {
+    if (eql(u8, action, "shrink") or eql(u8, action, "explain") or eql(u8, action, "label")) {
         const index_text = parts.next() orelse {
             if (eql(u8, request.method, "POST")) {
                 if (eql(u8, action, "explain")) return explain_start(server, run, request.body, out);
-                if (eql(u8, action, "triage")) return triage_start(server, run, request.body, out);
+                if (eql(u8, action, "label")) return label_start(server, run, request.body, out);
                 return shrink_start(server, run, request.body, out);
             }
             return job_list(server, run, action, out);
@@ -4554,17 +4559,17 @@ fn shrink_start(server: *Server, run: *const Run, body: []const u8, out: *std.Io
     return 200;
 }
 
-/// POST /runs/<id>/triage: checker plugins over the run's stored timelines (`determinismo
-/// triage`): what a plugin labels them with once a bug is known, for a run made before it was.
+/// POST /runs/<id>/label: checker plugins over the run's stored timelines (`determinismo
+/// label`): what a plugin labels them with once a bug is known, for a run made before it was.
 /// `strategy`: the plugins, one a line, uploads by `@<name>` (kept by content, as a run's).
-const TriageRequest = struct { strategy: []const u8 };
+const LabelRequest = struct { strategy: []const u8 };
 
-/// Starts a triage of the run's ended timelines, in the background (`triage-<n>.jsonl` its
-/// output, its last line the result: the verdicts by message; `triage-<n>.verdicts.jsonl` each
+/// Starts labeling the run's ended timelines, in the background (`label-<n>.jsonl` its
+/// output, its last line the result: the verdicts by message; `label-<n>.verdicts.jsonl` each
 /// verdict; its request and pid beside). Each timeline's failed properties come from the run's
-/// store (serve's alone to open), written for it (`triage-<n>.failing.jsonl`).
-fn triage_start(server: *Server, run: *const Run, body: []const u8, out: *std.Io.Writer) !u16 {
-    const asked = std.json.parseFromSliceLeaky(TriageRequest, server.arena, body, .{
+/// store (serve's alone to open), written for it (`label-<n>.failing.jsonl`).
+fn label_start(server: *Server, run: *const Run, body: []const u8, out: *std.Io.Writer) !u16 {
+    const asked = std.json.parseFromSliceLeaky(LabelRequest, server.arena, body, .{
         .ignore_unknown_fields = true,
     }) catch return error.BadRequest;
     if (std.mem.trim(u8, asked.strategy, " \n").len == 0) return error.BadRequest;
@@ -4580,41 +4585,41 @@ fn triage_start(server: *Server, run: *const Run, body: []const u8, out: *std.Io
         };
     };
     var index: u32 = 0;
-    for (try job_indices(server, run.id, "triage-")) |earlier| index = @max(index, earlier + 1);
+    for (try job_indices(server, run.id, "label-")) |earlier| index = @max(index, earlier + 1);
     const shared = server.shared;
     shared.lock();
     defer shared.unlock();
     if (shared.job_count == jobs_max) return error.TooManyJobs;
     for (shared.jobs[0..shared.job_count]) |job| {
-        if (job.run == run.id and job.kind == .triage) index = @max(index, job.index + 1);
+        if (job.run == run.id and job.kind == .label) index = @max(index, job.index + 1);
     }
     var failing: std.Io.Writer.Allocating = .init(server.arena);
     for (rows) |row| try failing.writer.print("{f}\n", .{std.json.fmt(row, .{})});
-    const failing_path = try std.fs.path.join(server.arena, &.{ directory, try print(server, "triage-{d}.failing.jsonl", .{index}) });
+    const failing_path = try std.fs.path.join(server.arena, &.{ directory, try print(server, "label-{d}.failing.jsonl", .{index}) });
     try std.Io.Dir.cwd().writeFile(server.io, .{ .sub_path = failing_path, .data = failing.written() });
     var argv: std.ArrayList([]const u8) = .empty;
-    // This server's explorer, not the run's: triage replays nothing (it reads the stored
-    // events), and a run made before triage keeps an explorer without it.
+    // This server's explorer, not the run's: labeling replays nothing (it reads the stored
+    // events), and a run made before labeling keeps an explorer without it.
     try argv.appendSlice(server.arena, &.{
-        server.options.self, "triage",
+        server.options.self, "label",
         "--events",          try std.fs.path.join(server.arena, &.{ directory, "events" }),
         "--failing",         failing_path,
-        "--out",             try std.fs.path.join(server.arena, &.{ directory, try print(server, "triage-{d}.verdicts.jsonl", .{index}) }),
+        "--out",             try std.fs.path.join(server.arena, &.{ directory, try print(server, "label-{d}.verdicts.jsonl", .{index}) }),
         "--json",
     });
     var lines = std.mem.tokenizeScalar(u8, strategy, '\n');
     while (lines.next()) |line| try argv.appendSlice(server.arena, &.{ "--strategy", line });
     try std.Io.Dir.cwd().writeFile(server.io, .{
-        .sub_path = try std.fs.path.join(server.arena, &.{ directory, try print(server, "triage-{d}.request.json", .{index}) }),
+        .sub_path = try std.fs.path.join(server.arena, &.{ directory, try print(server, "label-{d}.request.json", .{index}) }),
         .data = try print(server, "{f}\n", .{std.json.fmt(asked, .{})}),
     });
-    const output = try std.fs.path.join(server.arena, &.{ directory, try print(server, "triage-{d}.jsonl", .{index}) });
+    const output = try std.fs.path.join(server.arena, &.{ directory, try print(server, "label-{d}.jsonl", .{index}) });
     const pid = try spawn(server, try reserved(server, argv.items), output, &.{"DETERMINISMO_CPU_PRIORITY=1"}, .fresh);
     try std.Io.Dir.cwd().writeFile(server.io, .{
-        .sub_path = try std.fs.path.join(server.arena, &.{ directory, try print(server, "triage-{d}.pid", .{index}) }),
+        .sub_path = try std.fs.path.join(server.arena, &.{ directory, try print(server, "label-{d}.pid", .{index}) }),
         .data = try print(server, "{d}\n", .{pid}),
     });
-    shared.jobs[shared.job_count] = .{ .run = run.id, .index = index, .pid = pid, .kind = .triage };
+    shared.jobs[shared.job_count] = .{ .run = run.id, .index = index, .pid = pid, .kind = .label };
     shared.job_count += 1;
     try out.print("{{\"id\":{d}}}\n", .{index});
     return 200;

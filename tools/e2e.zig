@@ -224,7 +224,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "wasm-reach", check_wasm_reach },               .{ "plugins-many", check_plugins_many },
         .{ "strategy-follow", check_strategy_follow },     .{ "steppers", check_steppers },
         .{ "reactive-faults", check_reactive_faults },     .{ "injectors", check_injectors },
-        .{ "triage", check_triage },                       .{ "wasm-upload", check_wasm_upload },
+        .{ "labels", check_labels },                       .{ "wasm-upload", check_wasm_upload },
         .{ "timeline-clocks", check_timeline_clocks },     .{ "egress", check_egress },
         .{ "ingress", check_ingress },                     .{ "ingress-session", check_ingress_session },
         .{ "moments", check_moments },                     .{ "properties", check_builtin_properties },
@@ -4327,28 +4327,28 @@ fn check_serve(context: *Context) !void {
     }, "serve: a shrink started over HTTP ends with a result ({s})", .{
         shrinks[0..@min(shrinks.len, 400)],
     });
-    // A triage of the run's stored timelines (src/triage.zig), started over HTTP: the broken
+    // Labels for the run's stored timelines (src/label.zig), started over HTTP: the broken
     // balance's signature labels the timeline that failed it.
-    const triage_asked = "{\"strategy\":\"python3 plugins/python/signatures.py " ++ balance_signature ++ "\"}";
-    _ = try curl(context, &.{ "-X", "POST", "-d", triage_asked, url ++ "/runs/1/triage" });
-    var triages: []const u8 = "";
+    const label_asked = "{\"strategy\":\"python3 plugins/python/signatures.py " ++ balance_signature ++ "\"}";
+    _ = try curl(context, &.{ "-X", "POST", "-d", label_asked, url ++ "/runs/1/label" });
+    var labelings: []const u8 = "";
     for (0..600) |_| {
-        triages = try curl(context, &.{url ++ "/runs/1/triage"});
-        if (std.mem.indexOf(u8, triages, "\"done\":true") != null) break;
+        labelings = try curl(context, &.{url ++ "/runs/1/label"});
+        if (std.mem.indexOf(u8, labelings, "\"done\":true") != null) break;
         sleep_ms(200);
     }
     const labeled = "\"message\":\"known: balance\",\"held\":[";
-    const held_at = std.mem.indexOf(u8, triages, labeled);
-    const held_rest = if (held_at) |at| triages[at + labeled.len ..] else "";
+    const held_at = std.mem.indexOf(u8, labelings, labeled);
+    const held_rest = if (held_at) |at| labelings[at + labeled.len ..] else "";
     const held = held_rest[0 .. std.mem.indexOfScalar(u8, held_rest, ']') orelse 0];
     var held_list = std.mem.tokenizeScalar(u8, held, ',');
     var failing_held = false;
     while (held_list.next()) |branch| failing_held = failing_held or std.mem.eql(u8, branch, failing);
     expect_all(context, &.{
-        .{ "the triage ended", std.mem.indexOf(u8, triages, "\"done\":true") != null },
+        .{ "the labeling ended", std.mem.indexOf(u8, labelings, "\"done\":true") != null },
         .{ "its result labels the failing timeline", failing_held },
-    }, "serve: a triage started over HTTP labels the run's failing timeline ({s})", .{
-        triages[0..@min(triages.len, 400)],
+    }, "serve: a labeling started over HTTP labels the run's failing timeline ({s})", .{
+        labelings[0..@min(labelings.len, 400)],
     });
     // A deploy replaces the initramfs: the run's replays still boot what it booted (kept by
     // content), to the same events.
@@ -8775,22 +8775,22 @@ fn check_coverage_shared(context: *Context) !void {
 /// (no spaces: a plugin's command is split at them).
 const balance_signature = "balance=total.balance.is.conserved.{0,400}condition.{0,4}false";
 
-/// Triage over a run that ended (src/triage.zig): the bank's timelines (seed 3: some break the
+/// Labels over a run that ended (src/label.zig): the bank's timelines (seed 3: some break the
 /// total balance) read back from their stored events by signatures.py, the broken balance's
 /// assertion its signature: the timelines it labels are those that failed, a verdict line each.
-fn check_triage(context: *Context) !void {
+fn check_labels(context: *Context) !void {
     const arena = context.arena;
     const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
-    const events = try std.fs.path.join(arena, &.{ context.scratch, "triage-events" });
+    const events = try std.fs.path.join(arena, &.{ context.scratch, "label-events" });
     const report = try explore(context, &.{
         "--program",  program, "--scenario",   "bank", "--seed", "3",
         "--branches", "8",     "--events-dir", events,
     });
     var branches: [8]Branch = undefined;
     const count = parse_branches(report, &branches);
-    const out = try std.fs.path.join(arena, &.{ context.scratch, "triage.jsonl" });
+    const out = try std.fs.path.join(arena, &.{ context.scratch, "labels.jsonl" });
     const plugin = "python3 plugins/python/signatures.py " ++ balance_signature;
-    const triaged = try run_kept(context, &.{ context.determinismo, "triage", "--events", events, "--strategy", plugin, "--out", out });
+    const labeled_run = try run_kept(context, &.{ context.determinismo, "label", "--events", events, "--strategy", plugin, "--out", out });
     const verdicts = std.Io.Dir.cwd().readFileAlloc(context.io, out, arena, .limited(16 << 20)) catch "";
     var labeled: [8]bool = @splat(false);
     var lines = std.mem.splitScalar(u8, verdicts, '\n');
@@ -8809,10 +8809,10 @@ fn check_triage(context: *Context) !void {
         if (branch.index < labeled.len and labeled[branch.index] != branch.failing) agree = false;
     }
     expect_all(context, &.{
-        .{ "triage read the run's stored timelines", triaged.term == .exited and triaged.term.exited == 0 },
+        .{ "label read the run's stored timelines", labeled_run.term == .exited and labeled_run.term.exited == 0 },
         .{ "some timelines broke the balance", failing > 0 },
         .{ "the timelines labeled are those that failed", agree },
-    }, "triage: {d} timelines, {d} failing, {d} verdicts", .{ count, failing, verdict_count });
+    }, "labels: {d} timelines, {d} failing, {d} verdicts", .{ count, failing, verdict_count });
 }
 
 /// A static program without libc (its own _start, so no constructor runs, as a Zig program's),
