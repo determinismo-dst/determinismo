@@ -1341,7 +1341,7 @@ fn run_script(
         // name no node). The runner is no node of the system's, and never gone: its links'
         // faults ("degrade runner ...") were all skipped, the scripted timeline missing them.
         const runner = std.mem.eql(u8, fault.node, "runner");
-        const gone = fault.node.len > 0 and !runner and system.node(fault.node) == null;
+        const gone = fault.node.len > 0 and !runner and !names_a_node(system, fault);
         if (gone) continue;
         apply(arena, system, fault);
         injections += 1;
@@ -1351,6 +1351,16 @@ fn run_script(
     network_stop(system);
     leftovers_check(system);
     sdk.event("faults_stop", .{ .injections = injections, .script = true });
+}
+
+/// Whether a scripted fault names a node of the system. An outage's names every node it took
+/// down, joined by commas ("witness,echo", its event's for reading; `outage` holds them): looked
+/// up whole, no node had that name and every scripted outage was skipped as a gone node's.
+fn names_a_node(system: *const schema.System, fault: *const Applied) bool {
+    if (fault.kind != .outage) return system.node(fault.node) != null;
+    var names = std.mem.splitScalar(u8, fault.node, ',');
+    while (names.next()) |name| if (system.node(name) != null) return true;
+    return false;
 }
 
 fn monotonic_ns() u64 {
