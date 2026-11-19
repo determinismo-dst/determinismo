@@ -950,6 +950,7 @@ test "hello readies a plugin's struct from undefined memory, as TCP's connect le
     strategy.response_end = 0;
     strategy.loopback = false;
     strategy.ring = null;
+    strategy.wasm = null; // start's, before connect: not a module.
     try write_all(from[1], "{\"name\":\"t\",\"wants\":[\"assertions\",\"batched\"]}\n{}\n");
     try strategy.hello(1, null);
     const moment: Events.Moment = .{ .vtime_ns = 5, .branches = 9 };
