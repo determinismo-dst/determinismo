@@ -34,6 +34,10 @@ pub const Header = struct {
     /// at boot, where timer interrupts land in their slack, CPU modulation's stretches; part of
     /// `inputs`): a replay from the tape boots it. Null: the run's options as given.
     machine: ?Machine = null,
+    /// The strategy plugins that answered it, as run (one a line, an upload's kept copy named
+    /// by its content's hash): what made its decisions. Null: none, or a tape from before
+    /// 2026-11-19. A replay needs none of them.
+    strategy: ?[]const u8 = null,
     /// Set for a timeline that goes on from a moment of another of its run (explore --extend:
     /// a session's): that timeline and the moment. Its tape is whole (what the other's gave it
     /// up to the moment, then its own), under a number of its own (claim_next).
@@ -59,6 +63,8 @@ pub const Machine = struct {
 /// chain boots that segment with.
 pub const Segment = struct { branch: u32, seed: u64, vtime_ns: u64, jitter_seed: ?u64 = null };
 pub const chain_length_max = 64;
+/// A header's strategy (Header.strategy) at most.
+pub const strategy_size_max = 2048;
 
 /// A moment of a branch of the setup snapshot, where a nested snapshot is taken.
 pub const Fork = struct {
@@ -243,7 +249,7 @@ pub const Overrides = struct {
 pub fn write_header(fd: linux.fd_t, header: Header) void {
     assert(fd >= 0);
     assert(header.chain.len <= chain_length_max);
-    var buffer: [512 + chain_length_max * 112 + pokes_size_max * 2]u8 = undefined;
+    var buffer: [512 + chain_length_max * 112 + pokes_size_max * 2 + strategy_size_max * 2]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
     writer.print("{{\"tape\":{d},\"inputs\":\"{x:0>16}\",\"exploration_seed\":\"{x:0>16}\"," ++
         "\"branch\":{d},\"branch_seed\":\"{x:0>16}\"", .{
@@ -282,6 +288,11 @@ pub fn write_header(fd: linux.fd_t, header: Header) void {
             machine.timer_delay_permille,
             machine.custom_faults,
         }) catch unreachable;
+    }
+    if (header.strategy) |text| {
+        assert(text.len <= strategy_size_max);
+        writer.writeAll(",\"strategy\":") catch unreachable;
+        std.json.Stringify.value(text, .{}, &writer) catch unreachable;
     }
     if (header.fork) |fork| {
         writer.print(",\"from_branch\":{d},\"from_vtime_ns\":{d}", .{
@@ -458,6 +469,10 @@ fn header_take(header_line: []const u8, fba: *std.heap.FixedBufferAllocator) !He
         else
             null,
         .machine = if (header.object.get("machine")) |machine| try machine_parse(machine) else null,
+        .strategy = if (header.object.get("strategy")) |text|
+            (if (text == .string) text.string else return error.BadTape)
+        else
+            null,
     };
     if (header.object.get("chain")) |chain| {
         if (chain != .array or chain.array.items.len > chain_length_max) return error.BadTape;

@@ -164,7 +164,8 @@ const usage =
     \\                            of earlier branches that reached new behaviors; replay one by
     \\                            its tape)
     \\                            [--strategy "<plugin> <args>"]...   (several: each asked in
-    \\                            order, strategies.zig) [--tape-dir <dir>]
+    \\                            order, strategies.zig) [--strategy-follow]   (their files
+    \\                            followed: new bytes reach the next timelines) [--tape-dir <dir>]
     \\                            [--run-url <url>]   (the run's HTTP API, told to the strategy:
     \\                            serve gives it) [--history <file>]   (the behaviors the
     \\                            system's last runs reached, record.jsonl.behaviors: one they
@@ -540,6 +541,8 @@ const Arguments = struct {
     /// Run only this branch (to replay one timeline of an exploration).
     branch_only: ?u32 = null,
     strategy_command: ?[]const u8 = null,
+    /// Its plugins' files followed (strategies.zig): new bytes reach the next timelines.
+    strategy_follow: bool = false,
     tape_directory: ?[]const u8 = null,
     /// Replay the branch recorded in this tape.
     tape_path: ?[]const u8 = null,
@@ -2800,7 +2803,11 @@ const moment_after_snapshot = node_core.moment_after_snapshot;
 fn strategy_start(context: Context, arguments: *const Arguments, exploration: *Exploration) !void {
     const command = arguments.strategy_command orelse return;
     const strategy = try context.arena.create(Strategies);
-    try strategy.start(context.arena, command, context.environ);
+    const follow: ?Strategies.Follow = if (arguments.strategy_follow) .{
+        .io = context.io,
+        .data = try runs.data_directory(context.arena, arguments.data_directory),
+    } else null;
+    try strategy.start(context.arena, command, context.environ, follow);
     try strategy.hello(exploration.exploration_seed, arguments.run_url);
     exploration.strategy = strategy;
     // A run shows the strategy by its own name (serve's strategy_name), not only its command.
@@ -3323,6 +3330,8 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
                 .branch = place.path[place.path.len - 1].branch,
                 .vtime_ns = place.path[place.path.len - 1].vtime_ns,
             };
+            // A followed plugin's new bytes, from this timeline on (strategies.zig).
+            _ = try strategy.refresh(context.arena);
             const choice = try strategy.branch(place.index, place.seed, from);
             if (choice.seed) |seed| place.seed = seed;
             if (choice.jitter_seed) |jitter| place.jitter_seed = jitter;
@@ -3606,6 +3615,7 @@ fn branch_announce(
             .host = exploration.host,
             .tsc_jitter_seed = exploration.tsc_jitter_seed,
             .machine = exploration.machine,
+            .strategy = if (exploration.strategy) |strategy| strategy.commands else null,
         });
     }
 }
@@ -8120,6 +8130,10 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
             index += 1;
             if (index == argv.len) return error.Usage;
             arguments.history_path = argv[index];
+            continue;
+        }
+        if (std.mem.eql(u8, argv[index], "--strategy-follow")) {
+            arguments.strategy_follow = true;
             continue;
         }
         if (std.mem.eql(u8, argv[index], "--run-url")) {

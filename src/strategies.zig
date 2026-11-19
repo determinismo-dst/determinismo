@@ -6,10 +6,17 @@
 //! ends and the events it wants; the machine passes from one plugin to the next (each sees what
 //! the ones before it decided); every checker's verdicts are the timeline's; the setup is told to
 //! each that wants it. A planning plugin's plan draws first, as one alone's did.
+//!
+//! Followed (`--strategy-follow`, serve's `strategy_follow`): a plugin whose command names a
+//! file (a program, or a module after `wasm:`) runs from a copy of it kept by content
+//! (runs.artifact_keep), and before each timeline the file is read again: new bytes are kept
+//! and that plugin restarted on them, so an upload reaches the run's next timelines while the
+//! running ones keep theirs. Each timeline's tape says the plugins it ran with (`commands`).
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const Strategy = @import("strategy.zig");
+const runs = @import("runs.zig");
 const Events = @import("core").events;
 
 pub const plugins_max = 8;
@@ -29,35 +36,136 @@ reason: []const u8 = "",
 ended: bool = false,
 name_buffer: [Strategy.name_size_max * plugins_max + plugins_max]u8 = undefined,
 name_size: usize = 0,
+/// The plugins' commands as run, one a line (a followed plugin's kept copy): each tape's.
+commands: []const u8 = "",
+/// Following their files (Follow), each plugin's source if it is followed.
+follow: ?Follow = null,
+sources: [plugins_max]?Source = @splat(null),
+/// What hello said, for a plugin started again.
+exploration_seed: u64 = 0,
+run_url: ?[]const u8 = null,
+environ: [:null]const ?[*:0]const u8 = &.{},
+
+pub const Follow = struct { io: std.Io, data: []const u8 };
+
+/// A followed plugin's file, its command around it, and the bytes last run.
+const Source = struct { path: []const u8, rest: []const u8, hash: u64 };
 
 const Strategies = @This();
 
 /// `commands`: one plugin's command per line (start's forms: a program and its arguments,
-/// `tcp://`, `image:`, `wasm:`).
+/// `tcp://`, `image:`, `wasm:`). `follow`: their files followed (the module's head).
 pub fn start(
     strategies: *Strategies,
     arena: std.mem.Allocator,
     commands: []const u8,
     environ: [:null]const ?[*:0]const u8,
+    follow: ?Follow,
 ) !void {
+    strategies.* = .{ .plugins = &.{}, .follow = follow, .environ = environ };
     var plugins: std.ArrayList(*Strategy) = .empty;
     var lines = std.mem.tokenizeScalar(u8, commands, '\n');
     while (lines.next()) |line| {
-        const command = std.mem.trim(u8, line, " \t\r");
+        var command = std.mem.trim(u8, line, " \t\r");
         if (command.len == 0) continue;
         if (plugins.items.len == plugins_max) return error.TooManyPlugins;
+        if (follow) |given| if (try source_of(arena, given, command)) |source| {
+            strategies.sources[plugins.items.len] = source;
+            command = try kept_command(arena, given, source);
+        };
         const plugin = try arena.create(Strategy);
         try plugin.start(arena, command, environ);
         try plugins.append(arena, plugin);
     }
     if (plugins.items.len == 0) return error.NoStrategy;
-    strategies.* = .{ .plugins = plugins.items };
+    strategies.plugins = plugins.items;
+    try strategies.commands_set(arena);
+}
+
+/// A command's file (a program's path, or a module's after `wasm:`), if it names one: followed.
+fn source_of(arena: std.mem.Allocator, follow: Follow, command: []const u8) !?Source {
+    const bare = if (std.mem.startsWith(u8, command, "wasm:")) command["wasm:".len..] else command;
+    const end = std.mem.indexOfScalar(u8, bare, ' ') orelse bare.len;
+    const path = bare[0..end];
+    if (std.mem.indexOfScalar(u8, path, '/') == null) return null; // A program found in PATH.
+    _ = arena;
+    const hash = file_hash(follow.io, path) orelse return null;
+    return .{ .path = path, .rest = bare[end..], .hash = hash };
+}
+
+/// A file's content hash (runs.artifact_keep's), read through a buffer freed at once: asked
+/// before every timeline, never held.
+fn file_hash(io: std.Io, path: []const u8) ?u64 {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, std.heap.page_allocator, .limited(64 << 20)) catch return null;
+    defer std.heap.page_allocator.free(bytes);
+    return std.hash.Wyhash.hash(0, bytes);
+}
+
+/// Its kept copy's command: a module's (by its bytes) after `wasm:`, its arguments after it.
+fn kept_command(arena: std.mem.Allocator, follow: Follow, source: Source) ![]const u8 {
+    const kept = try runs.artifact_keep(arena, follow.io, follow.data, source.path);
+    var magic: [4]u8 = @splat(0);
+    const file = try std.Io.Dir.cwd().openFile(follow.io, kept, .{});
+    defer file.close(follow.io);
+    _ = file.readPositionalAll(follow.io, &magic, 0) catch 0;
+    const prefix = if (std.mem.eql(u8, &magic, "\x00asm")) "wasm:" else "";
+    return std.fmt.allocPrint(arena, "{s}{s}{s}", .{ prefix, kept, source.rest });
+}
+
+fn commands_set(strategies: *Strategies, arena: std.mem.Allocator) !void {
+    var text: std.Io.Writer.Allocating = .init(arena);
+    for (strategies.plugins, 0..) |plugin, index| {
+        if (index > 0) try text.writer.writeAll("\n");
+        try text.writer.writeAll(plugin.command);
+    }
+    strategies.commands = text.written()[0..@min(text.written().len, @import("core").tape.strategy_size_max)];
+}
+
+/// Before a timeline: each followed plugin's file read again; new bytes kept and that plugin
+/// started again on them (said on standard error). Whether one was.
+pub fn refresh(strategies: *Strategies, arena: std.mem.Allocator) !bool {
+    const follow = strategies.follow orelse return false;
+    var changed = false;
+    for (strategies.plugins, 0..) |*plugin, index| {
+        const known = strategies.sources[index] orelse continue;
+        const now = file_hash(follow.io, known.path) orelse continue;
+        if (now == known.hash) continue;
+        var source = known;
+        source.hash = now;
+        const command = try kept_command(arena, follow, source);
+        plugin.*.stop();
+        const fresh = try arena.create(Strategy);
+        try fresh.start(arena, command, strategies.environ);
+        try fresh.hello(strategies.exploration_seed, strategies.run_url);
+        plugin.* = fresh;
+        strategies.sources[index] = source;
+        changed = true;
+        std.debug.print("[determinismo] strategy: {s} new, its next timelines on {s}\n", .{ source.path, command });
+    }
+    if (changed) {
+        strategies.aggregate();
+        try strategies.commands_set(arena);
+    }
+    return changed;
 }
 
 pub fn hello(strategies: *Strategies, exploration_seed: u64, run_url: ?[]const u8) !void {
+    strategies.exploration_seed = exploration_seed;
+    strategies.run_url = run_url;
+    for (strategies.plugins) |plugin| try plugin.hello(exploration_seed, run_url);
+    strategies.aggregate();
+}
+
+/// What they ask for and their names, from each plugin's hello.
+fn aggregate(strategies: *Strategies) void {
+    strategies.decides = false;
+    strategies.wants_setup = false;
+    strategies.wants_machine = false;
+    strategies.wants_check = false;
+    strategies.wants_behaviors = false;
+    strategies.planner = null;
     var writer: std.Io.Writer = .fixed(&strategies.name_buffer);
     for (strategies.plugins, 0..) |plugin, index| {
-        try plugin.hello(exploration_seed, run_url);
         strategies.decides = strategies.decides or plugin.decides;
         strategies.wants_setup = strategies.wants_setup or plugin.wants_setup;
         strategies.wants_machine = strategies.wants_machine or plugin.wants_machine;

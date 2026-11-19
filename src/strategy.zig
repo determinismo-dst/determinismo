@@ -138,6 +138,8 @@ loopback: bool = false,
 ring: ?[]align(std.heap.page_size_min) u8 = null,
 /// A module loaded into the explorer (`wasm:`, wasm_plugin.zig): calls are direct, no fds.
 wasm: ?*wasm_plugin.Plugin = null,
+/// The command it was started with (each tape's Header.strategy, through strategies.zig).
+command: []const u8 = "",
 
 const Strategy = @This();
 
@@ -165,6 +167,7 @@ pub fn start(
 ) !void {
     assert(command.len > 0);
     strategy.wasm = null;
+    strategy.command = command;
     if (std.mem.startsWith(u8, command, wasm_plugin.prefix)) {
         strategy.wasm = try wasm_plugin.load(arena, command[wasm_plugin.prefix.len..], environ);
         strategy.pid = 0;

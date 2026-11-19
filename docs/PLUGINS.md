@@ -109,6 +109,13 @@ from its source and uploads it to serve, where a run names it:
 (d/start-run {... :strategy "@decide_named node.start_draw 7"})
 ```
 
+A run that asks `strategy_follow` (explore's `--strategy-follow`) follows its uploads instead:
+the explorer keeps an upload's bytes by content as it starts, and before each timeline reads it
+again; new bytes are kept and that plugin started again on them, so an upload reaches the run's
+next timelines while running ones keep theirs. Each timeline's tape says the plugins it ran with
+(its header's `strategy`, the kept copies by hash): what made its decisions, whichever upload
+it was (e2e `strategy-follow`).
+
 A run keeps the upload it names by content, as it keeps its program: its request says
 `strategy_asked` (`@decide_named node.start_draw 7`) and the kept copy
 (`artifacts/<hash>-decide_named`, the hash serve answered the upload with). A later upload under

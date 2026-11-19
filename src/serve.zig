@@ -1576,6 +1576,10 @@ pub const RunRequest = struct {
     /// the upload's bytes by content (strategy_resolve), a later upload of the name never this
     /// run's.
     strategy_asked: ?[]const u8 = null,
+    /// Its uploads followed: a new upload under a name it runs reaches its next timelines,
+    /// each tape saying the bytes it ran with (explore --strategy-follow, strategies.zig).
+    /// Otherwise the bytes uploaded when it started, all run long.
+    strategy_follow: bool = false,
     /// Timelines (at most, with a time budget).
     branches: ?u32 = null,
     /// Explore until then: "90s", "10m", "2h".
@@ -1948,7 +1952,7 @@ fn run_start(server: *Server, asked_as_given: RunRequest, out: *std.Io.Writer) !
     // answered, and a resume runs them, whatever was uploaded under its name since.
     if (asked.strategy) |strategy| if (uploads_named(strategy)) {
         asked.strategy_asked = strategy;
-        asked.strategy = try strategy_resolve(server, strategy);
+        asked.strategy = if (asked.strategy_follow) try uploads_followed(server, strategy) else try strategy_resolve(server, strategy);
     };
     const machine = try machine_kept(server, asked.memory_mib, asked.seed.?);
     // As run: the seed drawn is in it, and the program it ran, for its replays.
@@ -2043,6 +2047,7 @@ fn explore_arguments(
     if (asked.strategy) |strategy| {
         const command = try strategy_resolve(server, strategy);
         try argv.appendSlice(server.arena, &.{ "--strategy", command });
+        if (asked.strategy_follow) try argv.append(server.arena, "--strategy-follow");
     }
     if (asked.jobs) |jobs| {
         try argv.appendSlice(server.arena, &.{ "--jobs", try print(server, "{d}", .{jobs}) });
@@ -5177,6 +5182,32 @@ fn strategy_resolve(server: *Server, strategy: []const u8) ![]const u8 {
         if (!first) try resolved.writer.writeAll("\n");
         first = false;
         try resolved.writer.writeAll(try plugin_resolve(server, line));
+    }
+    return resolved.written();
+}
+
+/// A followed run's plugins: each `@<name>` line its upload's own path (the explorer keeps
+/// its bytes by content and reads it again before each timeline), anything else as given.
+fn uploads_followed(server: *Server, strategy: []const u8) ![]const u8 {
+    var resolved: std.Io.Writer.Allocating = .init(server.arena);
+    var lines = std.mem.splitScalar(u8, strategy, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) try resolved.writer.writeAll("\n");
+        first = false;
+        if (!std.mem.startsWith(u8, line, "@")) {
+            try resolved.writer.writeAll(line);
+            continue;
+        }
+        const end = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
+        const name = line[1..end];
+        if (!strategy_name_valid(name)) return error.BadRequest;
+        const uploaded = try print(server, "{s}/strategies/{s}", .{ server.options.data_directory, name });
+        std.Io.Dir.cwd().access(server.io, uploaded, .{}) catch {
+            server.detail = try print(server, "no strategy uploaded as {s}", .{name});
+            return error.BadRequest;
+        };
+        try resolved.writer.print("{s}{s}", .{ uploaded, line[end..] });
     }
     return resolved.written();
 }
