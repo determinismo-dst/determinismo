@@ -10,7 +10,7 @@
         },
         .wamr = .{
             .url = "https://github.com/bytecodealliance/wasm-micro-runtime/archive/refs/tags/WAMR-2.4.4.tar.gz",
-            .hash = "N-V-__8AAHQiMQFl9RnB-2ZP-tXIBf_6qzzPno9N39KSrWaM",
+            .hash = "N-V-__8AAHQiMQFSaHB5VrwXb0gz8MsyCJDTtMs48kVlLK1f",
         },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "sdk", "guest", "tools", "examples", "tests", "workload", "workloads.zig" },
