@@ -461,7 +461,16 @@ pub const BranchChoice = struct {
     /// reads jitter by (VM.Options.tsc_jitter_seed), from where it starts (the setup snapshot, or
     /// a moment of another, whose clock it keeps without one).
     jitter_seed: ?u64 = null,
+    /// Its stepper (`"stepper":{"margin_branches":N}`): how many branches before a stop KVM
+    /// starts single-stepping (VM.Options.margin_branches). A speed choice: the guest sees
+    /// the same at any margin past the PMI's skid (the e2e `steppers` check: equal events).
+    margin_branches: ?u32 = null,
 };
+
+/// A stepper's margin: past the PMI's skid (65 branches seen on a W-2295; 64 overshot), at most
+/// a million (the steps would be the whole run).
+pub const margin_branches_min = 96;
+pub const margin_branches_max = 1 << 20;
 
 /// A timeline's start: its index, seed and where it branches from. The reply may choose its
 /// seed and its clock (BranchChoice), its tape's header then saying them.
@@ -486,6 +495,13 @@ pub fn branch(strategy: *Strategy, index: u32, seed: u64, from: ?From) !BranchCh
         if (clock != .object) return error.BadPluginReply;
         if (clock.object.get("jitter_seed")) |chosen| {
             choice.jitter_seed = try hex16(chosen);
+        }
+    }
+    if (reply.get("stepper")) |stepper| {
+        if (stepper != .object) return error.BadPluginReply;
+        if (stepper.object.get("margin_branches")) |chosen| {
+            if (chosen != .integer or chosen.integer < margin_branches_min or chosen.integer > margin_branches_max) return error.BadPluginReply;
+            choice.margin_branches = @intCast(chosen.integer);
         }
     }
     return choice;

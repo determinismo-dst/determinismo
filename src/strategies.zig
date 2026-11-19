@@ -213,6 +213,7 @@ pub fn branch(strategies: *Strategies, index: u32, seed: u64, from: ?Strategy.Fr
         const own = try plugin.branch(index, seed, from);
         if (choice.seed == null) choice.seed = own.seed;
         if (choice.jitter_seed == null) choice.jitter_seed = own.jitter_seed;
+        if (choice.margin_branches == null) choice.margin_branches = own.margin_branches;
     }
     return choice;
 }

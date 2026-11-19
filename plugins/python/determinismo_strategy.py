@@ -75,6 +75,9 @@ def _dispatch(strategy, name, request):
                     reply["seed"] = f"{chosen['seed']:016x}"
                 if chosen.get("jitter_seed") is not None:
                     reply["clock"] = {"jitter_seed": f"{chosen['jitter_seed']:016x}"}
+                # And its stepper: {"margin_branches": int} (a speed choice).
+                if chosen.get("margin_branches") is not None:
+                    reply["stepper"] = {"margin_branches": int(chosen["margin_branches"])}
                 return reply
         return {}
     if method == "returns":

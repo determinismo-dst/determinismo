@@ -306,7 +306,8 @@ std::string determinismo_close(std::string const &fd_text) {
           (let [given (when-let [f (:branch chosen)] (f state request))]
             (cond-> {}
               (and (map? given) (string? (:seed given))) (assoc :seed (:seed given))
-              (and (map? given) (map? (:clock given))) (assoc :clock (:clock given)))))
+              (and (map? given) (map? (:clock given))) (assoc :clock (:clock given))
+              (and (map? given) (map? (:stepper given))) (assoc :stepper (:stepper given)))))
       (= method "event")
       (let [f (:event (strategy-for (:source request)))]
         (if (and f (= end-timeline (f state request))) {:end true} {}))

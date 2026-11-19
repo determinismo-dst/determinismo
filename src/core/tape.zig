@@ -38,6 +38,9 @@ pub const Header = struct {
     /// by its content's hash): what made its decisions. Null: none, or a tape from before
     /// 2026-11-19. A replay needs none of them.
     strategy: ?[]const u8 = null,
+    /// Its stepper's margin, when its strategy chose one (VM.Options.margin_branches): how it was
+    /// stepped, never what the guest saw (a replay steps alike, for its timings).
+    margin_branches: ?u32 = null,
     /// Set for a timeline that goes on from a moment of another of its run (explore --extend:
     /// a session's): that timeline and the moment. Its tape is whole (what the other's gave it
     /// up to the moment, then its own), under a number of its own (claim_next).
@@ -289,6 +292,7 @@ pub fn write_header(fd: linux.fd_t, header: Header) void {
             machine.custom_faults,
         }) catch unreachable;
     }
+    if (header.margin_branches) |margin| writer.print(",\"margin_branches\":{d}", .{margin}) catch unreachable;
     if (header.strategy) |text| {
         assert(text.len <= strategy_size_max);
         writer.writeAll(",\"strategy\":") catch unreachable;
@@ -469,6 +473,10 @@ fn header_take(header_line: []const u8, fba: *std.heap.FixedBufferAllocator) !He
         else
             null,
         .machine = if (header.object.get("machine")) |machine| try machine_parse(machine) else null,
+        .margin_branches = if (header.object.get("margin_branches")) |margin|
+            (if (margin == .integer and margin.integer > 0 and margin.integer <= std.math.maxInt(u32)) @intCast(margin.integer) else return error.BadTape)
+        else
+            null,
         .strategy = if (header.object.get("strategy")) |text|
             (if (text == .string) text.string else return error.BadTape)
         else

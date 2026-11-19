@@ -3335,11 +3335,16 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
             const choice = try strategy.branch(place.index, place.seed, from);
             if (choice.seed) |seed| place.seed = seed;
             if (choice.jitter_seed) |jitter| place.jitter_seed = jitter;
+            if (choice.margin_branches) |margin| place.margin_branches = margin;
         }
         // Its clock: its own (Planned.jitter_seed) for its VM alone, the run's for the rest.
         const jitter_run = options.tsc_jitter_seed;
         defer options.tsc_jitter_seed = jitter_run;
         if (place.jitter_seed) |jitter| options.tsc_jitter_seed = jitter;
+        // And its stepper (Planned.margin_branches): a speed choice, the guest's events alike.
+        const margin_run = options.margin_branches;
+        defer options.margin_branches = margin_run;
+        if (place.margin_branches) |margin| options.margin_branches = margin;
         options.seed = place.seed;
         Events.ranges_salt = place.seed; // Its own draw over the range buckets (events.zig).
         const moment_ms = branches.arguments.moment_vtime_ms;
@@ -3616,6 +3621,7 @@ fn branch_announce(
             .tsc_jitter_seed = exploration.tsc_jitter_seed,
             .machine = exploration.machine,
             .strategy = if (exploration.strategy) |strategy| strategy.commands else null,
+            .margin_branches = place.margin_branches,
         });
     }
 }
@@ -3644,6 +3650,7 @@ fn branch_place(branches: Branches, index_flat: usize, single: bool, position: u
         .snapshot = branches.snapshot,
         .path = if (replay) |tape_replay| tape_replay.header.chain else &.{},
         .jitter_seed = if (replay) |tape_replay| tape_replay.header.clock_jitter_seed else null,
+        .margin_branches = if (replay) |tape_replay| tape_replay.header.margin_branches else null,
     };
 }
 
@@ -3667,6 +3674,9 @@ const Planned = struct {
     /// choice at its branch, else a child's its parent's. Its path's segments say each
     /// ancestor's, which a replay boots each segment with. Null: the run's.
     jitter_seed: ?u64 = null,
+    /// Its stepper's margin (VM.Options.margin_branches): its strategy's choice at its branch,
+    /// its tape's header saying it (a replay steps alike). Null: the run's.
+    margin_branches: ?u32 = null,
 };
 
 /// How a branch went, for planning the next generation: the behaviors it reached first, when.
