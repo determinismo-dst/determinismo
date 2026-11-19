@@ -8214,8 +8214,11 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
     }
     assert(index == argv.len);
     if (arguments.kernel_path.len == 0 and arguments.command != .validate) return error.Usage; // It boots nothing.
-    if (arguments.memory_mib < memory_mib_min) return error.Usage;
-    if (arguments.memory_mib > memory_mib_max) return error.Usage;
+    // Said alone: the usage after it buried it (ParadeDB's 40 GiB lines, trial 2083 on srv4).
+    if (arguments.memory_mib < memory_mib_min or arguments.memory_mib > memory_mib_max) {
+        say("[determinismo] --memory-mib {d}: a VM takes {d} to {d} MiB\n", .{ arguments.memory_mib, memory_mib_min, memory_mib_max });
+        return error.MemorySize;
+    }
     if (arguments.time_budget_ns != null and !arguments.branches_given) {
         arguments.branches = branches_max;
     }

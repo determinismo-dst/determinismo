@@ -1971,6 +1971,9 @@ fn run_start(server: *Server, asked_as_given: RunRequest, out: *std.Io.Writer) !
         asked.strategy_asked = strategy;
         asked.strategy = if (asked.strategy_follow) try uploads_followed(server, strategy) else try strategy_resolve(server, strategy);
     };
+    // Refused here, with its reason, not by a started run's explorer (trial 2083: ParadeDB's
+    // 40 GiB lines, a run in error with a usage text for a reason).
+    if (asked.memory_mib) |mib| try memory_mib_check(server, mib);
     const machine = try machine_kept(server, asked.memory_mib, asked.seed.?);
     // As run: the seed drawn is in it, and the program it ran, for its replays.
     asked.build = build_options.commit; // The run's explorer is this binary.
@@ -3132,6 +3135,7 @@ fn machine_create(server: *Server, asked: MachineRequest) !u32 {
     const arena = server.arena;
     if ((asked.program == null) == (asked.compose == null)) return error.BadRequest;
     if (asked.vcpus < 2 or asked.vcpus > 32) return error.BadRequest;
+    try memory_mib_check(server, asked.memory_mib);
     const shared = server.shared;
     // A machine holds a place on a CPU of its pool for its life (`run` takes it as it starts,
     // and a machine does not end by itself), machines_per_cpu of them a CPU: with every place
@@ -6103,6 +6107,16 @@ fn machine_exact_unless_jittered(arena: std.mem.Allocator, machine: []const []co
 /// The host's machine arguments, with the kernel and the initramfs kept (artifact_keep), the
 /// memory asked for (the last --memory-mib is explore's), and the clock's event (unless the
 /// host's give one): its resumes and replays count the same, whatever the default becomes.
+/// A guest's size a VM takes (the explorer's --memory-mib limits), or the request refused, saying
+/// them.
+fn memory_mib_check(server: *Server, mib: u32) !void {
+    const min = 64;
+    const max: u64 = VM.memory_size_max >> 20;
+    if (mib >= min and mib <= max) return;
+    server.detail = try print(server, "memory_mib {d}: a VM takes {d} to {d} MiB", .{ mib, min, max });
+    return error.BadRequest;
+}
+
 fn machine_kept(server: *Server, memory_mib: ?u32, seed: u64) ![]const []const u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(server.arena, server.options.machine);
