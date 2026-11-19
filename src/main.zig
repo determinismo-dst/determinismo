@@ -697,7 +697,7 @@ fn pokes_parse(text: []const u8, vm: ?*VM) !usize {
             const guest = guest_memory.GuestMemory{ .bytes = machine.memory };
             const target = guest.range(address, value.len) orelse return error.PokeOutsideRam;
             @memcpy(target, value);
-            std.debug.print("[determinismo] poke: 0x{x} = {s} ({d} bytes)\n", .{ address, hex, value.len });
+            say("[determinismo] poke: 0x{x} = {s} ({d} bytes)\n", .{ address, hex, value.len });
         }
         count += 1;
     }
@@ -750,7 +750,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     var arguments = parse_arguments(arena, try run_expand(arena, init.io, argv)) catch {
-        std.debug.print("{s}", .{usage});
+        say("{s}", .{usage});
         std.process.exit(2);
     };
     if (arguments.command == .validate) std.process.exit(try command_validate(arena, init.io, &arguments));
@@ -777,16 +777,16 @@ pub fn main(init: std.process.Init) !void {
     }) else try list_split(arena, profile);
     const verdicts = try arena.alloc(u32, names.len);
     for (names, verdicts) |name, *failing| {
-        std.debug.print("[determinismo] profile {s}\n", .{name});
+        say("[determinismo] profile {s}\n", .{name});
         var copy = arguments;
         copy.profile = name;
         failing.* = try system_run(init, vm, copy);
     }
-    std.debug.print("[determinismo] profiles:\n", .{});
+    say("[determinismo] profiles:\n", .{});
     for (names, verdicts) |name, failing| {
         const status = if (failing > 0) "FAIL" else "PASS";
         const line = "  {s} {s} ({d} scenarios with failing properties)\n";
-        std.debug.print(line, .{ status, name, failing });
+        say(line, .{ status, name, failing });
     }
     for (verdicts) |failing| if (failing > 0) std.process.exit(3);
 }
@@ -871,10 +871,10 @@ fn command_tool(
     // file) it buried what was said in a hundred lines.
     return result catch |err| {
         if (err == error.Usage) {
-            std.debug.print("{s}", .{usage});
+            say("{s}", .{usage});
             return 2;
         }
-        std.debug.print("error: {s}\n", .{@errorName(err)});
+        say("error: {s}\n", .{@errorName(err)});
         return 2;
     };
 }
@@ -900,7 +900,7 @@ const OwnCpu = struct {
         if (own.held != null) return;
         if (!own.opened) {
             own.pool.open() catch |err| {
-                std.debug.print("[determinismo] the CPU pool: {s}\n", .{@errorName(err)});
+                say("[determinismo] the CPU pool: {s}\n", .{@errorName(err)});
                 linux.exit_group(1);
             };
             own.opened = true;
@@ -914,7 +914,7 @@ const OwnCpu = struct {
         if (own.held != null) return;
         if (!own.opened) {
             own.pool.open() catch |err| {
-                std.debug.print("[determinismo] the CPU pool: {s}\n", .{@errorName(err)});
+                say("[determinismo] the CPU pool: {s}\n", .{@errorName(err)});
                 linux.exit_group(1);
             };
             own.opened = true;
@@ -1082,7 +1082,7 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
             const own = if (scenario) |name| if (known.system.scenario(name)) |found| found.drive_ms_max else null else null;
             break :steered if (own) |ms| ms else arguments.drive_max_ms;
         } else null;
-        if (scenario) |name| std.debug.print("[determinismo] scenario {s}\n", .{name});
+        if (scenario) |name| say("[determinismo] scenario {s}\n", .{name});
         switch (arguments.command) {
             .validate => unreachable, // main's: it boots nothing.
             .run => try command_run(context, vm, &options, arguments.from_snapshot),
@@ -1181,7 +1181,7 @@ fn run_register(arena: std.mem.Allocator, io: std.Io, arguments: *Arguments) !vo
                 const own = try runs.directory_of(arena, data, id);
                 if (runs.running_pid(arena, own) == null) {
                     try runs.output_tee(arena, try std.fs.path.join(arena, &.{ own, "output.log" }));
-                    std.debug.print("[determinismo] run {d} resumed: {s}\n", .{ id, own });
+                    say("[determinismo] run {d} resumed: {s}\n", .{ id, own });
                     break :claimed own;
                 }
             }
@@ -1200,18 +1200,18 @@ fn run_register(arena: std.mem.Allocator, io: std.Io, arguments: *Arguments) !vo
                 const target_z = try arena.dupeSentinel(u8, target, 0);
                 const kept = linux.errno(linux.access(target_z, linux.F_OK)) == .SUCCESS;
                 if (kept) {
-                    std.debug.print("error: {s} {s} holds run {d}'s; give another, or delete it " ++
+                    say("error: {s} {s} holds run {d}'s; give another, or delete it " ++
                         "(its run then keeps none)\n", .{ asked[2], path, id });
                     return error.DirectoryOfAnotherRun;
                 }
                 try runs.link_drop(arena, data, id, asked[0]);
-                std.debug.print("[determinismo] {s} {s} was run {d}'s, deleted since: that run " ++
+                say("[determinismo] {s} {s} was run {d}'s, deleted since: that run " ++
                     "keeps none\n", .{ asked[2], path, id });
             }
         }
         const run = try runs.claim(arena, io, data);
         try runs.output_tee(arena, try std.fs.path.join(arena, &.{ run.directory, "output.log" }));
-        std.debug.print("[determinismo] run {d}: {s}\n", .{ run.id, run.directory });
+        say("[determinismo] run {d}: {s}\n", .{ run.id, run.directory });
         // A new run's clock jitters (VM.Options.tsc_jitter_seed), from its seed unless given.
         if (arguments.tsc_jitter_seed == null) {
             const drawn = jitter_from_seed(arguments.seed);
@@ -1260,7 +1260,7 @@ fn run_scenario(
     }
     const run = try runs.claim(arena, io, data);
     try runs.output_tee(arena, try std.fs.path.join(arena, &.{ run.directory, "output.log" }));
-    std.debug.print("[determinismo] run {d}: {s} (scenario {s})\n", .{ run.id, run.directory, scenario });
+    say("[determinismo] run {d}: {s} (scenario {s})\n", .{ run.id, run.directory, scenario });
     try run_request_write(arena, io, data, run.directory, arguments);
     try runs.running_mark(arena, run.directory);
     // The record is opened once per run (command_explore): this one's anew.
@@ -1575,7 +1575,7 @@ fn system_prepare(
     arguments.system = try std.json.parseFromSliceLeaky(std.json.Value, arena, system_json, .{});
     for (prepared.disk_paths, 0..) |path, index| arguments.disk_paths[index] = path;
     arguments.disk_count = @intCast(prepared.disk_paths.len);
-    std.debug.print("[determinismo] system {x:0>16}: profile {s}, {d} nodes, disk {s}, pin {s}\n", .{
+    say("[determinismo] system {x:0>16}: profile {s}, {d} nodes, disk {s}, pin {s}\n", .{
         prepared.hash,          prepared.system.profile, prepared.system.nodes.len,
         prepared.disk_paths[0], prepared.pin_path,
     });
@@ -1605,11 +1605,11 @@ fn scenarios_selected(
     const wanted = arguments.scenario orelse if (system.scenarios.len == 1)
         system.scenarios[0].name
     else {
-        std.debug.print("[determinismo] pick a scenario with --scenario (or all)\n", .{});
+        say("[determinismo] pick a scenario with --scenario (or all)\n", .{});
         return error.Usage;
     };
     if (std.mem.eql(u8, wanted, "all") and system.scenario("all") != null) {
-        std.debug.print("[determinismo] a scenario is named all: rename it (--scenario all " ++
+        say("[determinismo] a scenario is named all: rename it (--scenario all " ++
             "explores every scenario, so it would never run alone)\n", .{});
         return error.Usage;
     }
@@ -1622,7 +1622,7 @@ fn scenarios_selected(
         return all;
     }
     const scenario = system.scenario(wanted) orelse {
-        std.debug.print("[determinismo] no scenario named {s}\n", .{wanted});
+        say("[determinismo] no scenario named {s}\n", .{wanted});
         return error.Usage;
     };
     try quorum_known(system, scenario);
@@ -1638,7 +1638,7 @@ fn scenarios_selected(
 fn quorum_known(system: anytype, scenario: anytype) !void {
     for (scenario.quorum) |name| {
         if (system.node(name) == null) {
-            std.debug.print("[determinismo] scenario {s}'s quorum names {s}, no node of this profile\n", .{ scenario.name, name });
+            say("[determinismo] scenario {s}'s quorum names {s}, no node of this profile\n", .{ scenario.name, name });
             return error.Usage;
         }
     }
@@ -1655,8 +1655,8 @@ fn alternatives_say(scenario: anytype) void {
         .eventually, .finally => ending += 1,
         else => {},
     };
-    if (first > 1) std.debug.print("[determinismo] scenario {s}: {d} first commands, a timeline runs one of them\n", .{ scenario.name, first });
-    if (ending > 1) std.debug.print("[determinismo] scenario {s}: {d} eventually and finally commands, a timeline runs one of them\n", .{ scenario.name, ending });
+    if (first > 1) say("[determinismo] scenario {s}: {d} first commands, a timeline runs one of them\n", .{ scenario.name, first });
+    if (ending > 1) say("[determinismo] scenario {s}: {d} eventually and finally commands, a timeline runs one of them\n", .{ scenario.name, ending });
 }
 
 /// Whether the explorer answers its timelines' composers' asks for another driver phase
@@ -1868,16 +1868,16 @@ fn snapshot_diff(init: std.process.Init, names: []const []const u8) !void {
         }
         if (listed < 40) {
             listed += 1;
-            std.debug.print("page 0x{x}: {d} words differ in Accessed/Dirty bits, {d} otherwise", .{ offset, words_ad, words_other });
+            say("page 0x{x}: {d} words differ in Accessed/Dirty bits, {d} otherwise", .{ offset, words_ad, words_other });
             if (first_other) |at| {
-                std.debug.print(" (first at +0x{x}: {x:0>16} vs {x:0>16})", .{
+                say(" (first at +0x{x}: {x:0>16} vs {x:0>16})", .{
                     at, std.mem.readInt(u64, a[at..][0..8], .little), std.mem.readInt(u64, b[at..][0..8], .little),
                 });
             }
-            std.debug.print("\n", .{});
+            say("\n", .{});
         }
     }
-    std.debug.print("{d} pages differ; words: {d} only Accessed, {d} only Dirty, {d} both, {d} otherwise\n", .{
+    say("{d} pages differ; words: {d} only Accessed, {d} only Dirty, {d} both, {d} otherwise\n", .{
         pages_differing, accessed_only, dirty_only, both, other,
     });
 }
@@ -1978,12 +1978,12 @@ const RecordLine = struct {
 
 fn resume_read(context: Context, arguments: *const Arguments, inputs: u64) !*const Resumed {
     const path = arguments.record_path orelse {
-        std.debug.print("[determinismo] --resume continues the run of a record: give --record\n", .{});
+        say("[determinismo] --resume continues the run of a record: give --record\n", .{});
         return error.Usage;
     };
     const tree_run = arguments.branching == .tree;
     if (tree_run and arguments.strategy_command != null) {
-        std.debug.print("[determinismo] --resume continues trees without a strategy (a strategy's " ++
+        say("[determinismo] --resume continues trees without a strategy (a strategy's " ++
             "state was its own process's)\n", .{});
         return error.Usage;
     }
@@ -2008,7 +2008,7 @@ fn resume_read(context: Context, arguments: *const Arguments, inputs: u64) !*con
                     run.horizon_ns == arguments.horizon_ns and
                     run.return_branches == arguments.return_branches and run.queue));
             if (!same) {
-                std.debug.print("[determinismo] {s} is the record of another run (inputs {s}, " ++
+                say("[determinismo] {s} is the record of another run (inputs {s}, " ++
                     "seed {s}, {s} branching; these: {s}, {s}, {s}; a tree's generation, " ++
                     "pipeline, archive, horizon, return branches and queue too): start a new run\n", .{
                     path,                          run.inputs orelse "?", run.seed orelse "?",
@@ -2039,13 +2039,13 @@ fn resume_read(context: Context, arguments: *const Arguments, inputs: u64) !*con
         }
     }
     if (!run_seen) {
-        std.debug.print("[determinismo] {s} has no run to continue\n", .{path});
+        say("[determinismo] {s} has no run to continue\n", .{path});
         return error.Usage;
     }
     if (tree_run) {
         const summaries_path = try std.fmt.allocPrint(context.arena, "{s}.summaries", .{path});
         const bytes = std.Io.Dir.cwd().readFileAlloc(context.io, summaries_path, context.arena, .unlimited) catch |err| {
-            std.debug.print("[determinismo] {s}: {s} (a tree continues from its timelines' " ++
+            say("[determinismo] {s}: {s} (a tree continues from its timelines' " ++
                 "summaries, recorded since this version)\n", .{ summaries_path, @errorName(err) });
             return error.Usage;
         };
@@ -2058,12 +2058,12 @@ fn resume_read(context: Context, arguments: *const Arguments, inputs: u64) !*con
         }
         for (missing.items) |index| _ = resumed.done.remove(index);
     }
-    std.debug.print("[determinismo] resuming {s}: {d} timelines recorded, skipped\n", .{ path, resumed.done.count() });
+    say("[determinismo] resuming {s}: {d} timelines recorded, skipped\n", .{ path, resumed.done.count() });
     const left = for (0..arguments.branches) |index| {
         if (!resumed.done.contains(@intCast(index))) break true;
     } else false;
     if (!left) {
-        std.debug.print("[determinismo] the run is complete: all {d} timelines recorded\n", .{arguments.branches});
+        say("[determinismo] the run is complete: all {d} timelines recorded\n", .{arguments.branches});
         std.process.exit(0);
     }
     return resumed;
@@ -2329,7 +2329,7 @@ fn command_explore(
                 options.cmdline = try std.fmt.allocPrint(context.arena, "{s} det.custom_faults={s}", .{ options.cmdline, decided.machine.custom_faults });
             }
             exploration.machine = decided.machine;
-            std.debug.print("[determinismo] the machine its strategy decided: wall clock {d}, timer slack {d} us landing at {d}/1000 of it, jitter {x:0>16}, stretches {d}-{d} us\n", .{
+            say("[determinismo] the machine its strategy decided: wall clock {d}, timer slack {d} us landing at {d}/1000 of it, jitter {x:0>16}, stretches {d}-{d} us\n", .{
                 decided.machine.epoch_seconds, decided.machine.timer_slack_ns / std.time.ns_per_us, decided.machine.timer_delay_permille, decided.tsc_jitter_seed,
                 decided.machine.modulation_stretch_ns[0] / std.time.ns_per_us, decided.machine.modulation_stretch_ns[1] / std.time.ns_per_us,
             });
@@ -2343,9 +2343,9 @@ fn command_explore(
     if (options.cpuid_table != null) {
         // A replay on another model says so: the guest is shown the table's CPU, the host is
         // another.
-        std.debug.print("[determinismo] inputs {x:0>16} (determinism ABI {d}, CPU signature {x:0>8} " ++
+        say("[determinismo] inputs {x:0>16} (determinism ABI {d}, CPU signature {x:0>8} " ++
             "the given table's, on a host of {x:0>8})\n", .{ exploration.inputs, VM.determinism_abi, signature, host_signature });
-    } else std.debug.print("[determinismo] inputs {x:0>16} (determinism ABI {d}, CPU signature " ++
+    } else say("[determinismo] inputs {x:0>16} (determinism ABI {d}, CPU signature " ++
         "{x:0>8})\n", .{ exploration.inputs, VM.determinism_abi, signature });
     if (arguments.resume_run) {
         exploration.done = try resume_read(context, arguments, exploration.inputs);
@@ -2404,7 +2404,7 @@ fn command_explore(
         const scratch = try context.arena.alloc(u8, 64 * 1024);
         const header = try tape.parse(source, scratch, overrides);
         if (header.inputs != exploration.inputs) {
-            std.debug.print("[determinismo] the tape was recorded with inputs {x:0>16}; " ++
+            say("[determinismo] the tape was recorded with inputs {x:0>16}; " ++
                 "these are {x:0>16} (kernel, initramfs, command line, disks or CPU modulation " ++
                 "differ: runs before 2026-10-28 had none, --no-cpu-modulation; modulated runs before " ++
                 "2026-11-01 another modulation version, " ++ std.fmt.comptimePrint("{d}", .{VM.modulation_version}) ++ " now)\n", .{
@@ -2416,7 +2416,7 @@ fn command_explore(
         // replay that parts from the tape may then be the build's doing (run 56, recorded the day
         // before: the same 26 of 64 parted, at the same events, with or without hyperthreads).
         if (header.host) |host| if (host != exploration.host) {
-            std.debug.print("[determinismo] the tape was recorded by another build of determinismo " ++
+            say("[determinismo] the tape was recorded by another build of determinismo " ++
                 "({x:0>16}; this is {x:0>16}): a replay that parts from it may be the build's " ++
                 "doing\n", .{ host, exploration.host });
         };
@@ -2444,7 +2444,7 @@ fn command_explore(
             own.extends = .{ .branch = header.branch, .vtime_ns = moment_ms * std.time.ns_per_ms };
             const tape_fd = try tape.claim_next(tapes, &own);
             // Said to whoever started it (serve's session: its reply's timeline).
-            std.debug.print("[determinismo] timeline {d}: timeline {d} from {d} ms on, extended\n", .{ own.branch, header.branch, moment_ms });
+            say("[determinismo] timeline {d}: timeline {d} from {d} ms on, extended\n", .{ own.branch, header.branch, moment_ms });
             exploration.extend = .{
                 .extends = own.extends.?,
                 .lineage = lineage,
@@ -2513,7 +2513,7 @@ fn command_explore(
         const directory = std.fs.path.dirname(path) orelse ".";
         try snapshot.disk_load(context.arena, context.io, directory, std.fs.path.basename(path), options.check_buffer);
         if (snapshot.memory_size != options.memory_size) return error.SnapshotMemoryDiffers;
-        std.debug.print("[determinismo] on from {s}: the timeline at {d}ns, not from boot\n", .{
+        say("[determinismo] on from {s}: the timeline at {d}ns, not from boot\n", .{
             std.fs.path.basename(path), snapshot.tsc / report.tsc_per_ns,
         });
     } else {
@@ -2572,7 +2572,7 @@ fn command_explore(
     // Setup mode: the setup ran to setup_complete (explore_snapshot ends the process otherwise),
     // its events are in setup.jsonl; no timeline.
     if (arguments.setup_only) {
-        std.debug.print("[determinismo] setup mode: setup complete at {d:.3}s of virtual time, " ++
+        say("[determinismo] setup mode: setup complete at {d:.3}s of virtual time, " ++
             "{d:.1}s of wall time; no timeline (a full run: the same request without " ++
             "--setup-only)\n", .{
             @as(f64, @floatFromInt(snapshot.tsc / report.tsc_per_ns)) / 1e9,
@@ -2682,11 +2682,11 @@ fn command_explore(
         if (exploration.strategy == null) try strategy_start(context, arguments, &exploration);
         defer if (exploration.strategy) |strategy| strategy.stop();
         if (arguments.time_budget_text) |budget| {
-            std.debug.print("[determinismo] a tree for {s} (at most {d} timelines) on {d} workers\n", .{
+            say("[determinismo] a tree for {s} (at most {d} timelines) on {d} workers\n", .{
                 budget, arguments.branches, jobs,
             });
         } else {
-            std.debug.print("[determinismo] a tree of {d} timelines on {d} workers\n", .{ arguments.branches, jobs });
+            say("[determinismo] a tree of {d} timelines on {d} workers\n", .{ arguments.branches, jobs });
         }
         try explore_tree(context, vm, options, branches, jobs);
     } else if (jobs == 1) {
@@ -2701,11 +2701,11 @@ fn command_explore(
             exploration.strategy = null;
         }
         if (arguments.time_budget_text) |budget| {
-            std.debug.print("[determinismo] branches for {s} (at most {d}) on {d} workers\n", .{
+            say("[determinismo] branches for {s} (at most {d}) on {d} workers\n", .{
                 budget, arguments.branches, jobs,
             });
         } else {
-            std.debug.print("[determinismo] {d} branches on {d} workers\n", .{
+            say("[determinismo] {d} branches on {d} workers\n", .{
                 arguments.branches, jobs,
             });
         }
@@ -2718,7 +2718,7 @@ fn command_explore(
         try multiverse.replays_judge(found.replayed, found.same, found.first_different);
         for (found.different) |line| {
             const rejudged = std.mem.indexOf(u8, line, " rejudged ") != null;
-            std.debug.print("[determinismo] {s}: {s}\n", .{ if (rejudged) "judged anew" else "did not replay", line });
+            say("[determinismo] {s}: {s}\n", .{ if (rejudged) "judged anew" else "did not replay", line });
         }
     }
     multiverse.summarize(monotonic_ns() - time_start_ns);
@@ -2747,7 +2747,7 @@ fn explore_fork(context: Context, vm: *VM, options: *VM.Options, fork: Fork) !*c
     const outcome = try vm.run_until_exit();
     const expected: VM.Outcome = if (fork.fork.exec != null) .command_done else .moment_reached;
     if (std.meta.activeTag(outcome) != std.meta.activeTag(expected)) {
-        std.debug.print("[determinismo] branch {d} ended ({s}) before {d}ns\n", .{
+        say("[determinismo] branch {d} ended ({s}) before {d}ns\n", .{
             fork.fork.branch, @tagName(outcome), fork.fork.vtime_ns,
         });
         vm.deinit();
@@ -2758,7 +2758,7 @@ fn explore_fork(context: Context, vm: *VM, options: *VM.Options, fork: Fork) !*c
     try snapshot.take_copy(vm);
     vm.deinit();
     const wall_s = @as(f64, @floatFromInt(monotonic_ns() - time_start_ns)) / std.time.ns_per_s;
-    std.debug.print("[determinismo] forked branch {d} at vtime={d}ns branches={d} " ++
+    say("[determinismo] forked branch {d} at vtime={d}ns branches={d} " ++
         "({d:.3}s wall); its branches follow\n", .{
         fork.fork.branch,
         fork.fork.vtime_ns,
@@ -2819,7 +2819,7 @@ test "a run's strategy in a tree takes its run's tapes" {
 fn branching_resolve(arguments: *Arguments, at_moment: bool) !void {
     if (arguments.changed != null and arguments.branching != .tree) return changed_needs_tree();
     if (arguments.changed_repository != null and arguments.changed == null) {
-        std.debug.print("[determinismo] --changed-repository says where --changed's range is: " ++
+        say("[determinismo] --changed-repository says where --changed's range is: " ++
             "give the range too (a commit, a..b, v1.6.0..v1.7.0)\n", .{});
         return error.Usage;
     }
@@ -2828,7 +2828,7 @@ fn branching_resolve(arguments: *Arguments, at_moment: bool) !void {
     // its directory (run_register, after this: serve's strategy runs were refused, run 1340).
     if (arguments.branching_given and arguments.strategy_command != null) {
         if (arguments.tape_directory == null and !exploration_is_run(arguments)) {
-            std.debug.print("[determinismo] a strategy in a tree needs --tape-dir: nodes " ++
+            say("[determinismo] a strategy in a tree needs --tape-dir: nodes " ++
                 "replay their parents' decisions from their tapes\n", .{});
             return error.Usage;
         }
@@ -2843,7 +2843,7 @@ fn branching_resolve(arguments: *Arguments, at_moment: bool) !void {
     // it starts (extract --branch 18 --tape branch-18.jsonl was refused: run 730, 2026-11-03).
     if (arguments.branch_only) |only| {
         if (!arguments.branching_given and only >= arguments.generation_size and arguments.tape_path == null) {
-            std.debug.print("[determinismo] branch {d} of a tree exploration (the default) " ++
+            say("[determinismo] branch {d} of a tree exploration (the default) " ++
                 "starts from a moment of another: replay it from its tape (--tape " ++
                 "<tape dir>/branch-{d}.jsonl), or explore with --branching flat\n", .{
                 only, only,
@@ -2881,7 +2881,7 @@ fn retroactive_texts(
 const filtered_stream_text = "\"stream\":\"filtered ";
 
 fn changed_needs_tree() error{Usage} {
-    std.debug.print("[determinismo] --changed aims the tree explorer: not with flat branching, " ++
+    say("[determinismo] --changed aims the tree explorer: not with flat branching, " ++
         "a strategy's plan, shards or a replay\n", .{});
     return error.Usage;
 }
@@ -3008,7 +3008,7 @@ fn worker_run(
     // The host's CPUs, shared with every other run's workers: one per timeline (cpus.zig).
     var pool: cpus.Pool = undefined;
     pool.open() catch |err| {
-        std.debug.print("[determinismo] worker {d}: the CPU pool: {s}\n", .{
+        say("[determinismo] worker {d}: the CPU pool: {s}\n", .{
             worker.worker, @errorName(err),
         });
         linux.exit_group(1);
@@ -3048,7 +3048,7 @@ fn worker_explore(
     strategy_start(context, branches.arguments, exploration) catch return false;
     defer if (exploration.strategy) |strategy| strategy.stop();
     explore_branches(context, vm, options, branches) catch |err| {
-        std.debug.print("[determinismo] worker {d}: {s}\n", .{ branches.worker, @errorName(err) });
+        say("[determinismo] worker {d}: {s}\n", .{ branches.worker, @errorName(err) });
         return false;
     };
     return true;
@@ -3092,7 +3092,7 @@ fn setup_tape_load(context: Context, tape_path: []const u8, header: tape.Header)
     const overrides = try context.arena.create(tape.Overrides);
     const setup_header = try tape.parse(source, try context.arena.alloc(u8, 64 * 1024), overrides);
     if (setup_header.inputs != header.inputs or setup_header.exploration_seed != header.exploration_seed) {
-        std.debug.print("[determinismo] {s} is another exploration's setup (inputs {x:0>16}, seed {x:0>16})\n", .{
+        say("[determinismo] {s} is another exploration's setup (inputs {x:0>16}, seed {x:0>16})\n", .{
             path, setup_header.inputs, setup_header.exploration_seed,
         });
         return error.SetupTapeDiffers;
@@ -3147,7 +3147,7 @@ fn explore_snapshot(
     vm.tape_fd = null;
     vm.overrides = null;
     if (outcome != .setup_complete) {
-        std.debug.print("[determinismo] the guest never signalled setup_complete ({s})\n", .{
+        say("[determinismo] the guest never signalled setup_complete ({s})\n", .{
             @tagName(outcome),
         });
         std.process.exit(1);
@@ -3167,13 +3167,13 @@ fn setup_draws_say(draws: *const VM.SetupDraws) void {
     for (0..draws.count) |index| {
         const name = draws.name(index);
         if (std.mem.eql(u8, name, "node.start_draw")) continue;
-        if (said == 0) std.debug.print("[determinismo] the setup drew, one value for every timeline of the run:", .{});
-        std.debug.print("{s} {s}", .{ if (said == 0) "" else ",", name });
+        if (said == 0) say("[determinismo] the setup drew, one value for every timeline of the run:", .{});
+        say("{s} {s}", .{ if (said == 0) "" else ",", name });
         said += 1;
     }
     if (said == 0) return;
-    if (draws.dropped > 0) std.debug.print(" (and {d} more)", .{draws.dropped});
-    std.debug.print(" (a first command, or each start, draws per timeline)\n", .{});
+    if (draws.dropped > 0) say(" (and {d} more)", .{draws.dropped});
+    say(" (a first command, or each start, draws per timeline)\n", .{});
 }
 
 /// The setup's progress line (explore_snapshot): its VM's virtual time (VM.progress), printed
@@ -3190,7 +3190,7 @@ const SetupWatch = struct {
             _ = linux.nanosleep(&pause, null);
             waited_ms += std.time.ms_per_s;
             if (waited_ms % progress_interval_ms != 0) continue;
-            std.debug.print("[determinismo] setup at {d}s of virtual time, {d}s of wall time\n", .{
+            say("[determinismo] setup at {d}s of virtual time, {d}s of wall time\n", .{
                 @atomicLoad(u64, &watch.vtime_ns, .monotonic) / std.time.ns_per_s,
                 (monotonic_ns() - watch.start_ns) / std.time.ns_per_s,
             });
@@ -3782,7 +3782,7 @@ fn explore_tree(
     const exploration = branches.exploration;
     const size = branches.arguments.generation_size;
     if (!tree.fits(size, branches.arguments.return_branches)) {
-        std.debug.print("error: --return-branches {d} does not divide a generation of {d}'s " ++
+        say("error: --return-branches {d} does not divide a generation of {d}'s " ++
             "{d} returned timelines\n", .{ branches.arguments.return_branches, size, size - tree.roots(size) });
         return error.Usage;
     }
@@ -3810,7 +3810,7 @@ fn explore_tree(
         registry.release(disk);
         const left = holders.listening(registry.explorer);
         if (left > 0) {
-            std.debug.print("[determinismo] holders: {d} still listening at the tree's end (never in the registry)\n", .{left});
+            say("[determinismo] holders: {d} still listening at the tree's end (never in the registry)\n", .{left});
             activity.holders_left(left);
         }
     };
@@ -3889,7 +3889,7 @@ fn explore_tree(
         try state.seen.ensureTotalCapacity(arena, known.count());
         var hashes = known.keyIterator();
         while (hashes.next()) |hash| state.seen.putAssumeCapacity(hash.*, {});
-        std.debug.print("[determinismo] tree: {d} behaviors known from the setup\n", .{state.seen.count()});
+        say("[determinismo] tree: {d} behaviors known from the setup\n", .{state.seen.count()});
     }
     // The configuration bandit warm from the system's last runs (serve's history, `.bandit`
     // beside it): none yet, a run starts cold.
@@ -3897,7 +3897,7 @@ fn explore_tree(
         const learned_path = try std.fmt.allocPrint(arena, "{s}.bandit", .{path});
         if (std.Io.Dir.cwd().readFileAlloc(context.io, learned_path, arena, .limited(1 << 24))) |learned| {
             bandit_zig.warm(&state.bandit, arena, learned);
-            std.debug.print("[determinismo] configuration bandit: warm from the system's last runs ({d} draws)\n", .{state.bandit.name_count});
+            say("[determinismo] configuration bandit: warm from the system's last runs ({d} draws)\n", .{state.bandit.name_count});
         } else |_| {}
     };
     if (branches.arguments.record_path) |record| {
@@ -4007,7 +4007,7 @@ fn explore_tree(
                 _ = linux.waitpid(entry.pid, &status, 0);
                 _ = linux.close(entry.results);
             }
-            std.debug.print("[determinismo] the budget's grace is over: {d} timelines still running " ++
+            say("[determinismo] the budget's grace is over: {d} timelines still running " ++
                 "stopped, not counted\n", .{running_count});
             running_count = 0;
             continue;
@@ -4035,7 +4035,7 @@ fn explore_tree(
         }
         if (!late and !waiting_said and batch.summaries.count >= size) if (judging) |*pending| {
             waiting_said = true;
-            std.debug.print("[determinismo] tree: generation {d} complete while generation {d}'s " ++
+            say("[determinismo] tree: generation {d} complete while generation {d}'s " ++
                 "nodes are made: it waits, timelines going on\n", .{ pending.generation + 1, pending.generation });
         };
         // Timelines start as CPUs free up, in the queue's order; none past the budget, and none
@@ -4150,7 +4150,7 @@ fn behaviors_write(context: Context, state: *const TreeState, record: []const u8
 fn history_read(arena: std.mem.Allocator, io: std.Io, path: []const u8) !*const std.AutoHashMapUnmanaged(u64, u32) {
     const source = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 28));
     const history = try history_parse(arena, source);
-    std.debug.print("[determinismo] history: {d} behaviors from the system's last runs\n", .{history.count()});
+    say("[determinismo] history: {d} behaviors from the system's last runs\n", .{history.count()});
     return history;
 }
 
@@ -4465,7 +4465,7 @@ fn claims_look(state: *TreeState, pool: ?*cpus.Pool, running: []Running, jobs: u
     // abfb598 it had none, returned here at once, and nothing said so; the tree check expects
     // this line). What it learns comes later: its looks count once as many timelines ended as
     // it has workers, and while every worker has one.
-    if (state.claims_looked_ns == 0) std.debug.print("[determinismo] the run's VMs claim their " ++
+    if (state.claims_looked_ns == 0) say("[determinismo] the run's VMs claim their " ++
         "guest's {d} MiB each until it learns what the host holds for each (looks every {d} s " ++
         "from its {d}th timeline's end, while every worker has one)\n", .{
         cpus.claim_bytes >> 20, claims_look_ns / std.time.ns_per_s, jobs,
@@ -4481,7 +4481,7 @@ fn claims_look(state: *TreeState, pool: ?*cpus.Pool, running: []Running, jobs: u
         if (youngest) |entry| {
             entry.short = true;
             _ = linux.kill(entry.pid, .KILL);
-            std.debug.print("[determinismo] memory is short ({d} MiB available) after the run claimed " ++
+            say("[determinismo] memory is short ({d} MiB available) after the run claimed " ++
                 "less than its guests' size: its claims are the guests' again, and timeline {d}, its " ++
                 "youngest, ends and runs again\n", .{ cpus.memory_available() >> 20, entry.place.index });
         }
@@ -4495,12 +4495,12 @@ fn claims_look(state: *TreeState, pool: ?*cpus.Pool, running: []Running, jobs: u
     // size or back to it (what they hold grew: Vitess's run 2070 claimed 11 GiB of 16 at 40
     // timelines, its guest's size again some minutes later, and said nothing of it).
     if (claim != 0 and (state.claims_said == 0 or held_before == 0)) {
-        std.debug.print("[determinismo] the run's VMs claim {d} MiB each from now, not their guest's " ++
+        say("[determinismo] the run's VMs claim {d} MiB each from now, not their guest's " ++
             "{d}: half again what the host had in use for each ({d} timelines ended)\n", .{
             claim >> 20, cpus.claim_bytes >> 20, state.ended,
         });
     } else if (claim == 0 and state.claims.held_max != 0 and (held_before == 0 or state.claims_said != 0)) {
-        std.debug.print("[determinismo] the run's VMs claim their guest's {d} MiB each: the host had " ++
+        say("[determinismo] the run's VMs claim their guest's {d} MiB each: the host had " ++
             "{d} MiB in use for each at most ({d} timelines ended)\n", .{
             cpus.claim_bytes >> 20, state.claims.held_max >> 20, state.ended,
         });
@@ -4736,7 +4736,7 @@ const Busy = struct {
         busy.advance(0);
         multiverse.workers = busy.jobs;
         multiverse.at_once = busy.at_once();
-        std.debug.print("[determinismo] workers: {d:.1} timelines at once of {d} on average " ++
+        say("[determinismo] workers: {d:.1} timelines at once of {d} on average " ++
             "({d:.0}%); their VMs waited {d:.0}s for memory, {d:.0}s for a CPU\n", .{
             busy.at_once(),
             busy.jobs,
@@ -4820,7 +4820,7 @@ fn progress_print(running: []const Running, multiverse: *const report.Multiverse
     line.print("), {d} done, {d} failing, generation {d}\n", .{
         multiverse.branches, multiverse.failing_branches, generation,
     }) catch {};
-    std.debug.print("{s}", .{line.buffered()});
+    say("{s}", .{line.buffered()});
 }
 
 const Finished = struct { at: usize, killed: bool = false };
@@ -4850,7 +4850,7 @@ fn timeline_reaped(
         if (!short) {
             state.kills += 1;
             if (state.kills > kills_max) return error.WorkerFailed;
-            std.debug.print("[determinismo] timeline {d} was killed (SIGKILL: the host's OOM " ++
+            say("[determinismo] timeline {d} was killed (SIGKILL: the host's OOM " ++
                 "killer?) before it finished: it runs again ({d} so far)\n", .{ place.index, state.kills });
         }
         try queue_plan(arena, state, place);
@@ -5036,7 +5036,7 @@ const Ladders = struct {
         const snapshots = std.fs.path.dirname(to) orelse return;
         const marker = std.fmt.bufPrint(&path_buffer, "{s}/failure-{d}.log", .{ snapshots, branch }) catch return;
         std.Io.Dir.cwd().writeFile(ladders.io, .{ .sub_path = marker, .data = text.items }) catch {};
-        std.debug.print("[determinismo] ladder of timeline {d}: {d} of {d} in-run snapshots on disk kept\n", .{
+        say("[determinismo] ladder of timeline {d}: {d} of {d} in-run snapshots on disk kept\n", .{
             branch, kept, on_disk.len,
         });
     }
@@ -5053,7 +5053,7 @@ const Ladders = struct {
         ladders.mutex.lockUncancelable(ladders.io);
         defer ladders.mutex.unlock(ladders.io);
         const setup_hashes = ladders.setup_hashes orelse ladders.setup_prepare() catch |err| {
-            std.debug.print("[determinismo] ladder of timeline {d}: the setup snapshot: {s}\n", .{ job.branch, @errorName(err) });
+            say("[determinismo] ladder of timeline {d}: the setup snapshot: {s}\n", .{ job.branch, @errorName(err) });
             for (job.helds) |held| holders.end(held);
             return;
         };
@@ -5090,7 +5090,7 @@ const Ladders = struct {
         // needed). None when nothing was saved: the disk holders' keep_disk may have written it
         // (run 1831's timeline 12: 3 kept, then this ladder's 0 of 4 emptied its list).
         if (saved == 0) {
-            std.debug.print("[determinismo] ladder of timeline {d}: 0 of {d} in-run snapshots on disk\n", .{ job.branch, job.helds.len });
+            say("[determinismo] ladder of timeline {d}: 0 of {d} in-run snapshots on disk\n", .{ job.branch, job.helds.len });
             return;
         }
         var text: std.ArrayList(u8) = .empty;
@@ -5105,7 +5105,7 @@ const Ladders = struct {
         const snapshots = std.fs.path.dirname(ladders.ladder.directory) orelse return;
         const marker = std.fmt.bufPrint(&path_buffer, "{s}/failure-{d}.log", .{ snapshots, job.branch }) catch return;
         std.Io.Dir.cwd().writeFile(ladders.io, .{ .sub_path = marker, .data = text.items }) catch {};
-        std.debug.print("[determinismo] ladder of timeline {d}: {d} of {d} in-run snapshots on disk\n", .{
+        say("[determinismo] ladder of timeline {d}: {d} of {d} in-run snapshots on disk\n", .{
             job.branch, saved, job.helds.len,
         });
     }
@@ -5908,7 +5908,7 @@ fn tree_judge_begin(
             const first = state.registry.earliest(back.branch);
             before_holders = first != null and first.? > back.vtime_ns;
             holders_gone = first != null and first.? <= back.vtime_ns;
-            if (first) |first_ns| std.debug.print("[determinismo] tree: a return to timeline {d} at {d} ms, " ++
+            if (first) |first_ns| say("[determinismo] tree: a return to timeline {d} at {d} ms, " ++
                 "{s} at {d} ms (it began at {d} ms): a replay\n", .{
                 back.branch,
                 back.vtime_ns / std.time.ns_per_ms,
@@ -6098,7 +6098,7 @@ fn tree_judge_end(
     for (plan.items) |entry| node_served(state, entry.snapshot);
     nodes_claim_refresh(state);
     if (state.nodes_skipped > 0) {
-        std.debug.print("[determinismo] {d} returns not made so far: the run's nodes held half " ++
+        say("[determinismo] {d} returns not made so far: the run's nodes held half " ++
             "the host's memory\n", .{state.nodes_skipped});
     }
     // As many planned as judged: the rest start over from the setup snapshot.
@@ -6118,7 +6118,7 @@ fn tree_judge_end(
     activity.found(judging.reached_count, state.seen.count());
     var makers_waited: u32 = 0;
     for (makings[0..making_count]) |making| makers_waited += @intFromBool(making.waited);
-    std.debug.print("[determinismo] tree: generation {d}: {d} branches, {d} new behaviors " ++
+    say("[determinismo] tree: generation {d}: {d} branches, {d} new behaviors " ++
         "({d} known); {d} moments returned to ({d} from holders in memory, {d} from holders on disk, " ++
         "{d} replayed from the parent's start, {d} of them before its first holder, {d} with its holders before it taken or gone, " ++
         "{d} with a holder on disk that did not load); " ++
@@ -6936,7 +6936,7 @@ fn node_make_start(
             write_all(pair[1], std.mem.asBytes(snapshot));
             write_all(pair[1], &.{node_loaded}); // From the holder on disk (node_make_finish).
             linux.exit_group(0);
-        } else |err| std.debug.print("[determinismo] tree: holder {d}ns of branch {d} not loaded " ++
+        } else |err| say("[determinismo] tree: holder {d}ns of branch {d} not loaded " ++
             "from disk ({s}): a replay\n", .{ on_disk.held.vtime_ns, parent.index, @errorName(err) });
         if (making.chain_from) |setup| {
             from = setup;
@@ -6946,15 +6946,15 @@ fn node_make_start(
             from = node_core.chain(arena, vm, options, from, parent.path, making.tape_directory, ancestor, &failure) catch |err| {
                 const segment = failure.?.segment;
                 if (failure.?.tape_unread) {
-                    std.debug.print("[determinismo] tree: branch {d}'s tape unread: {s}\n", .{ segment.branch, @errorName(err) });
-                } else std.debug.print("[determinismo] tree: no snapshot at {d}ns of branch {d}'s path: {s}\n", .{
+                    say("[determinismo] tree: branch {d}'s tape unread: {s}\n", .{ segment.branch, @errorName(err) });
+                } else say("[determinismo] tree: no snapshot at {d}ns of branch {d}'s path: {s}\n", .{
                     segment.vtime_ns, segment.branch, @errorName(err),
                 });
                 linux.exit_group(1);
             };
         }
         const snapshot = node_make(arena, vm, options, from, parent_recorded, at, parent.path.len > 0) catch |err| {
-            std.debug.print("[determinismo] tree: no snapshot at {d}ns of branch {d}: {s}\n", .{
+            say("[determinismo] tree: no snapshot at {d}ns of branch {d}: {s}\n", .{
                 at, parent.index, @errorName(err),
             });
             linux.exit_group(1);
@@ -7046,7 +7046,7 @@ const MakerStart = struct {
 fn maker_begin(arena: std.mem.Allocator, start: MakerStart, making: *NodeMaking) !bool {
     const parent = making.parent;
     const parent_recorded = Recorded.load(arena, start.tape_directory, parent.index, parent.seed, start.tape_buffer) catch |err| {
-        std.debug.print("[determinismo] timeline {d}'s tape could not be loaded ({s}): its return to {d} ms is not made\n", .{
+        say("[determinismo] timeline {d}'s tape could not be loaded ({s}): its return to {d} ms is not made\n", .{
             parent.index, @errorName(err), making.back.vtime_ns / std.time.ns_per_ms,
         });
         return false;
@@ -7309,7 +7309,7 @@ fn snapshots_compare(back: TreeReturn, held: *const Snapshot, replayed: *const S
             const a = std.mem.asBytes(&@field(held, name));
             const b = std.mem.asBytes(&@field(replayed, name));
             const at = std.mem.indexOfDiff(u8, a, b) orelse 0;
-            std.debug.print("[determinismo] verify #{d} at {d}ns: {s} differs (byte {d} of {d}: " ++
+            say("[determinismo] verify #{d} at {d}ns: {s} differs (byte {d} of {d}: " ++
                 "{x} against {x})\n", .{
                 back.branch,
                 back.vtime_ns,
@@ -7323,7 +7323,7 @@ fn snapshots_compare(back: TreeReturn, held: *const Snapshot, replayed: *const S
     }
     const memory_same = memory_equal(held, replayed);
     if (!memory_same) differ += 1;
-    std.debug.print("[determinismo] verify #{d} at {d}ns: {s}{s}\n", .{
+    say("[determinismo] verify #{d} at {d}ns: {s}{s}\n", .{
         back.branch,
         back.vtime_ns,
         if (differ == 0) "the same" else "DIFFERENT",
@@ -7451,7 +7451,7 @@ fn memory_equal(held: *const Snapshot, replayed: *const Snapshot) bool {
             pages_differing += 1;
             if (pages_differing > 8) continue;
             const first = std.mem.indexOfDiff(u8, x, y).?;
-            std.debug.print("[determinismo] verify: page at {d} differs from byte {d}: {x} against " ++
+            say("[determinismo] verify: page at {d} differs from byte {d}: {x} against " ++
                 "{x}{s}{s}\n", .{
                 offset + at,
                 first,
@@ -7465,9 +7465,9 @@ fn memory_equal(held: *const Snapshot, replayed: *const Snapshot) bool {
             mappings_name(held, offset + at);
         }
     }
-    if (xsave_headers > 0) std.debug.print("[determinismo] verify: {d} pages differ only in an " ++
+    if (xsave_headers > 0) say("[determinismo] verify: {d} pages differ only in an " ++
         "XSAVE header's x87/SSE in-use bits (the same registers either way)\n", .{xsave_headers});
-    if (pages_differing > 0) std.debug.print("[determinismo] verify: {d} pages differ\n", .{pages_differing});
+    if (pages_differing > 0) say("[determinismo] verify: {d} pages differ\n", .{pages_differing});
     return pages_differing == 0;
 }
 
@@ -7578,7 +7578,7 @@ fn mappings_name(snapshot: *const Snapshot, page_address: u64) void {
             }
         }
     }
-    if (told == 0) std.debug.print("[determinismo] verify: no mapping of it but the direct map (cr3 {x})\n", .{
+    if (told == 0) say("[determinismo] verify: no mapping of it but the direct map (cr3 {x})\n", .{
         snapshot.sregs.cr3,
     });
 }
@@ -7600,7 +7600,7 @@ fn mapping_tell(address: u64, told: u32) u32 {
     const direct_map_end: u64 = 0xffff_c880_0000_0000;
     if (address >= direct_map_start and address < direct_map_end) return 0;
     if (told >= 8) return 0;
-    std.debug.print("[determinismo] verify: mapped at {x}{s}\n", .{
+    say("[determinismo] verify: mapped at {x}{s}\n", .{
         address, if (address < (1 << 47)) " (user space)" else "",
     });
     return 1;
@@ -7623,7 +7623,7 @@ fn page_dump(address: u64, held: []const u8, replayed: []const u8) void {
         _ = linux.write(@intCast(fd), side.bytes.ptr, side.bytes.len);
         _ = linux.close(@intCast(fd));
     }
-    std.debug.print("[determinismo] verify: page written to /tmp/determinismo-verify-{d}-{d}-{{held,replayed}}\n", .{
+    say("[determinismo] verify: page written to /tmp/determinismo-verify-{d}-{d}-{{held,replayed}}\n", .{
         linux.getpid(), address,
     });
 }
@@ -7640,7 +7640,7 @@ fn rings_name(snapshot: *const Snapshot, address: u64) void {
         };
         for (parts) |part| {
             if (address < part.start or address >= part.start + part.length) continue;
-            std.debug.print("[determinismo] verify: that is disk {d}'s {s}, byte {d} (the VMM's " ++
+            say("[determinismo] verify: that is disk {d}'s {s}, byte {d} (the VMM's " ++
                 "indices: available {d}, used {d})\n", .{
                 disk, part.name, address - part.start, block.available_index, block.used_index,
             });
@@ -7727,13 +7727,13 @@ fn rewind(
     if (exploration.replay) |replay| vm.overrides = replay.overrides;
     const outcome = try vm.run_until_exit();
     if (outcome != .moment_reached or !vm.until_hit) {
-        std.debug.print("[determinismo] rewind: the condition does not hold in time\n", .{});
+        say("[determinismo] rewind: the condition does not hold in time\n", .{});
         return;
     }
     const at = (try vm.moment()).vtime_ns;
     const target = at -| ns;
     try moment_after_snapshot(snapshot, target);
-    std.debug.print("[determinismo] rewind: the condition holds at {d}ns; the moment is {d}ns\n", .{
+    say("[determinismo] rewind: the condition holds at {d}ns; the moment is {d}ns\n", .{
         at, target,
     });
     options.until = null;
@@ -7797,6 +7797,22 @@ const StrategyCheck = struct {
         try events.emit(end, try std.fmt.bufPrint(&said, "{{\"event\":\"strategy_check\",\"details\":{{\"assertions\":{d}}}}}", .{count}));
     }
 };
+
+/// A line on standard error in one write: forked workers share it, and std.debug.print's small
+/// buffer wrote a long line in pieces another process's whole line could land between (a
+/// tree's generation line took a timeline's `[branch 18]` line inside it: e2e pausing parsed
+/// 31 of 32 timelines, 2026-11-19). Up to 4 KiB, a pipe's atomic write; a longer one as before.
+fn say(comptime format: []const u8, arguments: anytype) void {
+    var buffer: [4096]u8 = undefined;
+    const line = std.fmt.bufPrint(&buffer, format, arguments) catch return std.debug.print(format, arguments);
+    var written: usize = 0;
+    while (written < line.len) {
+        const result = linux.write(2, line[written..].ptr, line.len - written);
+        if (linux.errno(result) == .INTR) continue;
+        if (linux.errno(result) != .SUCCESS or result == 0) return;
+        written += result;
+    }
+}
 
 /// Tells the strategy how the branch ended; returns true when it asks to stop.
 const BranchResult = struct { index: u32, outcome: VM.Outcome };
@@ -8375,7 +8391,7 @@ fn parse_option(
         // Compiled here as det-faults compiles it: a pattern it would not take is a usage error
         // now, not a run whose faults reach what it meant to spare.
         _ = regex.Regex.compile(value) catch |err| {
-            std.debug.print("--fault-exclusions: {s}: {s}\n", .{ value, @errorName(err) });
+            say("--fault-exclusions: {s}: {s}\n", .{ value, @errorName(err) });
             return error.Usage;
         };
         arguments.fault_exclusions = value;
@@ -8474,7 +8490,7 @@ fn open_disks(arena: std.mem.Allocator, paths: []const []const u8) ![]const VM.D
         const path_z = try arena.dupeSentinel(u8, path, 0);
         const result = linux.open(path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
         if (linux.errno(result) != .SUCCESS) {
-            std.debug.print("[determinismo] cannot open disk {s}\n", .{path});
+            say("[determinismo] cannot open disk {s}\n", .{path});
             return error.OpenFailed;
         }
         const fd: linux.fd_t = @intCast(result);
