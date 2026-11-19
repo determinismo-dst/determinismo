@@ -109,6 +109,12 @@ from its source and uploads it to serve, where a run names it:
 (d/start-run {... :strategy "@decide_named node.start_draw 7"})
 ```
 
+A run keeps the upload it names by content, as it keeps its program: its request says
+`strategy_asked` (`@decide_named node.start_draw 7`) and the kept copy
+(`artifacts/<hash>-decide_named`, the hash serve answered the upload with). A later upload under
+the name changes the runs started after it, never a running one or its resume; a repeat takes
+the latest.
+
 A plugin can run anywhere: `tcp://<address>:<port>` connects to one already listening (one
 connection per exploration worker). `plugins/python/serve_tcp.py <port> <command>` serves any
 plugin command that way, and an SSH tunnel brings it to the host from a laptop:

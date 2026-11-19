@@ -1572,6 +1572,10 @@ pub const RunRequest = struct {
     /// The program as asked, when `program` is the copy the run kept (artifact_keep): a
     /// repeat starts from the program as asked, the host's current build.
     program_asked: ?[]const u8 = null,
+    /// The strategy as asked (`@<name> [arguments]`, an upload) when `strategy` is its kept copy:
+    /// the upload's bytes by content (strategy_resolve), a later upload of the name never this
+    /// run's.
+    strategy_asked: ?[]const u8 = null,
     /// Timelines (at most, with a time budget).
     branches: ?u32 = null,
     /// Explore until then: "90s", "10m", "2h".
@@ -1939,6 +1943,12 @@ fn run_start(server: *Server, asked_as_given: RunRequest, out: *std.Io.Writer) !
     if (asked.program) |path| if (asked.from_snapshot == null) {
         if (asked.program_asked == null) asked.program_asked = path;
         asked.program = try artifact_keep(server, asked.program_asked.?);
+    };
+    // An uploaded strategy kept by content as the program is: its record says which bytes
+    // answered, and a resume runs them, whatever was uploaded under its name since.
+    if (asked.strategy) |strategy| if (std.mem.startsWith(u8, strategy, "@")) {
+        asked.strategy_asked = strategy;
+        asked.strategy = try strategy_resolve(server, strategy);
     };
     const machine = try machine_kept(server, asked.memory_mib, asked.seed.?);
     // As run: the seed drawn is in it, and the program it ran, for its replays.
@@ -5140,7 +5150,10 @@ fn strategies_route(
         .flags = .{ .permissions = .executable_file },
     });
     const kind = if (wasm_module(bytes)) "wasm" else "executable";
-    try out.print("{{\"strategy\":\"@{s}\",\"bytes\":{d},\"kind\":\"{s}\"}}\n", .{ given, bytes.len, kind });
+    // Its content's hash: the name of the copy a run keeps of it (runs.artifact_keep's).
+    try out.print("{{\"strategy\":\"@{s}\",\"bytes\":{d},\"kind\":\"{s}\",\"hash\":\"{x:0>16}\"}}\n", .{
+        given, bytes.len, kind, std.hash.Wyhash.hash(0, bytes),
+    });
     return 201;
 }
 
@@ -5152,17 +5165,25 @@ fn strategy_name_valid(name: []const u8) bool {
     return true;
 }
 
-/// `@<name> args` names an uploaded strategy: its path, with the arguments (`wasm:` before a
-/// WebAssembly module's: run inside the explorer).
+/// `@<name> args` names an uploaded strategy: its bytes kept by content (artifacts/<hash>-<name>,
+/// as a run's program), with the arguments (`wasm:` before a WebAssembly module's: run inside
+/// the explorer). Anything else is a command as given.
 fn strategy_resolve(server: *Server, strategy: []const u8) ![]const u8 {
     if (!std.mem.startsWith(u8, strategy, "@")) return strategy;
     const end = std.mem.indexOfScalar(u8, strategy, ' ') orelse strategy.len;
     const name = strategy[1..end];
     if (!strategy_name_valid(name)) return error.BadRequest;
-    const path = try print(server, "{s}/strategies/{s}", .{ server.options.data_directory, name });
+    const uploaded = try print(server, "{s}/strategies/{s}", .{ server.options.data_directory, name });
+    const kept = artifact_keep(server, uploaded) catch |err| switch (err) {
+        error.BadRequest => {
+            server.detail = try print(server, "no strategy uploaded as {s}", .{name});
+            return error.BadRequest;
+        },
+        else => return err,
+    };
     var magic: [4]u8 = @splat(0);
-    file_start(server.arena, path, &magic);
-    return print(server, "{s}{s}{s}", .{ if (wasm_module(&magic)) "wasm:" else "", path, strategy[end..] });
+    file_start(server.arena, kept, &magic);
+    return print(server, "{s}{s}{s}", .{ if (wasm_module(&magic)) "wasm:" else "", kept, strategy[end..] });
 }
 
 /// A WebAssembly module's bytes start so (its magic, `\0asm`).
@@ -5812,6 +5833,9 @@ fn run_repeat(server: *Server, id: u32) !void {
     if (!asked.repeat) return;
     asked.seed = null;
     asked.program = asked.program_asked orelse asked.program; // The current build.
+    // And the strategy's latest upload under its name.
+    if (asked.strategy_asked) |strategy| asked.strategy = strategy;
+    asked.strategy_asked = null;
     const body = try std.fmt.allocPrint(server.arena, "{f}", .{std.json.fmt(asked, .{})});
     var out: std.Io.Writer.Allocating = .init(server.arena);
     _ = try run_create(server, body, &out.writer);

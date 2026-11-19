@@ -1963,10 +1963,18 @@ fn check_wasm_upload(context: *Context) !void {
         if (run.len > 0 and !going) break;
         sleep_ms(200);
     }
+    // The run keeps the upload by content: its request names the kept copy (its hash) and the
+    // name as asked, whatever is uploaded under the name after.
+    const hash = try std.fmt.allocPrint(arena, "{x:0>16}", .{std.hash.Wyhash.hash(0, module)});
+    const hash_said = try std.fmt.allocPrint(arena, "\"hash\":\"{s}\"", .{hash});
+    const kept_said = try std.fmt.allocPrint(arena, "\"strategy\":\"wasm:{s}/artifacts/{s}-decide_named node.start_draw 7\"", .{ data, hash });
     expect_all(context, &.{
         .{ "serve took the upload as a wasm module", std.mem.indexOf(u8, uploaded, "\"kind\":\"wasm\"") != null },
+        .{ "and said its content's hash", std.mem.indexOf(u8, uploaded, hash_said) != null },
         .{ "the run's strategy is the module, run inside the explorer", std.mem.indexOf(u8, run, "\"strategy_name\":\"wasm/decide-named\"") != null },
-    }, "wasm upload: {s}; run {s}", .{ std.mem.trim(u8, uploaded, "\n"), run[0..@min(run.len, 400)] });
+        .{ "its request names the kept copy by that hash", std.mem.indexOf(u8, run, kept_said) != null },
+        .{ "and the name as asked", std.mem.indexOf(u8, run, "\"strategy_asked\":\"@decide_named node.start_draw 7\"") != null },
+    }, "wasm upload: {s}; run {s}", .{ std.mem.trim(u8, uploaded, "\n"), run[0..@min(run.len, 1200)] });
 }
 
 /// A wasm plugin reaches outside its messages: reach.wasm (WASI) reads its arguments and the wall
