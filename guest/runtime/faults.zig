@@ -585,6 +585,35 @@ fn exclusions_load() ?regex.Regex {
     return compiled;
 }
 
+/// A strategy's own faults (the machine it decided: explore's `det.custom_faults=` on the
+/// guest's command line, hex of "node\tcommand\n" each, strategy.zig): custom faults of the
+/// nodes named, drawn among theirs. Read once, at the first collection.
+const PluginFault = struct { node: []const u8, command: []const u8 };
+var plugin_faults_text: [256]u8 = undefined; // strategy.zig's custom_faults_size_max.
+var plugin_faults_list: [4]PluginFault = undefined; // Its custom_faults_max.
+var plugin_faults_count: usize = 0;
+var plugin_faults_read = false;
+
+fn plugin_faults() []const PluginFault {
+    if (plugin_faults_read) return plugin_faults_list[0..plugin_faults_count];
+    plugin_faults_read = true;
+    var hex_buffer: [2 * plugin_faults_text.len]u8 = undefined;
+    const hex = cmdline_word("det.custom_faults=", &hex_buffer) orelse return &.{};
+    const text = std.fmt.hexToBytes(&plugin_faults_text, hex) catch {
+        sdk.event("custom_faults_invalid", .{ .reason = "hex" });
+        return &.{};
+    };
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (plugin_faults_count == plugin_faults_list.len) break;
+        const tab = std.mem.indexOfScalar(u8, line, '\t') orelse continue;
+        plugin_faults_list[plugin_faults_count] = .{ .node = line[0..tab], .command = line[tab + 1 ..] };
+        plugin_faults_count += 1;
+    }
+    sdk.event("custom_faults", .{ .count = plugin_faults_count });
+    return plugin_faults_list[0..plugin_faults_count];
+}
+
 /// The value of `key<value>` among the kernel's command line's words, copied into `buffer`.
 fn cmdline_word(comptime key: []const u8, buffer: []u8) ?[]const u8 {
     const fd = linux.open(sdk.cmdline_path(), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
@@ -1346,6 +1375,9 @@ fn faults_collect(
         for (allowed.custom) |program| {
             faults_add(faults, &count, .{ .kind = .custom, .node = node.name, .program = program });
         }
+        for (plugin_faults()) |fault| if (std.mem.eql(u8, fault.node, node.name)) {
+            faults_add(faults, &count, .{ .kind = .custom, .node = node.name, .program = fault.command });
+        };
         links_collect(system, index, faults, &count);
     }
     var endpoints: [endpoints_max]bool = @splat(false);

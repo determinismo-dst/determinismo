@@ -457,11 +457,20 @@ const stretch_us_max = 10 * std.time.us_per_s;
 /// The machine a run boots, a strategy's to decide when it wants (`"wants":["machine"]`):
 /// `{"method":"machine","epoch_seconds":E,"timer_slack_us":S,"timer_delay_permille":D,
 /// "tsc_jitter_seed":"<hex>","modulation_stretch_us":[low,high]}`, the run's own (D: how far into
-/// its slack a timer lands at the earliest, thousandths), and the reply's fields replace them
+/// its slack a timer lands at the earliest, thousandths); a reply may also give
+/// `"custom_faults":[{"node","command"},...]`, faults of its own the injector draws among a
+/// node's (each command run in the node, as a profile's custom fault), and the reply's fields replace them
 /// (each within its bounds, else BadPluginReply). Asked once, before the machine is made.
 pub const MachineChoice = struct { machine: tape.Machine, tsc_jitter_seed: u64 };
 
-pub fn machine(strategy: *Strategy, given: MachineChoice) !MachineChoice {
+/// A plugin's own faults (its machine's `custom_faults`): at most this many, each a node's name
+/// and a command run in it as a profile's custom fault (an absolute path, then arguments).
+/// Their text ("node\tcommand\n" each) is at most custom_faults_size_max bytes: twice that in
+/// hex on the guest's command line, as long as a --fault-exclusions pattern's.
+pub const custom_faults_max = 4;
+pub const custom_faults_size_max = 256;
+
+pub fn machine(strategy: *Strategy, arena: std.mem.Allocator, given: MachineChoice) !MachineChoice {
     assert(strategy.wants_machine);
     var writer: std.Io.Writer = .fixed(&strategy.request);
     try writer.print("{{\"method\":\"machine\",\"epoch_seconds\":{d},\"timer_slack_us\":{d},\"timer_delay_permille\":{d},\"tsc_jitter_seed\":\"{x:0>16}\",\"modulation_stretch_us\":[{d},{d}]}}", .{
@@ -485,6 +494,24 @@ pub fn machine(strategy: *Strategy, given: MachineChoice) !MachineChoice {
     if (reply.get("timer_delay_permille")) |value| {
         if (value != .integer or value.integer < 0 or value.integer > 1000) return error.BadPluginReply;
         chosen.machine.timer_delay_permille = @intCast(value.integer);
+    }
+    if (reply.get("custom_faults")) |value| {
+        if (value != .array or value.array.items.len > custom_faults_max) return error.BadPluginReply;
+        // On the guest's command line as det-faults reads it: hex of "node\tcommand\n"...
+        var listed: [custom_faults_size_max]u8 = undefined;
+        var text: std.Io.Writer = .fixed(&listed);
+        for (value.array.items) |item| {
+            if (item != .object) return error.BadPluginReply;
+            const node = item.object.get("node") orelse return error.BadPluginReply;
+            const command = item.object.get("command") orelse return error.BadPluginReply;
+            if (node != .string or command != .string) return error.BadPluginReply;
+            if (node.string.len == 0) return error.BadPluginReply;
+            for (node.string) |c| if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_' and c != '.') return error.BadPluginReply;
+            if (command.string.len < 2 or command.string[0] != '/') return error.BadPluginReply;
+            for (command.string) |c| if (c < 0x20 or c == 0x7f) return error.BadPluginReply;
+            text.print("{s}\t{s}\n", .{ node.string, command.string }) catch return error.BadPluginReply;
+        }
+        chosen.machine.custom_faults = try std.fmt.allocPrint(arena, "{x}", .{text.buffered()});
     }
     if (reply.get("tsc_jitter_seed")) |value| {
         if (value != .string or value.string.len != 16) return error.BadPluginReply;

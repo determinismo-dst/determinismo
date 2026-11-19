@@ -162,9 +162,13 @@ Two hooks before the timelines, each for a plugin that asks for it in its hello'
   past a timer's deadline its interrupt may land (up to 1 s), how far into that slack it lands
   at the earliest (thousandths: interrupts late as a loaded host makes them; explore's
   `--timer-landing-permille`), the clock's jitter, and CPU modulation's stretches (1 us to
-  10 s, low below high). The machine is in every tape's header
-  and the run's record: a replay and a resume boot it, never asking again.
-  `plugins/python/machine_date.py` sets the wall clock.
+  10 s, low below high). The reply may also add faults of the plugin's own:
+  `"custom_faults":[{"node":"<name>","command":"/abs/path args"},...]` (up to 4, 256 bytes in
+  all), each a command run in that node at random times, drawn by the fault injector among the
+  node's other faults as a profile's custom fault (Redis's `CLIENT PAUSE`, an admin API's
+  failover, a compaction). The machine is in every tape's header and the run's record: a
+  replay and a resume boot it, never asking again. `plugins/python/machine_date.py` sets the
+  wall clock; `plugins/python/plugin_faults.py` adds a fault.
 
 ## Tapes
 

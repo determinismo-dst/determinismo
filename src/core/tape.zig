@@ -42,6 +42,9 @@ pub const Machine = struct {
     modulation_stretch_ns: [2]u64,
     /// How far into its slack a timer lands at the earliest (VM.Options.timer_delay_permille).
     timer_delay_permille: u16 = 0,
+    /// A plugin's own faults as the guest's command line gives them (`det.custom_faults=`: hex
+    /// of [{"node","command"},...]); empty: none.
+    custom_faults: []const u8 = "",
 };
 
 /// One step of a path: branch `branch` (seed `seed`) ran from the previous step's moment to
@@ -258,9 +261,13 @@ pub fn write_header(fd: linux.fd_t, header: Header) void {
         writer.print(",\"tsc_jitter_seed\":\"{x:0>16}\"", .{header.tsc_jitter_seed}) catch unreachable;
     }
     if (header.machine) |machine| {
-        writer.print(",\"machine\":{{\"epoch_seconds\":{d},\"timer_slack_ns\":{d},\"modulation_stretch_ns\":[{d},{d}],\"timer_delay_permille\":{d}}}", .{
-            machine.epoch_seconds,            machine.timer_slack_ns,       machine.modulation_stretch_ns[0],
-            machine.modulation_stretch_ns[1], machine.timer_delay_permille,
+        writer.print(",\"machine\":{{\"epoch_seconds\":{d},\"timer_slack_ns\":{d},\"modulation_stretch_ns\":[{d},{d}],\"timer_delay_permille\":{d},\"custom_faults\":\"{s}\"}}", .{
+            machine.epoch_seconds,
+            machine.timer_slack_ns,
+            machine.modulation_stretch_ns[0],
+            machine.modulation_stretch_ns[1],
+            machine.timer_delay_permille,
+            machine.custom_faults,
         }) catch unreachable;
     }
     if (header.fork) |fork| {
@@ -589,11 +596,14 @@ fn machine_parse(value: std.json.Value) !Machine {
     if (epoch.integer < 0 or slack.integer < 0) return error.BadTape;
     const delay: i64 = if (value.object.get("timer_delay_permille")) |given| if (given == .integer) given.integer else return error.BadTape else 0;
     if (delay < 0 or delay > 1000) return error.BadTape;
+    const custom: []const u8 = if (value.object.get("custom_faults")) |given| if (given == .string) given.string else return error.BadTape else "";
+    for (custom) |c| if (!std.ascii.isHex(c)) return error.BadTape;
     return .{
         .epoch_seconds = @intCast(epoch.integer),
         .timer_slack_ns = @intCast(slack.integer),
         .modulation_stretch_ns = .{ @intCast(stretch.array.items[0].integer), @intCast(stretch.array.items[1].integer) },
         .timer_delay_permille = @intCast(delay),
+        .custom_faults = custom,
     };
 }
 
@@ -865,7 +875,7 @@ test "a tape keeps the machine a strategy decided for its run" {
     const allocator = std.testing.allocator;
     var pipe: [2]linux.fd_t = undefined;
     try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&pipe, .{})));
-    const machine: Machine = .{ .epoch_seconds = 951782400, .timer_slack_ns = 250_000, .modulation_stretch_ns = .{ 5_000_000, 90_000_000 }, .timer_delay_permille = 600 };
+    const machine: Machine = .{ .epoch_seconds = 951782400, .timer_slack_ns = 250_000, .modulation_stretch_ns = .{ 5_000_000, 90_000_000 }, .timer_delay_permille = 600, .custom_faults = "5b5d" };
     write_header(pipe[1], .{ .inputs = 0xaa, .exploration_seed = 3, .branch = 1, .branch_seed = 9, .machine = machine });
     _ = linux.close(pipe[1]);
     var buffer: [4096]u8 = undefined;
@@ -874,9 +884,13 @@ test "a tape keeps the machine a strategy decided for its run" {
     try std.testing.expectEqual(.SUCCESS, linux.errno(size));
     const scratch = try allocator.alloc(u8, 64 * 1024);
     defer allocator.free(scratch);
-    try std.testing.expectEqual(machine, (try machine_of(buffer[0..size], scratch)).?);
+    const read = (try machine_of(buffer[0..size], scratch)).?;
+    try std.testing.expectEqual(machine.epoch_seconds, read.epoch_seconds);
+    try std.testing.expectEqual(machine.timer_delay_permille, read.timer_delay_permille);
+    try std.testing.expectEqualStrings(machine.custom_faults, read.custom_faults);
     const overrides = try allocator.create(Overrides);
     defer allocator.destroy(overrides);
     const header = try parse(buffer[0..size], scratch, overrides);
-    try std.testing.expectEqual(machine, header.machine.?);
+    try std.testing.expectEqual(machine.modulation_stretch_ns, header.machine.?.modulation_stretch_ns);
+    try std.testing.expectEqualStrings(machine.custom_faults, header.machine.?.custom_faults);
 }

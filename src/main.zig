@@ -374,6 +374,9 @@ const Arguments = struct {
     timer_slack_us: u64 = 1000,
     /// How far into its slack a timer lands at the earliest (VM.Options.timer_delay_permille).
     timer_delay_permille: u16 = 0,
+    /// A plugin's own faults for the guest (`det.custom_faults=`, hex), adopted from a tape or a
+    /// record (tape.Machine.custom_faults).
+    custom_faults: ?[]const u8 = null,
     /// The raw PMU event that is the guest's clock (see VM.Options.branch_event).
     branch_event: u64 = VM.branch_event_default,
     /// Another host's guest CPUID table (`determinismo cpuid`'s), to replay its runs here.
@@ -1690,7 +1693,7 @@ fn cmdline_build(
     arguments: *const Arguments,
     scenario: ?[]const u8,
 ) ![]const u8 {
-    var parts: [16][]const u8 = undefined; // The base and each word below: 13, room to spare.
+    var parts: [16][]const u8 = undefined; // The base and each word below: 14, room to spare.
     var count: u32 = 0;
     parts[count] = base;
     count += 1;
@@ -1740,6 +1743,12 @@ fn cmdline_build(
     }
     if (arguments.keep) |names| { // det-composer's: commands kept in every timeline.
         parts[count] = try std.fmt.allocPrint(arena, "det.keep={s}", .{names});
+        count += 1;
+    }
+    // Last: a strategy's machine appends it so to a fresh run's (command_explore), which its
+    // replays then build alike.
+    if (arguments.custom_faults) |hex| { // det-faults': a plugin's own faults (tape.Machine).
+        parts[count] = try std.fmt.allocPrint(arena, "det.custom_faults={s}", .{hex});
         count += 1;
     }
     return std.mem.join(arena, " ", parts[0..count]);
@@ -1936,6 +1945,7 @@ fn machine_adopt(arguments: *Arguments, machine: tape.Machine) void {
     arguments.timer_slack_us = machine.timer_slack_ns / std.time.ns_per_us;
     arguments.cpu_modulation_stretch_ns = machine.modulation_stretch_ns;
     arguments.timer_delay_permille = machine.timer_delay_permille;
+    arguments.custom_faults = if (machine.custom_faults.len > 0) machine.custom_faults else null;
     arguments.machine_adopted = machine;
 }
 
@@ -2300,7 +2310,7 @@ fn command_explore(
     } else if (arguments.strategy_command != null and arguments.tape_path == null and !arguments.resume_run and fresh_setup) {
         try strategy_start(context, arguments, &exploration);
         if (exploration.strategy.?.wants_machine) {
-            const decided = try exploration.strategy.?.machine(.{
+            const decided = try exploration.strategy.?.machine(context.arena, .{
                 .machine = .{
                     .epoch_seconds = options.epoch_seconds,
                     .timer_slack_ns = options.timer_slack_ns,
@@ -2314,6 +2324,10 @@ fn command_explore(
             options.modulation_stretch_ns = decided.machine.modulation_stretch_ns;
             options.timer_delay_permille = decided.machine.timer_delay_permille;
             options.tsc_jitter_seed = decided.tsc_jitter_seed;
+            // Its own faults, to the guest's injector on its command line (in the inputs).
+            if (decided.machine.custom_faults.len > 0) {
+                options.cmdline = try std.fmt.allocPrint(context.arena, "{s} det.custom_faults={s}", .{ options.cmdline, decided.machine.custom_faults });
+            }
             exploration.machine = decided.machine;
             std.debug.print("[determinismo] the machine its strategy decided: wall clock {d}, timer slack {d} us landing at {d}/1000 of it, jitter {x:0>16}, stretches {d}-{d} us\n", .{
                 decided.machine.epoch_seconds, decided.machine.timer_slack_ns / std.time.ns_per_us, decided.machine.timer_delay_permille, decided.tsc_jitter_seed,
