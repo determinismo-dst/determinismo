@@ -869,19 +869,20 @@ fn wamr_link(b: *std.Build, module: *std.Build.Module) void {
     };
     for (includes) |directory| module.addIncludePath(wamr.path(directory));
     const flags = [_][]const u8{
-        "-DBH_PLATFORM_LINUX",                   "-DBUILD_TARGET_X86_64",
-        "-DBH_MALLOC=wasm_runtime_malloc",       "-DBH_FREE=wasm_runtime_free",
-        "-DWASM_ENABLE_INTERP=0",                "-DWASM_ENABLE_AOT=1",
-        "-DWASM_ENABLE_JIT=0",                   "-DWASM_ENABLE_THREAD_MGR=1",
-        "-DWASM_ENABLE_SHARED_MEMORY=1",         "-DWASM_ENABLE_LIBC_BUILTIN=0",
-        "-DWASM_ENABLE_LIBC_WASI=1",             "-DWASM_ENABLE_BULK_MEMORY=1",
-        "-DWASM_ENABLE_REF_TYPES=1",             "-DWASM_DISABLE_HW_BOUND_CHECK=1",
-        "-DWASM_DISABLE_STACK_HW_BOUND_CHECK=1", "-DWASM_DISABLE_WAKEUP_BLOCKING_OP=1",
-        "-DWASM_ENABLE_LOG=0",                   "-DWASM_HAVE_MREMAP=1",
-        "-D_GNU_SOURCE",                         "-DNDEBUG",
+        "-DBH_PLATFORM_LINUX",                 "-DBUILD_TARGET_X86_64",
+        "-DBH_MALLOC=wasm_runtime_malloc",     "-DBH_FREE=wasm_runtime_free",
+        "-DWASM_ENABLE_INTERP=0",              "-DWASM_ENABLE_AOT=1",
+        "-DWASM_ENABLE_JIT=0",                 "-DWASM_ENABLE_THREAD_MGR=1",
+        "-DWASM_ENABLE_SHARED_MEMORY=1",       "-DWASM_ENABLE_LIBC_BUILTIN=0",
+        "-DWASM_ENABLE_LIBC_WASI=1",           "-DWASM_ENABLE_MODULE_INST_CONTEXT=1",
+        "-DWASM_ENABLE_BULK_MEMORY=1",         "-DWASM_ENABLE_REF_TYPES=1",
+        "-DWASM_DISABLE_HW_BOUND_CHECK=1",     "-DWASM_DISABLE_STACK_HW_BOUND_CHECK=1",
+        "-DWASM_DISABLE_WAKEUP_BLOCKING_OP=1", "-DWASM_ENABLE_LOG=0",
+        "-DWASM_HAVE_MREMAP=1",                "-D_GNU_SOURCE",
+        "-DNDEBUG",
         // Its loaders read and write words at any address (x86-64 allows it): by design, so the
         // sanitizer's alignment check is off for it alone, every other one kept.
-        "-fno-sanitize=alignment",
+                                   "-fno-sanitize=alignment",
     };
     module.addCSourceFiles(.{
         .root = wamr.path("core"),
