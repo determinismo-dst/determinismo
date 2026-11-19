@@ -15,7 +15,8 @@
 ;;            {:returns [...] :fill "fresh"|"explorer"}: where the tree branches next
 ;;   :event   (fn [state request]) -> end-timeline to end the timeline there, else anything
 ;;   :decide  (fn [state request]) -> {:hex "<bytes>"} to answer a randomness pull, nil the default
-;;   :branch  (fn [state request]) and :end (fn [state request]): a timeline's start and end
+;;   :branch  (fn [state request]) and :end (fn [state request]): a timeline's start and end;
+;;            :branch may return {:seed "<16 hex digits>"}: the timeline's seed instead
 ;;   :machine (fn [request]) -> the machine the run boots, before it does: {:epoch_seconds ...
 ;;            :timer_slack_us ... :tsc_jitter_seed "<hex>" :modulation_stretch_us [low high]}, any
 ;;            of them (docs/PLUGINS.md's machine)
@@ -292,9 +293,10 @@ std::string determinismo_close(std::string const &fd_text) {
                                        (when (some :machine all) ["machine"]))))
          :ring ring-supported?})
       (= method "branch")
+      ;; A :branch function may give the timeline another seed: {:seed "<16 hex digits>"}.
       (do (reset! state {})
-          (when-let [f (:branch chosen)] (f state request))
-          {})
+          (let [given (when-let [f (:branch chosen)] (f state request))]
+            (if (and (map? given) (string? (:seed given))) {:seed (:seed given)} {})))
       (= method "event")
       (let [f (:event (strategy-for (:source request)))]
         (if (and f (= end-timeline (f state request))) {:end true} {}))
