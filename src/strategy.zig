@@ -1050,22 +1050,42 @@ pub fn branch_end(strategy: *Strategy, end: BranchEnd) !bool {
     return stop_value == .bool and stop_value.bool;
 }
 
+/// A history the timeline's commands recorded for one of the program's host checks
+/// (`sdk.record`: JSON lines), given whole to a checker plugin.
+pub const History = struct { name: []const u8, records: []const u8 };
+/// A check request with its histories at most this large, on every transport: a history past
+/// it is given as its size alone (`"records":null,"bytes":N`).
+const check_request_size_max = ring_request_size_max;
+
 /// A plugin's verdicts on a timeline: at most this many, each an assertion event line.
 pub const check_assertions_max = 64;
 pub const check_line_size_max = 4096; // Events.emit's largest event.
 const assertion_types = [_][]const u8{ "always", "always_or_unreachable", "sometimes", "reachable", "unreachable" };
 
 /// A timeline that ended, judged by a plugin that wants "check" (its events told first):
-/// `{"method":"check","index":I}`, the reply `{"assertions":[{"type":"always"|"sometimes"|...,
+/// `{"method":"check","index":I,"histories":[{"name","records"},...]}` (the records the
+/// program's host checks get, Elle's or a linearizability checker's input), the reply `{"assertions":[{"type":"always"|"sometimes"|...,
 /// "message":"...","condition":bool,"details":{...}},...]}`. Each is written into `lines` as an
 /// assertion event (`{"assert":{...}}`, as the SDKs make), in `buffer`; returns how many.
-pub fn judge(strategy: *Strategy, index: u32, buffer: []u8, lines: [][]const u8) !usize {
+pub fn judge(strategy: *Strategy, index: u32, histories: []const History, buffer: []u8, lines: [][]const u8) !usize {
     assert(lines.len >= check_assertions_max);
     _ = try strategy.flush(); // Its last events first: it judges the whole timeline.
     strategy.ended = false;
-    var writer: std.Io.Writer = .fixed(&strategy.request);
-    try writer.print("{{\"method\":\"check\",\"index\":{d}}}", .{index});
-    const reply = try strategy.call(writer.buffered());
+    var request: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer request.deinit();
+    try request.writer.print("{{\"method\":\"check\",\"index\":{d},\"histories\":[", .{index});
+    for (histories, 0..) |history, position| {
+        if (position > 0) try request.writer.writeAll(",");
+        const mark = request.written().len;
+        try request.writer.print("{{\"name\":{f},\"records\":{f}}}", .{ std.json.fmt(history.name, .{}), std.json.fmt(history.records, .{}) });
+        // Past a request's room: its size alone (the ring's room, kept on every transport).
+        if (request.written().len + 2 > check_request_size_max) {
+            request.shrinkRetainingCapacity(mark);
+            try request.writer.print("{{\"name\":{f},\"records\":null,\"bytes\":{d}}}", .{ std.json.fmt(history.name, .{}), history.records.len });
+        }
+    }
+    try request.writer.writeAll("]}");
+    const reply = try strategy.call_long(request.written());
     const assertions = reply.get("assertions") orelse return 0;
     if (assertions != .array or assertions.array.items.len > check_assertions_max) return error.BadPluginReply;
     var used: usize = 0;

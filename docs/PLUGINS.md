@@ -170,7 +170,11 @@ Two hooks before the timelines, each for a plugin that asks for it in its hello'
   replay and a resume boot it, never asking again. `plugins/python/machine_date.py` sets the
   wall clock; `plugins/python/plugin_faults.py` adds a fault.
 - `"check"`: a checker. Each timeline that ended (not one cut short at a moment) is judged by it
-  at its end, its events told first: `{"method":"check","index":I}`, the reply
+  at its end, its events told first: `{"method":"check","index":I,"histories":[{"name","records"},...]}`
+  (`histories`: what the timeline's commands recorded for the program's host checks with
+  `sdk.record`, JSON lines, whole: Elle's or a linearizability checker's input; one past the
+  request's 16 MiB as `"records":null,"bytes":N`;
+  `plugins/python/history_check.py`), the reply
   `{"assertions":[{"type":"always"|"sometimes"|"reachable"|"unreachable"|"always_or_unreachable","message":"...","condition":true|false,"details":{...}},...]}`
   (up to 64). Each is an assertion of the timeline at its end moment, as the program's host
   checks' are (after its guest hash: a replay without the plugin keeps the guest hash), so the

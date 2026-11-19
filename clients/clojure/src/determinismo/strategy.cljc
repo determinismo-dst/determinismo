@@ -22,8 +22,9 @@
 ;;            of them (docs/PLUGINS.md's machine)
 ;;   :check   (fn [state request]) -> a timeline that ended, judged from the events it was told:
 ;;            [{:type "always" :message "..." :condition bool :details {...}} ...], the
-;;            timeline's assertions (docs/PLUGINS.md's check); with :wants ["plans"] it is never
-;;            asked for a decision
+;;            timeline's assertions (docs/PLUGINS.md's check); (:histories request) has what the
+;;            timeline recorded for the program's host checks ([{:name :records} ...], JSON
+;;            lines); with :wants ["plans"] it is never asked for a decision
 ;; :wants (["behaviors"], ["labeled"], ["setup"]: the setup's decisions too, ...) and :decide make
 ;; the hello's answer. `state` is an atom
 ;; per connection: one exploration worker's timelines, reset at each branch. Every answer a

@@ -19,7 +19,7 @@ A strategy is an object with any of these methods; missing ones answer the defau
     branch(index, seed[, start])              a timeline starts: return an int to give it another seed
     plan()                                    with wants "plans": {"<decision name>": [[low, high,
                                               weight], ...]}, drawn from by the explorer
-    check(index)                              with wants "check": a timeline ended; its assertions,
+    check(index[, histories])                 with wants "check": a timeline ended; its assertions,
                                               [{"type": "always"|"sometimes"|..., "message",
                                               "condition", "details"}, ...], the timeline's
     branch_end(index, outcome, events, failing)   return True to stop the exploration
@@ -129,7 +129,14 @@ def _dispatch(strategy, name, request):
         return strategy.machine(request) if hasattr(strategy, "machine") else {}
     if method == "check":
         # With `wants = ["check", ...]`: the timeline ended (its events told); its verdicts.
-        return {"assertions": list(strategy.check(request["index"]) or [])} if hasattr(strategy, "check") else {}
+        if not hasattr(strategy, "check"):
+            return {}
+        arguments = [request["index"]]
+        # The histories its commands recorded for the program's host checks: [{"name", "records"
+        # (JSON lines, or None past the request's room), "bytes"}], for a checker that takes them.
+        if "histories" in inspect.signature(strategy.check).parameters:
+            arguments.append(request.get("histories", []))
+        return {"assertions": list(strategy.check(*arguments) or [])}
     if method == "branch_end":
         stop = False
         if hasattr(strategy, "branch_end"):

@@ -72,6 +72,13 @@ pub const Hook = struct {
         return .{ .context = hook, .run = run_hook };
     }
 
+    /// The program's checks behind `end_checks`, when they are a Hook's (a checker plugin is
+    /// given their histories: main.zig's StrategyCheck).
+    pub fn of(given: VM.EndChecks) ?*const Hook {
+        if (given.run != &run_hook) return null;
+        return @ptrCast(@alignCast(given.context));
+    }
+
     fn run_hook(context: *const anyopaque, events: *Events, end: Events.Moment, keep: ?[]const u8) anyerror!void {
         const hook: *const Hook = @ptrCast(@alignCast(context));
         try run(events, end, hook.checks, .{ .program = hook.program, .scenario = hook.scenario, .lines = hook.lines, .keep = keep });

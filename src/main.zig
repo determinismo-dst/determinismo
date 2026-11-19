@@ -7780,7 +7780,18 @@ const StrategyCheck = struct {
         const buffer = try std.heap.page_allocator.alloc(u8, Strategy.check_assertions_max * Strategy.check_line_size_max);
         defer std.heap.page_allocator.free(buffer);
         var lines: [Strategy.check_assertions_max][]const u8 = undefined;
-        const count = try check.strategy.judge(check.index, buffer, &lines);
+        // The histories its commands recorded for the program's checks, whole.
+        var histories: [Events.check_count_max]Strategy.History = undefined;
+        var history_count: usize = 0;
+        if (check.inner) |inner| if (checks.Hook.of(inner)) |program| {
+            for (program.checks, 0..) |program_check, position| {
+                if (position >= Events.check_count_max) break;
+                const records = events.check_input(position) orelse continue;
+                histories[history_count] = .{ .name = program_check.name, .records = records };
+                history_count += 1;
+            }
+        };
+        const count = try check.strategy.judge(check.index, histories[0..history_count], buffer, &lines);
         for (lines[0..count]) |line| try events.emit(end, line);
         var said: [128]u8 = undefined;
         try events.emit(end, try std.fmt.bufPrint(&said, "{{\"event\":\"strategy_check\",\"details\":{{\"assertions\":{d}}}}}", .{count}));
