@@ -1745,7 +1745,8 @@ fn check_machine_decisions(context: *Context) !void {
     const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
     const tapes = try std.fs.path.join(arena, &.{ context.scratch, "machine-tapes" });
     const common = [_][]const u8{ "--program", program, "--scenario", "bank", "--seed", "3" };
-    const look = [_][]const u8{ "--at-vtime-ms", "3000", "--exec", "date -u +%F" };
+    // Inside the timeline: its setup ends at 0.728 s, it at 1.141 s (the bank's transfers race).
+    const look = [_][]const u8{ "--at-vtime-ms", "1000", "--exec", "date -u +%F" };
     const report = try explore(context, &(common ++ look ++ [_][]const u8{
         "--branches", "1",                                                "--jobs",     "1",
         "--strategy", "python3 plugins/python/machine_date.py 951782400", "--tape-dir", tapes,
@@ -1773,7 +1774,7 @@ fn check_machine_decisions(context: *Context) !void {
     const late_replays = parsed and std.mem.eql(u8, landed[0].events_hash, landed_replayed[0].events_hash);
     expect_all(context, &.{
         .{ "the strategy decided the machine (wall clock 951782400)", decided },
-        .{ "the guest's date at 3 s is 2000-02-29", dated },
+        .{ "the guest's date at 1 s is 2000-02-29", dated },
         .{ "the timeline replayed from its tape alone boots the same machine", replay_dated },
         .{ "timers landing 900/1000 into their slack make another timeline", moved },
         .{ "which replays alone from its tape as it ran", late_replays },
