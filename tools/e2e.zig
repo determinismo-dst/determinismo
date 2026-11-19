@@ -7460,6 +7460,28 @@ fn check_shrink(context: *Context) !void {
     }, "shrink: {d} of {d} faults kept, failing in {d}/8 with them, {d}/8 with all, {d}/8 with none ({d} explorations)", .{
         result.kept.len, result.faults, result.failing_kept, result.failing_whole, result.failing_none, result.explorations,
     });
+    // The same script shrunk with a plugin's cuts first (shrink --strategy, Strategy.shrink):
+    // shrink_by_node.py's candidates judged, then ddmin from the smallest that reproduces it;
+    // the result keeps the rule. Asked only when the failure needs faults (none fails less).
+    const plugin_path = try std.fs.path.join(arena, &.{ context.scratch, "shrink-plugin.json" });
+    var plugin_argv: std.ArrayList([]const u8) = .empty;
+    try plugin_argv.appendSlice(arena, shrink_argv.items[0 .. shrink_argv.items.len - 2]); // Its --out and --json our own.
+    try plugin_argv.appendSlice(arena, &.{ plugin_path, "--json", "--strategy", "python3 plugins/python/shrink_by_node.py" });
+    const plugin_shrunk = try run_kept(context, plugin_argv.items);
+    const plugin_last = std.mem.trim(u8, plugin_shrunk.stdout[(std.mem.lastIndexOfScalar(u8, std.mem.trimEnd(u8, plugin_shrunk.stdout, "\n"), '\n') orelse 0)..], " \n");
+    const plugin_parsed = std.json.parseFromSliceLeaky(Shape, arena, plugin_last, .{ .ignore_unknown_fields = true }) catch
+        return expect(context, false, "shrink with a plugin: a JSON result ({s})", .{plugin_last[0..@min(plugin_last.len, 200)]});
+    const with_plugin = plugin_parsed.shrink;
+    const plugin_needed = @max(1, (with_plugin.failing_whole + 1) / 2);
+    const plugin_rule = if (with_plugin.kept.len == 0) with_plugin.failing_none >= plugin_needed else with_plugin.failing_kept >= plugin_needed;
+    const asked = std.mem.indexOf(u8, plugin_shrunk.stderr, "[determinismo] shrink: the plugin's ") != null;
+    expect_all(context, &.{
+        .{ "the failure needs faults (else no plugin is asked)", with_plugin.failing_none < plugin_needed },
+        .{ "the plugin's cuts were judged", asked },
+        .{ "its result keeps the rule", plugin_rule },
+    }, "shrink with shrink_by_node.py: {d} of {d} faults kept, failing in {d}/8 with them ({d} explorations, {d} without it)", .{
+        with_plugin.kept.len, with_plugin.faults, with_plugin.failing_kept, with_plugin.explorations, result.explorations,
+    });
 }
 
 /// In how many timelines a property failed, from its report line ("failing in    3  <message>").
