@@ -8,11 +8,14 @@ WORKDIR /src/client
 RUN clang -shared -fPIC -o /usr/lib/libvoidstar.so voidstar_stub.c && \
     clang -g -O1 -fsanitize-coverage=trace-pc-guard -c maze.c -o maze.o && \
     clang -fuse-ld=lld -Wl,--build-id -o /usr/local/bin/maze maze.o -L/usr/lib -lvoidstar && \
+    clang -O2 -fsanitize-coverage=trace-pc-guard -c maze.c -o maze-bare.o && \
+    clang -fuse-ld=lld -Wl,--build-id -o /usr/local/bin/maze-bare maze-bare.o -L/usr/lib -lvoidstar && \
     clang -g -O1 -fsanitize-coverage=trace-pc-guard -c maze_sdk.c -o maze_sdk.o && \
     clang -fuse-ld=lld -Wl,--build-id -o /usr/local/bin/maze-sdk maze_sdk.o && \
-    mkdir -p /symbols /opt/antithesis/test/v1/maze /opt/antithesis/test/v1/maze_sdk && \
+    mkdir -p /symbols /opt/antithesis/test/v1/maze /opt/antithesis/test/v1/maze_sdk /opt/antithesis/test/v1/maze_again && \
     cp /usr/local/bin/maze /symbols/maze && cp /usr/local/bin/maze-sdk /symbols/maze-sdk && \
     cp maze/singleton_driver_maze.sh /opt/antithesis/test/v1/maze/ && \
     cp maze_sdk/singleton_driver_maze_sdk.sh /opt/antithesis/test/v1/maze_sdk/ && \
-    chmod +x /opt/antithesis/test/v1/maze/* /opt/antithesis/test/v1/maze_sdk/*
+    cp maze_again/singleton_driver_maze_again.sh /opt/antithesis/test/v1/maze_again/ && \
+    chmod +x /opt/antithesis/test/v1/maze/* /opt/antithesis/test/v1/maze_sdk/* /opt/antithesis/test/v1/maze_again/*
 CMD ["sleep", "infinity"]
