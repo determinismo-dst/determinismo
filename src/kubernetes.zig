@@ -70,6 +70,7 @@ pub fn images_note(arena: std.mem.Allocator, manifest: []const u8, images: *std.
         if (std.mem.indexOf(u8, value, " #")) |comment| value = std.mem.trimEnd(u8, value[0..comment], " ");
         value = std.mem.trim(u8, value, "\"'");
         if (value.len == 0) continue;
+        value = try normalized(arena, value);
         for (images.items) |known| {
             if (std.mem.eql(u8, known, value)) break;
         } else {
@@ -83,8 +84,9 @@ pub fn images_note(arena: std.mem.Allocator, manifest: []const u8, images: *std.
 pub fn images_add(arena: std.mem.Allocator, list: []const u8, images: *std.ArrayList([]const u8)) !void {
     var listed = std.mem.tokenizeScalar(u8, list, ',');
     while (listed.next()) |raw| {
-        const value = std.mem.trim(u8, raw, " ");
+        var value = std.mem.trim(u8, raw, " ");
         if (value.len == 0) continue;
+        value = try normalized(arena, value);
         for (images.items) |known| {
             if (std.mem.eql(u8, known, value)) break;
         } else {
@@ -107,8 +109,24 @@ test images_add {
     try std.testing.expectEqualStrings("registry.example/paradedb:18-abc", images.items[1]);
 }
 
+/// A reference as containerd's CRI looks it up (Docker's normalization): Docker Hub's
+/// `docker.io/<name>` (or `index.docker.io/`) with one path component is
+/// `docker.io/library/<name>`. The images' archives are named so: containerd names an image by
+/// its archive's name as written, and a pod's `docker.io/postgres:18` finds
+/// `docker.io/library/postgres:18` only.
+pub fn normalized(arena: std.mem.Allocator, reference: []const u8) ![]const u8 {
+    for ([_][]const u8{ "docker.io/", "index.docker.io/" }) |hub| {
+        if (!std.mem.startsWith(u8, reference, hub)) continue;
+        const rest = reference[hub.len..];
+        const path = rest[0 .. std.mem.indexOfAny(u8, rest, ":@") orelse rest.len];
+        const library = std.mem.indexOfScalar(u8, path, '/') == null;
+        return std.fmt.allocPrint(arena, "docker.io/{s}{s}", .{ if (library) "library/" else "", rest });
+    }
+    return reference;
+}
+
 /// Antithesis asks for fully qualified references (registry, name and tag or digest): the
-/// guest pulls nothing, so a reference must name the image K3s imported, as written.
+/// guest pulls nothing, so a reference must name an image K3s imported (normalized).
 pub fn qualified(reference: []const u8) bool {
     const slash = std.mem.indexOfScalar(u8, reference, '/') orelse return false;
     const registry = reference[0..slash];
@@ -298,6 +316,12 @@ test images_note {
     try std.testing.expectEqual(@as(usize, 2), images.items.len);
     try std.testing.expectEqualStrings("docker.io/library/redis:7.4-alpine", images.items[0]);
     try std.testing.expectEqualStrings("localhost/client:1", images.items[1]);
+    // Docker Hub's short form as containerd's CRI looks it up (ParadeDB's publisher names
+    // docker.io/postgres:18): the archive named so, and one image under either spelling.
+    try images_note(arena, "image: docker.io/postgres:18\nimage: index.docker.io/team/app:2\nimage: docker.io/redis:7.4-alpine\n", &images);
+    try std.testing.expectEqual(@as(usize, 4), images.items.len);
+    try std.testing.expectEqualStrings("docker.io/library/postgres:18", images.items[2]);
+    try std.testing.expectEqualStrings("docker.io/team/app:2", images.items[3]);
 }
 
 test qualified {

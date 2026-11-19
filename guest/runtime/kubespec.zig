@@ -10,6 +10,11 @@
 //!                               (pg_search.so names it NEEDED), its SDKs use it
 //!   /dev/determinismo           the device libvoidstar reaches the guest through, allowed
 //!                               after the default spec's deny-all (the last rule wins)
+//!   /opt/determinismo           the node's, read-only as every node has it: det-stop-faults,
+//!                               ANTITHESIS_STOP_FAULTS (and DETERMINISMO_STOP_FAULTS) in the
+//!                               environment, and the fault injector's control FIFO it writes
+//!                               to (made when the injector starts, after the pods: the
+//!                               directory's bind finds it)
 //!   /opt/determinismo/coverage  the edges reported, shared by every process of every node
 //!   /opt/determinismo/sdk       the SDKs' fallback output, ANTITHESIS_SDK_LOCAL_OUTPUT in the
 //!                               environment
@@ -22,6 +27,11 @@ const linux = std.os.linux;
 const device_path = "/dev/determinismo";
 const voidstar_source = "/opt/determinismo/lib/libvoidstar.so"; // initramfs.zig's.
 const sdk_output = "ANTITHESIS_SDK_LOCAL_OUTPUT=/opt/determinismo/sdk/output";
+const stop_faults_path = "/opt/determinismo/bin/det-stop-faults"; // nodes.zig's.
+const stop_faults = [_][]const u8{
+    "DETERMINISMO_STOP_FAULTS=" ++ stop_faults_path,
+    "ANTITHESIS_STOP_FAULTS=" ++ stop_faults_path,
+};
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -51,8 +61,11 @@ pub fn spec_with(arena: std.mem.Allocator, text: []const u8, major: u32, minor: 
     const process = try object_at(arena, spec, "process");
     const env = try array_at(arena, process, "env");
     try env.append(.{ .string = sdk_output });
+    for (stop_faults) |entry| try env.append(.{ .string = entry });
 
     const mounts = try array_at(arena, spec, "mounts");
+    // The directory before the writable ones within it.
+    try mounts.append(try bind(arena, "/opt/determinismo", "/opt/determinismo", "ro"));
     try mounts.append(try bind(arena, voidstar_source, "/usr/lib/libvoidstar.so", "ro"));
     try mounts.append(try bind(arena, "/opt/determinismo/coverage", "/opt/determinismo/coverage", "rw"));
     try mounts.append(try bind(arena, "/opt/determinismo/sdk", "/opt/determinismo/sdk", "rw"));
@@ -106,7 +119,7 @@ fn bind(arena: std.mem.Allocator, source: []const u8, destination: []const u8, a
     return .{ .object = mount };
 }
 
-test "containerd's default spec given libvoidstar, the device after the deny-all, the coverage and the SDK's output" {
+test "containerd's default spec given libvoidstar, the device after the deny-all, determinismo's directory, the coverage, the SDK's output and the quiet-period command" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -133,15 +146,21 @@ test "containerd's default spec given libvoidstar, the device after the deny-all
     const spec = try std.json.parseFromSliceLeaky(Spec, arena, text, .{ .ignore_unknown_fields = true });
     try std.testing.expectEqualStrings("1.3.0", spec.ociVersion); // The rest kept.
     try std.testing.expectEqualStrings("/k8s.io", spec.linux.cgroupsPath);
-    try std.testing.expectEqual(@as(usize, 1), spec.process.env.len);
+    try std.testing.expectEqual(@as(usize, 3), spec.process.env.len);
     try std.testing.expectEqualStrings(sdk_output, spec.process.env[0]);
-    try std.testing.expectEqual(@as(usize, 4), spec.mounts.len);
+    try std.testing.expectEqualStrings("DETERMINISMO_STOP_FAULTS=/opt/determinismo/bin/det-stop-faults", spec.process.env[1]);
+    try std.testing.expectEqualStrings("ANTITHESIS_STOP_FAULTS=/opt/determinismo/bin/det-stop-faults", spec.process.env[2]);
+    try std.testing.expectEqual(@as(usize, 5), spec.mounts.len);
     try std.testing.expectEqualStrings("/proc", spec.mounts[0].destination);
-    try std.testing.expectEqualStrings("/usr/lib/libvoidstar.so", spec.mounts[1].destination);
-    try std.testing.expectEqualStrings(voidstar_source, spec.mounts[1].source);
+    // Determinismo's directory first, read-only: the writable binds within it come after.
+    try std.testing.expectEqualStrings("/opt/determinismo", spec.mounts[1].destination);
     try std.testing.expectEqualStrings("ro", spec.mounts[1].options[1]);
-    try std.testing.expectEqualStrings("/opt/determinismo/coverage", spec.mounts[2].destination);
-    try std.testing.expectEqualStrings("/opt/determinismo/sdk", spec.mounts[3].destination);
+    try std.testing.expectEqualStrings("/usr/lib/libvoidstar.so", spec.mounts[2].destination);
+    try std.testing.expectEqualStrings(voidstar_source, spec.mounts[2].source);
+    try std.testing.expectEqualStrings("ro", spec.mounts[2].options[1]);
+    try std.testing.expectEqualStrings("/opt/determinismo/coverage", spec.mounts[3].destination);
+    try std.testing.expectEqualStrings("rw", spec.mounts[3].options[1]);
+    try std.testing.expectEqualStrings("/opt/determinismo/sdk", spec.mounts[4].destination);
     try std.testing.expectEqualStrings(device_path, spec.linux.devices[0].path);
     try std.testing.expectEqual(@as(u32, 123), spec.linux.devices[0].minor);
     // The deny-all first, then the device allowed: the last rule that matches wins.

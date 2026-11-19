@@ -18,7 +18,9 @@ spec:
     spec:
       containers:
         - name: redis
-          image: docker.io/library/redis:7.4-alpine
+          # Docker Hub's short form (as ParadeDB's publisher names postgres:18): containerd's CRI
+          # looks it up as docker.io/library/redis, the probe's spelling.
+          image: docker.io/redis:7.4-alpine
           args: ["redis-server", "--appendonly", "yes", "--appendfsync", "always", "--dir", "/data"]
           ports:
             - containerPort: 6379

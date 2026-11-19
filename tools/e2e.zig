@@ -3913,6 +3913,9 @@ fn check_kubernetes(context: *Context) !void {
     const missing = try run_kept(context, &.{ "grep", "-rlF", "probe missing", explored });
     const sdk_env = try run_kept(context, &.{ "grep", "-rlF", "probe sdk output /opt/determinismo/sdk/output", explored });
     const probe_faulted = try run_kept(context, &.{ "sh", "-c", try std.fmt.allocPrint(arena, "grep -rhF '\"pod\":\"probe\"' {s} | grep -cF '\"event\":\"fault\"' || true", .{explored}) });
+    // A quiet period asked from a pod ($ANTITHESIS_STOP_FAULTS 7, anytime_quiet_period.sh): the
+    // fault injector took it.
+    const quiet = try run_kept(context, &.{ "grep", "-rlF", "\"faults_quiet\",\"details\":{\"duration_ns\":7000000000", explored });
     var same = false;
     if (count > 0) {
         const index = try std.fmt.allocPrint(arena, "{d}", .{branches[0].index});
@@ -3934,6 +3937,7 @@ fn check_kubernetes(context: *Context) !void {
         .{ "pods' container exits judged (no unexpected container exits)", exits.stdout.len > 0 },
         .{ "a bare Pod given libvoidstar, its device, the coverage and the SDK's output", std.mem.eql(u8, std.mem.trim(u8, given.stdout, " \n"), "4") and missing.stdout.len == 0 },
         .{ "a bare Pod's environment names the SDK's output", sdk_env.stdout.len > 0 },
+        .{ "a pod's template paused faults ($ANTITHESIS_STOP_FAULTS 7 in the client's pod)", quiet.stdout.len > 0 },
         .{ "no fault of the excluded probe pod (fault_exclusions ^probe$)", std.mem.eql(u8, std.mem.trim(u8, probe_faulted.stdout, " \n"), "0") },
         .{ "no fault of the K3s node or its pods failed to apply or heal", std.mem.eql(u8, std.mem.trim(u8, pod_failures.stdout, " \n"), "0") },
     }, "kubernetes: manifests in K3s, deployed before branching, templates run in their pod; " ++
