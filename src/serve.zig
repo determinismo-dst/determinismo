@@ -5092,9 +5092,12 @@ fn notebook(server: *Server, run: *const Run, request: Request, out: *std.Io.Wri
     return 200;
 }
 
-/// Strategies uploaded to this server (`PUT /strategies/<name>`, the executable as the body;
-/// `GET /strategies` lists them). A run names one as `@<name> [arguments]`. They run on this
-/// host as any `--strategy` command does, so serve should listen where only trusted users reach.
+/// Strategies uploaded to this server (`PUT /strategies/<name>`, the executable as the body, or
+/// its base64 with `?encoding=base64`: a client that sends text, jank's and babashka's;
+/// `GET /strategies` lists them). A run names one as `@<name> [arguments]`. An executable
+/// runs on this host as any `--strategy` command does, so serve should listen where only
+/// trusted users reach; a WebAssembly module (its first bytes `\0asm`) runs inside the
+/// explorer, sandboxed (`wasm:`, src/wasm_plugin.zig).
 fn strategies_route(
     server: *Server,
     name: ?[]const u8,
@@ -5124,13 +5127,20 @@ fn strategies_route(
     };
     if (!eql(u8, request.method, "PUT")) return error.NotFound;
     if (!strategy_name_valid(given) or request.body.len == 0) return error.BadRequest;
+    const base64 = if (query_value(server.query_string, "encoding")) |encoding|
+        if (eql(u8, encoding, "base64")) true else return error.BadRequest
+    else
+        false;
+    const bytes = if (base64) try base64_decoded(server.arena, request.body) else request.body;
+    if (bytes.len == 0) return error.BadRequest;
     const path = try std.fs.path.join(server.arena, &.{ directory, given });
     try cwd.writeFile(server.io, .{
         .sub_path = path,
-        .data = request.body,
+        .data = bytes,
         .flags = .{ .permissions = .executable_file },
     });
-    try out.print("{{\"strategy\":\"@{s}\",\"bytes\":{d}}}\n", .{ given, request.body.len });
+    const kind = if (wasm_module(bytes)) "wasm" else "executable";
+    try out.print("{{\"strategy\":\"@{s}\",\"bytes\":{d},\"kind\":\"{s}\"}}\n", .{ given, bytes.len, kind });
     return 201;
 }
 
@@ -5142,15 +5152,52 @@ fn strategy_name_valid(name: []const u8) bool {
     return true;
 }
 
-/// `@<name> args` names an uploaded strategy: its path, with the arguments.
+/// `@<name> args` names an uploaded strategy: its path, with the arguments (`wasm:` before a
+/// WebAssembly module's: run inside the explorer).
 fn strategy_resolve(server: *Server, strategy: []const u8) ![]const u8 {
     if (!std.mem.startsWith(u8, strategy, "@")) return strategy;
     const end = std.mem.indexOfScalar(u8, strategy, ' ') orelse strategy.len;
     const name = strategy[1..end];
     if (!strategy_name_valid(name)) return error.BadRequest;
-    return print(server, "{s}/strategies/{s}{s}", .{
-        server.options.data_directory, name, strategy[end..],
-    });
+    const path = try print(server, "{s}/strategies/{s}", .{ server.options.data_directory, name });
+    var magic: [4]u8 = @splat(0);
+    file_start(server.arena, path, &magic);
+    return print(server, "{s}{s}{s}", .{ if (wasm_module(&magic)) "wasm:" else "", path, strategy[end..] });
+}
+
+/// A WebAssembly module's bytes start so (its magic, `\0asm`).
+fn wasm_module(bytes: []const u8) bool {
+    return std.mem.startsWith(u8, bytes, "\x00asm");
+}
+
+/// A file's first bytes, into `start` (left as it was when the file cannot be read).
+fn file_start(arena: std.mem.Allocator, path: []const u8, start: []u8) void {
+    const path_z = arena.dupeSentinel(u8, path, 0) catch return;
+    const opened = linux.open(path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(opened) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(opened));
+    _ = linux.read(@intCast(opened), start.ptr, start.len);
+}
+
+/// A base64 body (standard alphabet, padded; line breaks ignored), decoded.
+fn base64_decoded(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var compact: std.ArrayList(u8) = .empty;
+    for (text) |c| if (c != '\n' and c != '\r' and c != ' ') try compact.append(arena, c);
+    const decoder = std.base64.standard.Decoder;
+    const size = decoder.calcSizeForSlice(compact.items) catch return error.BadRequest;
+    const bytes = try arena.alloc(u8, size);
+    decoder.decode(bytes, compact.items) catch return error.BadRequest;
+    return bytes;
+}
+
+test base64_decoded {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const decoded = try base64_decoded(arena_state.allocator(), "AGFzbQ\nEAAAA=\n");
+    try std.testing.expectEqualSlices(u8, "\x00asm\x01\x00\x00\x00", decoded);
+    try std.testing.expect(wasm_module(decoded));
+    try std.testing.expect(!wasm_module("#!/bin/sh\n"));
+    try std.testing.expectError(error.BadRequest, base64_decoded(arena_state.allocator(), "not base64!"));
 }
 
 test strategy_name_valid {

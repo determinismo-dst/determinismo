@@ -443,6 +443,14 @@
 
 (defn strategies [] (parse (request :get "/strategies")))
 
+(defn upload-strategy!
+  "Uploads a strategy plugin to serve from a local file, as `name`: an executable (run on
+  serve's host) or a WebAssembly module (run inside the explorer, sandboxed). A run names it
+  as \"@<name> [arguments]\". Sent in base64, so any client's text request carries it.
+  Answers {:strategy \"@<name>\" :bytes n :kind \"wasm\"|\"executable\"}."
+  [name path]
+  (parse (request :put (str "/strategies/" name "?encoding=base64") (http/file-base64 path))))
+
 (defn machines
   "The machines serve holds (a sandbox's, a CI job's): {:machine :alive :directory
   :checkpoints}."
