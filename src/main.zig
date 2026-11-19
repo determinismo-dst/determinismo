@@ -2449,14 +2449,41 @@ fn command_explore(
         collected.* = .{ .allocator = context.arena };
         // The setup's named draws (a node's knobs as it first starts, the swarm's seed), shared by
         // every timeline from its snapshot: noted as a timeline's are (draws.zig).
+        // The setup's decisions are a strategy's too: asked here, recorded on the setup's tape
+        // (setup.jsonl, beside the timelines'), which a replay's setup applies (a timeline's
+        // pulls count from boot, after the setup's: the two tapes never meet).
+        const recording = arguments.strategy_command != null and exploration.replay == null;
+        if (recording) {
+            try strategy_start(context, arguments, &exploration);
+            try exploration.strategy.?.setup(exploration.exploration_seed);
+        }
+        const setup_tape: ?linux.fd_t = if (recording) if (exploration.tape_directory) |directory| tape_fd: {
+            const fd = try open_for_writing(context.arena, try std.fs.path.join(context.arena, &.{ directory, setup_tape_name }));
+            tape.write_header(fd, .{
+                .inputs = exploration.inputs,
+                .exploration_seed = exploration.exploration_seed,
+                .branch = 0,
+                .branch_seed = 0,
+                .fork = exploration.fork,
+                .chain = &.{},
+                .host = exploration.host,
+                .tsc_jitter_seed = exploration.tsc_jitter_seed,
+            });
+            break :tape_fd fd;
+        } else null else null;
+        defer if (setup_tape) |fd| close(fd);
+        const setup_taped: ?*tape.Overrides = if (exploration.replay) |replay|
+            try setup_tape_load(context, arguments.tape_path.?, replay.header)
+        else
+            null;
         var setup_advice: advisor_zig.Explorer = .{
-            .strategy = null,
+            .strategy = exploration.strategy,
             .learned = null,
             .draws = if (arguments.events_directory != null) try context.arena.create(draws_zig.Draws) else null,
             .fixed = arguments.decide,
         };
         if (setup_advice.draws) |draws| draws.reset(.first);
-        try explore_snapshot(vm, options, snapshot, collected, setup_advice.advisor());
+        try explore_snapshot(vm, options, snapshot, collected, setup_advice.advisor(), setup_tape, setup_taped);
         if (setup_advice.draws) |draws| try draws_write(context.arena, arguments.events_directory.?, "draws-setup.jsonl", draws);
         setup_behaviors = &collected.set;
     }
@@ -2581,8 +2608,8 @@ fn command_explore(
         null;
     if (arguments.branching == .tree) {
         // A strategy decides within its branches and chooses where the tree returns: an
-        // instance here (and one per worker).
-        try strategy_start(context, arguments, &exploration);
+        // instance here (the setup's, when it decided the setup) and one per worker.
+        if (exploration.strategy == null) try strategy_start(context, arguments, &exploration);
         defer if (exploration.strategy) |strategy| strategy.stop();
         if (arguments.time_budget_text) |budget| {
             std.debug.print("[determinismo] a tree for {s} (at most {d} timelines) on {d} workers\n", .{
@@ -2593,10 +2620,16 @@ fn command_explore(
         }
         try explore_tree(context, vm, options, branches, jobs);
     } else if (jobs == 1) {
-        try strategy_start(context, arguments, &exploration);
+        if (exploration.strategy == null) try strategy_start(context, arguments, &exploration);
         defer if (exploration.strategy) |strategy| strategy.stop();
         try explore_branches(context, vm, options, branches);
     } else {
+        // The setup's instance ends before the workers fork: each starts its own, and one that
+        // kept this one's connection would keep the plugin from seeing its end.
+        if (exploration.strategy) |strategy| {
+            strategy.stop();
+            exploration.strategy = null;
+        }
         if (arguments.time_budget_text) |budget| {
             std.debug.print("[determinismo] branches for {s} (at most {d}) on {d} workers\n", .{
                 budget, arguments.branches, jobs,
@@ -2974,7 +3007,40 @@ fn write_all(fd: linux.fd_t, bytes: []const u8) void {
 
 /// The setup run to its snapshot; every behavior it reached into `collected` (the tree's first
 /// known set: Events.behaviors_collected).
-fn explore_snapshot(vm: *VM, options: *VM.Options, snapshot: *Snapshot, collected: *Events.Collected, advisor: ?VM.Advisor) !void {
+/// The setup's own tape beside the timelines': what a strategy decided before the snapshot.
+const setup_tape_name = "setup.jsonl";
+
+/// A replay's setup tape (beside its timeline's, from the same exploration), if the run had one:
+/// what a strategy decided in the setup, applied as the setup runs again.
+fn setup_tape_load(context: Context, tape_path: []const u8, header: tape.Header) !?*tape.Overrides {
+    const directory = std.fs.path.dirname(tape_path) orelse ".";
+    const path = try std.fs.path.join(context.arena, &.{ directory, setup_tape_name });
+    const source = std.Io.Dir.cwd().readFileAlloc(context.io, path, context.arena, .unlimited) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    const overrides = try context.arena.create(tape.Overrides);
+    const setup_header = try tape.parse(source, try context.arena.alloc(u8, 64 * 1024), overrides);
+    if (setup_header.inputs != header.inputs or setup_header.exploration_seed != header.exploration_seed) {
+        std.debug.print("[determinismo] {s} is another exploration's setup (inputs {x:0>16}, seed {x:0>16})\n", .{
+            path, setup_header.inputs, setup_header.exploration_seed,
+        });
+        return error.SetupTapeDiffers;
+    }
+    return overrides;
+}
+
+fn explore_snapshot(
+    vm: *VM,
+    options: *VM.Options,
+    snapshot: *Snapshot,
+    collected: *Events.Collected,
+    advisor: ?VM.Advisor,
+    /// Where the setup's answers are taped (a strategy decided them), or null.
+    tape_fd: ?linux.fd_t,
+    /// A replay's setup tape, applied as the setup runs again, or null.
+    taped: ?*tape.Overrides,
+) !void {
     Events.behaviors_collected = collected;
     defer Events.behaviors_collected = null;
     options.stop_at_setup_complete = true;
@@ -3004,8 +3070,12 @@ fn explore_snapshot(vm: *VM, options: *VM.Options, snapshot: *Snapshot, collecte
     try vm.init(options);
     // After the machine's init, which starts it with none.
     vm.advisor = advisor;
+    vm.tape_fd = tape_fd;
+    vm.overrides = taped;
     const outcome = try vm.run_until_exit();
     vm.advisor = null;
+    vm.tape_fd = null;
+    vm.overrides = null;
     if (outcome != .setup_complete) {
         std.debug.print("[determinismo] the guest never signalled setup_complete ({s})\n", .{
             @tagName(outcome),

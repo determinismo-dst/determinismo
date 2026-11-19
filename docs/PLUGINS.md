@@ -146,8 +146,12 @@ Every request has a `method`. Every response is a JSON object; `{}` always means
 | `{"method":"branch_end","index":I,"outcome":"<outcome>","events":E,"failing":["<property>",...]}` | The branch ended. | `{}` to continue, `{"stop":true}` to end the exploration early |
 
 Seeds are 64-bit and travel as 16 hex digits, since JSON numbers lose precision past 2^53.
-`vtime_ns` and `branches` together are the moment (ARCHITECTURE.md §1). Decisions made before
-the snapshot (boot and setup) are not sent: every branch shares them.
+`vtime_ns` and `branches` together are the moment (ARCHITECTURE.md §1). The setup's decisions
+(a node's knobs as it first starts, the swarm's seed, its start draws: before the snapshot every
+timeline starts from) are a strategy's too: a `branch` request with `"setup":true` first, then
+its decisions and events as a timeline's, its answers on the setup's own tape (`setup.jsonl`
+beside the timelines'), which a replay applies as the setup runs again. What the setup decided,
+every timeline of the run shares.
 
 ## Tapes
 

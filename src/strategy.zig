@@ -432,6 +432,17 @@ pub fn branch(strategy: *Strategy, index: u32, seed: u64, from: ?From) !void {
     _ = try strategy.call(writer.buffered());
 }
 
+/// The setup's start, before the snapshot every timeline starts from: its decisions are the
+/// strategy's too (`{"method":"branch","index":0,"seed":...,"setup":true}`), on the setup's tape.
+pub fn setup(strategy: *Strategy, seed: u64) !void {
+    strategy.plan_count = 0;
+    strategy.flushed_ns = 0;
+    strategy.ended = false;
+    var writer: std.Io.Writer = .fixed(&strategy.request);
+    try writer.print("{{\"method\":\"branch\",\"index\":0,\"seed\":\"{x:0>16}\",\"setup\":true}}", .{seed});
+    _ = try strategy.call(writer.buffered());
+}
+
 /// A branch of the generation that just ended, as the tree explorer saw it: `novel` behaviors no
 /// branch before it had, the last of them (`moment_ns`, `label`) where it would return.
 pub const Candidate = struct {
