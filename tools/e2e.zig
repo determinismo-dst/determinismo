@@ -5907,8 +5907,11 @@ fn check_catalog(context: *Context) !void {
 }
 
 /// Guidance: four digits must add up to 35 (5 timelines in 10000), one comparison that coverage
-/// cannot see into. 300 timelines miss it by chance; with the guidance assertion's distance,
-/// det-strategy-mutate climbs to it.
+/// cannot see into. With the guidance assertion's distance, det-strategy-mutate climbs to it:
+/// it solves it in more timelines than the explorer alone, and in several. Counted, not "300
+/// timelines miss it": 300 at 5 in 10000 hit by chance about once in seven explorations, and any
+/// change to the guest's bytes (an initramfs program's) draws other timelines from seed 3, so a
+/// fixed seed's miss became a hit at 06dd448 with nothing wrong.
 fn check_guidance(context: *Context) !void {
     const arena = context.arena;
     const program = try std.fs.path.join(arena, &.{ context.bin, "det-selftest" });
@@ -5921,22 +5924,22 @@ fn check_guidance(context: *Context) !void {
         "--program",  program, "--profile",        "maze-sum", "--scenario", "maze", "--seed", "3",
         "--branches", "300",   "--verify-replays", "0",        "--jobs",     "1",
     };
-    const property = "PASS sometimes             hit in  300/300 branches, failing in    0  " ++
-        "maze sum";
-    const random = try explore(context, &common);
+    const random_events = try std.fmt.allocPrint(arena, "{s}/guidance-random", .{context.scratch});
+    _ = try explore(context, &(common ++ [_][]const u8{ "--events-dir", random_events }));
     const sync = try std.fmt.allocPrint(arena, "{s}/guidance-sync", .{context.scratch});
     try std.Io.Dir.cwd().createDirPath(context.io, sync);
     const strategy = try std.fmt.allocPrint(arena, "{s}/det-strategy-mutate --sync-dir {s}", .{
         context.bin, sync,
     });
-    const guided = try explore(context, &(common ++ [_][]const u8{ "--strategy", strategy }));
-    const missed = std.mem.indexOf(u8, random, property) == null;
-    const found = std.mem.indexOf(u8, guided, property) != null;
+    const guided_events = try std.fmt.allocPrint(arena, "{s}/guidance-guided", .{context.scratch});
+    _ = try explore(context, &(common ++ [_][]const u8{ "--strategy", strategy, "--events-dir", guided_events }));
+    const solved = "assert.message=\"maze sum\" assert.condition=true";
+    const random_solved = try query_count(context, &.{ random_events, solved });
+    const guided_solved = try query_count(context, &.{ guided_events, solved });
     expect_all(context, &.{
-        .{ "300 random timelines miss it", missed },
-        .{ "the guided strategy solves it", found },
-    }, "guidance: 300 random timelines miss the sum maze; guided by its distance, the strategy " ++
-        "solves it", .{});
+        .{ "the guided strategy solves it in several timelines", guided_solved >= 3 },
+        .{ "more than the explorer alone does", guided_solved > random_solved },
+    }, "guidance: the sum maze solved in {d} of 300 timelines guided by its distance, {d} without", .{ guided_solved, random_solved });
 }
 
 /// The tree explorer: timelines return to moments of earlier ones (a path at least one deep),
