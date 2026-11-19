@@ -153,7 +153,7 @@ pub fn setup_origin_write(setup: *const Snapshot, disk: *const Disk) ?Origin {
     if (pid == 0) {
         const writer = linux.fork();
         if (writer != 0) linux.exit_group(0);
-        cpus.unpin();
+        cpus.forked_without_cpu();
         const mapped = linux.mmap(null, setup.memory_size, .{ .READ = true }, .{ .TYPE = .SHARED }, setup.memory_fd, 0);
         if (linux.errno(mapped) != .SUCCESS) linux.exit_group(1);
         const memory: []align(std.heap.page_size_min) const u8 = @as([*]align(std.heap.page_size_min) const u8, @ptrFromInt(mapped))[0..setup.memory_size];
@@ -1014,7 +1014,7 @@ pub const Owner = struct {
         const pid = linux.fork();
         if (pid == 0) {
             // It waits; it runs only for whoever asks, who holds a CPU meanwhile (cpus.zig).
-            cpus.unpin();
+            cpus.forked_without_cpu();
             owner.serve(vm, listener, moment);
         }
         _ = linux.close(listener);
@@ -1092,7 +1092,7 @@ pub const Owner = struct {
         const pid = linux.fork();
         if (pid == 0) {
             machine_forget(vm);
-            cpus.unpin();
+            cpus.forked_without_cpu();
             const memory: []align(std.heap.page_size_min) const u8 = vm.memory;
             Snapshot.disk_save(owner.snapshot, memory, vm.memory_fd, hashes, disk.directory, name, base, point.idle) catch
                 linux.exit_group(1);

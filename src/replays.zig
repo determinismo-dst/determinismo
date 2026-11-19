@@ -84,8 +84,9 @@ pub const Verifier = struct {
             runs.running_forget(); // The run is the explorer's: it ends with it.
             _ = linux.setpgid(0, 0); // Its replays with it: stopped as one.
             // Forked while the explorer held its CPU for the setup: its replays (programs of
-            // their own, which read their affinity afresh) get every CPU the run was given.
-            cpus.unpin();
+            // their own, which read their affinity afresh) get every CPU the run was given, and
+            // the CPU is the explorer's alone.
+            cpus.forked_without_cpu();
             const action: linux.Sigaction = .{
                 .handler = .{ .handler = finish_requested },
                 .mask = linux.sigemptyset(),

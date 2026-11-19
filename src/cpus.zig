@@ -471,6 +471,7 @@ pub const Pool = struct {
                 // The claim, where the others read it while this process holds the CPU.
                 const claim: CpuClaim = .{ .bytes = claim_bytes, .run = run_of_this_process() };
                 _ = linux.pwrite(pool.fds[slot], std.mem.asBytes(&claim), @sizeOf(CpuClaim), 0);
+                held_note(pool.fds[slot]);
                 pin(pool.cpus[slot]);
                 return .{
                     .slot = slot,
@@ -703,6 +704,7 @@ pub const Pool = struct {
         const none: u64 = 0;
         _ = linux.pwrite(pool.fds[held.slot], std.mem.asBytes(&none), @sizeOf(u64), @offsetOf(CpuClaim, "run"));
         _ = linux.flock(pool.fds[held.slot], std.posix.LOCK.UN);
+        held_forget(pool.fds[held.slot]);
         unpin(); // Not pinned to a CPU it no longer holds (nor are what it forks or runs next).
     }
 };
@@ -1270,6 +1272,79 @@ fn pin(cpu: u16) void {
 pub fn unpin() void {
     const set = given();
     linux.sched_setaffinity(0, &set) catch {};
+}
+
+/// The CPUs' files this process locked (take, give back): a process forked from it has copies,
+/// and a lock lives while any copy of its file is open.
+var held_fds: [cpus_max]linux.fd_t = @splat(-1);
+
+fn held_note(fd: linux.fd_t) void {
+    for (&held_fds) |*slot| if (slot.* < 0) {
+        slot.* = fd;
+        return;
+    };
+    unreachable; // One a CPU of the pool's at most.
+}
+
+fn held_forget(fd: linux.fd_t) void {
+    for (&held_fds) |*slot| if (slot.* == fd) {
+        slot.* = -1;
+    };
+}
+
+/// In a process forked from one that held a CPU (a holder, a disk writer, a replayer), which holds
+/// none itself: its copies of the CPUs' files that one locked, closed, and not pinned to them. Kept
+/// open, a worker killed holding its CPU (a run's budget stopping its timelines) left the CPU
+/// locked by its holders, its claim counted as a running VM's: run 2089's CPUs 4 to 7, four
+/// killed workers' 32 GiB each, and the run's last node makers waited for room behind them for
+/// good. The forking process's own pool is not used here after (a holder opens one of its own).
+pub fn forked_without_cpu() void {
+    for (&held_fds) |*fd| if (fd.* >= 0) {
+        _ = linux.close(fd.*);
+        fd.* = -1;
+    };
+    unpin();
+}
+
+test "a CPU's lock goes with the process that took it, not with what it forked" {
+    var pipe_fds: [2]i32 = undefined;
+    try std.testing.expect(linux.errno(linux.pipe2(&pipe_fds, .{ .CLOEXEC = true })) == .SUCCESS);
+    defer _ = linux.close(pipe_fds[0]);
+    const worker = linux.fork();
+    if (worker == 0) {
+        // A worker takes a CPU of its own pool (as a run's do: a test's pool is its process's)
+        // and forks a holder (it sleeps on, holding none); then it is killed holding the CPU, no
+        // give (a run's budget stopping its timelines).
+        var pool: Pool = undefined;
+        pool.open() catch linux.exit_group(1);
+        const held = pool.take();
+        const cpu: u32 = pool.cpus[held.slot];
+        const holder = linux.fork();
+        if (holder == 0) {
+            forked_without_cpu();
+            // Said once it holds none: the test reads the CPU's lock after this, and the worker's
+            // end.
+            _ = linux.write(pipe_fds[1], std.mem.asBytes(&cpu), @sizeOf(u32));
+            _ = linux.nanosleep(&.{ .sec = 3, .nsec = 0 }, null);
+            linux.exit_group(0);
+        }
+        linux.exit_group(0);
+    }
+    _ = linux.close(pipe_fds[1]);
+    var cpu: u32 = undefined;
+    try std.testing.expect(linux.read(pipe_fds[0], std.mem.asBytes(&cpu), @sizeOf(u32)) == @sizeOf(u32));
+    var status: i32 = 0;
+    _ = linux.waitpid(@intCast(worker), &status, 0);
+    // The holder lives on: the CPU is free all the same, its claim no longer counted (run 2089's
+    // CPUs 4 to 7, locked by four killed workers' holders, counted as 32 GiB VMs each: the run's
+    // last node makers waited for room behind them for good).
+    var path_buffer: [96]u8 = undefined;
+    const directory = try std.fmt.bufPrintSentinel(&path_buffer, "/tmp/determinismo-cpus-test-{d}", .{worker}, 0);
+    const file = try pool_file(directory, "cpu", cpu);
+    defer _ = linux.close(file);
+    const lock = linux.flock(file, std.posix.LOCK.EX | std.posix.LOCK.NB);
+    try std.testing.expect(linux.errno(lock) == .SUCCESS);
+    _ = linux.flock(file, std.posix.LOCK.UN);
 }
 
 test "pinned, a process still counts and pools the CPUs it was given" {
