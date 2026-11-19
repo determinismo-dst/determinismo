@@ -38,3 +38,5 @@ examples/kine/kclient/kclient
 .secrets/
 plugins/clojure/proposed/
 examples/jank-interop/jank-coverage/*.tar
+# Plugins built beside their sources (api's wasm-build).
+plugins/wasm/*.wasm

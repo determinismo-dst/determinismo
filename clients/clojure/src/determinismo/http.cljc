@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <string>
 #include <unistd.h>
+#include <sys/wait.h>
 
 // method url body -> \"<status>\\n<body>\": curl, the body from a temporary file (no quoting).
 std::string determinismo_http(std::string const &method, std::string const &url, std::string const &body) {
@@ -89,6 +90,21 @@ std::string determinismo_file_base64(std::string const &path) {
   return determinismo_base64(bytes);
 }
 
+// A command line (sh's, its words quoted) -> \"<exit status>\\n<output>\": standard output and
+// error together.
+std::string determinismo_run(std::string const &command) {
+  std::string out;
+  int status = -1;
+  if (FILE *pipe = popen((command + \" 2>&1\").c_str(), \"r\")) {
+    std::array<char, 65536> buffer;
+    size_t n;
+    while ((n = fread(buffer.data(), 1, buffer.size(), pipe)) > 0) out.append(buffer.data(), n);
+    status = pclose(pipe);
+  }
+  int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : 255;
+  return std::to_string(code) + \"\\n\" + out;
+}
+
 void determinismo_sleep_ms(long ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
 
 std::string determinismo_getenv(std::string const &name) {
@@ -149,6 +165,20 @@ std::string determinismo_getenv(std::string const &name) {
   [text]
   #?(:clj (.encodeToString (java.util.Base64/getEncoder) (.getBytes ^String text "UTF-8"))
      :jank (str (cpp/determinismo_base64 (cpp/cast cpp/std.string text)))))
+
+(defn run
+  "Runs a program with its arguments (strings, no shell between) in this process's working
+  directory: [exit-status output], its standard output and error together."
+  [argv]
+  #?(:clj (let [process (-> (ProcessBuilder. ^java.util.List (mapv str argv))
+                            (.redirectErrorStream true)
+                            (.start))
+                output (slurp (.getInputStream process))]
+            [(.waitFor process) output])
+     :jank (let [quoted (str/join " " (map #(str "'" (str/replace (str %) "'" "'\\''") "'") argv))
+                 answer (str (cpp/determinismo_run (cpp/cast cpp/std.string quoted)))
+                 cut (str/index-of answer "\n")]
+             [(parse-long (subs answer 0 cut)) (subs answer (inc cut))])))
 
 (defn sleep-ms [ms]
   #?(:clj (Thread/sleep (long ms))

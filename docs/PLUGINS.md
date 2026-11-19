@@ -83,7 +83,14 @@ machine's. It imports nothing else (no clock, no files, no randomness of its own
 are a function of the messages it was sent, and its overrides are on the tapes as any plugin's.
 Zig builds one with `-target wasm32-freestanding -fno-entry -rdynamic`
 (`plugins/wasm/decide_named.zig`, built and installed with the self-tests); Rust, C and TinyGo
-target wasm32 too.
+target wasm32 too. From a REPL, the Clojure client builds one from its source and uploads it to
+serve, where a run names it:
+
+```clojure
+(def module (d/wasm-build "plugins/wasm/decide_named.zig"))   ; zig on this machine
+(d/upload-strategy! "decide_named" (:module module))
+(d/start-run {... :strategy "@decide_named node.start_draw 7"})
+```
 
 A plugin can run anywhere: `tcp://<address>:<port>` connects to one already listening (one
 connection per exploration worker). `plugins/python/serve_tcp.py <port> <command>` serves any
