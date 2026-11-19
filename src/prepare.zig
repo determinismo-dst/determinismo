@@ -743,7 +743,7 @@ fn kubernetes_describe(context: Context, directory: []const u8, extra_images: ?[
     if (files.items.len == 0) return error.NoManifests;
     var hasher = std.hash.Wyhash.init(0);
     // What the context is made of besides them: a change to its scripts or K3s makes another.
-    for ([_][]const u8{ kubernetes.ready_script, kubernetes.exec_script, kubernetes.start_script, kubernetes.containerd_dropin, kubernetes.k3s_image }) |part| {
+    for ([_][]const u8{ kubernetes.ready_script, kubernetes.exec_script, kubernetes.start_script, kubernetes.containerd_dropin, kubernetes.k3s_image, kubernetes.images_format }) |part| {
         hasher.update(part);
     }
     for (files.items) |path| {
@@ -845,12 +845,19 @@ fn kubernetes_context(
         try executable_write(context, target, try kubernetes.wrapper(arena, image, try std.fmt.allocPrint(arena, "/{s}", .{path})));
     }
     if (images.len > 0) {
-        std.debug.print("[determinismo] saving the manifests' {d} images for K3s\n", .{images.len});
-        var argv: std.ArrayList([]const u8) = .empty;
-        const archive = try path_join(context, &.{ staging, "images.tar" });
-        try argv.appendSlice(arena, &.{ "podman", "save", "--quiet", "--multi-image-archive", "--format", "docker-archive", "--output", archive });
-        try argv.appendSlice(arena, images);
-        _ = try tool(context, argv.items);
+        // Each image an OCI archive of zstd layers, named by its reference (a digest's too).
+        // K3s imports each as it is and containerd unpacks a layer when a container first needs
+        // it, so the node holds both in memory (containerd's root is a tmpfs): uncompressed
+        // layers (a docker-archive's) doubled the images' size there, ParadeDB's 9 GB to 18 GB
+        // of a 32 GiB guest.
+        std.debug.print("[determinismo] saving the manifests' {d} images for K3s (zstd layers)\n", .{images.len});
+        const folder = try path_join(context, &.{ staging, "images" });
+        try cwd.createDirPath(context.io, folder);
+        for (images, 0..) |image, index| {
+            const archive = try path_join(context, &.{ folder, try std.fmt.allocPrint(arena, "{d}.tar", .{index}) });
+            const target = try std.fmt.allocPrint(arena, "oci-archive:{s}:{s}", .{ archive, image });
+            _ = try tool(context, &.{ "podman", "push", "--quiet", "--compression-format", "zstd", "--force-compression", image, target });
+        }
     }
     const text = try kubernetes.dockerfile(arena, images.len > 0, seen.count() > 0);
     try cwd.writeFile(context.io, .{ .sub_path = try path_join(context, &.{ staging, "Dockerfile" }), .data = text });

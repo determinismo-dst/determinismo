@@ -118,12 +118,15 @@ pub fn qualified(reference: []const u8) bool {
     return domain and tagged;
 }
 
-/// The node image's Dockerfile: K3s, its air-gap images, the workload's images (images.tar,
-/// when there are any), and determinismo's tools and the templates' wrappers.
+/// How the workload's images reach K3s (part of the node's hash: another format, another node).
+pub const images_format = "images/<n>.tar: OCI archives of zstd layers";
+
+/// The node image's Dockerfile: K3s, its air-gap images, the workload's images (images/, an OCI
+/// archive each, when there are any), and determinismo's tools and the templates' wrappers.
 pub fn dockerfile(arena: std.mem.Allocator, with_images: bool, with_templates: bool) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.print(arena, "FROM {s}\nADD {s} /var/lib/rancher/k3s/agent/images/\n", .{ k3s_image, airgap_url });
-    if (with_images) try out.appendSlice(arena, "COPY images.tar /var/lib/rancher/k3s/agent/images/workload.tar\n");
+    if (with_images) try out.appendSlice(arena, "COPY images/ /var/lib/rancher/k3s/agent/images/\n");
     try out.print(arena, "COPY determinismo-kubernetes/ {s}/\n", .{tools_directory});
     if (with_templates) try out.appendSlice(arena, "COPY antithesis/ /opt/antithesis/\n");
     return out.items;
