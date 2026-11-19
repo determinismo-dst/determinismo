@@ -812,8 +812,8 @@ fn clock_skew_draw(max_ns: u64) u64 {
     var top: u64 = clock_skew_ns_min * 10;
     while (top < max_ns and decades < 3) : (decades += 1) top *= 10;
     var low: u64 = clock_skew_ns_min;
-    for (0..sdk.random_below(decades + 1)) |_| low *= 10;
-    return low + sdk.random_below(@min(low * 10, max_ns) - low);
+    for (0..sdk.random_below_named("fault.clock.skew_decade", decades + 1)) |_| low *= 10;
+    return low + sdk.random_below_named("fault.clock.skew_ns", @min(low * 10, max_ns) - low);
 }
 
 test clock_skew_draw {
@@ -852,7 +852,7 @@ fn draw(fault: *const Fault) Applied {
         },
         .pod_degrade => {
             applied.process_index = @intCast(sdk.random_below(processes_max));
-            const flavor = sdk.random_choice(Degradation, std.enums.values(Degradation));
+            const flavor = choice_named(Degradation, "fault.degrade.flavor", std.enums.values(Degradation));
             applied.flavor = flavor;
             applied.netem = degradation(flavor);
         },
@@ -864,20 +864,20 @@ fn draw(fault: *const Fault) Applied {
             applied.duration_ns = @min(applied.duration_ns, regime.thread_pause_max_ns);
         },
         .degrade => {
-            const flavor = sdk.random_choice(Degradation, std.enums.values(Degradation));
+            const flavor = choice_named(Degradation, "fault.degrade.flavor", std.enums.values(Degradation));
             applied.flavor = flavor;
             applied.netem = degradation(flavor);
         },
         .clock_skip => {
-            applied.forward = sdk.random_below(2) == 0;
-            applied.skip_ns = sdk.random_below(clock_skip_ns_max);
-            applied.permanent = sdk.random_below(4) == 0;
+            applied.forward = sdk.random_below_named("fault.clock.forward", 2) == 0;
+            applied.skip_ns = sdk.random_below_named("fault.clock.skip_ns", clock_skip_ns_max);
+            applied.permanent = sdk.random_below_named("fault.clock.permanent", 4) == 0;
         },
         .clock_skew => {
-            applied.forward = sdk.random_below(2) == 0;
+            applied.forward = sdk.random_below_named("fault.clock.forward", 2) == 0;
             applied.skip_ns = clock_skew_draw(fault.skew_ns_max);
             // One in four strobes, flipping every 10 ms to a second.
-            if (sdk.random_below(4) == 0) applied.strobe_ns = (10 + sdk.random_below(991)) * std.time.ns_per_ms;
+            if (sdk.random_below_named("fault.clock.strobe", 4) == 0) applied.strobe_ns = (10 + sdk.random_below_named("fault.clock.strobe_ms", 991)) * std.time.ns_per_ms;
         },
         .outage => {
             applied.outage = outage_draw(fault.endpoints);
@@ -918,10 +918,10 @@ fn draw(fault: *const Fault) Applied {
             const kept = comptime disk_failures_kept();
             const failures: []const nodes.DiskFailure = if (fault.lost_writes) all else &kept;
             applied.disk = .{
-                .failure = sdk.random_choice(nodes.DiskFailure, failures),
-                .delay_ms = @intCast(1 + sdk.random_below(disk_delay_ms_max)),
-                .corrupt_byte = @intCast(1 + sdk.random_below(disk_sector_size)),
-                .corrupt_value = @intCast(sdk.random_below(256)),
+                .failure = choice_named(nodes.DiskFailure, "fault.disk.failure", failures),
+                .delay_ms = @intCast(1 + sdk.random_below_named("fault.disk.delay_ms", disk_delay_ms_max)),
+                .corrupt_byte = @intCast(1 + sdk.random_below_named("fault.disk.corrupt_byte", disk_sector_size)),
+                .corrupt_value = @intCast(sdk.random_below_named("fault.disk.corrupt_value", 256)),
             };
             // Half the time one file's blocks alone, as CORDS injects (one fault in one block
             // of one file of one node: Ganesan et al., FAST 2017): the rest of the disk healthy,
@@ -4055,11 +4055,11 @@ fn baseline_start(system: *const schema.System) void {
     for (system.nodes) |node| any = any or node.faults.degrade;
     if (!any) return;
     const delay_ns = baseline_delay_ns_min +
-        sdk.random_below(baseline_delay_ns_max - baseline_delay_ns_min);
+        sdk.random_below_named("network.baseline_delay_ns", baseline_delay_ns_max - baseline_delay_ns_min);
     baseline = .{
         .delay_ns = delay_ns,
-        .jitter_ns = sdk.random_below(delay_ns / 2),
-        .loss_ppm = @intCast(sdk.random_below(baseline_loss_ppm_max + 1)),
+        .jitter_ns = sdk.random_below_named("network.baseline_jitter_ns", delay_ns / 2),
+        .loss_ppm = @intCast(sdk.random_below_named("network.baseline_loss_ppm", baseline_loss_ppm_max + 1)),
         .seed = sdk.random_u64(),
     };
     network_refresh(system);
@@ -4071,12 +4071,13 @@ fn baseline_start(system: *const schema.System) void {
 }
 
 /// Durable disks' latency for the timeline (the network has its baseline, disks theirs): each
-/// I/O 0 to `disk_baseline_ms_max` ms, as a real disk's sync takes time.
+/// I/O 0 to `disk_baseline_ms_max` ms, as a real disk's sync takes time. Named, as the
+/// network's baseline is: a strategy's to steer.
 fn disk_baseline_start(system: *const schema.System) void {
     var any = false;
     for (system.nodes) |node| any = any or node.faults.crash or node.faults.disk;
     if (!any) return;
-    const delay_ms: u32 = @intCast(sdk.random_below(disk_baseline_ms_max + 1));
+    const delay_ms: u32 = @intCast(sdk.random_below_named("disk.baseline_ms", disk_baseline_ms_max + 1));
     nodes.disk_baseline_set(system, delay_ms) catch |err| {
         sdk.event("disk_baseline_failed", .{ .err = @errorName(err) });
         return;
@@ -4090,33 +4091,43 @@ fn degradable(system: *const schema.System, name: []const u8) bool {
     return node.faults.degrade;
 }
 
-/// netem settings for one flavor of degradation, every parameter a platform decision.
+/// One of `items`, drawn as a named decision over their names (sdk.decide): the value
+/// sdk.random_choice draws, which a strategy steers by name (a device model's, a fault's).
+fn choice_named(comptime T: type, name: []const u8, items: []const T) T {
+    var names: [32][]const u8 = undefined;
+    assert(items.len > 0 and items.len <= names.len);
+    for (items, 0..) |item, index| names[index] = @tagName(item);
+    return items[sdk.decide(name, names[0..items.len])];
+}
+
+/// netem settings for one flavor of degradation, every parameter a platform decision, named:
+/// the network's model is a strategy's to steer (its delays, losses, rates; plans shape them).
 fn degradation(flavor: Degradation) nodes.Netem {
     var netem = nodes.Netem{
-        .delay_ns = sdk.random_below(degrade_delay_ns_max),
+        .delay_ns = sdk.random_below_named("fault.degrade.delay_ns", degrade_delay_ns_max),
         .seed = sdk.random_u64(),
     };
     switch (flavor) {
         .delay_loss => {
-            netem.jitter_ns = sdk.random_below(degrade_delay_ns_max / 4);
-            const percent = sdk.random_below(degrade_loss_percent_max + 1);
+            netem.jitter_ns = sdk.random_below_named("fault.degrade.jitter_ns", degrade_delay_ns_max / 4);
+            const percent = sdk.random_below_named("fault.degrade.loss_percent", degrade_loss_percent_max + 1);
             netem.loss_ppm = @intCast(percent * (nodes.Netem.ppm / 100));
         },
-        .duplicate => netem.duplicate_percent = @intCast(1 + sdk.random_below(30)),
-        .corrupt => netem.corrupt_percent = @intCast(1 + sdk.random_below(10)),
+        .duplicate => netem.duplicate_percent = @intCast(1 + sdk.random_below_named("fault.degrade.duplicate_percent", 30)),
+        .corrupt => netem.corrupt_percent = @intCast(1 + sdk.random_below_named("fault.degrade.corrupt_percent", 10)),
         .reorder => {
             netem.delay_ns = 1 + netem.delay_ns; // Reordering needs a delay to jump.
-            netem.reorder_percent = @intCast(1 + sdk.random_below(50));
+            netem.reorder_percent = @intCast(1 + sdk.random_below_named("fault.degrade.reorder_percent", 50));
         },
         .congestion => {
             const rate_min = 10 * 1024;
-            netem.rate_bytes_per_second = @intCast(rate_min + sdk.random_below(1024 * 1024));
+            netem.rate_bytes_per_second = @intCast(rate_min + sdk.random_below_named("fault.degrade.rate", 1024 * 1024));
         },
         // Losses in bursts (docs/SWARM.md, part 7): 1 to 5% of packets start one, each lasts 2
         // to 10 packets on average (leaving at 10 to 50%), every packet in it lost.
         .burst_loss => {
-            netem.burst_enter_ppm = @intCast(10_000 + sdk.random_below(40_001));
-            netem.burst_leave_ppm = @intCast(100_000 + sdk.random_below(400_001));
+            netem.burst_enter_ppm = @intCast(10_000 + sdk.random_below_named("fault.degrade.burst_enter_ppm", 40_001));
+            netem.burst_leave_ppm = @intCast(100_000 + sdk.random_below_named("fault.degrade.burst_leave_ppm", 400_001));
         },
     }
     return netem;
@@ -4471,7 +4482,7 @@ fn injected_applied(system: *const schema.System, request: *const Request) !Appl
         },
         .pod_degrade => {
             applied.process_index = @intCast(sdk.random_below(processes_max));
-            const flavor = sdk.random_choice(Degradation, std.enums.values(Degradation));
+            const flavor = choice_named(Degradation, "fault.degrade.flavor", std.enums.values(Degradation));
             applied.flavor = flavor;
             applied.netem = degradation(flavor);
         },
@@ -4543,8 +4554,8 @@ fn injected_applied(system: *const schema.System, request: *const Request) !Appl
         .disk => applied.disk = .{
             .failure = request.failure,
             .delay_ms = request.delay_ms,
-            .corrupt_byte = @intCast(1 + sdk.random_below(disk_sector_size)),
-            .corrupt_value = request.corrupt_value orelse @intCast(sdk.random_below(256)),
+            .corrupt_byte = @intCast(1 + sdk.random_below_named("fault.disk.corrupt_byte", disk_sector_size)),
+            .corrupt_value = request.corrupt_value orelse @intCast(sdk.random_below_named("fault.disk.corrupt_value", 256)),
             .file = try request_string_kept(request.file),
         },
         else => {},
