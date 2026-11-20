@@ -4579,7 +4579,7 @@ fn claims_look(state: *TreeState, pool: ?*cpus.Pool, running: []Running, jobs: u
     // this line). What it learns comes later: its looks count once as many timelines ended as
     // it has workers, and while every worker has one.
     if (state.claims_looked_ns == 0) say("[determinismo] the run's VMs claim their " ++
-        "guest's {d} MiB each until it learns what the host holds for each (looks every {d} s " ++
+        "guest's {d} MiB each until it learns what one holds of its own (looks every {d} s " ++
         "from its {d}th timeline's end, while every worker has one)\n", .{
         cpus.claim_bytes >> 20, claims_look_ns / std.time.ns_per_s, jobs,
     });
