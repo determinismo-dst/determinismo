@@ -1637,10 +1637,14 @@ fn check_plugin_faults(context: *Context) !void {
     const events = try std.fs.path.join(arena, &.{ context.scratch, "plugin-fault-events" });
     const plain_events = try std.fs.path.join(arena, &.{ context.scratch, "plugin-fault-plain" });
     const common = [_][]const u8{ "--program", program, "--scenario", "bank", "--seed", "5", "--no-swarm" };
+    // Its fault picked whenever a fault is drawn (the guest's "fault" decision, by its name):
+    // drawn among the node's two dozen others it came or not by the seed's draws, which move
+    // with the inputs (on d50a4e6's guest, "drawn 0" three times in one check tree, drawn in
+    // another, 2026-11-20).
     const report = try explore(context, &(common ++ [_][]const u8{
         "--branches",   "4",                                                                                       "--jobs",     "2",
         "--strategy",   "python3 plugins/python/plugin_faults.py redis /usr/local/bin/redis-cli CLIENT PAUSE 200", "--tape-dir", tapes,
-        "--events-dir", events,
+        "--events-dir", events,                                                                                    "--decide",   "fault=custom redis /usr/local/bin/redis-cli CLIENT PAUSE 200",
     }));
     _ = try explore(context, &(common ++ [_][]const u8{ "--branches", "4", "--jobs", "2", "--events-dir", plain_events }));
     var branches: [4]Branch = undefined;
