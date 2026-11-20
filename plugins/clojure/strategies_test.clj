@@ -86,6 +86,32 @@
     (testing "half the returns aimed, the rest the explorer's rule"
       (is (= [4 9] (mapv :branch (s/trace-target-returns 1 [(candidate 4 "x") (candidate 9 "y")] 2)))))))
 
+(deftest a-branch-point-whose-children-never-climb-loses-its-turn
+  (s/ladder-target! :double-vote)
+  (let [ns 1000000000
+        late (fn [index at] (s/trace-target-event (atom {:index index})
+                                                  {:vtime_ns at :event {:output {:source "raft-node-1" :text "x [DEBUG] node-1: updated currentTerm: term=4"}}}))
+        start (fn [index from] (s/trace-target-start (atom {}) {:index index :from from})
+                (s/trace-target-event (atom {:index index})
+                                      {:vtime_ns 0 :event {:output {:source "raft-node-1" :text "x [DEBUG] node-1: updated currentTerm: term=5"}}}))
+        pick (fn [] (:branch (first (s/trace-frontier 1 [(candidate 4 "x") (candidate 5 "y")] 1))))]
+    (start 4 nil) (late 4 (* 3 ns))
+    (start 5 nil) (late 5 (* 2 ns))
+    (testing "both at rung 1: the later one first"
+      (is (= 4 (pick))))
+    (testing "three children of 4's moment, none climbing: 5's turn"
+      (doseq [child [20 21 22]] (s/trace-target-start (atom {}) {:index child :from {:branch 4 :vtime_ns (+ (* 3 ns) 1000)}}))
+      (is (= 5 (pick))))
+    (testing "a child that climbs counts for its point, not against it"
+      (doseq [child [23 24 25]] (s/trace-target-start (atom {}) {:index child :from {:branch 5 :vtime_ns (+ (* 2 ns) 1000)}}))
+      (is (= 4 (pick)) "5's three failures equal 4's: the later again")
+      (s/trace-target-event (atom {:index 25})
+                            {:vtime_ns (* 4 ns) :event {:output {:source "raft-node-1" :text "x [DEBUG] node-1: granted vote: term=4 candidate=10.0.0.5:8300"}}})
+      (s/trace-target-event (atom {:index 25})
+                            {:vtime_ns (* 5 ns) :event {:output {:source "raft-node-1" :text "x [DEBUG] node-1: granted vote: term=4 candidate=10.0.0.3:8300"}}})
+      (is (= 2 (get-in @s/trace-progress [25 :best])))
+      (is (= 5 (pick)) "5's point has a climb now: two failures to 4's three"))))
+
 (deftest the-agent-arm-steers-a-timelines-next-step-with-the-options-it-chose
   (reset! s/trace-target {:steps [{:action "starting_leadership_transfer" :role 0}
                                   {:action "leadership_transfer_timeout" :role 0}]})

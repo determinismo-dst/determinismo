@@ -1103,7 +1103,8 @@
   (if (:ladder @trace-target)
     (ladder-start index from)
   (let [states (inherited from)]
-    (swap! trace-progress assoc index {:start states :states states :history [] :best (trace-best states)}))))
+    (swap! trace-progress assoc index {:start states :states states :history [] :best (trace-best states)
+                                       :from (:branch from) :from-best (trace-best states)}))))
 
 (def trace-recent-max 40)
 
@@ -1202,7 +1203,8 @@
 (defn- ladder-start [index from]
   (let [state (if from (ladder-state-at (get @trace-progress (:branch from)) (:vtime_ns from)) {})]
     (swap! trace-progress update index merge
-           {:ladder-start state :ladder-state state :ladder-events [] :best (:level state 0)})))
+           {:ladder-start state :ladder-state state :ladder-events [] :best (:level state 0)
+            :from (:branch from) :from-best (:level state 0)})))
 
 (defn- ladder-event [index vtime_ns event]
   (when (ladder-names (:event event))
@@ -1215,19 +1217,39 @@
                                             (update :ladder-events (fnil conj []) [vtime_ns event]))
                                   (> (:level after 0) best) (assoc :best_ns vtime_ns))))))))
 
+(defn trace-point-tries
+  "Each branch point's tries and climbs, from the branches the run has: a point is a timeline at
+  the progress it had made (its moment just after its furthest step, or any later moment with no
+  further step), a try a branch started there, a climb one that went past that progress."
+  []
+  (reduce (fn [tries {:keys [from from-best best]}]
+            (if from
+              (update tries [from from-best]
+                      (fn [{:keys [tried climbed] :or {tried 0 climbed 0}}]
+                        {:tried (inc tried) :climbed (+ climbed (if (> (or best 0) from-best) 1 0))}))
+              tries))
+          {} (vals @trace-progress)))
+
 (defn trace-frontier
   "The candidates whose own events advanced the target furthest, each its moment just after its
-  furthest step."
+  furthest step, a point's turn falling as its branches fail to go further: its progress over the
+  square root of one plus its failed tries (tries no climb came from), so a point tried three
+  times without a climb waits behind an untried one of the same progress, and one a step further
+  stays ahead until it has failed three times as well."
   [generation candidates count]
-  (let [steps (clojure.core/count (:steps @trace-target))]
+  (let [steps (clojure.core/count (:steps @trace-target))
+        tries (trace-point-tries)]
     (->> candidates
          (keep (fn [c]
-                 (let [{:keys [best best_ns]} (get @trace-progress (:branch c))]
+                 (let [{:keys [best best_ns]} (get @trace-progress (:branch c))
+                       {:keys [tried climbed] :or {tried 0 climbed 0}} (get tries [(:branch c) best])
+                       failed (max 0 (- tried climbed))]
                    (when (and best best_ns (pos? best) (<= best_ns (room-end c)))
-                     {:score best
+                     {:score (/ best (Math/sqrt (inc failed)))
                       :branch (:branch c)
                       :vtime_ns (clamp-moment c (+ best_ns 1000))
-                      :reason (str "trace-target: " best " of " steps " steps matched (generation " generation ")")}))))
+                      :reason (str "trace-target: " best " of " steps " steps, " tried " tries there, "
+                                   climbed " went further (generation " generation ")")}))))
          (sort-by (fn [r] [(- (:score r)) (- (:vtime_ns r))]))
          (take count))))
 
