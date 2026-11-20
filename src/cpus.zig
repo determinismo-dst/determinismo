@@ -1607,6 +1607,10 @@ pub const ClaimLearning = struct {
     /// (its VMs young, or few) took it down: ParadeDB's run 2098 went from 4.0 to 2.2 GiB at its
     /// generation 2's, as it was about to admit VMs that grow to 2.7 GiB each.
     held_max: u64 = 0,
+    /// Before as many timelines ended as the run has workers: what its VMs held at its last
+    /// plateau_looks looks counted, the oldest next written.
+    recent: [plateau_looks]u64 = @splat(0),
+    recent_count: u32 = 0,
     /// The run said a claim under its guests' size.
     softened: bool = false,
     /// Memory ran short after that: its claims are its guests' size for good.
@@ -1622,10 +1626,33 @@ pub const ClaimLearning = struct {
     /// counted the holders, serve and other runs on a few VMs: ParadeDB's run 2095 went back to
     /// its 32 GiB guests from 23 GiB "a VM" with 1 or 2 admitted, while its one running VM held
     /// 2.25 GB of its own; 1 VM at a time for hours.
+    /// Before as many timelines ended as it has workers, it learns once what its VMs hold stopped
+    /// growing: no more than plateau_growth over a minute of looks (claims_look's every 5 s). A
+    /// run of long timelines waited hours for its workers' count of ends at its guests' size:
+    /// ParadeDB's proptests (run 2098), 13 minutes a timeline, 4 VMs of 32 GiB for 2.5 hours,
+    /// while each held its 2.6 GB of its own within its first 2 minutes (and 2.7 GB at most).
     pub fn sample(learning: *ClaimLearning, held: u64, admitted: u32, workers: u32, jobs: u32, ended: u64) void {
-        if (ended < jobs or admitted == 0 or workers < jobs) return;
-        learning.held_max = @max(learning.held_max, held);
+        if (admitted == 0 or workers < jobs) return;
+        if (ended >= jobs) {
+            learning.held_max = @max(learning.held_max, held);
+            return;
+        }
+        // The look plateau_looks ago, overwritten by this one.
+        const at = learning.recent_count % plateau_looks;
+        const before = learning.recent[at];
+        learning.recent[at] = held;
+        learning.recent_count += 1;
+        if (learning.recent_count <= plateau_looks) return;
+        if (held > before + before / plateau_growth) return; // Still growing.
+        var most: u64 = 0;
+        for (learning.recent) |look| most = @max(most, look);
+        learning.held_max = @max(learning.held_max, most);
     }
+
+    /// A minute of looks (claims_look_ns apart), over which what the VMs hold has stopped growing
+    /// when it grew by no more than a fiftieth.
+    pub const plateau_looks = 13;
+    const plateau_growth = 50;
 
     /// The claim to say for a VM of `guest` bytes: half again what one held at most; 0 (its
     /// guest's size) while nothing is learned, where that is no less, and once memory ran
@@ -1694,6 +1721,36 @@ test "what a VM held at most stays, however long the run's VMs are young after (
     try std.testing.expect(grown > 4 * gib - gib / 8 and grown < 4 * gib + gib / 8);
     for (0..1000) |_| learning.sample(1536 * mib, 3, 40, 40, 109);
     try std.testing.expectEqual(grown, learning.claim(32 * gib));
+}
+
+test "before its workers' count of timelines ended, a run learns once what its VMs hold stopped growing" {
+    const mib: u64 = 1 << 20;
+    const gib: u64 = 1 << 30;
+    // ParadeDB's run 2098: 4 VMs admitted of 40 workers, none ended; its VMs at 2.2, 2.4, 2.55
+    // then 2.6 GB of their own.
+    var learning: ClaimLearning = .{};
+    for ([_]u64{ 2200, 2400, 2550 }) |held| learning.sample(held * mib, 4, 40, 40, 0);
+    try std.testing.expectEqual(@as(u64, 0), learning.claim(32 * gib)); // Growing: not yet.
+    for (0..ClaimLearning.plateau_looks - 3) |_| learning.sample(2600 * mib, 4, 40, 40, 0);
+    try std.testing.expectEqual(@as(u64, 0), learning.claim(32 * gib)); // Less than a minute flat.
+    for (0..3) |_| learning.sample(2600 * mib, 4, 40, 40, 0);
+    try std.testing.expectEqual(3900 * mib, learning.claim(32 * gib));
+    // Memory that grows slowly, a hundredth a look: never flat, learned only once as many
+    // timelines ended as workers.
+    var slow: ClaimLearning = .{};
+    var held: u64 = 2000 * mib;
+    for (0..200) |_| {
+        slow.sample(held, 4, 40, 40, 10);
+        held += held / 100;
+    }
+    try std.testing.expectEqual(@as(u64, 0), slow.claim(32 * gib));
+    slow.sample(held, 4, 40, 40, 40);
+    try std.testing.expect(slow.claim(32 * gib) != 0);
+    // Workers without a timeline, or none of its VMs admitted: nothing counted.
+    var idle: ClaimLearning = .{};
+    for (0..100) |_| idle.sample(2 * gib, 0, 40, 40, 0);
+    for (0..100) |_| idle.sample(2 * gib, 4, 20, 40, 0);
+    try std.testing.expectEqual(@as(u64, 0), idle.claim(32 * gib));
 }
 
 test "memory short under a learned claim: the guest's size for good; never said, never short" {

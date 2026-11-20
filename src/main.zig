@@ -4582,11 +4582,12 @@ fn claims_look(state: *TreeState, pool: ?*cpus.Pool, running: []Running, jobs: u
     if (now -| state.claims_looked_ns < claims_look_ns) return;
     // Said at its first look: the explorer has a pool for its run's claims and looks (at
     // abfb598 it had none, returned here at once, and nothing said so; the tree check expects
-    // this line). What it learns comes later: its looks count once as many timelines ended as
-    // it has workers, and while every worker has one.
+    // this line). What it learns comes later, while every worker has a timeline: once what its
+    // VMs hold stopped growing for a minute, or once as many timelines ended as it has workers.
     if (state.claims_looked_ns == 0) say("[determinismo] the run's VMs claim their " ++
         "guest's {d} MiB each until it learns what one holds of its own (looks every {d} s " ++
-        "from its {d}th timeline's end, while every worker has one)\n", .{
+        "while every worker has one: once that stops growing for a minute, or from its {d}th " ++
+        "timeline's end)\n", .{
         cpus.claim_bytes >> 20, claims_look_ns / std.time.ns_per_s, jobs,
     });
     state.claims_looked_ns = now;
