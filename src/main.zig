@@ -4092,7 +4092,7 @@ fn explore_tree(
             makings_stop(pending.makings[0..pending.making_count]);
         };
         // A generation judged meanwhile: its branches planned once its nodes are all made.
-        if (judging) |*pending| if (try tree_judge_poll(arena, maker_start(vm, options, branches, &state), &state, pending)) {
+        if (judging) |*pending| if (try tree_judge_poll(arena, maker_start(vm, options, branches, &state), branches, &state, pending)) {
             try tree_judge_end(context, vm, options, branches, &state, &batch, pending);
             judging = null;
             continue;
@@ -5766,6 +5766,14 @@ const Judging = struct {
     makings: []NodeMaking,
     making_count: u32,
     reached_count: usize,
+    /// The makings whose branches are planned (a prefix: judge_plan_ready), the branches so far,
+    /// and the nodes made by where from (a holder in memory, one on disk, or a replay from the
+    /// parent's start, along its path from the setup snapshot for an earlier generation's).
+    planned: u32 = 0,
+    branches_planned: u32 = 0,
+    made: Made = .{},
+
+    const Made = struct { all: u32 = 0, held: u32 = 0, disk: u32 = 0, before: u32 = 0, gone: u32 = 0, unloaded: u32 = 0 };
 };
 
 /// A generation complete (the timelines that finished since the last): what each reached that
@@ -5789,7 +5797,7 @@ fn tree_judge(
 /// Whether every node of the generation being judged is made: the ones ready collected, those
 /// that waited for room started as it comes (makings_start), the others left to make (a child
 /// process each), without waiting.
-fn tree_judge_poll(arena: std.mem.Allocator, start: MakerStart, state: *TreeState, judging: *Judging) !bool {
+fn tree_judge_poll(arena: std.mem.Allocator, start: MakerStart, branches: Branches, state: *TreeState, judging: *Judging) !bool {
     const makings = judging.makings[0..judging.making_count];
     for (makings) |*making| {
         if (making.ready or making.waiting) continue;
@@ -5797,7 +5805,10 @@ fn tree_judge_poll(arena: std.mem.Allocator, start: MakerStart, state: *TreeStat
         const result = linux.poll(&poll_fds, 1, 0);
         if (linux.errno(result) == .SUCCESS and result > 0) node_make_finish(making);
     }
-    try makings_start(arena, start, makings, state.jobs, &state.nodes_skipped);
+    // The made prefix's branches planned now (not while holders are verified: that compares
+    // the nodes first, tree_judge_end): timelines start from the first nodes as later ones come.
+    if (!branches.arguments.verify_holders) try judge_plan_ready(arena, branches, state, judging);
+    try makings_start(arena, start, makings, state.jobs, runners_keep(state), &state.nodes_skipped);
     for (makings) |making| if (!making.ready) return false;
     return true;
 }
@@ -5809,6 +5820,69 @@ fn maker_start(vm: *VM, options: *const VM.Options, branches: Branches, state: *
         .tape_directory = branches.arguments.tape_directory,
         .tape_buffer = state.tape_buffer,
     };
+}
+
+/// The judgment's nodes made so far, their branches planned, in the makings' order: the made
+/// prefix not planned yet, each node's branches at the queue's planned end. Planned as they come
+/// (tree_judge_poll), timelines start from a judgment's first nodes while its later ones are
+/// made, where before every one waited for all: ParadeDB's run 2091, its generation's 6 nodes
+/// (134.5 GiB) made before any of their 32 branches could start beside them.
+fn judge_plan_ready(arena: std.mem.Allocator, branches: Branches, state: *TreeState, judging: *Judging) !void {
+    const makings = judging.makings[0..judging.making_count];
+    while (judging.planned < makings.len and makings[judging.planned].ready) : (judging.planned += 1) {
+        try judge_plan_one(arena, branches, state, judging, &makings[judging.planned]);
+    }
+}
+
+fn judge_plan_one(arena: std.mem.Allocator, branches: Branches, state: *TreeState, judging: *Judging, making: *NodeMaking) !void {
+    const snapshot = making.snapshot orelse return;
+    index_settle(state);
+    if (state.next_index >= state.total) {
+        node_free(snapshot, branches.snapshot); // Not needed after all.
+        return;
+    }
+    const parent = making.parent;
+    const back = making.back;
+    const at = back.vtime_ns;
+    judging.made.all += 1;
+    judging.made.held += @intFromBool(making.held);
+    judging.made.disk += @intFromBool(making.disk != null);
+    judging.made.before += @intFromBool(making.before_holders);
+    judging.made.gone += @intFromBool(making.holders_gone);
+    judging.made.unloaded += @intFromBool(making.unloaded);
+    const path = try arena.alloc(tape.Segment, parent.path.len + 1);
+    @memcpy(path[0..parent.path.len], parent.path);
+    path[parent.path.len] = .{
+        .branch = parent.index,
+        .seed = parent.seed,
+        .vtime_ns = at,
+        .jitter_seed = parent.jitter_seed,
+    };
+    for (0..(back.branches orelse state.children)) |_| {
+        index_settle(state);
+        if (state.next_index >= state.total) break;
+        try queue_push(arena, state, .{
+            .index = state.next_index,
+            .seed = branch_seed(state.base, state.next_index),
+            .snapshot = snapshot,
+            .path = path,
+            .generation = judging.generation + 1,
+            .why = back.why,
+            .cell = back.cell,
+            // A strategy's horizon as it gave it; `--horizon` drawn per timeline.
+            .horizon_ns = if (back.horizon_ns) |horizon|
+                at + horizon
+            else if (branches.arguments.horizon_ns) |horizon|
+                at + horizon_drawn(horizon, branch_seed(state.base, state.next_index))
+            else
+                null,
+            .disk_origin = if (making.disk) |on_disk| .{ .branch = on_disk.branch, .vtime_ns = on_disk.held.vtime_ns } else null,
+            .jitter_seed = parent.jitter_seed, // Its parent's clock, unless its strategy chooses one.
+        });
+        state.next_index += 1;
+        returns_planned += 1;
+        judging.branches_planned += 1;
+    }
 }
 
 /// A generation judged up to its nodes, started (tree_judge_poll collects them, tree_judge_end
@@ -6030,7 +6104,7 @@ fn tree_judge_begin(
         // (the returns' order): started as room comes, the explorer's loop going on
         // (makings_start; waiting here for one in flight to answer stopped the loop for 43% of
         // etcd's 12-hour run 2007).
-        if (waiting or !maker_may_start(makings[0..making_count], state.jobs, cpus.memory_available())) {
+        if (waiting or !maker_may_start(makings[0..making_count], state.jobs, cpus.memory_available(), runners_keep(state))) {
             waiting = true;
             makings[making_count].waiting = true;
             makings[making_count].waited = true;
@@ -6044,7 +6118,7 @@ fn tree_judge_begin(
         }
         making_count += 1;
     }
-    if (waiting) try makings_start(arena, maker_start(vm, options, branches, state), makings[0..making_count], state.jobs, &state.nodes_skipped);
+    if (waiting) try makings_start(arena, maker_start(vm, options, branches, state), makings[0..making_count], state.jobs, runners_keep(state), &state.nodes_skipped);
     // The next generation fills the spare summaries meanwhile, from those carried; this one's
     // stay the Judging's.
     const carried = summaries.count - judged;
@@ -6118,64 +6192,11 @@ fn tree_judge_end(
         snapshots_compare(making.back, held_node, replay_node);
         node_free(replay_node, branches.snapshot);
     };
-    const planned_before = state.queue.items.len;
-    var made: u32 = 0;
-    // The nodes made, by where from: a holder in memory, one on disk, or a replay from the
-    // parent's start (along its path, from the setup snapshot, for an earlier generation's).
-    var made_held: u32 = 0;
-    var made_disk: u32 = 0;
-    var made_before: u32 = 0;
-    var made_gone: u32 = 0;
-    var made_unloaded: u32 = 0;
-    for (makings[0..making_count]) |*making| {
-        const snapshot = making.snapshot orelse continue;
-        index_settle(state);
-        if (state.next_index >= state.total) {
-            node_free(snapshot, branches.snapshot); // Not needed after all.
-            continue;
-        }
-        const parent = making.parent;
-        const back = making.back;
-        const at = back.vtime_ns;
-        made += 1;
-        made_held += @intFromBool(making.held);
-        made_disk += @intFromBool(making.disk != null);
-        made_before += @intFromBool(making.before_holders);
-        made_gone += @intFromBool(making.holders_gone);
-        made_unloaded += @intFromBool(making.unloaded);
-        const path = try arena.alloc(tape.Segment, parent.path.len + 1);
-        @memcpy(path[0..parent.path.len], parent.path);
-        path[parent.path.len] = .{
-            .branch = parent.index,
-            .seed = parent.seed,
-            .vtime_ns = at,
-            .jitter_seed = parent.jitter_seed,
-        };
-        for (0..(back.branches orelse state.children)) |_| {
-            index_settle(state);
-            if (state.next_index >= state.total) break;
-            try queue_push(arena, state, .{
-                .index = state.next_index,
-                .seed = branch_seed(state.base, state.next_index),
-                .snapshot = snapshot,
-                .path = path,
-                .generation = generation + 1,
-                .why = back.why,
-                .cell = back.cell,
-                // A strategy's horizon as it gave it; `--horizon` drawn per timeline.
-                .horizon_ns = if (back.horizon_ns) |horizon|
-                    at + horizon
-                else if (branches.arguments.horizon_ns) |horizon|
-                    at + horizon_drawn(horizon, branch_seed(state.base, state.next_index))
-                else
-                    null,
-                .disk_origin = if (making.disk) |on_disk| .{ .branch = on_disk.branch, .vtime_ns = on_disk.held.vtime_ns } else null,
-                .jitter_seed = parent.jitter_seed, // Its parent's clock, unless its strategy chooses one.
-            });
-            state.next_index += 1;
-            returns_planned += 1;
-        }
-    }
+    // The nodes made, their branches planned in the makings' order: those planned as they
+    // came (tree_judge_poll), the rest here.
+    try judge_plan_ready(arena, branches, state, judging);
+    assert(judging.planned == making_count);
+    const made = judging.made;
     // These timelines served their start snapshots (a snapshot goes with its last timeline;
     // the setup snapshot is everyone's: never freed).
     for (plan.items) |entry| node_served(state, entry.snapshot);
@@ -6185,7 +6206,8 @@ fn tree_judge_end(
             "the host's memory\n", .{state.nodes_skipped});
     }
     // As many planned as judged: the rest start over from the setup snapshot.
-    while (state.queue.items.len - planned_before < done.len) : (state.next_index += 1) {
+    var planned = judging.branches_planned;
+    while (planned < done.len) : (state.next_index += 1) {
         index_settle(state);
         if (state.next_index >= state.total) break;
         try queue_push(arena, state, .{
@@ -6196,6 +6218,7 @@ fn tree_judge_end(
             .why = "From the setup snapshot: some timelines of every generation start " ++
                 "over, so the tree does not only deepen.",
         });
+        planned += 1;
     }
     activity.interval(.judge, activity.ms_of_monotonic(judging.start_ns), activity.now_ms(), .{});
     activity.found(judging.reached_count, state.seen.count());
@@ -6206,7 +6229,7 @@ fn tree_judge_end(
         "{d} replayed from the parent's start, {d} of them before its first holder, {d} with its holders before it taken or gone, " ++
         "{d} with a holder on disk that did not load); " ++
         "judged in {d:.1} s (timelines going on meanwhile, {d} of its makers waited for room); a timeline's ending {d:.0} s ({d} measured)\n", .{
-        generation,                                                                     done.len,      judging.reached_count,                                                state.seen.count(),         made, made_held, made_disk, made - made_held - made_disk, made_before, made_gone, made_unloaded,
+        generation,                                                                     done.len,      judging.reached_count,                                                state.seen.count(),         made.all, made.held, made.disk, made.all - made.held - made.disk, made.before, made.gone, made.unloaded,
         @as(f64, @floatFromInt(monotonic_ns() - judging.start_ns)) / std.time.ns_per_s, makers_waited, @as(f64, @floatFromInt(state.novelty.cost_ms())) / std.time.ms_per_s, state.novelty.ending_count,
     });
     // Its summaries the spare ones again (the next judgment's).
@@ -7107,11 +7130,23 @@ fn makings_in_flight(makings: []const NodeMaking) u32 {
 }
 
 /// Whether one more maker may start beside those in flight: a job for it, and room for its VM
-/// (maker_room; the first of them starts whatever the memory: its own admission waits).
-fn maker_may_start(makings: []const NodeMaking, jobs: u32, available: u64) bool {
+/// (maker_room) with `keep` left for the timelines planned and waiting to run (runners_keep).
+/// With none waiting, the first of them starts whatever the memory (its own admission waits).
+/// Made while their branches waited for room, a judgment's nodes took the host: ParadeDB's run
+/// 2091, 134.5 GiB of nodes before any of their 32 GiB VMs could start.
+fn maker_may_start(makings: []const NodeMaking, jobs: u32, available: u64, keep: u64) bool {
     const in_flight = makings_in_flight(makings);
     if (in_flight >= jobs) return false;
-    return in_flight == 0 or maker_room(available, cpus.reserve_bytes(), cpus.claim_bytes, in_flight);
+    if (in_flight == 0 and keep == 0) return true;
+    return maker_room(available, cpus.reserve_bytes() + keep, cpus.claim_bytes, in_flight);
+}
+
+/// The room a judgment's makers leave: a VM's, while timelines it planned (not the filler's,
+/// started only to keep CPUs busy) wait to run; none otherwise. Memory admission keeps one of
+/// those running whatever its nodes hold (cpus.Pool.stalled_alone), so nodes come as their
+/// branches go.
+fn runners_keep(state: *const TreeState) u64 {
+    return if (state.filler_start > state.queue_head) cpus.claim_bytes else 0;
 }
 
 /// What starts a maker: the tapes' directory and the buffer a parent's tape is loaded in (one
@@ -7151,11 +7186,11 @@ fn maker_begin(arena: std.mem.Allocator, start: MakerStart, making: *NodeMaking)
 /// to 16 GB available, made its nodes 1.5 at a time and its explorer was in that wait for 43%
 /// of its time (68 gaps over 30 s in its samples, 13,901 s of 32,227 s; a drain taken up
 /// after 3 min 37 s, 405 children ended and not collected).
-fn makings_start(arena: std.mem.Allocator, start: MakerStart, makings: []NodeMaking, jobs: u32, skipped: *u32) !void {
+fn makings_start(arena: std.mem.Allocator, start: MakerStart, makings: []NodeMaking, jobs: u32, keep: u64, skipped: *u32) !void {
     var waiting = false;
     for (makings) |*making| {
         if (!making.waiting) continue;
-        if (!maker_may_start(makings, jobs, cpus.memory_available())) {
+        if (!maker_may_start(makings, jobs, cpus.memory_available(), keep)) {
             waiting = true;
             break;
         }
@@ -7230,7 +7265,7 @@ test makings_stop {
 /// or a judgment made in one go).
 fn makings_finish_all(arena: std.mem.Allocator, start: MakerStart, makings: []NodeMaking, jobs: u32, skipped: *u32) !void {
     while (true) {
-        try makings_start(arena, start, makings, jobs, skipped);
+        try makings_start(arena, start, makings, jobs, 0, skipped);
         if (makings_in_flight(makings) == 0) break; // None waits then: the first always starts.
         makings_finish_any(makings);
     }
@@ -7295,24 +7330,27 @@ test "a maker short of room waits, not the explorer: the one in flight is left t
     // does not start, and the question comes back at once with the one in flight left alone
     // (the explorer waited for it here, its loop stopped: 2 s in this test).
     const start_ns = monotonic_ns();
-    try std.testing.expect(!maker_may_start(&makings, 40, reserve + 6 * gib));
+    try std.testing.expect(!maker_may_start(&makings, 40, reserve + 6 * gib, 0));
     try std.testing.expect(monotonic_ns() - start_ns < std.time.ns_per_s);
     try std.testing.expect(!makings[0].ready);
     try std.testing.expectEqual(@as(u32, 1), makings_in_flight(&makings));
     // Room for the one in flight and the next: it starts. Not for a third beside two.
-    try std.testing.expect(maker_may_start(&makings, 40, reserve + 8 * gib));
+    try std.testing.expect(maker_may_start(&makings, 40, reserve + 8 * gib, 0));
     makings[1].waiting = false; // Started (in flight: neither ready nor waiting).
-    try std.testing.expect(!maker_may_start(&makings, 40, reserve + 8 * gib));
-    try std.testing.expect(maker_may_start(&makings, 40, reserve + 12 * gib));
+    try std.testing.expect(!maker_may_start(&makings, 40, reserve + 8 * gib, 0));
+    try std.testing.expect(maker_may_start(&makings, 40, reserve + 12 * gib, 0));
     makings[1].waiting = true;
     // A job for each: none beside as many in flight as the run has, whatever the memory.
-    try std.testing.expect(!maker_may_start(&makings, 1, reserve + 64 * gib));
+    try std.testing.expect(!maker_may_start(&makings, 1, reserve + 64 * gib, 0));
     // The memory unknown: never a reason to wait.
-    try std.testing.expect(maker_may_start(&makings, 40, 0));
+    try std.testing.expect(maker_may_start(&makings, 40, 0, 0));
     // None in flight: the first starts whatever the memory (its own admission waits).
     node_make_finish(&makings[0]);
     try std.testing.expect(makings[0].ready);
-    try std.testing.expect(maker_may_start(&makings, 40, 1 * gib));
+    try std.testing.expect(maker_may_start(&makings, 40, 1 * gib, 0));
+    // Timelines planned and waiting to run: a VM's room is kept for them, the first maker too.
+    try std.testing.expect(!maker_may_start(&makings, 40, reserve + 6 * gib, 4 * gib));
+    try std.testing.expect(maker_may_start(&makings, 40, reserve + 8 * gib, 4 * gib));
     // Those that wait are not started in a run that starts no timeline any more.
     makings_cancel(&makings);
     for (makings) |making| try std.testing.expect(making.ready and !making.waiting);
