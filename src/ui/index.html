@@ -825,7 +825,7 @@ function reportBodyHtml(part) {
   const charts = sectionHtml("charts", "Charts", "behaviors discovered, failing properties, the run's activity",
     chartsHtml() + activityHtml(), state.open.has("charts"));
   return statsHtml() + part.findings() + part.properties() + charts + part.origins() + part.triage()
-    + part.logged() + part.changed() + appendix(["environment", "utilization", "decisions", "ranges", "explored"]);
+    + part.labels() + part.logged() + part.changed() + appendix(["environment", "utilization", "decisions", "ranges", "explored"]);
 }
 
 // Keyboard focus survives a re-render (a running run's page re-renders every few seconds, which
@@ -907,6 +907,7 @@ function renderPage() {
       properties: () => sectionHtml("properties", "Properties", propertiesSummary(), propertiesBody(), isOpen("properties")),
       origins: () => sectionHtml("origins", "Where failures came from", "timelines by how they began", `<div id="origins-body" class="muted"><span class="loading" role="status" aria-label="Loading"></span></div>`, isOpen("origins")),
       triage: () => sectionHtml("triage", "Triage", "hypotheses, each checked by a replay", `<div id="triage-body" class="muted"><span class="loading" role="status" aria-label="Loading"></span></div>`, isOpen("triage")),
+      labels: () => sectionHtml("labels", "Labels", "what checker plugins say of its timelines, asked after it ended", labelsBodyHtml(), isOpen("labels")),
       logged: () => sectionHtml("logged", "Logged errors", "what the nodes logged as errors, no property reading them", `<div id="logged-body" class="muted"><span class="loading" role="status" aria-label="Loading"></span></div>`, isOpen("logged")),
       changed: () => run.changed ? sectionHtml("changed", "Changed code", changedSummary(run.changed), changedBody(run.changed), isOpen("changed")) : "",
       environment: () => sectionHtml("environment", "Environment", environmentSummary(), environmentBody(), isOpen("environment")),
@@ -948,6 +949,7 @@ function renderPage() {
   outputDraw();
   findingsLoad();
   triageLoad();
+  labelsWire();
   if (isOpen("logged")) loggedLoad();
   if ($("#discovery")) discoveryDraw();
   activityDraw();
@@ -2235,6 +2237,57 @@ function replaysDraw(box, replays) {
     : `<div class="muted">No timeline replayed yet.</div>`;
   box.querySelectorAll("tr.clickable").forEach((row) => row.addEventListener("click", () =>
     logsOpen(Number(row.dataset.branch), 0)));
+}
+
+// Labels (determinismo label, POST /runs/<id>/label): checker plugins told the run's stored
+// timelines and asked to check each, as the run would have; their verdicts by message, each with
+// the timelines it held in and failed in. A known bug's signature labels the runs made before it
+// was known (plugins/python/signatures.py: "@<upload>" or a command on serve's host).
+let labelsTimer = null;
+function labelsBodyHtml() {
+  return `<div style="margin:6px 0">
+      <input id="label-strategy" class="mono" style="width:60%" placeholder="@my-labels, or python3 plugins/python/signatures.py name=regex"
+        title="A checker plugin: an upload (@name) or a command on serve's host">
+      <button id="label-start">Label</button></div>
+    <div id="labels-list" class="muted"><span class="loading" role="status" aria-label="Loading"></span></div>`;
+}
+function labelsWire() {
+  $("#label-start")?.addEventListener("click", async () => {
+    const strategy = ($("#label-strategy")?.value || "").trim();
+    if (!strategy) return;
+    try { await apiJson(`/runs/${state.runId}/label`, { strategy }); }
+    catch (error) { $("#labels-list").innerHTML = `<div class="fail-text">Label: ${escape(error.message)}</div>`; return; }
+    labelsLoad();
+  });
+  labelsLoad();
+}
+async function labelsLoad() {
+  const box = $("#labels-list");
+  if (!box) return;
+  const run = state.runId;
+  let list;
+  try { list = await apiJson(`/runs/${run}/label`); } catch { box.innerHTML = ""; return; }
+  if (run !== state.runId) return;
+  const summary = $("#labels .summary");
+  if (summary && list.length) summary.textContent = `${list.length} labeling${list.length > 1 ? "s" : ""}`;
+  const timelines = (branches) => branches.slice(0, 16).map((branch) =>
+    `<span class="link mono" data-branch="${branch}" style="cursor:pointer">#${branch}</span>`).join(" ")
+    + (branches.length > 16 ? ` <span class="muted">and ${branches.length - 16} more</span>` : "");
+  box.classList.toggle("muted", list.length === 0);
+  box.innerHTML = list.length === 0 ? "None yet." : list.slice().reverse().map((job) => {
+    const asked = job.of && job.of.strategy ? `<div class="mono muted" style="font-size:12px">${escape(job.of.strategy)}</div>` : "";
+    const result = job.result && job.result.label;
+    if (!result) return `<div style="margin:8px 0">${asked}<div class="muted">${job.done ? "Ended without a result" : "Labeling…"}
+      <span class="mono">${escape(job.progress || "")}</span></div></div>`;
+    const rows = result.labels.map((label) => `<tr><td>${escape(label.message)}</td><td class="muted">${escape(label.type)}</td>
+      <td>${label.held.length} ${timelines(label.held)}</td><td>${label.failed.length ? `<span class="fail-text">${label.failed.length}</span> ${timelines(label.failed)}` : "0"}</td></tr>`).join("");
+    return `<div style="margin:8px 0">${asked}
+      <div class="muted">${result.timelines} timelines read, ${result.verdicts} verdicts</div>
+      ${result.labels.length ? `<table><tr><th>Message</th><th>Type</th><th>Held in</th><th>Failed in</th></tr>${rows}</table>` : ""}</div>`;
+  }).join("");
+  box.querySelectorAll("[data-branch]").forEach((link) => link.addEventListener("click", () => timelineOpen(Number(link.dataset.branch))));
+  clearTimeout(labelsTimer);
+  if (list.some((job) => !job.done) && run === state.runId) labelsTimer = setTimeout(labelsLoad, 5000);
 }
 
 // Findings: what changed since the previous run of the same system and scenario.
