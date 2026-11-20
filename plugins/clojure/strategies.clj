@@ -1014,13 +1014,12 @@
       (if before (second before) (or start #{})))
     #{}))
 
-(defn trace-target-start [state {:keys [index from] :as request}]
-  (jev-follow-start state request)
+(defn trace-target-start [state {:keys [index from]}]
+  (swap! state assoc :index index)
   (let [states (inherited from)]
     (swap! trace-progress assoc index {:start states :states states :history [] :best (trace-best states)})))
 
-(defn trace-target-event [state {:keys [vtime_ns event] :as request}]
-  (jev-follow-event state request)
+(defn trace-target-event [state {:keys [vtime_ns event]}]
   (when-let [steps (:steps @trace-target)]
     (when (and (string? (:event event)) (event-node event))
       (let [index (:index @state)]
@@ -1075,12 +1074,13 @@
 (def trace-agent-chance 0.7)
 (def trace-agent-events-max 20)
 (def trace-agent-stalls-max 3)
+(def trace-agent-options-max 48)
 
 (defn trace-agent-event [state {:keys [event] :as request}]
   (trace-target-event state request)
   (when (map? (:decision event))
     (let [{label :name options :options} (:decision event)]
-      (when (and (string? label) (< 1 (clojure.core/count options) (inc jev-options-max)))
+      (when (and (string? label) (< 1 (clojure.core/count options) (inc trace-agent-options-max)))
         (swap! trace-decisions assoc label (vec options))))))
 
 (defn- trace-stalls
