@@ -20,6 +20,71 @@
   (reset! s/fault-learned {})
   (reset! s/council-learned {}))
 
+;; Model traces as targets: the Raft PoC's stuck leader (Quint's simulator, 3 steps at one node).
+(def stuck-itf
+  {:states [{(keyword "mbt::actionTaken") "init" (keyword "mbt::nondetPicks") {}}
+            {(keyword "mbt::actionTaken") "starting_leadership_transfer"
+             (keyword "mbt::nondetPicks") {:n {:tag "Some" :value "raft-node-1"} :t {:tag "Some" :value {:#bigint "5"}}}}
+            {(keyword "mbt::actionTaken") "leadership_transfer_timeout"
+             (keyword "mbt::nondetPicks") {:n {:tag "Some" :value "raft-node-1"}}}
+            {(keyword "mbt::actionTaken") "leadership_transfer_in_progress"
+             (keyword "mbt::nondetPicks") {:n {:tag "Some" :value "raft-node-1"}}}]})
+
+(defn- event [name node] {:event name :details {:source node}})
+
+(deftest a-model-trace-is-a-target-of-roles
+  (let [file (java.io.File/createTempFile "stuck" ".itf.json")]
+    (spit file (cheshire.core/generate-string stuck-itf))
+    (is (= [{:action "starting_leadership_transfer" :role 0}
+            {:action "leadership_transfer_timeout" :role 0}
+            {:action "leadership_transfer_in_progress" :role 0}]
+           (:steps (s/target! (str file)))))))
+
+(deftest a-timelines-events-match-the-target-in-order-one-node-a-role
+  (let [steps [{:action "starting_leadership_transfer" :role 0}
+               {:action "leadership_transfer_timeout" :role 0}
+               {:action "leadership_transfer_in_progress" :role 0}]
+        run (fn [events] (s/trace-best (reduce #(s/trace-advance steps %1 %2) #{} events)))]
+    (testing "in order, at one node: the whole target"
+      (is (= 3 (run [(event "starting_leadership_transfer" "raft-node-0")
+                     (event "election_won" "raft-node-2")
+                     (event "leadership_transfer_timeout" "raft-node-0")
+                     (event "leadership_transfer_in_progress" "raft-node-0")]))))
+    (testing "another node's timeout is not this transfer's"
+      (is (= 1 (run [(event "starting_leadership_transfer" "raft-node-0")
+                     (event "leadership_transfer_timeout" "raft-node-1")]))))
+    (testing "a later transfer at another node is matched afresh, not stuck on the first's node"
+      (is (= 3 (run [(event "starting_leadership_transfer" "raft-node-0")
+                     (event "starting_leadership_transfer" "raft-node-1")
+                     (event "leadership_transfer_timeout" "raft-node-1")
+                     (event "leadership_transfer_in_progress" "raft-node-1")]))))
+    (testing "out of order: no further than the order allows"
+      (is (= 1 (run [(event "leadership_transfer_timeout" "raft-node-0")
+                     (event "starting_leadership_transfer" "raft-node-0")]))))))
+
+(deftest the-tree-returns-just-after-the-furthest-match-and-a-branch-inherits-its-parents
+  (reset! s/trace-target {:steps [{:action "starting_leadership_transfer" :role 0}
+                                  {:action "leadership_transfer_timeout" :role 0}
+                                  {:action "leadership_transfer_in_progress" :role 0}]})
+  (reset! s/trace-progress {})
+  (let [state (atom {})
+        ns 1000000000]
+    (s/trace-target-start state {:index 4 :from nil})
+    (s/trace-target-event state {:vtime_ns (* 2 ns) :event (event "starting_leadership_transfer" "raft-node-2")})
+    (s/trace-target-event state {:vtime_ns (* 5 ns) :event (event "leadership_transfer_timeout" "raft-node-2")})
+    (s/trace-target-start (atom {}) {:index 9 :from nil})
+    (testing "timeline 4 matched two steps: the return is just after its second"
+      (let [[aimed] (s/trace-frontier 1 [(candidate 4 "x") (candidate 9 "y")] 1)]
+        (is (= 4 (:branch aimed)))
+        (is (= (+ (* 5 ns) 1000) (:vtime_ns aimed)))))
+    (testing "a branch from timeline 4 at 6 s starts with its two steps; at 3 s with one"
+      (s/trace-target-start (atom {}) {:index 12 :from {:branch 4 :vtime_ns (* 6 ns)}})
+      (is (= 2 (s/trace-best (get-in @s/trace-progress [12 :states]))))
+      (s/trace-target-start (atom {}) {:index 13 :from {:branch 4 :vtime_ns (* 3 ns)}})
+      (is (= 1 (s/trace-best (get-in @s/trace-progress [13 :states])))))
+    (testing "half the returns aimed, the rest the explorer's rule"
+      (is (= [4 9] (mapv :branch (s/trace-target-returns 1 [(candidate 4 "x") (candidate 9 "y")] 2)))))))
+
 (deftest rarity-is-the-explorers-whole-rule
   (fresh!)
   (testing "without an archive offered, the frontier alone (explorers before it)"

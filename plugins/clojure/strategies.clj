@@ -929,6 +929,135 @@
             {:hex (index-hex index size)
              :reason (str "nemesis: " (nth options index) ", at the leader (" leader ")")}))))))
 
+;; Model traces as targets -----------------------------------------------------------------------
+;; A Quint counterexample or witness (`quint run --mbt --out-itf <file>`: the actions taken, each
+;; with the simulator's picks) as a target for the explorer: its steps, each an action (an event's
+;; name) by a node, the nodes standing for whichever play their parts (the first node a step names
+;; is role 0, the next another role 1...). A timeline's progress is the target's longest prefix its
+;; events matched in order, each role one node throughout; a branch starts with its parent's
+;; matches up to its moment. `:trace-target` returns just after the furthest matches for half its
+;; returns and leaves the rest to the explorer's own rule; `:trace-target-agent` asks Claude where
+;; to return and what to steer (docs/QUINT.md). `(target! "stuck.itf.json")`, or the control port's
+;; "target <path>". The Raft PoC's stuck leader: starting_leadership_transfer(X),
+;; leadership_transfer_timeout(X), leadership_transfer_in_progress(X).
+
+(defonce trace-target (atom nil))   ; {:steps [{:action "..." :role 0}] :source path}
+(defonce trace-progress (atom {}))  ; branch index -> {:states #{{:k :bind}} :history [[at_ns states]]}
+(def trace-states-max 64)
+
+(defn- itf-plain
+  "An ITF value as plain data: bigints as numbers, maps, sets, tuples and variants unwrapped."
+  [v]
+  (cond
+    (map? v) (cond
+               (contains? v :#bigint) (bigint (:#bigint v))
+               (contains? v :#map) (into {} (for [[k x] (:#map v)] [(itf-plain k) (itf-plain x)]))
+               (contains? v :#set) (set (map itf-plain (:#set v)))
+               (contains? v :#tup) (mapv itf-plain (:#tup v))
+               (and (contains? v :tag) (contains? v :value)) {:tag (:tag v) :value (itf-plain (:value v))}
+               :else (into {} (for [[k x] v] [k (itf-plain x)])))
+    (sequential? v) (mapv itf-plain v)
+    :else v))
+
+(defn itf-steps
+  "A trace's steps after its init: each {:action :node}, the node its pick `n` (an Option's Some)."
+  [path]
+  (let [trace (json/parse-string (slurp path) true)]
+    (vec (for [state (rest (:states trace))
+               :let [action (get state (keyword "mbt::actionTaken"))
+                     pick (itf-plain (get-in state [(keyword "mbt::nondetPicks") :n]))
+                     node (when (and (map? pick) (= "Some" (:tag pick))) (:value pick))]
+               :when (and action (not= "init" action))]
+           {:action action :node node}))))
+
+(defn target-of
+  "Steps with their nodes as roles, numbered by first appearance."
+  [steps]
+  (let [roles (reduce (fn [roles {:keys [node]}] (if (or (nil? node) (contains? roles node)) roles (assoc roles node (count roles))))
+                      {} steps)]
+    (mapv (fn [{:keys [action node]}] {:action action :role (get roles node)}) steps)))
+
+(defn target! [path]
+  (reset! trace-target {:steps (target-of (itf-steps path)) :source path})
+  (reset! trace-progress {})
+  @trace-target)
+
+(defn- event-node [event]
+  (or (get-in event [:details :source]) (get-in event [:details :node])))
+
+(defn trace-advance
+  "The matches after `event` (a timeline's event, by name): each match whose next step it is, by a
+  node its role allows (the role's own node, or a node no other role has), one step further; the
+  matches before kept, and a fresh one ({:k 0}) always, so a later beginning is found too."
+  [steps states event]
+  (let [name (:event event)
+        node (event-node event)
+        moved (for [{:keys [k bind] :as state} (conj states {:k 0 :bind {}})
+                    :let [step (get steps k)]
+                    :when (and step node (= name (:action step)))
+                    :let [role (:role step) bound (get bind role)]
+                    :when (or (= bound node) (and (nil? bound) (not (some #{node} (vals bind)))))]
+                {:k (inc k) :bind (if (nil? role) bind (assoc bind role node))})]
+    (->> (into (set states) moved)
+         (sort-by (comp - :k))
+         (take trace-states-max)
+         set)))
+
+(defn trace-best [states] (reduce max 0 (map :k states)))
+
+(defn- inherited
+  "A branch's matches at its start: its parent's at its moment (none for a fresh start)."
+  [from]
+  (if-let [{:keys [branch vtime_ns]} from]
+    (let [{:keys [history start]} (get @trace-progress branch)
+          before (last (filter #(<= (first %) vtime_ns) history))]
+      (if before (second before) (or start #{})))
+    #{}))
+
+(defn trace-target-start [state {:keys [index from] :as request}]
+  (jev-follow-start state request)
+  (let [states (inherited from)]
+    (swap! trace-progress assoc index {:start states :states states :history [] :best (trace-best states)})))
+
+(defn trace-target-event [state {:keys [vtime_ns event] :as request}]
+  (jev-follow-event state request)
+  (when-let [steps (:steps @trace-target)]
+    (when (and (string? (:event event)) (event-node event))
+      (let [index (:index @state)]
+        (swap! trace-progress
+               (fn [all]
+                 (let [{:keys [states] :as now} (get all index {:start #{} :states #{} :history []})
+                       after (trace-advance steps states event)]
+                   (if (= after states)
+                     all
+                     (assoc all index (-> now
+                                          (assoc :states after :best (trace-best after))
+                                          (update :history conj [vtime_ns after])
+                                          (cond-> (> (trace-best after) (trace-best states)) (assoc :best_ns vtime_ns))))))))))))
+
+(defn trace-frontier
+  "The candidates whose own events advanced the target furthest, each its moment just after its
+  furthest step."
+  [generation candidates count]
+  (let [steps (clojure.core/count (:steps @trace-target))]
+    (->> candidates
+         (keep (fn [c]
+                 (let [{:keys [best best_ns]} (get @trace-progress (:branch c))]
+                   (when (and best best_ns (pos? best) (<= best_ns (room-end c)))
+                     {:score best
+                      :branch (:branch c)
+                      :vtime_ns (clamp-moment c (+ best_ns 1000))
+                      :reason (str "trace-target: " best " of " steps " steps matched (generation " generation ")")}))))
+         (sort-by (fn [r] [(- (:score r)) (- (:vtime_ns r))]))
+         (take count))))
+
+(defn trace-target-returns
+  "The furthest matches for half the returns, the explorer's own rule for the rest."
+  [generation candidates count]
+  (let [aimed (trace-frontier generation candidates (quot (inc count) 2))
+        taken (set (map :branch aimed))]
+    (concat aimed (rarity generation (remove #(taken (:branch %)) candidates) (- count (clojure.core/count aimed))))))
+
 ;; Built in, merged at every load (a reload adds or updates them; ones made at the REPL stay).
 (def end-timeline
   "What a strategy's :event fn returns to end the timeline at that moment (the explorer stops it
@@ -960,6 +1089,8 @@
          :jev-blend-logs {:returns (fn [generation candidates count]
                                      (jev-returns generation candidates count :blend true :logs true))}
          :leader-faults {:returns (fn [& _] nil) :decide #'leader-faults-decide :event #'leader-faults-event}
+         :trace-target {:returns #'trace-target-returns :event #'trace-target-event :branch #'trace-target-start
+                        :wants ["behaviors" "labeled" "assertions" "batched"]}
          :adaptive {:returns (fn [generation candidates count] (adaptive-returns generation candidates count))}
          :evolve {:returns (fn [generation candidates count] (evolve-returns generation candidates count))}
          :learn {:returns (fn [generation candidates count] (learn-returns generation candidates count))
@@ -1006,6 +1137,7 @@
         (swap! jev-follow-by-run assoc @current-run @jev-follow-stats))
       (reset! current-run run)
       (reset! ends {}) (reset! starts {}) (reset! archive {})
+      (reset! trace-progress {}) ; The target stays: set for the arm, not the run.
       (reset! jev-weights {}) (reset! jev-options {}) (reset! jev-properties {})
       (reset! jev-history [])
       (reset! jev-stories {})
@@ -1978,6 +2110,9 @@
                                   (reset! jev-properties {}) (reset! jev-history []) "ok")
                       "events-dir" (do (reset! events-dir argument) "ok")
                       "jev-system" (do (reset! jev-system argument) "ok")
+                      ;; A model trace to aim at (trace-target): a Quint ITF file on this host.
+                      "target" (try (str "ok " (clojure.core/count (:steps (target! argument))) " steps")
+                                    (catch Throwable e (str "error " (ex-message e))))
                       ;; What the strategies did, by run (its run_url): how much jev-follow steered,
                       ;; :evolve's proposals. One JSON line (ab.py --host-control).
                       "stats" (json/generate-string
