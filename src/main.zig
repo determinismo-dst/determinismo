@@ -1781,7 +1781,7 @@ fn command_run(context: Context, vm: *VM, options: *const VM.Options, from_snaps
         // A fast VM going on from a saved snapshot (`run --vcpus N --from-snapshot`).
         assert(options.vcpus > 1);
         const snapshot = try context.arena.create(Snapshot);
-        try snapshot.disk_load(context.arena, context.io, std.fs.path.dirname(path) orelse ".", std.fs.path.basename(path), options.check_buffer);
+        try snapshot.disk_load(context.arena, context.io, std.fs.path.dirname(path) orelse ".", std.fs.path.basename(path), options.check_buffer, null);
         if (snapshot.memory_size != options.memory_size) return error.SnapshotMemoryDiffers;
         try vm.init_fast_from_snapshot(options, snapshot);
     } else try vm.init(options);
@@ -1841,7 +1841,7 @@ fn snapshot_diff(init: std.process.Init, names: []const []const u8) !void {
     var snapshots: [2]Snapshot = undefined;
     const check_buffer = try std.heap.page_allocator.alloc(u8, checks.input_size_max); // Touched as used.
     for (&snapshots, 0..) |*snapshot, side| {
-        try snapshot.disk_load(arena, init.io, names[2 * side], names[2 * side + 1], check_buffer);
+        try snapshot.disk_load(arena, init.io, names[2 * side], names[2 * side + 1], check_buffer, null);
     }
     if (snapshots[0].memory_size != snapshots[1].memory_size) return error.SizesDiffer;
     const size = snapshots[0].memory_size;
@@ -2518,7 +2518,7 @@ fn command_explore(
     if (arguments.from_snapshot) |path| {
         const directory = std.fs.path.dirname(path) orelse ".";
         const name = std.fs.path.basename(path);
-        try snapshot.disk_load(context.arena, context.io, directory, name, options.check_buffer);
+        try snapshot.disk_load(context.arena, context.io, directory, name, options.check_buffer, null);
         if (snapshot.memory_size != options.memory_size) return error.SnapshotMemoryDiffers;
         exploration.exploration_seed = futures_seed(arguments.seed, snapshot);
         options.seed = exploration.exploration_seed;
@@ -2541,7 +2541,7 @@ fn command_explore(
     } else if (arguments.tape_snapshot) |path| {
         // The taped timeline's own state at a moment of it: its seed and tape go on from there.
         const directory = std.fs.path.dirname(path) orelse ".";
-        try snapshot.disk_load(context.arena, context.io, directory, std.fs.path.basename(path), options.check_buffer);
+        try snapshot.disk_load(context.arena, context.io, directory, std.fs.path.basename(path), options.check_buffer, null);
         if (snapshot.memory_size != options.memory_size) return error.SnapshotMemoryDiffers;
         say("[determinismo] on from {s}: the timeline at {d}ns, not from boot\n", .{
             std.fs.path.basename(path), snapshot.tsc / report.tsc_per_ns,
@@ -3942,6 +3942,9 @@ fn explore_tree(
         .history = if (branches.arguments.history_path) |path| try history_read(arena, context.io, path) else null,
         .setup = branches.snapshot,
         .setup_vtime_ns = branches.snapshot.events.last_vtime_ns,
+        // The setup's origin among the holders on disk is the root's when the tree starts from
+        // the setup (not from a later moment): chains on it load over the root.
+        .root_origin = if (branches.setup) |setup| (if (setup == branches.snapshot) tree_branches.setup_disk_origin else null) else null,
         .return_offsets_ns = branches.arguments.return_offsets_ns,
         .jobs = jobs,
         .holding = holding,
@@ -5328,6 +5331,9 @@ const TreeState = struct {
     /// The setup's last moment (virtual time): no return lands before it (every return replays
     /// from the setup's snapshot). Kept apart from `setup`, which tests leave undefined.
     setup_vtime_ns: u64 = 0,
+    /// The setup's origin among the holders on disk, when it is the tree's root (setup ==
+    /// branches.snapshot): disk nodes over the root (DiskHeld.root_origin).
+    root_origin: ?holders.Origin = null,
     /// Offsets a return just after a behavior may land before it (`--return-offsets`).
     return_offsets_ns: []const u64 = &return_offsets_default,
     /// A resumed run's: recorded timelines are not run again; their summaries are judged.
@@ -6139,6 +6145,8 @@ fn tree_judge_begin(
                 .branch = back.branch,
                 .disk = state.disk.?,
                 .io = state.io,
+                .root_origin = state.root_origin,
+                .root_fd = state.setup.memory_fd,
             } else null,
         };
         // Room for one more maker's VM beside those in flight, each to grow to its guest's size:
@@ -7148,7 +7156,16 @@ test maker_room {
 }
 
 /// A holder on disk, for a node maker to load.
-const DiskHeld = struct { held: holders.Held, branch: u32, disk: *const holders.Disk, io: std.Io };
+const DiskHeld = struct {
+    held: holders.Held,
+    branch: u32,
+    disk: *const holders.Disk,
+    io: std.Io,
+    /// The tree's root among the holders on disk (its setup's origin) and its memfd: a chain
+    /// reaching it loads as a node over the root (Snapshot.disk_load's `root`).
+    root_origin: ?holders.Origin = null,
+    root_fd: linux.fd_t = -1,
+};
 
 /// The node at `vtime_ns` from a holder on disk: its snapshot itself at its own moment, else a
 /// replay on from it as the holder would have made (HolderMaker).
@@ -7163,7 +7180,12 @@ fn disk_node(
     const held = on_disk.held;
     var name_buffer: [Snapshot.disk_name_max]u8 = undefined;
     const name = holders.Disk.name(&name_buffer, on_disk.branch, held.vtime_ns);
-    return node_core.from_disk(arena, vm, options, on_disk.io, on_disk.disk.directory, name, held.vtime_ns, .{ .idle = held.idle }, recorded, vtime_ns);
+    var root_buffer: [Snapshot.disk_name_max]u8 = undefined;
+    const root: ?Snapshot.DiskRoot = if (on_disk.root_origin) |origin| .{
+        .name = holders.Disk.name(&root_buffer, origin.branch, origin.vtime_ns),
+        .fd = on_disk.root_fd,
+    } else null;
+    return node_core.from_disk(arena, vm, options, on_disk.io, on_disk.disk.directory, name, held.vtime_ns, .{ .idle = held.idle }, recorded, vtime_ns, root);
 }
 
 /// The makers still making (started, not collected).

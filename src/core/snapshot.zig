@@ -764,8 +764,15 @@ pub fn disk_exists(directory: []const u8, name: []const u8) bool {
     return std.os.linux.errno(std.os.linux.access(path, std.posix.F_OK)) == .SUCCESS;
 }
 
+/// A tree's root among the snapshots on disk: its name there (the setup's, every chain's first
+/// base) and its memory (Snapshot.root's memfd).
+pub const DiskRoot = struct { name: []const u8, fd: std.os.linux.fd_t };
+
 /// Loads `<directory>/<name>` and the chain of bases it needs: its memory into a memfd of its
-/// own, its checks' inputs into `check_buffer`.
+/// own, its checks' inputs into `check_buffer`. With `root`, a chain that reaches it stops there:
+/// the memfd holds only the pages above it (zeros written: a hole is the root's page), base_fd
+/// the root's, as a node over the root made in memory (ParadeDB's run 2098: a node loaded from
+/// a holder on disk held 20.08 GiB beside those over the root of 0.36 to 0.59).
 pub fn disk_load(
     snapshot: *Snapshot,
     arena: std.mem.Allocator,
@@ -773,6 +780,7 @@ pub fn disk_load(
     directory: []const u8,
     name: []const u8,
     check_buffer: []u8,
+    root: ?DiskRoot,
 ) !void {
     const linux = std.os.linux;
     const cwd = std.Io.Dir.cwd();
@@ -783,8 +791,13 @@ pub fn disk_load(
     var loaded: []u64 = &.{}; // The pages already taken from a newer one.
     var current: []const u8 = name;
     var depth: u32 = 0;
+    var over_root: std.os.linux.fd_t = -1;
     while (true) : (depth += 1) {
         if (depth == disk_chain_max) return error.SnapshotChainTooLong;
+        if (root) |known| if (depth > 0 and std.mem.eql(u8, current, known.name)) {
+            over_root = known.fd; // The rest is the root's memory.
+            break;
+        };
         const state_path = try std.fmt.allocPrint(arena, "{s}/{s}.state", .{ directory, current });
         const state = try cwd.readFileAlloc(io, state_path, arena, .unlimited);
         if (state.len < @sizeOf(DiskHeader)) return error.SnapshotTruncated;
@@ -815,17 +828,19 @@ pub fn disk_load(
         if (linux.errno(opened) != .SUCCESS) return error.SnapshotMemoryMissing;
         const source: linux.fd_t = @intCast(opened);
         defer _ = linux.close(source);
-        try pages_apply(source, memory_fd.?, bitmap, loaded);
+        try pages_apply(source, memory_fd.?, bitmap, loaded, root != null);
         const base = header.base_name();
         if (base.len == 0) break;
         current = try arena.dupe(u8, base);
     }
     snapshot.memory_fd = memory_fd.?;
+    snapshot.base_fd = over_root;
 }
 
 /// The pages of `bitmap` not in `loaded` yet: copied from `source` (zeros skipped: a memfd reads
 /// as zeros), and then in `loaded`.
-fn pages_apply(source: std.os.linux.fd_t, target: std.os.linux.fd_t, bitmap: []const u64, loaded: []u64) !void {
+/// `zeros`: written too (over a root, a page of zeros is not the root's page a hole would be).
+fn pages_apply(source: std.os.linux.fd_t, target: std.os.linux.fd_t, bitmap: []const u64, loaded: []u64, zeros: bool) !void {
     const run_pages_max = 256;
     var buffer: [run_pages_max * page_size]u8 align(page_size) = undefined;
     var page: usize = 0;
@@ -849,6 +864,11 @@ fn pages_apply(source: std.os.linux.fd_t, target: std.os.linux.fd_t, bitmap: []c
         }
         const bytes = buffer[0 .. (end - page) * page_size];
         try pread_all(source, bytes, page * page_size);
+        if (zeros) {
+            try pwrite_all(target, bytes, page * page_size);
+            page = end;
+            continue;
+        }
         var index: usize = 0;
         while (index < end - page) {
             if (std.mem.allEqual(u8, bytes[index * page_size ..][0..page_size], 0)) {
@@ -1012,6 +1032,77 @@ fn restore_msrs(snapshot: *const Snapshot, fd: std.os.linux.fd_t) !void {
         var one: kvm.Msrs(1) = .{ .count = 1, .entries = .{entry} };
         const written = try kvm.ioctl(fd, kvm.SET_MSRS, @intFromPtr(&one));
         if (written != 1) std.log.debug("MSR 0x{x} not restorable", .{entry.index});
+    }
+}
+
+test "a chain on disk that reaches the root loads over it: only the pages above it, zeros written" {
+    const linux = std.os.linux;
+    var path_buffer: [64]u8 = undefined;
+    const directory_z = try std.fmt.bufPrintSentinel(&path_buffer, "/tmp/determinismo-disk-root-test-{d}", .{linux.getpid()}, 0);
+    const directory: []const u8 = directory_z;
+    _ = linux.mkdir(directory_z, 0o755);
+    defer {
+        for ([_][]const u8{ "root.state", "root.mem", "h1-10.state", "h1-10.mem" }) |name| {
+            var file_buffer: [128]u8 = undefined;
+            const file = std.fmt.bufPrintSentinel(&file_buffer, "{s}/{s}", .{ directory, name }, 0) catch continue;
+            _ = linux.unlink(file);
+        }
+        _ = linux.rmdir(directory_z);
+    }
+    const pages = 64;
+    const size = pages * page_size;
+    // The root: pages 0..31 written (each its own byte).
+    const root = try memfd(size);
+    defer _ = linux.close(root);
+    var fill: [page_size]u8 = undefined;
+    for (0..32) |index| {
+        @memset(&fill, @intCast(index + 1));
+        try pwrite_all(root, &fill, index * page_size);
+    }
+    const map = struct {
+        fn of(fd: linux.fd_t, kind: linux.MAP_TYPE) ![]align(page_size) u8 {
+            const address = linux.mmap(null, size, .{ .READ = true, .WRITE = true }, .{ .TYPE = kind }, fd, 0);
+            if (linux.errno(address) != .SUCCESS) return error.Map;
+            return @as([*]align(page_size) u8, @ptrFromInt(address))[0..size];
+        }
+    };
+    var state: Snapshot = undefined;
+    @memset(std.mem.asBytes(&state), 0);
+    state.memory_fd = -1;
+    state.base_fd = -1;
+    state.memory_size = size;
+    const root_memory = try map.of(root, .SHARED);
+    defer _ = linux.munmap(root_memory.ptr, root_memory.len);
+    var hashes: [pages]u64 = undefined;
+    try pages_hash(root_memory, root, &hashes);
+    try disk_save(&state, root_memory, root, &hashes, directory, "root", null, false);
+    // A branch of it: three pages changed (one to zeros), saved against it.
+    const branch = try map.of(root, .PRIVATE);
+    defer _ = linux.munmap(branch.ptr, branch.len);
+    branch[3 * page_size + 7] = 0xaa;
+    @memset(branch[5 * page_size ..][0..page_size], 0);
+    branch[40 * page_size + 1] = 0xbb;
+    try disk_save(&state, branch, root, &hashes, directory, "h1-10", "root", false);
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const whole = try arena.alloc(u8, size);
+    for ([_]?DiskRoot{ .{ .name = "root", .fd = root }, null }) |given| {
+        var loaded: Snapshot = undefined;
+        try loaded.disk_load(arena, std.testing.io, directory, "h1-10", &.{}, given);
+        defer _ = linux.close(loaded.memory_fd);
+        var stat: linux.Statx = undefined;
+        try std.testing.expect(linux.errno(linux.statx(loaded.memory_fd, "", linux.AT.EMPTY_PATH, .{ .BLOCKS = true }, &stat)) == .SUCCESS);
+        if (given != null) {
+            // Over the root: its three pages alone, the zeros among them.
+            try std.testing.expectEqual(root, loaded.base_fd);
+            try std.testing.expectEqual(@as(u64, 3 * page_size), stat.blocks * 512);
+        } else {
+            try std.testing.expectEqual(@as(linux.fd_t, -1), loaded.base_fd);
+            try std.testing.expect(stat.blocks * 512 > 3 * page_size);
+        }
+        try loaded.memory_read(whole, 0);
+        try std.testing.expectEqualSlices(u8, branch, whole);
     }
 }
 

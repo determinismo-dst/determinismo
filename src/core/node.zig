@@ -136,9 +136,10 @@ pub fn from_disk(
     point: VM.Hold.Point,
     recorded: Recorded,
     vtime_ns: u64,
+    root: ?Snapshot.DiskRoot,
 ) !*const Snapshot {
     const loaded = try arena.create(Snapshot);
-    try loaded.disk_load(arena, io, directory, name, &.{});
+    try loaded.disk_load(arena, io, directory, name, &.{}, root);
     if (vtime_ns == held_ns) return loaded;
     return from_hold(arena, vm, options, loaded, recorded, vtime_ns, point);
 }
