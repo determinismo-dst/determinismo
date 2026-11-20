@@ -2178,7 +2178,7 @@ fn node_start(system: *const schema.System, applied: *const Applied) bool {
     };
     started catch |err| {
         // Nothing to fault (no pod to pick right now): not a failure.
-        const skipped = err == error.NoPods or err == error.OnePod or err == error.ThreadPending or
+        const skipped = err == error.NoPods or err == error.PodsSpared or err == error.OnePod or err == error.ThreadPending or
             err == error.SkewApart or err == error.SyscallErrorElsewhere;
         sdk.event(if (skipped) "fault_skipped" else "fault_failed", .{ .node = applied.node, .err = @errorName(err) });
         return false;
@@ -2376,7 +2376,8 @@ fn pod_pick(node: []const u8, index: u32, pod: *Pod, spare_drivers: bool) !linux
         order[candidates] = at;
         candidates += 1;
     }
-    if (candidates == 0) return error.NoPods;
+    // Pods, none to fault: never the node's own processes instead (fault_process).
+    if (candidates == 0) return error.PodsSpared;
     // The drawn pod, or the next in order with a process (a pod being deleted, or between its
     // containers' restarts, keeps a cgroup with none for a while).
     for (0..candidates) |attempt| {
@@ -2392,7 +2393,7 @@ fn pod_pick(node: []const u8, index: u32, pod: *Pod, spare_drivers: bool) !linux
             return pid;
         }
     }
-    return error.NoPods;
+    return error.PodsSpared;
 }
 
 /// A process of the pod (the first with a HOSTNAME naming the pod, which it notes), if any.
@@ -2635,7 +2636,7 @@ test address_parse {
 fn apply_pod_kill(applied: *const Applied) void {
     var pod: Pod = .{};
     _ = pod_pick(applied.node, applied.process_index, &pod, true) catch |err| {
-        const skipped = err == error.NoPods;
+        const skipped = err == error.NoPods or err == error.PodsSpared;
         sdk.event(if (skipped) "fault_skipped" else "fault_failed", .{ .node = applied.node, .err = @errorName(err) });
         return;
     };
@@ -3284,7 +3285,10 @@ fn durable_listen() void {
 /// of its pods (pod_pick: the cluster's own spared), never the platform's (K3s, containerd, a
 /// pod's shim or sandbox): stopped, those broke the drivers' kubectl exec, not the system (e2e
 /// kubernetes, 2026-11-03: a containerd-shim stopped 4.45 s, the driver's exec timed out loading
-/// its task, and the driver exited 1). Elsewhere, any of the node's processes.
+/// its task, and the driver exited 1). Elsewhere, any of the node's processes. Pods all spared
+/// (kube-system's, the exclusions'): none (error.PodsSpared, the fault skipped), never K3s's: a
+/// run excluding every pod but the cluster's had K3s's server stopped 14.8 s, the control plane
+/// with it, and an excluded operator lost its leader lease (ParadeDB's proptests, run 2098).
 fn fault_process(applied: *const Applied) !linux.pid_t {
     var pod: Pod = .{};
     if (pod_pick(applied.node, applied.process_index, &pod, false)) |pid| {

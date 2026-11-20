@@ -3924,6 +3924,19 @@ fn check_kubernetes(context: *Context) !void {
     // A quiet period asked from a pod ($ANTITHESIS_STOP_FAULTS 7, anytime_quiet_period.sh): the
     // fault injector took it.
     const quiet = try run_kept(context, &.{ "grep", "-rlF", "\"faults_quiet\",\"details\":{\"duration_ns\":7000000000", explored });
+    // Every pod excluded but the cluster's own (kube-system, spared anyway): process and thread
+    // pauses find no pod and are skipped, never K3s's own processes instead (stopped, K3s's
+    // server took the control plane with it).
+    const spared_dir = try std.fmt.allocPrint(arena, "{s}/kubernetes-spared", .{context.scratch});
+    const spared_args = [_][]const u8{
+        "--kubernetes", "examples/kubernetes/manifests", "--scenario",         "counter",               "--seed",     "2",
+        "--memory-mib", "4096",                          "--fault-exclusions", "^(redis|probe|client)", "--branches", "4",
+        "--events-dir", spared_dir,
+    };
+    _ = try explore(context, &spared_args);
+    try events_plain(context, spared_dir);
+    const spared_paused = try run_kept(context, &.{ "sh", "-c", try std.fmt.allocPrint(arena, "grep -rhF '\"event\":\"fault\"' {s} | grep -cE '\"kind\":\"(process_pause|thread_pause)\"' || true", .{spared_dir}) });
+    const spared_skipped = try run_kept(context, &.{ "grep", "-rlF", "\"err\":\"PodsSpared\"", spared_dir });
     var same = false;
     if (count > 0) {
         const index = try std.fmt.allocPrint(arena, "{d}", .{branches[0].index});
@@ -3943,6 +3956,7 @@ fn check_kubernetes(context: *Context) !void {
         .{ "faults on single pods, each naming its pod", pod_faults.stdout.len > 0 and named.stdout.len > 0 },
         .{ "no pod fault names a pod by its cgroup (pod<uid>)", std.mem.eql(u8, std.mem.trim(u8, unnamed.stdout, " \n"), "0") },
         .{ "the K3s node itself never paused, throttled or cut off (its pods are the nodes)", std.mem.eql(u8, std.mem.trim(u8, whole.stdout, " \n"), "0") },
+        .{ "every pod excluded: no process or thread paused (none of K3s's own), the pauses skipped (PodsSpared)", std.mem.eql(u8, std.mem.trim(u8, spared_paused.stdout, " \n"), "0") and spared_skipped.stdout.len > 0 },
         .{ "the pods' output as events named after them (redis-0)", pod_output.stdout.len > 0 },
         .{ "pods' container exits judged (no unexpected container exits)", exits.stdout.len > 0 },
         .{ "a bare Pod given libvoidstar, its device, the coverage and the SDK's output", std.mem.eql(u8, std.mem.trim(u8, given.stdout, " \n"), "4") and missing.stdout.len == 0 },
