@@ -33,6 +33,9 @@ vcpu_fd: linux.fd_t,
 memory_fd: linux.fd_t,
 /// False for branches: their memory_fd belongs to the snapshot they map copy-on-write.
 memory_fd_owned: bool,
+/// A branch of a tree's root, or of a node over it: memory_fd is the root's, and the snapshots it
+/// takes hold only what differs from it (Snapshot.base_fd).
+memory_over_root: bool = false,
 memory: []align(std.heap.page_size_min) u8,
 /// A replay's watchpoint (Options.watch), its pages read-only in KVM, and the writes logged.
 watch: ?Watch = null,
@@ -632,7 +635,7 @@ pub fn init_fast_from_snapshot(vm: *VM, options: *const Options, snapshot: *cons
     assert(options.vcpus > 1 and !options.deterministic);
     assert(options.memory_size == snapshot.memory_size);
     try vm.init_machine(options);
-    try vm.init_memory_private(snapshot.memory_fd, snapshot.memory_size);
+    try vm.init_memory_snapshot(snapshot);
     try vm.init_vcpu(options.cpuid_table, options.cpuid_msrs, options.guest_cpu);
     try vm.fast_clock_rate(); // Before the restore writes the TSC: at the rate it was read at.
     // The other vCPUs before the interrupt controllers' state, as at a fresh boot.
@@ -743,7 +746,7 @@ pub fn init_from_snapshot(vm: *VM, options: *const Options, snapshot: *const Sna
     assert(options.memory_size == snapshot.memory_size);
     try vm.init_machine(options);
     vm.watch = options.watch;
-    try vm.init_memory_private(snapshot.memory_fd, snapshot.memory_size);
+    try vm.init_memory_snapshot(snapshot);
     try vm.init_vcpu(options.cpuid_table, options.cpuid_msrs, options.guest_cpu);
     try snapshot.restore(vm);
     vm.timeline_cmdline = options.cmdline;
@@ -948,6 +951,14 @@ fn init_memory_fresh(vm: *VM, memory_size: u64) !void {
     vm.memory_fd_owned = true;
     _ = try syscall(linux.ftruncate(vm.memory_fd, @intCast(memory_size)));
     try vm.init_memory_map(.SHARED, memory_size);
+}
+
+/// A branch's memory: the snapshot's mapped copy-on-write, or the root's with the snapshot's
+/// differences from it read in (Snapshot.overlay_apply).
+fn init_memory_snapshot(vm: *VM, snapshot: *const Snapshot) !void {
+    try vm.init_memory_private(snapshot.map_fd(), snapshot.memory_size);
+    try snapshot.overlay_apply(vm.memory);
+    vm.memory_over_root = snapshot.root or snapshot.base_fd >= 0;
 }
 
 /// A branch writes to private copies of the snapshot's pages, which stays untouched.

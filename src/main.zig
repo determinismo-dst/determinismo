@@ -3926,6 +3926,9 @@ fn explore_tree(
     // Its workers, holders and node makers branch from snapshots it holds: their VMs may claim
     // what it learns they hold of their own (cpus.claim_shares). Before any of them forks.
     cpus.claim_shares = true;
+    // The tree's root, held for the whole run: its branches, and the nodes made from them, keep
+    // only their pages that differ from it (Snapshot.root, base_fd). Before any worker forks.
+    @constCast(branches.snapshot).root = true;
     var state: TreeState = .{
         .base = seed_base(exploration),
         .total = branches.arguments.branches,
@@ -5370,19 +5373,20 @@ fn nodes_claim_refresh(state: *TreeState) void {
     cpus.nodes_claim(bytes);
 }
 
-/// What a node is charged while it is made (its pages once made: nodes_claim_refresh): the tree's
-/// snapshots' own size so far, the largest of the setup's and their mean, half again for what a
-/// timeline grows, at most its VM's. The VM's whole size made a run under a memory limit make 1
-/// or 2 a generation in a 24 GB unit of 4 GB VMs (run 317: 14 returns not made) where their pages
-/// were a fraction of it.
+/// What a node is charged while it is made (its pages once made: nodes_claim_refresh): the mean
+/// of the tree's nodes' own so far (each its differences from the root: Snapshot.base_fd), half
+/// again for what a timeline grows, at most a VM's claim; a VM's claim before any (what one holds
+/// of its own, once the run learned it: what a node over the root is). The VM's whole size made a
+/// run under a memory limit make 1 or 2 a generation in a 24 GB unit of 4 GB VMs (run 317: 14
+/// returns not made) where their pages were a fraction of it.
 fn node_charge(state: *const TreeState) u64 {
     const setup = snapshot_bytes(state.setup);
-    if (setup == 0) return cpus.claim_bytes; // Its pages unknown: the VM's size.
-    var count: u64 = 1;
+    var count: u64 = 0;
     var iterator = state.users.keyIterator();
     while (iterator.next()) |snapshot| count += @intFromBool(snapshot.* != state.setup);
-    const mean = state.nodes_bytes / count;
-    return @min(cpus.claim_bytes, @max(setup, mean) * 3 / 2);
+    if (count == 0) return cpus.claim_bytes;
+    const mean = (state.nodes_bytes -| setup) / count;
+    return @min(cpus.claim_bytes, mean * 3 / 2);
 }
 
 /// The memory a snapshot's memfd holds (its pages written, not its size).
@@ -7507,7 +7511,9 @@ const node_replayed: u8 = 0;
 fn snapshots_compare(back: TreeReturn, held: *const Snapshot, replayed: *const Snapshot) void {
     var differ: u32 = 0;
     inline for (@typeInfo(Snapshot).@"struct".field_names) |name| {
-        if (comptime std.mem.eql(u8, name, "memory_fd")) continue;
+        // Descriptors and the tree's bookkeeping, not the machine.
+        if (comptime std.mem.eql(u8, name, "memory_fd") or std.mem.eql(u8, name, "base_fd") or
+            std.mem.eql(u8, name, "root")) continue;
         if (!field_same(name, held, replayed)) {
             differ += 1;
             const a = std.mem.asBytes(&@field(held, name));
@@ -7627,8 +7633,6 @@ fn segment_unusable(base: u64) kvm.Segment {
 }
 
 fn memory_equal(held: *const Snapshot, replayed: *const Snapshot) bool {
-    const a = held.memory_fd;
-    const b = replayed.memory_fd;
     const size = held.memory_size;
     var buffers: [2][1 << 20]u8 = undefined;
     var offset: u64 = 0;
@@ -7636,9 +7640,9 @@ fn memory_equal(held: *const Snapshot, replayed: *const Snapshot) bool {
     var xsave_headers: u64 = 0;
     while (offset < size) : (offset += buffers[0].len) {
         const length = @min(buffers[0].len, size - offset);
-        const read_a = linux.pread(a, &buffers[0], length, @intCast(offset));
-        const read_b = linux.pread(b, &buffers[1], length, @intCast(offset));
-        if (read_a != length or read_b != length) return false;
+        // Each whole: its own pages, the root's where it holds only its differences.
+        held.memory_read(buffers[0][0..length], offset) catch return false;
+        replayed.memory_read(buffers[1][0..length], offset) catch return false;
         if (std.mem.eql(u8, buffers[0][0..length], buffers[1][0..length])) continue;
         // Each page that differs (the first few told): a page of zeros on one side is one a copy
         // missed; contents on both, memory that changed.
@@ -7746,14 +7750,13 @@ test "xsave_bits_only: an x87 in-use bit in an XSAVE header, nothing else" {
 /// Says which virtual addresses of the running address space (CR3, 4-level paging) map a guest
 /// page, the kernel's direct map left out: a user address names a process's memory.
 fn mappings_name(snapshot: *const Snapshot, page_address: u64) void {
-    const fd = snapshot.memory_fd;
     const mask: u64 = 0x000f_ffff_ffff_f000;
     var told: u32 = 0;
     const pml4 = snapshot.sregs.cr3 & mask;
     for (0..512) |a| {
-        const e4 = entry_read(fd, pml4, a) orelse continue;
+        const e4 = entry_read(snapshot, pml4, a) orelse continue;
         for (0..512) |b| {
-            const e3 = entry_read(fd, e4 & mask, b) orelse continue;
+            const e3 = entry_read(snapshot, e4 & mask, b) orelse continue;
             const va3 = canonical((a << 39) | (b << 30));
             if (e3 & 0x80 != 0) { // 1 GiB page.
                 const base = e3 & 0x000f_ffff_c000_0000;
@@ -7763,7 +7766,7 @@ fn mappings_name(snapshot: *const Snapshot, page_address: u64) void {
                 continue;
             }
             for (0..512) |c| {
-                const e2 = entry_read(fd, e3 & mask, c) orelse continue;
+                const e2 = entry_read(snapshot, e3 & mask, c) orelse continue;
                 const va2 = va3 | (c << 21);
                 if (e2 & 0x80 != 0) { // 2 MiB page.
                     const base = e2 & 0x000f_ffff_ffe0_0000;
@@ -7774,7 +7777,7 @@ fn mappings_name(snapshot: *const Snapshot, page_address: u64) void {
                 }
                 var table: [512]u64 = undefined;
                 const length = std.mem.sliceAsBytes(&table).len;
-                if (linux.pread(fd, std.mem.sliceAsBytes(&table).ptr, length, @intCast(e2 & mask)) != length) continue;
+                snapshot.memory_read(std.mem.sliceAsBytes(&table)[0..length], e2 & mask) catch continue;
                 for (table, 0..) |e1, d| {
                     if (e1 & 1 == 0 or e1 & mask != page_address) continue;
                     told += mapping_tell(va2 | (d << 12), told);
@@ -7787,9 +7790,9 @@ fn mappings_name(snapshot: *const Snapshot, page_address: u64) void {
     });
 }
 
-fn entry_read(fd: linux.fd_t, table: u64, index: usize) ?u64 {
+fn entry_read(snapshot: *const Snapshot, table: u64, index: usize) ?u64 {
     var entry: u64 = 0;
-    if (linux.pread(fd, std.mem.asBytes(&entry), 8, @intCast(table + index * 8)) != 8) return null;
+    snapshot.memory_read(std.mem.asBytes(&entry), table + index * 8) catch return null;
     if (entry & 1 == 0) return null;
     return entry;
 }

@@ -12,6 +12,16 @@ pub const msr_count_max = 512;
 
 memory_fd: std.os.linux.fd_t,
 memory_size: u64,
+/// The root's memory (`root`) where this snapshot holds only the pages that differ from it: its
+/// memory_fd then has data at those pages alone (zeros written where the root's were not), a
+/// hole where the page is the root's. -1: memory_fd holds every page. A tree's nodes are made
+/// so (memory_differences): ParadeDB's run 2096 held six nodes of 18.4 GiB each that differed
+/// from its setup in 0.36 GiB (94,514 pages), 132 GiB where 24 would do, and its generation 1
+/// made no returns for it ("the run's nodes held half the host's memory").
+base_fd: std.os.linux.fd_t = -1,
+/// A tree's root (its setup, or the snapshot it branches from), held for the whole run: its
+/// branches, and branches of the nodes over it, capture only what differs from it.
+root: bool = false,
 regs: kvm.Regs,
 sregs: kvm.Sregs,
 xsave: kvm.Xsave,
@@ -140,27 +150,182 @@ fn state_save_at(snapshot: *Snapshot, vm: *VM, memory_fd: std.os.linux.fd_t, clo
 }
 
 /// A captured snapshot's memory: a copy of `memory` (this process's copy-on-write view of the
-/// VM's) in a memfd of its own.
+/// VM's) in a memfd of its own; over the root (`over_root`: `backing_fd` is the tree's root),
+/// only the pages that differ from it.
 pub fn capture_memory(
     snapshot: *Snapshot,
     memory: []align(std.heap.page_size_min) u8,
     backing_fd: std.os.linux.fd_t,
+    over_root: bool,
 ) !void {
     assert(snapshot.memory_fd == -1);
     assert(memory.len == snapshot.memory_size);
-    snapshot.memory_fd = try memory_copy(memory, backing_fd);
+    if (over_root) {
+        snapshot.memory_fd = try memory_differences(memory, backing_fd);
+        snapshot.base_fd = backing_fd;
+    } else snapshot.memory_fd = try memory_copy(memory, backing_fd);
 }
 
 /// Freezes a branch: its memory is a private copy-on-write mapping, so it is first copied into a
 /// memfd of its own. Only resident pages that are not all zeros are copied (mincore), so memory
-/// the guest never touched costs nothing.
+/// the guest never touched costs nothing; over the tree's root, only the pages that differ.
 pub fn take_copy(snapshot: *Snapshot, vm: *VM) !void {
     assert(!vm.memory_fd_owned); // A branch: its memory belongs to the parent snapshot.
-    const fd = try memory_copy(vm.memory, vm.memory_fd);
+    const backing = vm.memory_fd;
+    const fd = if (vm.memory_over_root)
+        try memory_differences(vm.memory, backing)
+    else
+        try memory_copy(vm.memory, backing);
     vm.memory_fd = fd;
     vm.memory_fd_owned = true;
     try snapshot.take(vm);
     assert(snapshot.memory_fd == fd);
+    if (vm.memory_over_root) snapshot.base_fd = backing;
+}
+
+/// The memfd a branch maps copy-on-write: the root's where this snapshot holds its differences
+/// alone (overlay_apply then writes them in).
+pub fn map_fd(snapshot: *const Snapshot) std.os.linux.fd_t {
+    return if (snapshot.base_fd >= 0) snapshot.base_fd else snapshot.memory_fd;
+}
+
+/// A branch's memory (`memory`, the root's mapped copy-on-write: map_fd) made this snapshot's:
+/// its pages that differ from the root's read in (each a private copy of the branch's).
+pub fn overlay_apply(snapshot: *const Snapshot, memory: []align(std.heap.page_size_min) u8) !void {
+    if (snapshot.base_fd < 0) return;
+    assert(memory.len == snapshot.memory_size);
+    const linux = std.os.linux;
+    var offset: u64 = 0;
+    while (offset < memory.len) {
+        const data = linux.lseek(snapshot.memory_fd, @intCast(offset), seek_data);
+        if (linux.errno(data) == .NXIO) break; // No data past it.
+        if (linux.errno(data) != .SUCCESS) return error.Seek;
+        const hole = linux.lseek(snapshot.memory_fd, @intCast(data), seek_hole);
+        if (linux.errno(hole) != .SUCCESS) return error.Seek;
+        const end = @min(hole, memory.len);
+        try pread_all(snapshot.memory_fd, memory[data..end], data);
+        offset = end;
+    }
+}
+
+/// `buffer.len` bytes of this snapshot's memory at `offset` (a page multiple, or within a page):
+/// its own pages, the root's where it holds none. For reading it whole (a verification), never a
+/// branch's way to it (map_fd, overlay_apply).
+pub fn memory_read(snapshot: *const Snapshot, buffer: []u8, offset: u64) !void {
+    const linux = std.os.linux;
+    if (snapshot.base_fd < 0) return pread_all(snapshot.memory_fd, buffer, offset);
+    try pread_all(snapshot.base_fd, buffer, offset);
+    const end = offset + buffer.len;
+    var at = offset;
+    while (at < end) {
+        const data = linux.lseek(snapshot.memory_fd, @intCast(at), seek_data);
+        if (linux.errno(data) == .NXIO) break;
+        if (linux.errno(data) != .SUCCESS) return error.Seek;
+        if (data >= end) break;
+        const hole = linux.lseek(snapshot.memory_fd, @intCast(data), seek_hole);
+        if (linux.errno(hole) != .SUCCESS) return error.Seek;
+        const stop = @min(hole, end);
+        try pread_all(snapshot.memory_fd, buffer[data - offset .. stop - offset], data);
+        at = stop;
+    }
+}
+
+const seek_data = 3;
+const seek_hole = 4;
+
+/// The pages of `memory` (a branch's copy-on-write view of the root's memfd `base_fd`) that differ
+/// from the root's, in a memfd of their own (zeros written where the root's page was not): those
+/// this process holds anonymously (/proc/self/pagemap: present and not the file's, or swapped
+/// out), each compared with the root's. A page mapped from the file is the root's.
+fn memory_differences(memory: []align(std.heap.page_size_min) u8, base_fd: std.os.linux.fd_t) !std.os.linux.fd_t {
+    const linux = std.os.linux;
+    const page = std.heap.page_size_min;
+    assert(memory.len % page == 0);
+    assert(base_fd >= 0);
+    const fd = try memfd(memory.len);
+    errdefer _ = linux.close(fd);
+    const opened = linux.open("/proc/self/pagemap", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(opened) != .SUCCESS) return error.Pagemap;
+    const pagemap: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(pagemap);
+    const present: u64 = 1 << 63;
+    const swapped: u64 = 1 << 62;
+    const file: u64 = 1 << 61;
+    const pages = memory.len / page;
+    const first = @intFromPtr(memory.ptr) / page;
+    var entries: [Candidates.entries_per_read]u64 = undefined;
+    var root_page: [page]u8 align(page) = undefined;
+    var index: usize = 0;
+    while (index < pages) {
+        const count = @min(entries.len, pages - index);
+        const bytes = std.mem.sliceAsBytes(entries[0..count]);
+        const read = linux.pread(pagemap, bytes.ptr, bytes.len, @intCast((first + index) * @sizeOf(u64)));
+        if (linux.errno(read) != .SUCCESS or read != bytes.len) return error.Pagemap;
+        for (entries[0..count], index..) |entry, at| {
+            const anonymous = (entry & present != 0 and entry & file == 0) or entry & swapped != 0;
+            if (!anonymous) continue;
+            const offset = at * page;
+            const mine = memory[offset..][0..page];
+            try pread_all(base_fd, &root_page, offset);
+            if (std.mem.eql(u8, mine, &root_page)) continue; // Written again as it was.
+            const written = linux.pwrite(fd, mine.ptr, page, @intCast(offset));
+            if (linux.errno(written) != .SUCCESS or written != page) return error.Write;
+        }
+        index += count;
+    }
+    return fd;
+}
+
+test "a branch of the root captures only the pages that differ from it, and a branch of that is the same memory" {
+    const linux = std.os.linux;
+    const page = std.heap.page_size_min;
+    const pages = 64;
+    // The root: pages 0..31 written (each its own byte), 32..63 never.
+    const root = try memfd(pages * page);
+    defer _ = linux.close(root);
+    var fill: [page]u8 = undefined;
+    for (0..32) |index| {
+        @memset(&fill, @intCast(index + 1));
+        try std.testing.expectEqual(@as(usize, page), linux.pwrite(root, &fill, page, @intCast(index * page)));
+    }
+    const map = struct {
+        fn private(fd: linux.fd_t) ![]align(page) u8 {
+            const address = linux.mmap(null, pages * page, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE }, fd, 0);
+            if (linux.errno(address) != .SUCCESS) return error.Map;
+            return @as([*]align(page) u8, @ptrFromInt(address))[0 .. pages * page];
+        }
+    };
+    const branch = try map.private(root);
+    defer _ = linux.munmap(branch.ptr, branch.len);
+    var reads: u64 = 0;
+    for (0..pages) |index| reads +%= branch[index * page]; // Every page read: the root's, mapped.
+    branch[3 * page + 7] = 0xaa; // Changed.
+    @memset(branch[5 * page ..][0..page], 0); // Zeros where the root's were not.
+    branch[9 * page] = 10; // Written again as it was (page 9 holds 10s).
+    branch[40 * page + 1] = 0xbb; // Where the root has nothing.
+    var snapshot: Snapshot = undefined;
+    snapshot.memory_fd = -1;
+    snapshot.memory_size = branch.len;
+    try snapshot.capture_memory(branch, root, true);
+    defer _ = linux.close(snapshot.memory_fd);
+    try std.testing.expectEqual(root, snapshot.base_fd);
+    // Its memfd holds three pages, the ones that differ.
+    var stat: linux.Statx = undefined;
+    try std.testing.expect(linux.errno(linux.statx(snapshot.memory_fd, "", linux.AT.EMPTY_PATH, .{ .BLOCKS = true }, &stat)) == .SUCCESS);
+    try std.testing.expectEqual(@as(u64, 3 * page), stat.blocks * 512);
+    // Read whole, and as a branch of it maps it: the branch's memory.
+    const whole = try std.testing.allocator.alloc(u8, branch.len);
+    defer std.testing.allocator.free(whole);
+    try snapshot.memory_read(whole, 0);
+    try std.testing.expectEqualSlices(u8, branch, whole);
+    const again = try map.private(snapshot.map_fd());
+    defer _ = linux.munmap(again.ptr, again.len);
+    try snapshot.overlay_apply(again);
+    try std.testing.expectEqualSlices(u8, branch, again);
+    // Read in a part across a page with differences and one without.
+    var part: [2 * page]u8 = undefined;
+    try snapshot.memory_read(&part, 4 * page);
+    try std.testing.expectEqualSlices(u8, branch[4 * page ..][0 .. 2 * page], &part);
 }
 
 const chunk_pages = 4096;
@@ -196,8 +361,6 @@ pub const Candidates = struct {
     const present: u64 = 1 << 63;
     const swapped: u64 = 1 << 62;
     const entries_per_read = 4096;
-    const seek_data = 3;
-    const seek_hole = 4;
 
     pub fn init(memory: []align(page_size) const u8, backing_fd: std.os.linux.fd_t) !Candidates {
         const linux = std.os.linux;
@@ -635,6 +798,9 @@ pub fn disk_load(
         if (state.len != state_end + words * @sizeOf(u64)) return error.SnapshotTruncated;
         if (depth == 0) {
             @memcpy(std.mem.asBytes(snapshot), state[@sizeOf(DiskHeader)..][0..@sizeOf(Snapshot)]);
+            // Its every page loaded below: not over a root, and none itself (the tree says so).
+            snapshot.base_fd = -1;
+            snapshot.root = false;
             if (header.check_used > check_buffer.len) return error.SnapshotChecksTooLarge;
             @memcpy(check_buffer[0..header.check_used], state[@sizeOf(DiskHeader) + @sizeOf(Snapshot) ..][0..header.check_used]);
             if (snapshot.memory_size != header.memory_size) return error.SnapshotTruncated;
