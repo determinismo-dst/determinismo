@@ -29,6 +29,8 @@ const ignored_fields = [_][]const u8{
     "env_file", "cap_add",     "cap_drop",
     "init",     "stop_signal", "platform",
     "tty",      "stdin_open",  "security_opt",
+    // Namespaced kernel settings (net.unix.max_dgram_qlen): not applied in a node yet.
+    "sysctls",
 };
 
 /// The profile ("default") of the Compose file at `path`. Relative build contexts are taken
@@ -674,11 +676,12 @@ fn memory_mib(text: []const u8) !u32 {
 }
 
 fn build_source(arena: std.mem.Allocator, directory: []const u8, value: yaml.Value) !schema.Build {
-    const context, const dockerfile = switch (value) {
-        .scalar => |text| .{ text, "Dockerfile" },
+    const context, const dockerfile, const args = switch (value) {
+        .scalar => |text| .{ text, "Dockerfile", &.{} },
         .mapping => .{
             try scalar(value.get("context") orelse return error.BuildWithoutContext),
             if (value.get("dockerfile")) |file| try scalar(file) else "Dockerfile",
+            try build_arguments(arena, value.get("args")),
         },
         else => return error.BadBuild,
     };
@@ -686,7 +689,60 @@ fn build_source(arena: std.mem.Allocator, directory: []const u8, value: yaml.Val
     return .{
         .context = if (absolute) context else try std.fs.path.join(arena, &.{ directory, context }),
         .dockerfile = dockerfile,
+        .args = args,
     };
+}
+
+/// A build's `args` (a map, or a list of "NAME=value"), as `--build-arg NAME=value`. A name
+/// without a value takes the caller's environment's in Compose, which is never read here (the
+/// same files make the same system): left out, the Dockerfile's default stands.
+fn build_arguments(arena: std.mem.Allocator, value: ?yaml.Value) ![]const []const u8 {
+    const present = value orelse return &.{};
+    var entries: std.ArrayList([]const u8) = .empty;
+    switch (present) {
+        .sequence => |items| for (items) |item| {
+            const text = try scalar(item);
+            if (std.mem.indexOfScalar(u8, text, '=') != null) try entries.append(arena, text);
+        },
+        .mapping => |fields| for (fields) |field| {
+            if (field.value == .empty) continue;
+            try entries.append(arena, try std.fmt.allocPrint(arena, "{s}={s}", .{ field.key, try scalar(field.value) }));
+        },
+        .empty => {},
+        .scalar => return error.BadBuildArgs,
+    }
+    return entries.items;
+}
+
+test build_source {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // hashicorp-raft-formalized's server: which of its patches are built in is a build argument
+    // (RAFT_PATCHES), so a build without it is another system.
+    const root = try yaml.parse(arena,
+        \\mapped:
+        \\  context: ../..
+        \\  dockerfile: antithesis-fm/server/Dockerfile
+        \\  args:
+        \\    RAFT_PATCHES: R1 R3 R4 R5
+        \\    UNSET:
+        \\listed:
+        \\  context: .
+        \\  args:
+        \\    - VERSION=2
+        \\    - FROM_ENVIRONMENT
+        \\
+    );
+    const mapped = try build_source(arena, "/p/config", root.get("mapped").?);
+    try std.testing.expectEqualStrings("antithesis-fm/server/Dockerfile", mapped.dockerfile);
+    try std.testing.expectEqual(1, mapped.args.len);
+    try std.testing.expectEqualStrings("RAFT_PATCHES=R1 R3 R4 R5", mapped.args[0]);
+    // A name without a value is the caller's environment's in Compose, which is never read here
+    // (the same files make the same system): the Dockerfile's default stands.
+    const listed = try build_source(arena, "/p", root.get("listed").?);
+    try std.testing.expectEqual(1, listed.args.len);
+    try std.testing.expectEqualStrings("VERSION=2", listed.args[0]);
 }
 
 /// A service's labels (a list of "key=value" or a map, as `environment`): `determinismo.faults`
