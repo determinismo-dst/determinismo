@@ -1073,8 +1073,9 @@ test "a chain on disk that reaches the root loads over it: only the pages above 
     state.memory_size = size;
     const root_memory = try map.of(root, .SHARED);
     defer _ = linux.munmap(root_memory.ptr, root_memory.len);
-    var hashes: [pages]u64 = undefined;
-    try pages_hash(root_memory, root, &hashes);
+    // As the setup's origin is written (holders' setup_origin_write): a table of zeros, which the
+    // save fills with the root's pages' hashes, every page that holds data written.
+    var hashes: [pages]u64 = @splat(0);
     try disk_save(&state, root_memory, root, &hashes, directory, "root", null, false);
     // A branch of it: three pages changed (one to zeros), saved against it.
     const branch = try map.of(root, .PRIVATE);
