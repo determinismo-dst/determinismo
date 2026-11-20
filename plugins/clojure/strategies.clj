@@ -1245,9 +1245,31 @@
   (trace-agent-ask! candidates)
   (trace-target-returns generation candidates count))
 
+(defn trace-agent-plan
+  "This timeline's plan (the explorer draws its named decisions from it, no round trip each): for
+  each decision the agent steers for its next step, its options `trace-agent-chance` of the weight,
+  the others the rest; nil (the explorer's own draws) for the others, and before any advice."
+  [state]
+  (let [steps (:steps @trace-target)
+        best (get-in @trace-progress [(:index @state) :best] 0)
+        action (:action (get steps best))]
+    (not-empty
+     (into {} (for [[label preferred] (get @trace-agent-steer action)
+                    :let [options (get @trace-decisions label)
+                          preferred (set preferred)
+                          aimed (keep-indexed (fn [i o] (when (preferred o) i)) options)
+                          others (- (clojure.core/count options) (clojure.core/count aimed))]
+                    :when (seq aimed)]
+                [label (vec (for [i (range (clojure.core/count options))
+                                  :let [w (if (preferred (nth options i))
+                                            (/ trace-agent-chance (clojure.core/count aimed))
+                                            (if (pos? others) (/ (- 1.0 trace-agent-chance) others) 0.0))]
+                                  :when (pos? w)]
+                              [i (inc i) (double w)]))])))))
+
 (defn trace-agent-decide
   "One of the agent's options for this decision, as this timeline's next step needs, most of the
-  time; nil (the injector's own draw) otherwise."
+  time; nil (the injector's own draw) otherwise. Asked only without plans (trace-agent-plan)."
   [state {:keys [decision size]}]
   (let [steps (:steps @trace-target)
         best (get-in @trace-progress [(:index @state) :best] 0)
@@ -1292,11 +1314,15 @@
          :jev-blend-logs {:returns (fn [generation candidates count]
                                      (jev-returns generation candidates count :blend true :logs true))}
          :leader-faults {:returns (fn [& _] nil) :decide #'leader-faults-decide :event #'leader-faults-event}
-         ;; Every event (no "assertions": told only those, a target's steps are log lines).
+         ;; Told every event (a deciding plugin is; "assertions" would tell only those, and a
+         ;; target's steps are log lines), asked no decision ("plans", none sent: the explorer's
+         ;; own draws, no round trip per decision).
          :trace-target {:returns #'trace-target-returns :event #'trace-target-event :branch #'trace-target-start
-                        :wants ["behaviors" "labeled" "batched"]}
+                        :decide (fn [_ _] nil) :plan (fn [_] nil)
+                        :wants ["behaviors" "labeled" "batched" "plans"]}
          :trace-target-agent {:returns #'trace-agent-returns :event #'trace-agent-event :branch #'trace-target-start
-                              :decide #'trace-agent-decide :wants ["behaviors" "labeled" "batched"]}
+                              :decide #'trace-agent-decide :plan #'trace-agent-plan
+                              :wants ["behaviors" "labeled" "batched" "plans"]}
          :adaptive {:returns (fn [generation candidates count] (adaptive-returns generation candidates count))}
          :evolve {:returns (fn [generation candidates count] (evolve-returns generation candidates count))}
          :learn {:returns (fn [generation candidates count] (learn-returns generation candidates count))

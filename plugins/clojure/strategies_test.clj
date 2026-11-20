@@ -98,6 +98,13 @@
     (with-redefs [rand (constantly 0.0)]
       (let [answer (s/trace-agent-decide (atom {:index 7}) {:decision {:name "fault" :options ["pause raft-node-0" "partition raft-node-1 raft-node-2" "kill raft-node-2"]} :size 1})]
         (is (= "01" (:hex answer))))))
+  (testing "as a plan: the timeout's option 7 in 10, the other two 3 in 20 each"
+    (is (= {"fault" [[0 1 0.15] [1 2 0.7] [2 3 0.15]]}
+           (update-vals (s/trace-agent-plan (atom {:index 7})) (fn [segments] (mapv (fn [[a b w]] [a b (/ (Math/round (* 100 w)) 100.0)]) segments))))))
+  (testing "a timeline at no steered step: no plan"
+    (reset! s/trace-progress {7 {:best 0}})
+    (is (nil? (s/trace-agent-plan (atom {:index 7}))))
+    (reset! s/trace-progress {7 {:best 1}}))
   (testing "a decision the agent said nothing of: the injector's own draw"
     (is (nil? (s/trace-agent-decide (atom {:index 7}) {:decision {:name "fault.timing" :options ["a" "b"]} :size 1}))))
   (testing "the prompt names the target and the decisions"
