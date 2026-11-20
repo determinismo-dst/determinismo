@@ -1596,22 +1596,20 @@ pub const ClaimLearning = struct {
     /// Memory ran short after that: its claims are its guests' size for good.
     hard: bool = false,
 
-    /// A look at the host: `in_use` of its memory, `nodes` of it the nodes' snapshots (every
-    /// process's nodes claim, Pool.nodes_held: counted in the admission on their own, so not on
-    /// the VMs; Vitess's run 2073 had 56 GiB of them on 7 VMs, 8 GiB a VM, and learned its
-    /// guests' size), beside `admitted` VMs of the run (those
-    /// holding a CPU: Pool.run_held), `workers` of its `jobs` having a timeline (running, or
-    /// waiting for its CPU or memory), `ended` timelines so far. Counted once as many
-    /// timelines ended as the run has workers (its VMs seen whole, not young) and while every
-    /// worker has a timeline: the VMs admitted are then as many as memory lets in, where a
-    /// run short of work (a judgment's nodes awaited, its end) has the host's other memory on
-    /// a few heads. The most of its last looks_max looks: a high one counts at once, and goes
-    /// once that many came after it (Turso's run 2071 learned 4.4 GiB a VM from one look with
-    /// 9 VMs admitted, where 39 held 1 GiB each for the rest of the run, its 40th worker kept
-    /// waiting for good).
-    pub fn sample(learning: *ClaimLearning, in_use: u64, nodes: u64, admitted: u32, workers: u32, jobs: u32, ended: u64) void {
+    /// A look at the run's VMs: `held`, the most one of its timeline processes holds of its own
+    /// (its anonymous memory: the pages its guest wrote, its VMM's, and the explorer's it shares
+    /// since its fork, so a little high; not the snapshot's pages it reads, counted once as the
+    /// nodes'), beside `admitted` VMs of the run (holding a CPU: Pool.run_held), `workers` of its
+    /// `jobs` having a timeline, `ended` timelines so far. Counted once as many timelines ended as
+    /// the run has workers (its VMs seen whole, not young), while every worker has a timeline and
+    /// one of its VMs runs. The most of its last looks_max looks: a high one counts at once, and
+    /// goes once that many came after it. The host's memory in use less the nodes', over the VMs
+    /// admitted, counted the holders, serve and other runs on a few VMs: ParadeDB's run 2095 went
+    /// back to its 32 GiB guests from 23 GiB "a VM" with 1 or 2 admitted, while its one running VM
+    /// held 2.25 GB of its own; 1 VM at a time for hours.
+    pub fn sample(learning: *ClaimLearning, held: u64, admitted: u32, workers: u32, jobs: u32, ended: u64) void {
         if (ended < jobs or admitted == 0 or workers < jobs) return;
-        learning.looks[learning.looks_count % looks_max] = (in_use -| nodes) / admitted;
+        learning.looks[learning.looks_count % looks_max] = held;
         learning.looks_count += 1;
         var most: u64 = 0;
         for (learning.looks[0..@min(learning.looks_count, looks_max)]) |look| most = @max(most, look);
@@ -1620,9 +1618,7 @@ pub const ClaimLearning = struct {
 
     /// The claim to say for a VM of `guest` bytes: half again what one held at most; 0 (its
     /// guest's size) while nothing is learned, where that is no less, and once memory ran
-    /// short. The host's memory in use but the nodes' is counted on the run's VMs (its holders,
-    /// serve, the host's own): the claim errs high, and a run whose holders fill memory learns
-    /// its guests' size.
+    /// short.
     pub fn claim(learning: *ClaimLearning, guest: u64) u64 {
         if (learning.hard or learning.held_max == 0) return 0;
         const learned = learning.held_max + learning.held_max / 2;
@@ -1646,64 +1642,58 @@ test "a run learns what its VMs hold once enough ended, and claims half again" {
     const gib: u64 = 1 << 30;
     var learning: ClaimLearning = .{};
     try std.testing.expectEqual(@as(u64, 0), learning.claim(4 * gib)); // Nothing learned.
-    learning.sample(40 * gib, 0, 40, 40, 40, 39); // Fewer timelines ended than workers: young VMs.
+    learning.sample(2 * gib, 40, 40, 40, 39); // Fewer timelines ended than workers: young VMs.
     try std.testing.expectEqual(@as(u64, 0), learning.claim(4 * gib));
-    learning.sample(78 * gib, 0, 20, 20, 40, 400); // Half its workers without a timeline: not counted.
+    learning.sample(2 * gib, 20, 20, 40, 400); // Half its workers without a timeline: not counted.
     try std.testing.expectEqual(@as(u64, 0), learning.claim(4 * gib));
-    // Run 2067's: 39 admitted of 40 workers with a timeline, 2 GiB a VM with the host's all.
-    learning.sample(78 * gib, 0, 39, 40, 40, 400);
+    learning.sample(2 * gib, 0, 40, 40, 400); // None of its VMs running: nothing to read.
+    try std.testing.expectEqual(@as(u64, 0), learning.claim(4 * gib));
+    // Run 2067's: VMs holding 2 GiB, 39 admitted of 40 workers with a timeline.
+    learning.sample(2 * gib, 39, 40, 40, 400);
     try std.testing.expectEqual(3 * gib, learning.claim(4 * gib));
-    learning.sample(60 * gib, 0, 40, 40, 40, 500); // Less later: what it held at most stays.
+    learning.sample(gib, 40, 40, 40, 500); // Less later: what one held at most stays.
     try std.testing.expectEqual(3 * gib, learning.claim(4 * gib));
     try std.testing.expectEqual(@as(u64, 0), learning.claim(3 * gib)); // No less than the guest.
-    // Holders filling memory (run 2061's: 173 GB in use beside 40 VMs): the guest's size.
-    learning.sample(173 * gib, 0, 40, 40, 40, 900);
-    try std.testing.expectEqual(@as(u64, 0), learning.claim(4 * gib));
-    // Guests that fill their memory (8 GiB ones holding 6: 20 admitted of 40 workers, the others
-    // waiting for memory): by the VMs admitted, not the workers, and so their guest's size.
+    // Guests that fill their memory (8 GiB ones holding 6): their guest's size.
     var large: ClaimLearning = .{};
-    large.sample(150 * gib, 0, 20, 40, 40, 400);
+    large.sample(6 * gib, 20, 40, 40, 400);
     try std.testing.expectEqual(@as(u64, 0), large.claim(8 * gib));
 }
 
-test "the nodes' memory, counted in the admission on its own, is not on the run's VMs" {
+test "what a run's VM holds of its own, not the host's memory over the VMs admitted" {
+    const kib: u64 = 1 << 10;
     const gib: u64 = 1 << 30;
-    // Vitess's run 2073 at 0.47 h: 99 GiB in use, 56 of them its nodes' snapshots, 7 VMs
-    // admitted of 40 workers with a timeline. Its VMs hold 43 GiB: half again 6.1 a VM.
+    // ParadeDB's run 2095 at its 64th timeline: 135.4 GiB of nodes, holders in memory and on
+    // disk, 1 VM admitted, 40 workers with a timeline; the VM's own memory 2,247,596 kB. Half
+    // again: 3.2 GiB of its 32 GiB guest, where the host's memory in use over its VM gave 23.
     var learning: ClaimLearning = .{};
-    learning.sample(99 * gib, 56 * gib, 7, 40, 40, 94);
-    const claim = learning.claim(16 * gib);
-    try std.testing.expect(claim != 0);
-    try std.testing.expect(claim > 9 * gib and claim < 10 * gib);
-    // Nodes past what is in use (read at another moment): nothing on the VMs, nothing learned.
-    var none: ClaimLearning = .{};
-    none.sample(40 * gib, 50 * gib, 7, 40, 40, 94);
-    try std.testing.expectEqual(@as(u64, 0), none.claim(16 * gib));
+    learning.sample(2_247_596 * kib, 1, 40, 40, 64);
+    const claim = learning.claim(32 * gib);
+    try std.testing.expect(claim > 3 * gib and claim < 4 * gib);
 }
 
 test "a look past the learning's window no longer counts: an early high one does not hold the claim for good" {
     const gib: u64 = 1 << 30;
     var learning: ClaimLearning = .{};
-    // Turso's run 2071 at its 41st timeline: 4.4 GiB in use for each VM admitted (few admitted
-    // yet, the host's other memory on them), past its 4 GiB guest: the guest's size.
-    learning.sample(40 * gib, 0, 9, 40, 40, 41);
+    // A VM holding 4.4 GiB of its 4 GiB guest's worth early: the guest's size.
+    learning.sample(4 * gib + 2 * gib / 5, 9, 40, 40, 41);
     try std.testing.expectEqual(@as(u64, 0), learning.claim(4 * gib));
-    // Then 1 GiB a VM, 39 admitted, for as many looks as the window holds: the early one gone.
-    for (0..ClaimLearning.looks_max) |_| learning.sample(39 * gib, 0, 39, 40, 40, 500);
+    // Then 1 GiB for as many looks as the window holds: the early one gone.
+    for (0..ClaimLearning.looks_max) |_| learning.sample(gib, 39, 40, 40, 500);
     try std.testing.expectEqual(gib + gib / 2, learning.claim(4 * gib));
     // One look higher again counts at once (the window's most).
-    learning.sample(39 * 3 * gib, 0, 39, 40, 40, 900);
+    learning.sample(3 * gib, 39, 40, 40, 900);
     try std.testing.expectEqual(@as(u64, 0), learning.claim(4 * gib));
 }
 
 test "memory short under a learned claim: the guest's size for good; never said, never short" {
     const gib: u64 = 1 << 30;
     var hard: ClaimLearning = .{};
-    hard.sample(160 * gib, 0, 40, 40, 40, 400); // 4 GiB a VM: half again is past the guest.
+    hard.sample(4 * gib, 40, 40, 40, 400); // 4 GiB a VM: half again is past the guest.
     try std.testing.expectEqual(@as(u64, 0), hard.claim(4 * gib));
     try std.testing.expect(!hard.short(2 * gib, 16 * gib)); // Its claims were its guests': not its doing.
     var learning: ClaimLearning = .{};
-    learning.sample(78 * gib, 0, 39, 40, 40, 400);
+    learning.sample(2 * gib, 39, 40, 40, 400);
     try std.testing.expectEqual(3 * gib, learning.claim(4 * gib));
     try std.testing.expect(!learning.short(9 * gib, 16 * gib)); // Half the reserve is there.
     try std.testing.expect(!learning.short(0, 16 * gib)); // Unknown: never a reason.

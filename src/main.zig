@@ -4523,10 +4523,47 @@ fn deciding_strategy(exploration: *const Exploration) bool {
 
 /// A timeline running in a process of its own (explore_tree): where its results come back, and
 /// where it started.
+/// The most a timeline process of the run holds of its own: its anonymous memory (RssAnon, in
+/// /proc/<pid>/status: the kernel's count, read at once where smaps_rollup walked a VM's pages
+/// for 48 ms): the pages its guest wrote, its VMM's, and the explorer's it shares since its
+/// fork (about 1.4 GiB on srv4, so a little high); not the snapshot pages it reads, the nodes'.
+/// 0 for a process gone or unreadable.
+fn vms_held_most(running: []const Running) u64 {
+    var most: u64 = 0;
+    for (running) |entry| {
+        if (entry.short) continue; // Ended already, not reaped yet.
+        most = @max(most, rss_anon(entry.pid));
+    }
+    return most;
+}
+
+fn rss_anon(pid: linux.pid_t) u64 {
+    var path_buffer: [40]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}/status", .{pid}, 0) catch return 0;
+    const opened = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(opened) != .SUCCESS) return 0;
+    const fd: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(fd);
+    var buffer: [4096]u8 = undefined;
+    const size = linux.read(fd, &buffer, buffer.len);
+    if (linux.errno(size) != .SUCCESS) return 0;
+    const key = "RssAnon:";
+    const at = std.mem.indexOf(u8, buffer[0..size], key) orelse return 0;
+    var fields = std.mem.tokenizeAny(u8, buffer[at + key.len .. size], " \t\n");
+    const kib = std.fmt.parseInt(u64, fields.next() orelse return 0, 10) catch return 0;
+    return kib * 1024;
+}
+
+test rss_anon {
+    // This process's own: read, and more than nothing.
+    try std.testing.expect(rss_anon(linux.getpid()) > 0);
+    try std.testing.expectEqual(@as(u64, 0), rss_anon(std.math.maxInt(i32)));
+}
+
 /// How often the explorer looks at the host's memory for its run's claims (claims_look).
 const claims_look_ns = 5 * std.time.ns_per_s;
 
-/// The run's claims, from the host's memory beside its VMs (cpus.ClaimLearning), every
+/// The run's claims, from its VMs' own memory (cpus.ClaimLearning, vms_held_most), every
 /// claims_look_ns: what its VMs came to hold is what the next ones claim, and what those running
 /// count as (the run's turn file: every process of the run reads it at its take). Memory short
 /// after it said less than its guests' size: the claims are the guests' again, for good, and its
@@ -4564,7 +4601,7 @@ fn claims_look(state: *TreeState, pool: ?*cpus.Pool, running: []Running, jobs: u
         return;
     }
     const held_before = state.claims.held_max;
-    state.claims.sample(cpus.host_in_use(), claims_pool.nodes_held(), claims_pool.run_held(), @intCast(running.len), jobs, state.ended);
+    state.claims.sample(vms_held_most(running), claims_pool.run_held(), @intCast(running.len), jobs, state.ended);
     const claim = state.claims.claim(cpus.claim_bytes);
     claims_pool.claim_soft_set(claim);
     // Said at its first look that counts, and whenever its VMs' claim goes below their guest's
@@ -4572,12 +4609,12 @@ fn claims_look(state: *TreeState, pool: ?*cpus.Pool, running: []Running, jobs: u
     // timelines, its guest's size again some minutes later, and said nothing of it).
     if (claim != 0 and (state.claims_said == 0 or held_before == 0)) {
         say("[determinismo] the run's VMs claim {d} MiB each from now, not their guest's " ++
-            "{d}: half again what the host had in use for each ({d} timelines ended)\n", .{
+            "{d}: half again the most one held of its own ({d} timelines ended)\n", .{
             claim >> 20, cpus.claim_bytes >> 20, state.ended,
         });
     } else if (claim == 0 and state.claims.held_max != 0 and (held_before == 0 or state.claims_said != 0)) {
-        say("[determinismo] the run's VMs claim their guest's {d} MiB each: the host had " ++
-            "{d} MiB in use for each at most ({d} timelines ended)\n", .{
+        say("[determinismo] the run's VMs claim their guest's {d} MiB each: one held " ++
+            "{d} MiB of its own at most ({d} timelines ended)\n", .{
             cpus.claim_bytes >> 20, state.claims.held_max >> 20, state.ended,
         });
     }

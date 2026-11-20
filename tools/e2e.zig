@@ -6287,7 +6287,7 @@ fn check_tree(context: *Context) !void {
     const held = holders_made(one) and holders_made(many);
     // Each the node a replay makes, in what the guest can see (--verify-holders remade them).
     const verified = holders_verified(one);
-    // The explorer looks at the host's memory beside its VMs for its run's claims, and says so
+    // The explorer looks at its VMs' own memory for its run's claims, and says so
     // at its first look: without a pool of its own it never looked, and nothing said so
     // (2026-11-18). Not its first look that counts (every worker running a timeline at a look
     // 5 s apart): a one-worker tree is idle most of its time, and that line came or not.
@@ -6296,7 +6296,7 @@ fn check_tree(context: *Context) !void {
     expect_all(context, &.{
         .{ "64 timelines with one worker", count == 64 },
         .{ "64 timelines with four", parallel_count == 64 },
-        .{ "the explorer looks at what the host holds for its VMs (its run's claims)", claims_looked },
+        .{ "the explorer looks at what its VMs hold (its run's claims)", claims_looked },
         .{ "the tree deepens (a path at least one deep)", deep.depth >= 1 },
         .{ "the deepest timeline replays alone from its tape", deep.replays },
         .{ "in-run snapshots made nodes, with one worker and with four", held },
