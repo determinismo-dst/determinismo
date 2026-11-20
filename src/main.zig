@@ -4084,8 +4084,13 @@ fn explore_tree(
             continue;
         };
         // A run that starts no timeline any more makes no node more: the makers that waited
-        // for room are not started (their returns' timelines would never run).
-        if (late) if (judging) |*pending| makings_cancel(pending.makings[0..pending.making_count]);
+        // for room are not started, and those making one are stopped (their returns' timelines
+        // would never run). Waited for, they held the run's end: Turso composer's run 2093, its
+        // budget and grace over, its explorer in makings_finish_all.
+        if (late) if (judging) |*pending| {
+            makings_cancel(pending.makings[0..pending.making_count]);
+            makings_stop(pending.makings[0..pending.making_count]);
+        };
         // A generation judged meanwhile: its branches planned once its nodes are all made.
         if (judging) |*pending| if (try tree_judge_poll(arena, maker_start(vm, options, branches, &state), &state, pending)) {
             try tree_judge_end(context, vm, options, branches, &state, &batch, pending);
@@ -7180,6 +7185,45 @@ fn makings_cancel(makings: []NodeMaking) void {
         making.ready = true;
     };
     cpus.makers_want_end();
+}
+
+/// The makers in flight stopped and collected, no node of theirs: a run that starts no timeline
+/// any more (makings_cancel has those that waited).
+fn makings_stop(makings: []NodeMaking) void {
+    for (makings) |*making| {
+        if (making.ready or making.waiting) continue;
+        assert(making.pid > 0);
+        _ = linux.kill(making.pid, .KILL);
+        close(making.socket);
+        var status: i32 = 0;
+        _ = linux.wait4(making.pid, &status, 0, null);
+        making.ready = true;
+    }
+}
+
+test makings_stop {
+    // A maker in flight (a child that would take its time), one that waited, one collected.
+    var pair: [2]linux.fd_t = undefined;
+    try std.testing.expectEqual(@as(usize, 0), linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &pair));
+    const pid = linux.fork();
+    if (pid == 0) {
+        const long: linux.timespec = .{ .sec = 600, .nsec = 0 };
+        _ = linux.nanosleep(&long, null);
+        linux.exit_group(0);
+    }
+    _ = linux.close(pair[1]);
+    var makings = [_]NodeMaking{
+        .{ .back = undefined, .parent = undefined, .pid = @intCast(pid), .socket = pair[0] },
+        .{ .back = undefined, .parent = undefined, .waiting = true },
+        .{ .back = undefined, .parent = undefined, .ready = true },
+    };
+    makings_stop(&makings);
+    try std.testing.expect(makings[0].ready and makings[0].snapshot == null);
+    try std.testing.expectEqual(@as(u32, 0), makings_in_flight(&makings));
+    // Its process is gone, collected: none left to wait for.
+    var status: i32 = 0;
+    try std.testing.expectEqual(linux.E.CHILD, linux.errno(linux.wait4(@intCast(pid), &status, linux.W.NOHANG, null)));
+    try std.testing.expect(makings[1].waiting and !makings[1].ready); // makings_cancel's.
 }
 
 /// Every maker of a judgment made, waited for: where nothing else goes on (no timeline runs,
