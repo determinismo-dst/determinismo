@@ -129,6 +129,46 @@
     (let [steps [{:action "leadership_transfer_timeout" :role 0}]]
       (is (= 1 (s/trace-best (s/trace-advance steps #{} (s/named-event {:output {:source "raft-node-0" :text "2026-11-19T00:00:12.609Z [DEBUG] node-0: leadership transfer timeout"}}))))))))
 
+(defn- line [source text] (s/named-event {:output {:source source :text (str "2026-11-19T00:00:01.000Z [DEBUG] " text)}}))
+
+(deftest the-double-votes-ladder-in-the-specs-terms
+  (let [fold (fn [lines] (:level (reduce s/ladder-fold {} lines)))]
+    (testing "ordinary elections: none of it (their own address is a node's vote for itself)"
+      (is (= 0 (fold [(line "raft-node-2" "node-2: granted vote: term=3 candidate=10.0.0.5:8300")
+                      (line "raft-node-2" "node-2: vote granted: from=node-2 term=3 tally=1")
+                      (line "raft-node-0" "node-0: granted vote: term=3 candidate=10.1.0.5:8300")
+                      (line "raft-node-2" "node-2: election won: term=3 tally=2")
+                      (line "raft-node-1" "node-1: pre-vote granted: from=node-1 term=4 tally=1")]))))
+    (testing "a term written late: 1; then that node's second vote in a term: 2; a second leader: 3"
+      (let [lines [(line "raft-node-1" "node-1: updated currentTerm: term=24")
+                   (line "raft-node-1" "node-1: granted vote: term=24 candidate=10.0.0.5:8300")
+                   (line "raft-node-1" "node-1: updated currentTerm: term=23")]]
+        (is (= 1 (fold lines)))
+        (is (= 2 (fold (conj lines (line "raft-node-1" "node-1: vote granted: from=node-1 term=24 tally=1")))))
+        (is (= 3 (fold (conj lines (line "raft-node-2" "node-2: election won: term=24 tally=2")
+                             (line "raft-node-1" "node-1: election won: term=24 tally=2")))))))))
+
+(deftest a-ladder-targets-progress-and-a-branchs-inheritance
+  (s/ladder-target! :double-vote)
+  (let [ns 1000000000
+        st (atom {})]
+    (s/trace-target-start st {:index 4 :from nil})
+    (s/trace-target-event st {:vtime_ns (* 2 ns) :event {:output {:source "raft-node-1" :text "x [DEBUG] node-1: updated currentTerm: term=5"}}})
+    (s/trace-target-event st {:vtime_ns (* 3 ns) :event {:output {:source "raft-node-1" :text "x [DEBUG] node-1: updated currentTerm: term=4"}}})
+    (is (= 1 (get-in @s/trace-progress [4 :best])))
+    (is (= (* 3 ns) (get-in @s/trace-progress [4 :best_ns])))
+    (testing "a branch after the late write starts at 1; one before it at 0"
+      (s/trace-target-start (atom {}) {:index 9 :from {:branch 4 :vtime_ns (* 5 ns)}})
+      (s/trace-target-start (atom {}) {:index 10 :from {:branch 4 :vtime_ns (* 2 ns)}})
+      (is (= 1 (get-in @s/trace-progress [9 :best])))
+      (is (= 0 (get-in @s/trace-progress [10 :best]))))
+    (testing "the agent's next step is the rung after the timeline's"
+      (reset! s/trace-decisions {"fault" ["pause raft-node-1" "kill raft-node-0"]})
+      (reset! s/trace-agent-steer {"voted_twice_in_a_term" {"fault" ["pause raft-node-1"]}})
+      (is (= {"fault" [[0 1 0.7] [1 2 0.3]]}
+             (update-vals (s/trace-agent-plan (atom {:index 4}))
+                          (fn [segments] (mapv (fn [[a b w]] [a b (/ (Math/round (* 100 w)) 100.0)]) segments))))))))
+
 (deftest rarity-is-the-explorers-whole-rule
   (fresh!)
   (testing "without an archive offered, the frontier alone (explorers before it)"

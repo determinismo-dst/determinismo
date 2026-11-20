@@ -942,6 +942,7 @@
 ;; leadership_transfer_timeout(X), leadership_transfer_in_progress(X).
 
 (defonce trace-target (atom nil))   ; {:steps [{:action "..." :role 0}] :source path}
+(declare ladder-start ladder-event ladder-steps ladder-target!)
 (defonce trace-progress (atom {}))  ; branch index -> {:states #{{:k :bind}} :history [[at_ns states]]}
 (def trace-states-max 64)
 
@@ -1099,8 +1100,10 @@
 
 (defn trace-target-start [state {:keys [index from]}]
   (swap! state assoc :index index)
+  (if (:ladder @trace-target)
+    (ladder-start index from)
   (let [states (inherited from)]
-    (swap! trace-progress assoc index {:start states :states states :history [] :best (trace-best states)})))
+    (swap! trace-progress assoc index {:start states :states states :history [] :best (trace-best states)}))))
 
 (def trace-recent-max 40)
 
@@ -1118,7 +1121,8 @@
 (defn trace-target-event [state {:keys [vtime_ns event]}]
   (let [event (or (named-event event) event)]
   (trace-recent (:index @state) vtime_ns event)
-  (when-let [steps (:steps @trace-target)]
+  (when (:ladder @trace-target) (ladder-event (:index @state) vtime_ns event))
+  (when-let [steps (when-not (:ladder @trace-target) (:steps @trace-target))]
     (when (and (string? (:event event)) (event-node event))
       (let [index (:index @state)]
         (swap! trace-progress
@@ -1131,6 +1135,85 @@
                                           (assoc :states after :best (trace-best after))
                                           (update :history conj [vtime_ns after])
                                           (cond-> (> (trace-best after) (trace-best states)) (assoc :best_ns vtime_ns)))))))))))))
+
+;; A ladder target: progress as a bug's ingredients in its spec's terms, not a sequence of events (a
+;; sequence the spec's invariants do not tell apart from ordinary runs scores them all as done: the
+;; double vote's six events occur in that order in ordinary elections, 121 of 132 timelines of run
+;; 1422 matched all six). The double vote's (hashicorp/raft#695, the spec's term_never_goes_back,
+;; one_vote_per_term, one_leader_per_term): 1 a node's term went back, 2 a node voted twice in one
+;; term, 3 two leaders in one term. Folded over a timeline's named events, a branch starting from
+;; its parent's state at its moment. `(ladder-target! :double-vote)`, or the control port's
+;; "target double-vote".
+
+(def ladder-steps
+  {:double-vote [{:action "term_went_back" :about "a node's term goes back (a term write landing late)"}
+                 {:action "voted_twice_in_a_term" :about "a node votes twice in one term (two candidates, or another and itself)"}
+                 {:action "two_leaders_in_a_term" :about "two nodes win the same term"}]})
+
+(defn- address-node
+  "A node's name from one of its addresses (the Raft PoC's: host .3 node-0, .4 node-1, .5 node-2 on
+  each of its networks)."
+  [address]
+  (if-let [[_ host] (re-find #"^\d+\.\d+\.\d+\.(\d+):" (str address))]
+    (get {"3" "raft-node-0" "4" "raft-node-1" "5" "raft-node-2"} host address)
+    address))
+
+(defn ladder-fold
+  "A timeline's double-vote state after one named event: terms, votes and leaders, and its level."
+  [state {:keys [event details]}]
+  (let [node (:source details)
+        term (:term details)
+        state (case event
+                "updated_currentterm"
+                (if (and node (integer? term))
+                  (cond-> (assoc-in state [:term node] term)
+                    (when-let [was (get-in state [:term node])] (< term was)) (update :back (fnil conj #{}) node))
+                  state)
+                "granted_vote"
+                (if (and node (integer? term))
+                  (let [candidate (address-node (:candidate details))]
+                    (update-in state [:votes [node term]] (fnil conj #{}) (if (= candidate node) "self" candidate)))
+                  state)
+                "vote_granted"
+                (if (and node (integer? term) (str/ends-with? node (str (:from details))))
+                  (update-in state [:votes [node term]] (fnil conj #{}) "self")
+                  state)
+                "election_won"
+                (if (and node (integer? term)) (update-in state [:leaders term] (fnil conj #{}) node) state)
+                state)
+        level (cond (some #(> (count %) 1) (vals (:leaders state))) 3
+                    (some #(> (count %) 1) (vals (:votes state))) 2
+                    (seq (:back state)) 1
+                    :else 0)]
+    (assoc state :level (max level (:level state 0)))))
+
+(def ^:private ladder-names #{"updated_currentterm" "granted_vote" "vote_granted" "election_won"})
+
+(defn ladder-target! [kind]
+  (reset! trace-target {:steps (get ladder-steps kind) :ladder kind :source (name kind)})
+  (reset! trace-progress {})
+  @trace-target)
+
+(defn- ladder-state-at
+  "A branch's ladder state at `vtime_ns`: its start's, folded over its own events to then."
+  [{:keys [ladder-start ladder-events]} vtime_ns]
+  (reduce ladder-fold (or ladder-start {}) (map second (take-while #(<= (first %) vtime_ns) ladder-events))))
+
+(defn- ladder-start [index from]
+  (let [state (if from (ladder-state-at (get @trace-progress (:branch from)) (:vtime_ns from)) {})]
+    (swap! trace-progress update index merge
+           {:ladder-start state :ladder-state state :ladder-events [] :best (:level state 0)})))
+
+(defn- ladder-event [index vtime_ns event]
+  (when (ladder-names (:event event))
+    (swap! trace-progress
+           (fn [all]
+             (let [{:keys [ladder-state best] :or {ladder-state {} best 0} :as now} (get all index)
+                   after (ladder-fold ladder-state event)]
+               (assoc all index (cond-> (-> now
+                                            (assoc :ladder-state after :best (:level after 0))
+                                            (update :ladder-events (fnil conj []) [vtime_ns event]))
+                                  (> (:level after 0) best) (assoc :best_ns vtime_ns))))))))
 
 (defn trace-frontier
   "The candidates whose own events advanced the target furthest, each its moment just after its
@@ -2344,7 +2427,9 @@
                       "events-dir" (do (reset! events-dir argument) "ok")
                       "jev-system" (do (reset! jev-system argument) "ok")
                       ;; A model trace to aim at (trace-target): a Quint ITF file on this host.
-                      "target" (try (str "ok " (clojure.core/count (:steps (target! argument))) " steps")
+                      "target" (try (str "ok " (clojure.core/count (:steps (if (contains? ladder-steps (keyword argument))
+                                                                                (ladder-target! (keyword argument))
+                                                                                (target! argument)))) " steps")
                                     (catch Throwable e (str "error " (ex-message e))))
                       ;; What the strategies did, by run (its run_url): how much jev-follow steered,
                       ;; :evolve's proposals. One JSON line (ab.py --host-control).
