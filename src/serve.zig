@@ -1601,6 +1601,10 @@ pub const RunRequest = struct {
     branches: ?u32 = null,
     /// Explore until then: "90s", "10m", "2h".
     time_budget: ?[]const u8 = null,
+    /// A timeline's ceiling of virtual time (explore's --timeline-limit, an hour unless asked):
+    /// one not finished by then ends as hung. Part of the guest's inputs (the composer starts
+    /// no driver past its half): its replays take it too.
+    timeline_limit: ?[]const u8 = null,
     /// "flat" or "tree" (explore's --branching).
     branching: ?[]const u8 = null,
     /// Fault kinds every node also allows, nodes that allow none (explore's --faults,
@@ -1751,6 +1755,7 @@ fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
     if (asked.from_snapshot != null) return error.BadRequest; // A session's fork's alone.
     // Refused here, as the explorer would refuse it at its start (det-faults' regex.zig).
     if (asked.fault_exclusions) |pattern| _ = regex.Regex.compile(pattern) catch return error.BadRequest;
+    if (asked.timeline_limit) |limit| _ = main_zig.duration_parse(limit) catch return error.BadRequest;
     if (asked.plan) return run_plan(server, asked, out);
     var run = asked;
     // A machine's checkpoint, as named (refused outside the machines' directory): flat branches.
@@ -3848,6 +3853,7 @@ fn session_futures_start(session: *Session, snapshot: []const u8) !void {
         .no_faults = original.no_faults,
         .coverage = original.coverage,
         .timeline = original.timeline,
+        .timeline_limit = original.timeline_limit,
         .min_drive = original.min_drive,
         .drivers_cpu_weight = original.drivers_cpu_weight,
         .fault_weights = original.fault_weights,
@@ -5387,6 +5393,21 @@ test strategy_name_valid {
     try std.testing.expect(!strategy_name_valid(".hidden"));
 }
 
+test "a run's timeline limit reaches its explorer and its replays (system_arguments)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // As serve reads a run's request: an etcd run's timelines (99% under 288 s) were held an
+    // hour each when a crash left its cluster dead (run 2100: 94% of its virtual time so).
+    const asked = try std.json.parseFromSliceLeaky(RunRequest, arena, "{\"program\":\"/bin/x\",\"timeline_limit\":\"20s\"}", .{ .ignore_unknown_fields = true });
+    var argv: std.ArrayList([]const u8) = .empty;
+    try system_arguments(arena, &argv, &asked);
+    const at = for (argv.items, 0..) |item, index| {
+        if (std.mem.eql(u8, item, "--timeline-limit")) break index;
+    } else return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("20s", argv.items[at + 1]);
+}
+
 pub fn system_arguments(
     arena: std.mem.Allocator,
     argv: *std.ArrayList([]const u8),
@@ -5407,6 +5428,7 @@ pub fn system_arguments(
     if (asked.coverage) |set| try argv.appendSlice(arena, &.{ "--coverage", set });
     // Part of the inputs (the guest's command line): replays need it too.
     if (asked.timeline) |length| try argv.appendSlice(arena, &.{ "--timeline", length });
+    if (asked.timeline_limit) |limit| try argv.appendSlice(arena, &.{ "--timeline-limit", limit });
     // Its injectors, on the system disk: the same disk for its replays.
     if (asked.injectors) |list| for (list) |path| try argv.appendSlice(arena, &.{ "--injector", path });
     // `det.swarm=0`, as the run had it: given to the run alone, every replay and session of a
