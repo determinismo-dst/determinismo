@@ -794,7 +794,14 @@ fn kubernetes_describe(context: Context, directory: []const u8, extra_images: ?[
         .env = &.{kubernetes.kubeconfig},
         .ready = .{ .tcp = kubernetes.api_port },
         .privileged = true,
-        .faults = .{ .pods = true },
+        // Antithesis's node on Kubernetes is a pod: a pause freezes "a container", a partition
+        // splits pods, and only thread pausing, clock skips and CPU modulation are the
+        // machine's. So the pod faults, and of this node's own (the whole cluster: its control
+        // plane and every pod, the excluded ones too) those that are the machine's alone: no
+        // pause, throttle, isolation, partition or degraded link of the node itself. Paused
+        // whole, CloudNativePG's excluded operator lost its leader lease and exited (ParadeDB's
+        // run 2095); its links reach only the runner.
+        .faults = .{ .pods = true, .pause = false, .throttle = false, .isolate = false, .partition = false, .degrade = false },
     };
     const profiles = try arena.alloc(schema.Profile, 1);
     profiles[0] = .{ .name = "kubernetes", .nodes = nodes };
