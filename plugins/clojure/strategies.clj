@@ -1292,10 +1292,11 @@
          :jev-blend-logs {:returns (fn [generation candidates count]
                                      (jev-returns generation candidates count :blend true :logs true))}
          :leader-faults {:returns (fn [& _] nil) :decide #'leader-faults-decide :event #'leader-faults-event}
+         ;; Every event (no "assertions": told only those, a target's steps are log lines).
          :trace-target {:returns #'trace-target-returns :event #'trace-target-event :branch #'trace-target-start
-                        :wants ["behaviors" "labeled" "assertions" "batched"]}
+                        :wants ["behaviors" "labeled" "batched"]}
          :trace-target-agent {:returns #'trace-agent-returns :event #'trace-agent-event :branch #'trace-target-start
-                              :decide #'trace-agent-decide :wants ["behaviors" "labeled" "assertions" "batched"]}
+                              :decide #'trace-agent-decide :wants ["behaviors" "labeled" "batched"]}
          :adaptive {:returns (fn [generation candidates count] (adaptive-returns generation candidates count))}
          :evolve {:returns (fn [generation candidates count] (evolve-returns generation candidates count))}
          :learn {:returns (fn [generation candidates count] (learn-returns generation candidates count))
