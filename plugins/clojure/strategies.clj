@@ -1058,6 +1058,113 @@
         taken (set (map :branch aimed))]
     (concat aimed (rarity generation (remove #(taken (:branch %)) candidates) (- count (clojure.core/count aimed))))))
 
+;; The agent arm: the same returns, and Claude choosing what to steer. After each generation (in the
+;; background: the tree never waits for it) Claude reads the target, where the furthest timelines
+;; stalled (their named events after their furthest step) and the decisions the timelines drew
+;; with their options, and says for each step as the next one which options make it likelier. A
+;; timeline's named decisions then take one of those options `trace-agent-chance` of the time, as
+;; its progress says which step is next; the injector's own draw otherwise. Every ask is kept in
+;; `@trace-agent-asks`; replays need no agent (the choices are on the tapes).
+
+(declare advisor-model)
+
+(defonce trace-decisions (atom {}))       ; decision name -> options seen
+(defonce trace-agent-steer (atom {}))     ; action -> {decision name -> [option]}
+(defonce trace-agent-asks (atom []))      ; [{:at :prompt :answer :steer}]
+(defonce trace-agent-in-flight (atom false))
+(def trace-agent-chance 0.7)
+(def trace-agent-events-max 20)
+(def trace-agent-stalls-max 3)
+
+(defn trace-agent-event [state {:keys [event] :as request}]
+  (trace-target-event state request)
+  (when (map? (:decision event))
+    (let [{label :name options :options} (:decision event)]
+      (when (and (string? label) (< 1 (clojure.core/count options) (inc jev-options-max)))
+        (swap! trace-decisions assoc label (vec options))))))
+
+(defn- trace-stalls
+  "The furthest timelines' named events after their furthest step (from the events directory)."
+  [candidates]
+  (let [names (set (map :action (:steps @trace-target)))]
+    (vec (for [c (take trace-agent-stalls-max
+                       (sort-by #(- (get-in @trace-progress [(:branch %) :best] 0)) candidates))
+               :let [{:keys [best best_ns]} (get @trace-progress (:branch c))]
+               :when (and best (pos? best))]
+           {:branch (:branch c) :matched best
+            :after (vec (take trace-agent-events-max
+                              (for [e (try (timeline (:branch c)) (catch Exception _ []))
+                                    :when (and (>= (or (:vtime_ns e) 0) (or best_ns 0))
+                                               (or (names (:event e)) (= "fault" (:event e))))]
+                                {:at_s (seconds (:vtime_ns e)) :event (:event e)
+                                 :node (event-node e) :details (clip (json/generate-string (:details e)) 160)})))}))))
+
+(defn trace-agent-prompt [stalls]
+  (str "You steer a deterministic simulation test toward a target: a sequence of a system's steps that "
+       "a model (Quint) says leads to a bug. Each step is an event name by a node; the same role is the "
+       "same node throughout (role 0 is one node, role 1 another).\n"
+       "Target: " (json/generate-string (:steps @trace-target)) "\n"
+       "Where the furthest timelines stopped (steps matched, then their events after the last one): "
+       (json/generate-string stalls) "\n"
+       "The decisions the simulation draws, with their options (faults, timings, inputs): "
+       (json/generate-string @trace-decisions) "\n"
+       "For each step of the target as the next one to happen, choose among those options the ones "
+       "that make it likelier to happen next. Answer with JSON only: {\"steer\": {\"<step's action>\": "
+       "{\"<decision name>\": [\"<option exactly as listed>\", ...]}}, \"why\": \"<two sentences>\"}"))
+
+(defn trace-agent-apply!
+  "Keeps an answer's steering where its options are ones the decisions have."
+  [answer]
+  (let [steer (into {} (for [[action by-decision] (:steer answer)
+                             :let [kept (into {} (for [[label options] by-decision
+                                                       :let [known (set (get @trace-decisions (name label)))
+                                                             options (vec (filter known options))]
+                                                       :when (seq options)]
+                                                   [(name label) options]))]
+                             :when (seq kept)]
+                         [(name action) kept]))]
+    (when (seq steer) (reset! trace-agent-steer steer))
+    steer))
+
+(defn trace-agent-ask! [candidates]
+  (when (and @trace-target (compare-and-set! trace-agent-in-flight false true))
+    (future
+      (try
+        (let [prompt (trace-agent-prompt (trace-stalls candidates))
+              result (let [process (.start (ProcessBuilder. ["claude" "-p" "--model" advisor-model prompt]))
+                           out (slurp (.getInputStream process))]
+                       (.waitFor process)
+                       out)
+              start (str/index-of result "{")
+              end (str/last-index-of result "}")
+              answer (when (and start end) (try (json/parse-string (subs result start (inc end)) true) (catch Exception _ nil)))
+              steer (when answer (trace-agent-apply! answer))]
+          (swap! trace-agent-asks #(conj (if (>= (clojure.core/count %) 64) (subvec % 1) %)
+                                         {:at (System/currentTimeMillis) :prompt prompt :answer (or answer result) :steer steer}))
+          (binding [*out* *err*] (println "trace-agent:" (pr-str (:why answer)) "steering" (clojure.core/count steer) "steps")))
+        (catch Exception e (binding [*out* *err*] (println "trace-agent:" (ex-message e))))
+        (finally (reset! trace-agent-in-flight false))))))
+
+(defn trace-agent-returns [generation candidates count]
+  (trace-agent-ask! candidates)
+  (trace-target-returns generation candidates count))
+
+(defn trace-agent-decide
+  "One of the agent's options for this decision, as this timeline's next step needs, most of the
+  time; nil (the injector's own draw) otherwise."
+  [state {:keys [decision size]}]
+  (let [steps (:steps @trace-target)
+        best (get-in @trace-progress [(:index @state) :best] 0)
+        action (:action (get steps best))
+        preferred (set (get-in @trace-agent-steer [action (:name decision)]))
+        options (:options decision)]
+    (when (and action (seq preferred) (< (rand) trace-agent-chance))
+      (let [aimed (keep-indexed (fn [i option] (when (preferred option) i)) options)]
+        (when (seq aimed)
+          (let [index (rand-nth aimed)]
+            {:hex (index-hex index size)
+             :reason (str "trace-agent: " (nth options index) ", for " action " (step " (inc best) ")")}))))))
+
 ;; Built in, merged at every load (a reload adds or updates them; ones made at the REPL stay).
 (def end-timeline
   "What a strategy's :event fn returns to end the timeline at that moment (the explorer stops it
@@ -1091,6 +1198,8 @@
          :leader-faults {:returns (fn [& _] nil) :decide #'leader-faults-decide :event #'leader-faults-event}
          :trace-target {:returns #'trace-target-returns :event #'trace-target-event :branch #'trace-target-start
                         :wants ["behaviors" "labeled" "assertions" "batched"]}
+         :trace-target-agent {:returns #'trace-agent-returns :event #'trace-agent-event :branch #'trace-target-start
+                              :decide #'trace-agent-decide :wants ["behaviors" "labeled" "assertions" "batched"]}
          :adaptive {:returns (fn [generation candidates count] (adaptive-returns generation candidates count))}
          :evolve {:returns (fn [generation candidates count] (evolve-returns generation candidates count))}
          :learn {:returns (fn [generation candidates count] (learn-returns generation candidates count))
@@ -1138,6 +1247,7 @@
       (reset! current-run run)
       (reset! ends {}) (reset! starts {}) (reset! archive {})
       (reset! trace-progress {}) ; The target stays: set for the arm, not the run.
+      (reset! trace-decisions {}) (reset! trace-agent-steer {})
       (reset! jev-weights {}) (reset! jev-options {}) (reset! jev-properties {})
       (reset! jev-history [])
       (reset! jev-stories {})

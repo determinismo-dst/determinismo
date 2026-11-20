@@ -3,6 +3,7 @@
 ;; no network); each test starts from a fresh per-run state.
 (ns strategies-test
   (:require [clojure.test :refer [deftest is testing run-tests]]
+            [clojure.string :as str]
             [strategies :as s]))
 
 (defn- candidate [branch label]
@@ -84,6 +85,25 @@
       (is (= 1 (s/trace-best (get-in @s/trace-progress [13 :states])))))
     (testing "half the returns aimed, the rest the explorer's rule"
       (is (= [4 9] (mapv :branch (s/trace-target-returns 1 [(candidate 4 "x") (candidate 9 "y")] 2)))))))
+
+(deftest the-agent-arm-steers-a-timelines-next-step-with-the-options-it-chose
+  (reset! s/trace-target {:steps [{:action "starting_leadership_transfer" :role 0}
+                                  {:action "leadership_transfer_timeout" :role 0}]})
+  (reset! s/trace-progress {7 {:best 1}})
+  (reset! s/trace-decisions {"fault" ["pause raft-node-0" "partition raft-node-1 raft-node-2" "kill raft-node-2"]})
+  (testing "only options the decisions have are kept"
+    (is (= {"leadership_transfer_timeout" {"fault" ["partition raft-node-1 raft-node-2"]}}
+           (s/trace-agent-apply! {:steer {:leadership_transfer_timeout {:fault ["partition raft-node-1 raft-node-2" "made up"]}}}))))
+  (testing "timeline 7 matched one step: its fault decision takes the timeout's option"
+    (with-redefs [rand (constantly 0.0)]
+      (let [answer (s/trace-agent-decide (atom {:index 7}) {:decision {:name "fault" :options ["pause raft-node-0" "partition raft-node-1 raft-node-2" "kill raft-node-2"]} :size 1})]
+        (is (= "01" (:hex answer))))))
+  (testing "a decision the agent said nothing of: the injector's own draw"
+    (is (nil? (s/trace-agent-decide (atom {:index 7}) {:decision {:name "fault.timing" :options ["a" "b"]} :size 1}))))
+  (testing "the prompt names the target and the decisions"
+    (let [prompt (s/trace-agent-prompt [])]
+      (is (str/includes? prompt "leadership_transfer_timeout"))
+      (is (str/includes? prompt "partition raft-node-1 raft-node-2")))))
 
 (deftest rarity-is-the-explorers-whole-rule
   (fresh!)
