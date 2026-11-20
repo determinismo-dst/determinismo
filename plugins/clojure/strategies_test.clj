@@ -105,6 +105,23 @@
       (is (str/includes? prompt "leadership_transfer_timeout"))
       (is (str/includes? prompt "partition raft-node-1 raft-node-2")))))
 
+(deftest a-log-line-is-named-as-determinismo-quint-names-it
+  (is (= {:event "election_won" :details {:source "raft-node-1" :term 4 :tally 2}}
+         (s/log-step {:source "raft-node-1" :text "2026-11-19T00:00:03.158Z [INFO]  node-1: election won: term=4 tally=2"})))
+  (is (= "leadership_transfer_timeout"
+         (:event (s/log-step {:source "raft-node-0" :text "2026-11-19T00:00:12.609Z [DEBUG] node-0: leadership transfer timeout"}))))
+  (is (= "err_leadership_transfer_timeout_ok_false"
+         (:event (s/log-step {:source "raft-node-0" :text "2026-11-19T00:00:12.609Z [DEBUG] node-0: sent response to client: {\"err\":\"leadership transfer timeout\",\"ok\":false}"}))))
+  (is (= {:event "election_won" :details {:source "raft-node-2" :level "info" :term 5 :last_leader_id "" :took "1.5ms"}}
+         (s/log-step {:source "raft-node-2" :text "level=info msg=\"Election Won!\" term=5 last-leader-id=\"\" took=1.5ms"})))
+  (is (= "connection_from" (:event (s/log-step {:source "raft-monitor" :text "connection from 10.0.0.6:56392"}))))
+  (is (= {:event "op_data" :details {:source "raft-node-1" :op "apply" :data "aadb6b27"}}
+         (s/log-step {:source "raft-node-1" :text "{\"op\":\"apply\",\"data\":\"aadb6b27\"}"})))
+  (is (nil? (s/log-step {:source "client" :text "---- 1234 ----"})))
+  (testing "an output event matches a target's step by its name and source"
+    (let [steps [{:action "leadership_transfer_timeout" :role 0}]]
+      (is (= 1 (s/trace-best (s/trace-advance steps #{} (s/named-event {:output {:source "raft-node-0" :text "2026-11-19T00:00:12.609Z [DEBUG] node-0: leadership transfer timeout"}}))))))))
+
 (deftest rarity-is-the-explorers-whole-rule
   (fresh!)
   (testing "without an archive offered, the frontier alone (explorers before it)"

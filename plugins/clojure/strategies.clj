@@ -985,6 +985,89 @@
 (defn- event-node [event]
   (or (get-in event [:details :source]) (get-in event [:details :node])))
 
+;; A system that says its steps in its log: an output line as an event, named by its message,
+;; as `determinismo quint` names it (src/quint.zig's log_step and log_name), so a target's steps
+;; match the lines a spec's actions take.
+
+(def ^:private log-name-max 64)
+
+(defn log-name
+  "A message as an action's name: its words' letters, lowercase, \"_\" between them; a word with a
+  digit in it left out. Nil when nothing is left, or too much."
+  [message]
+  (let [words (remove #(re-find #"[0-9]" %) (str/split (str/trim (str message)) #"[ \t]+"))
+        parts (keep (fn [word]
+                      (let [out (StringBuilder.)]
+                        (doseq [c word]
+                          (cond (Character/isLetter c) (.append out (Character/toLowerCase c))
+                                (and (pos? (.length out)) (not= \_ (.charAt out (dec (.length out))))) (.append out \_)))
+                        (let [text (str/replace (str out) #"_+$" "")]
+                          (when (seq text) text))))
+                    words)
+        name (str/join "_" parts)]
+    (when (and (seq name) (<= (count name) log-name-max)) name)))
+
+(defn- log-key [key] (str/replace key #"[^A-Za-z0-9]" "_"))
+
+(defn- log-key-char? [c] (or (Character/isLetterOrDigit c) (#{\_ \- \.} c)))
+
+(defn- log-pairs-at
+  "Where a line's key=value pairs begin: the first word that is `key=`."
+  [text]
+  (or (some (fn [equals]
+              (let [start (loop [i equals] (if (and (pos? i) (log-key-char? (.charAt ^String text (dec i)))) (recur (dec i)) i))]
+                (when (and (< start equals) (Character/isLetter (.charAt ^String text start))
+                           (or (zero? start) (= \space (.charAt ^String text (dec start)))))
+                  start)))
+            (keep-indexed (fn [i c] (when (= \= c) i)) text))
+      (count text)))
+
+(defn log-step
+  "An output event ({:source :text}) as a named event {:event :details}: nil when its line names
+  nothing."
+  [{:keys [source text]}]
+  (let [text (str/trim (str text))
+        fields {:source (or source "")}]
+    (if-let [object (when (str/starts-with? text "{") (try (json/parse-string text) (catch Exception _ nil)))]
+      (when (map? object)
+        (let [said (some #(let [v (get object %)] (when (string? v) v)) ["msg" "message" "event"])
+              naming (when said (some #(when (= said (get object %)) %) ["msg" "message" "event"]))
+              rest-keys (remove #{naming} (keys object))
+              name (log-name (or said (str/join " " rest-keys)))]
+          (when name
+            {:event name :details (into fields (for [k rest-keys] [(keyword (log-key k)) (get object k)]))})))
+      (let [at (log-pairs-at text)
+            message (-> (subs text 0 at) str/trim (str/replace #":+$" ""))
+            message (if-let [i (str/last-index-of message ": ")] (subs message (+ i 2)) message)
+            message (loop [m message]
+                      (if (and (seq m) (or (Character/isDigit (.charAt ^String m 0)) (= \[ (.charAt ^String m 0))))
+                        (recur (str/triml (if-let [i (str/index-of m " ")] (subs m i) "")))
+                        m))
+            pairs (loop [rest (subs text at) out {} message message]
+                    (let [rest (str/triml rest)
+                          equals (str/index-of rest "=")]
+                      (if (or (nil? equals) (zero? equals) (str/includes? (subs rest 0 equals) " "))
+                        [out message]
+                        (let [key (subs rest 0 equals)
+                              after (subs rest (inc equals))
+                              [value remaining] (if (str/starts-with? after "\"")
+                                                  (let [close (or (str/index-of after "\"" 1) (count after))]
+                                                    [(subs after 1 close) (subs after (min (inc close) (count after)))])
+                                                  (let [end (or (str/index-of after " ") (count after))]
+                                                    [(str/replace (subs after 0 end) #"[,;]+$" "") (subs after end)]))
+                              k (log-key key)]
+                          (if (and (#{"msg" "message"} k) (str/blank? message))
+                            (recur remaining out value)
+                            (recur remaining (assoc out (keyword k) (or (parse-long value) value)) message))))))
+            [details message] pairs
+            name (log-name message)]
+        (when name {:event name :details (merge fields details)})))))
+
+(defn named-event
+  "An event as the target's steps see it: an output line by its message, any other as it is."
+  [event]
+  (if-let [output (:output event)] (log-step output) event))
+
 (defn trace-advance
   "The matches after `event` (a timeline's event, by name): each match whose next step it is, by a
   node its role allows (the role's own node, or a node no other role has), one step further; the
@@ -1033,6 +1116,7 @@
                (if (> (clojure.core/count recent) trace-recent-max) (subvec recent 1) recent))))))
 
 (defn trace-target-event [state {:keys [vtime_ns event]}]
+  (let [event (or (named-event event) event)]
   (trace-recent (:index @state) vtime_ns event)
   (when-let [steps (:steps @trace-target)]
     (when (and (string? (:event event)) (event-node event))
@@ -1046,7 +1130,7 @@
                      (assoc all index (-> now
                                           (assoc :states after :best (trace-best after))
                                           (update :history conj [vtime_ns after])
-                                          (cond-> (> (trace-best after) (trace-best states)) (assoc :best_ns vtime_ns))))))))))))
+                                          (cond-> (> (trace-best after) (trace-best states)) (assoc :best_ns vtime_ns)))))))))))))
 
 (defn trace-frontier
   "The candidates whose own events advanced the target furthest, each its moment just after its
