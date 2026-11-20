@@ -248,8 +248,15 @@ pub const Pool = struct {
     /// Every CPU of the host's lock file, for the memory claimed on them (claim_fits).
     host_fds: [cpus_max]linux.fd_t = undefined,
     host_count: u32 = 0,
-    /// The run's turn to wait: one of its processes at a time holds it.
+    /// The run's turn to wait: one of its processes at a time holds it. Its file also keeps what
+    /// the run learned its VMs hold (claim_soft).
     turn_fd: linux.fd_t = -1,
+    /// The turn of the run's VMs that hold their whole memory (its verifier's replays, a fresh
+    /// boot: not claim_shares), a queue of their own: one waiting for room for its guest held
+    /// the run's turn, every branch behind it though they fit (ParadeDB's run 2098, 13:55 to
+    /// 14:10: 3 replays of 32 GiB queued, its 40 timelines waiting at 0 s with claims and memory
+    /// to spare, 4 timelines in 15 minutes).
+    whole_fd: linux.fd_t = -1,
     priority: bool = false,
     /// The CPU side of `priority` alone: past the run's turn, tried at once, the others leaving
     /// it the next CPU; not the sessions' memory room. A tree judgment's node makers (main.zig,
@@ -304,6 +311,15 @@ pub const Pool = struct {
         }, 0);
         const turn_fd = linux.open(turn_path, flags, 0o600);
         if (linux.errno(turn_fd) != .SUCCESS) return error.PoolFile;
+        const whole_path = try std.fmt.bufPrintSentinel(&turn_buffer, "{s}/run-{d}.whole", .{
+            directory, run_key orelse linux.getpid(),
+        }, 0);
+        const whole_fd = linux.open(whole_path, flags, 0o600);
+        if (linux.errno(whole_fd) != .SUCCESS) {
+            _ = linux.close(@intCast(turn_fd));
+            return error.PoolFile;
+        }
+        pool.whole_fd = @intCast(whole_fd);
         // A run's explorer clears the turns of runs gone (its own process is the key).
         if ((run_key orelse linux.getpid()) == linux.getpid()) _ = turns_sweep(directory);
         pool.turn_fd = @intCast(turn_fd);
@@ -333,6 +349,7 @@ pub const Pool = struct {
         for (pool.priority_fds[0..pool.count]) |fd| _ = linux.close(fd);
         for (pool.host_fds[0..pool.host_count]) |fd| _ = linux.close(fd);
         if (pool.turn_fd >= 0) _ = linux.close(pool.turn_fd);
+        if (pool.whole_fd >= 0) _ = linux.close(pool.whole_fd);
         pool.count = 0;
         pool.host_count = 0;
     }
@@ -367,20 +384,21 @@ pub const Pool = struct {
         // most of the host's CPUs idle).
         var memory_wait_ns: u64 = 0;
         var turn: TurnMemory = .{};
+        const queue = pool.queue_for(claim_shares);
         if (!cpu_first) {
-            const queued_at = TurnMemory.read(pool.turn_fd).at(asked_ns);
-            while (linux.errno(linux.flock(pool.turn_fd, std.posix.LOCK.EX)) == .INTR) {}
-            turn = TurnMemory.read(pool.turn_fd);
+            const queued_at = TurnMemory.read(queue).at(asked_ns);
+            while (linux.errno(linux.flock(queue, std.posix.LOCK.EX)) == .INTR) {}
+            turn = TurnMemory.read(queue);
             const now = monotonic_ns();
             memory_wait_ns = @min(turn.at(now) -| queued_at, now - asked_ns);
             // A holder that died waiting left its wait open: closed as of now.
             if (turn.since_ns != 0) {
                 turn = .{ .total_ns = turn.at(now) };
-                turn.write(pool.turn_fd);
+                turn.write(queue);
             }
         }
         defer if (!cpu_first) {
-            _ = linux.flock(pool.turn_fd, std.posix.LOCK.UN);
+            _ = linux.flock(queue, std.posix.LOCK.UN);
         };
         // Host-side only (which CPU a timeline runs on never changes it): any seed will do.
         var random: std.Random.DefaultPrng = .init(@as(u64, @intCast(linux.getpid())) ^ monotonic_ns());
@@ -396,7 +414,7 @@ pub const Pool = struct {
                     if (memory_wanted_open()) |fd| _ = linux.flock(fd, std.posix.LOCK.UN);
                     if (!cpu_first) {
                         turn = .{ .total_ns = turn.at(monotonic_ns()) };
-                        turn.write(pool.turn_fd);
+                        turn.write(queue);
                     }
                 }
                 return null;
@@ -422,7 +440,7 @@ pub const Pool = struct {
                     // The run's processes queued behind this one wait for it too.
                     if (!cpu_first) {
                         turn = .{ .since_ns = memory_since.?, .total_ns = turn.total_ns };
-                        turn.write(pool.turn_fd);
+                        turn.write(queue);
                     }
                     // A check waiting for memory: the runs leave it the sessions' room.
                     if (pool.priority) if (memory_priority_open()) |fd| {
@@ -468,7 +486,7 @@ pub const Pool = struct {
                 memory_wait_ns += now - since;
                 if (!cpu_first) {
                     turn = .{ .total_ns = turn.at(now) };
-                    turn.write(pool.turn_fd);
+                    turn.write(queue);
                 }
                 if (pool.priority) if (memory_priority_open()) |fd| {
                     _ = linux.flock(fd, std.posix.LOCK.UN);
@@ -710,6 +728,12 @@ pub const Pool = struct {
     pub fn claim_soft_set(pool: *const Pool, bytes: u64) void {
         const value = std.mem.toBytes(bytes);
         _ = linux.pwrite(pool.turn_fd, &value, value.len, claim_soft_offset);
+    }
+
+    /// The queue a take of this process waits its turn in: the run's for its branches, its whole
+    /// VMs' own for the others (whole_fd).
+    fn queue_for(pool: *const Pool, shares: bool) linux.fd_t {
+        return if (shares) pool.turn_fd else pool.whole_fd;
     }
 
     /// What a VM of this process claims: its guest's size, or less once its run learned so where
@@ -1446,8 +1470,9 @@ fn turns_sweep(directory: []const u8) u32 {
             const entry: *align(1) const linux.dirent64 = @ptrCast(&entries[at]);
             at += entry.reclen;
             const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&entry.name)), 0);
-            if (!std.mem.startsWith(u8, name, "run-") or !std.mem.endsWith(u8, name, ".turn")) continue;
-            const key = std.fmt.parseInt(linux.pid_t, name["run-".len .. name.len - ".turn".len], 10) catch continue;
+            if (!std.mem.startsWith(u8, name, "run-")) continue;
+            const suffix: []const u8 = if (std.mem.endsWith(u8, name, ".turn")) ".turn" else if (std.mem.endsWith(u8, name, ".whole")) ".whole" else continue;
+            const key = std.fmt.parseInt(linux.pid_t, name["run-".len .. name.len - suffix.len], 10) catch continue;
             if (key <= 0 or key == linux.getpid()) continue;
             var proc_buffer: [32]u8 = undefined;
             const proc = std.fmt.bufPrintSentinel(&proc_buffer, "/proc/{d}", .{key}, 0) catch continue;
@@ -2025,6 +2050,26 @@ test "a maker waiting for memory sleeps between its looks" {
     try std.testing.expect(test_give_up_calls <= waited_ns / wait_ns_max + 2);
 }
 
+test "a VM that holds its whole memory waits in a queue of its own, never before the run's branches" {
+    // A replay of the run's verifier holds its queue, waiting for room for its guest.
+    var replay: Pool = undefined;
+    try replay.open();
+    defer replay.close();
+    const whole = replay.queue_for(false);
+    try std.testing.expect(linux.errno(linux.flock(whole, std.posix.LOCK.EX)) == .SUCCESS);
+    defer _ = linux.flock(whole, std.posix.LOCK.UN);
+    // A branch of the run takes a CPU meanwhile.
+    claim_shares = true;
+    defer claim_shares = false;
+    var branch: Pool = undefined;
+    try branch.open();
+    defer branch.close();
+    test_give_up_at_ns = monotonic_ns() + 2 * std.time.ns_per_s;
+    const held = branch.take_unless(test_give_up) orelse return error.BranchWaitedForTheReplay;
+    branch.give(held);
+    unpin();
+}
+
 test "a judgment's maker takes a CPU past its run's turn, a plain take waits behind it" {
     // Another of the run's processes holds its turn, as a timeline waiting for a CPU does.
     var waiting: Pool = undefined;
@@ -2044,7 +2089,10 @@ test "a judgment's maker takes a CPU past its run's turn, a plain take waits beh
     const held = maker.take_unless(test_give_up) orelse return error.MakerWaited;
     maker.give(held);
     unpin();
-    // A plain take queues behind that turn (asleep in the kernel): nothing while it is held.
+    // A plain take of the run's branches queues behind that turn (asleep in the kernel): nothing
+    // while it is held.
+    claim_shares = true;
+    defer claim_shares = false;
     var plain: Pool = undefined;
     try plain.open();
     defer plain.close();
