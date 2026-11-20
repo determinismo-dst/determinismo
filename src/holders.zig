@@ -596,6 +596,13 @@ pub const Registry = struct {
                     if (registry.disk) |disk| disk.delete_one(entry.branch, entry.held.vtime_ns);
                     continue;
                 }
+                // One made in memory that left (its write whole: its hashes file is there) exited
+                // as it did, this explorer its subreaper: reaped with the others, else a zombie
+                // for the run's life (ParadeDB's run 2096: 246 at its 171st timeline).
+                if (entry.held.pid > 0 and !entry.taken) {
+                    dying[dying_count] = entry.held.pid;
+                    dying_count += 1;
+                }
                 var kept = entry;
                 kept.held.pid = 0; // Gone, if it was ever a process: a file now (take's on_disk).
                 kept.held.disk = true;
@@ -1717,6 +1724,49 @@ test "a holder made in memory that left to disk is kept within the budget; one e
     try std.testing.expect(disk.bytes_of(2, 10) > 0);
     // 3's part of a write is gone: nothing on disk outside the budget.
     try std.testing.expectEqual(@as(u64, 0), disk.bytes_of(3, 10));
+}
+
+test "a holder that left to disk and exited is reaped at its generation's judgment, its file kept" {
+    var path_buffer: [64]u8 = undefined;
+    const directory_z = try std.fmt.bufPrintSentinel(&path_buffer, "/tmp/determinismo-reaped-test-{d}", .{linux.getpid()}, 0);
+    const directory: []const u8 = directory_z;
+    _ = linux.mkdir(directory_z, 0o755);
+    const disk: Disk = .{ .directory = directory };
+    defer {
+        disk.delete(null);
+        _ = linux.rmdir(directory_z);
+    }
+    // Its files whole (the hashes file last), and the process gone: it wrote itself and exited.
+    var content: [4096]u8 = @splat(7);
+    for (Disk.suffixes) |suffix| {
+        var file_buffer: [128]u8 = undefined;
+        const file = try std.fmt.bufPrintSentinel(&file_buffer, "{s}/h1-10{s}", .{ directory, suffix }, 0);
+        const fd = linux.open(file, .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true }, 0o644);
+        try std.testing.expect(linux.errno(fd) == .SUCCESS);
+        _ = linux.write(@intCast(fd), &content, content.len);
+        _ = linux.close(@intCast(fd));
+    }
+    const forked = linux.fork();
+    if (forked == 0) linux.exit_group(0);
+    const pid: linux.pid_t = @intCast(forked);
+    // Exited, not waited for: a zombie, as the explorer finds a holder that left.
+    var info: linux.siginfo_t = undefined;
+    try std.testing.expect(linux.errno(linux.waitid(.PID, pid, &info, linux.W.EXITED | linux.W.NOWAIT, null)) == .SUCCESS);
+    var kept: [4]Registry.Entry = undefined;
+    var registry: Registry = .{ .explorer = 0, .kept = &kept, .disk = &disk };
+    registry.entries[0] = .{
+        .held = .{ .pid = pid, .worker = 0, .id = 0, .vtime_ns = 10, .disk = false },
+        .branch = 1,
+        .taken = false,
+    };
+    registry.count = 1;
+    registry.release_listed(&.{1});
+    registry.trims_wait();
+    // Kept on disk, and the process reaped: no longer this process's child.
+    try std.testing.expectEqual(@as(u32, 1), registry.kept_count);
+    try std.testing.expect(disk.bytes_of(1, 10) > 0);
+    var status: i32 = 0;
+    try std.testing.expectEqual(linux.E.CHILD, linux.errno(linux.wait4(pid, &status, 1, null))); // WNOHANG
 }
 
 test "a judged generation's holders in memory are ended together, each gone and reaped, then their files deleted" {
