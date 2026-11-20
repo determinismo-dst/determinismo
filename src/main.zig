@@ -3923,6 +3923,9 @@ fn explore_tree(
         )
     else
         null;
+    // Its workers, holders and node makers branch from snapshots it holds: their VMs may claim
+    // what it learns they hold of their own (cpus.claim_shares). Before any of them forks.
+    cpus.claim_shares = true;
     var state: TreeState = .{
         .base = seed_base(exploration),
         .total = branches.arguments.branches,

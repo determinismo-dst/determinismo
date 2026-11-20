@@ -189,7 +189,20 @@ pub var claim_bytes: u64 = 0;
 
 /// A CPU's lock file's content while a deterministic VM holds it: the VM's claim (its guest's
 /// size) and its run. A build before the run was written leaves its claim alone: read whole.
-const CpuClaim = extern struct { bytes: u64 = 0, run: u64 = 0 };
+/// A held CPU's claim: `bytes` its process's VM claims, `run` the run it is of, `shares` 1 where
+/// that VM branches from a snapshot its run holds (claim_shares): only such a VM counts as what
+/// its run learned they hold (claim_soft).
+const CpuClaim = extern struct { bytes: u64 = 0, run: u64 = 0, shares: u64 = 0 };
+
+/// This process's VMs branch from a snapshot their run holds (a tree's workers, its holders and
+/// node makers: the explorer sets it before they fork), their memory beyond what they write the
+/// snapshot's, counted once as the run's nodes: they may claim what the run learned they hold
+/// (claim_soft). A VM that holds its whole memory itself (a fresh boot, a replay of the run's
+/// verifier, its own process) claims its guest's size: ParadeDB's run 2096 admitted a
+/// verification replay at the 16.4 GiB its branches were learned to hold, and the replay's
+/// guest, booted afresh, took 39 GiB of shared memory in 5 minutes, MemAvailable down to 3 GiB
+/// (2026-11-20 06:40) while its branches held 5 GiB in all.
+pub var claim_shares: bool = false;
 
 /// Where a run's turn file keeps what the run learned its VMs come to hold (Pool.claim_soft),
 /// after its TurnMemory.
@@ -469,7 +482,11 @@ pub const Pool = struct {
                 const locked = linux.flock(pool.fds[slot], std.posix.LOCK.EX | std.posix.LOCK.NB);
                 if (linux.errno(locked) != .SUCCESS) continue;
                 // The claim, where the others read it while this process holds the CPU.
-                const claim: CpuClaim = .{ .bytes = claim_bytes, .run = run_of_this_process() };
+                const claim: CpuClaim = .{
+                    .bytes = claim_bytes,
+                    .run = run_of_this_process(),
+                    .shares = @intFromBool(claim_shares),
+                };
                 _ = linux.pwrite(pool.fds[slot], std.mem.asBytes(&claim), @sizeOf(CpuClaim), 0);
                 held_note(pool.fds[slot]);
                 pin(pool.cpus[slot]);
@@ -627,7 +644,7 @@ pub const Pool = struct {
             var claim: CpuClaim = .{};
             const got = linux.pread(fd, std.mem.asBytes(&claim), @sizeOf(CpuClaim), 0);
             if (linux.errno(got) != .SUCCESS or got < @sizeOf(u64)) continue;
-            const softened = soft != 0 and got == @sizeOf(CpuClaim) and claim.run == mine;
+            const softened = soft != 0 and got == @sizeOf(CpuClaim) and claim.run == mine and claim.shares != 0;
             claimed += if (softened) @min(claim.bytes, soft) else claim.bytes;
         }
         claimed += nodes_claimed(pool.directory_buffer[0..pool.directory_size]);
@@ -695,8 +712,10 @@ pub const Pool = struct {
         _ = linux.pwrite(pool.turn_fd, &value, value.len, claim_soft_offset);
     }
 
-    /// What a VM of this process claims: its guest's size, or less once its run learned so.
+    /// What a VM of this process claims: its guest's size, or less once its run learned so where
+    /// it branches from a snapshot the run holds (claim_shares).
     fn claim_now(pool: *const Pool) u64 {
+        if (!claim_shares) return claim_bytes;
         const soft = pool.claim_soft();
         return if (soft == 0) claim_bytes else @min(claim_bytes, soft);
     }
@@ -1752,6 +1771,8 @@ test "a run's VMs count as what the run learned they hold, another run's as its 
     defer claim_bytes = saved;
     claim_bytes = total / 2;
     defer holder.claim_soft_set(0);
+    claim_shares = true; // A tree's branches.
+    defer claim_shares = false;
     try std.testing.expectEqual(@as(u32, 0), other.run_held());
     const held = holder.take(); // A VM of half the host, of this run.
     try std.testing.expectEqual(@as(u32, 1), other.run_held());
@@ -1780,6 +1801,35 @@ test "a run's VMs count as what the run learned they hold, another run's as its 
     _ = linux.pread(holder.fds[held.slot], std.mem.asBytes(&claim), @sizeOf(CpuClaim), 0);
     try std.testing.expectEqual(total / 2, claim.bytes);
     try std.testing.expectEqual(@as(u64, 0), claim.run);
+}
+
+test "a VM holding its whole memory claims its guest's size, whatever its run learned" {
+    var holder: Pool = undefined;
+    try holder.open();
+    defer holder.close();
+    var other: Pool = undefined;
+    try other.open();
+    defer other.close();
+    holder.available_counts = false; // The claims' accounting alone.
+    other.available_counts = false;
+    const total = meminfo("MemTotal:");
+    if (total == 0) return error.SkipZigTest;
+    const saved = claim_bytes;
+    defer claim_bytes = saved;
+    claim_bytes = total / 2;
+    defer holder.claim_soft_set(0);
+    // The run learned its branches hold an eighth of the host; a VM of it booted afresh (its
+    // verifier's replay, as in ParadeDB's run 2096) holds half: it counts as half, and asks for it.
+    holder.claim_soft_set(total / 8);
+    const held = holder.take();
+    defer holder.give(held);
+    try std.testing.expect(!other.claim_fits(total / 2));
+    try std.testing.expectEqual(total / 2, other.claim_now());
+    // Its branches' processes: the learned claim, for their own VMs and the next.
+    claim_shares = true;
+    defer claim_shares = false;
+    try std.testing.expectEqual(total / 8, other.claim_now());
+    try std.testing.expect(!other.claim_fits(total / 2)); // The replay still holds its half.
 }
 
 test "a CPU is held by one process at a time, and given back" {
