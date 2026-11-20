@@ -667,7 +667,7 @@ pub const Multiverse = struct {
             "after {d} counter overflows, {d} a second of wall time; {d} timers delivered at a " ++
             "clock read\n", .{
             multiverse.mtf_steps,  multiverse.fast_steps,
-            multiverse.overflows,  multiverse.mtf_steps * std.time.ns_per_s / @max(multiverse.wall_ns, 1),
+            multiverse.overflows,  per_second(multiverse.mtf_steps, multiverse.wall_ns),
             multiverse.soft_exits,
         });
         print("[determinismo] virtual time per wall time: {d:.2} (one core; {d:.3}s virtual " ++
@@ -836,4 +836,21 @@ fn overshoot_warn(overshoots: u64) void {
 fn seconds(ns: u64) f64 {
     assert(ns < 1 << 53); // Exact in an f64.
     return @as(f64, @floatFromInt(ns)) / std.time.ns_per_s;
+}
+
+/// `count` a second of `wall_ns`, in 128 bits (a long run's count times a second's nanoseconds
+/// passes 64), at most the largest u64.
+fn per_second(count: u64, wall_ns: u64) u64 {
+    const rate = @as(u128, count) * std.time.ns_per_s / @max(wall_ns, 1);
+    return @intCast(@min(rate, std.math.maxInt(u64)));
+}
+
+test per_second {
+    // Run 2093 (Turso composer, 3 hours, 40 VMs): its single steps past 18 billion, times a
+    // second's nanoseconds, overflowed 64 bits as its summary was printed, and the explorer
+    // panicked before it recorded the summary.
+    try std.testing.expectEqual(@as(u64, 2_777_777), per_second(30_000_000_000, 3 * 3600 * std.time.ns_per_s));
+    try std.testing.expectEqual(@as(u64, 73_037), per_second(73_037, std.time.ns_per_s));
+    try std.testing.expectEqual(@as(u64, 0), per_second(0, 0));
+    try std.testing.expectEqual(std.math.maxInt(u64) / 1000, per_second(std.math.maxInt(u64) / 1000, std.time.ns_per_s));
 }
