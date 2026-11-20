@@ -1602,14 +1602,11 @@ test "a VM's memory claim counts while its CPU is held" {
 /// in every look, 169.3 GiB claimed of the 171.9 that may be, 110 GB available; 6.5% of the
 /// workers' time), and larger guests more (8 GiB: 40,472 s of a run 2060).
 pub const ClaimLearning = struct {
-    /// The looks a claim is learned from at most (claims_look in main.zig looks every 5 s: ten
-    /// minutes).
-    pub const looks_max = 120;
-    /// The most the host had in use for each of the run's VMs running, over its last looks
-    /// (`looks`, looks_max of them).
+    /// The most one of the run's VMs held of its own at a look counted (sample): its whole run's,
+    /// never lowered. Over a window of the last ten minutes' looks, a judgment of more than that
+    /// (its VMs young, or few) took it down: ParadeDB's run 2098 went from 4.0 to 2.2 GiB at its
+    /// generation 2's, as it was about to admit VMs that grow to 2.7 GiB each.
     held_max: u64 = 0,
-    looks: [looks_max]u64 = @splat(0),
-    looks_count: u32 = 0,
     /// The run said a claim under its guests' size.
     softened: bool = false,
     /// Memory ran short after that: its claims are its guests' size for good.
@@ -1621,18 +1618,13 @@ pub const ClaimLearning = struct {
     /// nodes'), beside `admitted` VMs of the run (holding a CPU: Pool.run_held), `workers` of its
     /// `jobs` having a timeline, `ended` timelines so far. Counted once as many timelines ended as
     /// the run has workers (its VMs seen whole, not young), while every worker has a timeline and
-    /// one of its VMs runs. The most of its last looks_max looks: a high one counts at once, and
-    /// goes once that many came after it. The host's memory in use less the nodes', over the VMs
-    /// admitted, counted the holders, serve and other runs on a few VMs: ParadeDB's run 2095 went
-    /// back to its 32 GiB guests from 23 GiB "a VM" with 1 or 2 admitted, while its one running VM
-    /// held 2.25 GB of its own; 1 VM at a time for hours.
+    /// one of its VMs runs. The host's memory in use less the nodes', over the VMs admitted,
+    /// counted the holders, serve and other runs on a few VMs: ParadeDB's run 2095 went back to
+    /// its 32 GiB guests from 23 GiB "a VM" with 1 or 2 admitted, while its one running VM held
+    /// 2.25 GB of its own; 1 VM at a time for hours.
     pub fn sample(learning: *ClaimLearning, held: u64, admitted: u32, workers: u32, jobs: u32, ended: u64) void {
         if (ended < jobs or admitted == 0 or workers < jobs) return;
-        learning.looks[learning.looks_count % looks_max] = held;
-        learning.looks_count += 1;
-        var most: u64 = 0;
-        for (learning.looks[0..@min(learning.looks_count, looks_max)]) |look| most = @max(most, look);
-        learning.held_max = most;
+        learning.held_max = @max(learning.held_max, held);
     }
 
     /// The claim to say for a VM of `guest` bytes: half again what one held at most; 0 (its
@@ -1691,18 +1683,17 @@ test "what a run's VM holds of its own, not the host's memory over the VMs admit
     try std.testing.expect(claim > 3 * gib and claim < 4 * gib);
 }
 
-test "a look past the learning's window no longer counts: an early high one does not hold the claim for good" {
+test "what a VM held at most stays, however long the run's VMs are young after (a judgment)" {
     const gib: u64 = 1 << 30;
+    const mib: u64 = 1 << 20;
     var learning: ClaimLearning = .{};
-    // A VM holding 4.4 GiB of its 4 GiB guest's worth early: the guest's size.
-    learning.sample(4 * gib + 2 * gib / 5, 9, 40, 40, 41);
-    try std.testing.expectEqual(@as(u64, 0), learning.claim(4 * gib));
-    // Then 1 GiB for as many looks as the window holds: the early one gone.
-    for (0..ClaimLearning.looks_max) |_| learning.sample(gib, 39, 40, 40, 500);
-    try std.testing.expectEqual(gib + gib / 2, learning.claim(4 * gib));
-    // One look higher again counts at once (the window's most).
-    learning.sample(3 * gib, 39, 40, 40, 900);
-    try std.testing.expectEqual(@as(u64, 0), learning.claim(4 * gib));
+    // ParadeDB's run 2098: VMs grown to 2.7 GiB of their own (a claim of 4.0), then a judgment
+    // of more than ten minutes, its VMs young (1.5 GiB) at every look.
+    learning.sample(2765 * mib, 34, 40, 40, 60);
+    const grown = learning.claim(32 * gib);
+    try std.testing.expect(grown > 4 * gib - gib / 8 and grown < 4 * gib + gib / 8);
+    for (0..1000) |_| learning.sample(1536 * mib, 3, 40, 40, 109);
+    try std.testing.expectEqual(grown, learning.claim(32 * gib));
 }
 
 test "memory short under a learned claim: the guest's size for good; never said, never short" {
