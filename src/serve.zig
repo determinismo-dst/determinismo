@@ -203,6 +203,12 @@ const Run = struct {
     /// Nothing more for the watcher to ingest: ingested since it finished, or found finished
     /// (ingested when first asked about).
     complete: bool = false,
+    /// This serve saw it end (runs_reap), not found ended at its start: its first failures not
+    /// on disk yet are saved after its end too (failures_snapshot, at its last ingest). A run of
+    /// seconds ended between two looks at its failures, its first failure in a timeline too short
+    /// for a holder (no ladder): never saved (e2e ui's run 1, a bank run of 13 s, once the guest's
+    /// change moved its seeds, 2026-11-20).
+    ended_here: bool = false,
 };
 
 const nrepl_port_base = 17000;
@@ -558,7 +564,8 @@ fn watch(shared: *Shared) void {
             // Its page's answers of before this ingest, again: its requests read them as kept.
             if (!final) answers_refresh(&server, id);
             const failures = if (server.options.failure_analysis) &failures_analyze else &failures_snapshot;
-            if (watches % failures_watch_interval == 0) failures(&server, id) catch |err| {
+            // And at a run's last ingest: one that ended between two looks is looked at once more.
+            if (watches % failures_watch_interval == 0 or final) failures(&server, id) catch |err| {
                 std.debug.print("[determinismo] run {d}'s failures not saved: {s} {s}\n", .{
                     id, @errorName(err), server.detail orelse "",
                 });
@@ -4250,9 +4257,9 @@ fn failures_analyze(server: *Server, id: u32) !void {
     const room = shared.job_count < jobs_max;
     shared.unlock();
     const run = found orelse return;
-    // A running run's: a finished one's failures were there to analyze while it ran (a serve
-    // restart visits every run once: it analyzed runs stopped hours before).
-    if (run.status != null or run.stopped) return;
+    // A running run's, or one this serve saw end (its last ingest: a run of seconds ends between
+    // two looks): a serve restart visits every run once, and analyzed runs stopped hours before.
+    if (run.stopped or (run.status != null and !run.ended_here)) return;
     if (busy or !room) return;
     // The analyses on disk: one running (an earlier server's, whose jobs this one never had)
     // makes it wait; the properties they analyze (whoever asked) are done.
@@ -4318,8 +4325,9 @@ fn failures_snapshot(server: *Server, id: u32) !void {
     const room = shared.job_count < jobs_max;
     shared.unlock();
     const run = found orelse return;
-    // A running run's: a serve restart visits every run once, and saved runs stopped hours before.
-    if (run.status != null or run.stopped) return;
+    // A running run's, or one this serve saw end (its last ingest): a serve restart visits every
+    // run once, and saved runs stopped hours before. Never a stopped one.
+    if (run.stopped or (run.status != null and !run.ended_here)) return;
     if (busy or !room) return;
     const rows = rows: {
         var connection = try run_connect(server, id);
@@ -5781,6 +5789,7 @@ fn runs_reap(shared: *Shared, ended: []u32) usize {
             if (host_runs.running_pid(server.arena, directory) != null) continue;
             const record = run_file(&server, run.id, "record.jsonl") catch "";
             run.status = recorded_status(record);
+            run.ended_here = true;
             drained_mark(&server, run);
             // Not this serve's child: what its explorer left is found by its session.
             if (std.fmt.parseInt(linux.pid_t, std.mem.trim(u8, run_file(&server, run.id, "pid") catch "", " \n"), 10)) |explorer| {
@@ -5798,6 +5807,7 @@ fn runs_reap(shared: *Shared, ended: []u32) usize {
         if (linux.errno(result) != .SUCCESS or result == 0) continue;
         const bits: u32 = @bitCast(status);
         run.status = if (bits & 0x7f == 0) (bits >> 8) & 0xff else 128 + (bits & 0x7f);
+        run.ended_here = true;
         exit_note(&server, run.id, bits);
         drained_mark(&server, run);
         // What the explorer left in its process group (it leads its session): holders of
