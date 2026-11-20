@@ -1753,7 +1753,8 @@ test "a holder that left to disk and exited is reaped at its generation's judgme
     var info: linux.siginfo_t = undefined;
     try std.testing.expect(linux.errno(linux.waitid(.PID, pid, &info, linux.W.EXITED | linux.W.NOWAIT, null)) == .SUCCESS);
     var kept: [4]Registry.Entry = undefined;
-    var registry: Registry = .{ .explorer = 0, .kept = &kept, .disk = &disk };
+    // A budget it fits in: kept, not trimmed.
+    var registry: Registry = .{ .explorer = 0, .kept = &kept, .disk = &disk, .kept_budget = 1 << 40 };
     registry.entries[0] = .{
         .held = .{ .pid = pid, .worker = 0, .id = 0, .vtime_ns = 10, .disk = false },
         .branch = 1,
