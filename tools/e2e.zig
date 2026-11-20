@@ -4488,7 +4488,10 @@ fn check_ui(context: *Context) !void {
     const data = try std.fs.path.join(arena, &.{ context.scratch, "ui-serve" });
     cwd.deleteTree(context.io, data) catch {};
     var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(arena, &.{ context.determinismo, "serve", "--listen", address, "--data", data });
+    // Saving first failures (--failure-snapshots, off by default): run 1's first failure is on disk
+    // by the explorer's ladder or by serve's save, whichever its timeline allows (one too short
+    // for a holder has no ladder: run 1's, once d50a4e6's guest moved its seeds, 2026-11-20).
+    try argv.appendSlice(arena, &.{ context.determinismo, "serve", "--listen", address, "--data", data, "--failure-snapshots" });
     try argv.appendSlice(arena, context.machine);
     var server = try std.process.spawn(context.io, .{ .argv = argv.items, .stdout = .ignore, .stderr = .ignore });
     defer server.kill(context.io);
