@@ -3466,10 +3466,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
                 .disk_always = branches.arguments.holders_on_disk,
                 .disk_sync_always = branches.arguments.holders_on_disk_sync,
                 .leave_always = branches.arguments.holders_leave,
-                // A root from the setup snapshot: the setup's copy among the disk holders as its
-                // origin (run 1914: a root's first disk holder wrote the whole 8 GB guest, every
-                // later one skipped while it wrote, and the moments before them replayed).
-                .disk_origin = place.disk_origin orelse if (place.path.len == 0 and branches.setup == place.snapshot) branches.setup_disk_origin else null,
+                .disk_origin = place.disk_origin orelse holder_origin(branches.setup, branches.setup_disk_origin, place.snapshot, place.path.len),
             };
             try owner.attach(vm);
         }
@@ -7186,6 +7183,38 @@ fn disk_node(
         .fd = on_disk.root_fd,
     } else null;
     return node_core.from_disk(arena, vm, options, on_disk.io, on_disk.disk.directory, name, held.vtime_ns, .{ .idle = held.idle }, recorded, vtime_ns, root);
+}
+
+/// The origin of a timeline's first disk holder, when its start has none of its own (a node loaded
+/// from a holder on disk does): the setup's copy among the disk holders for a root from the setup
+/// snapshot (run 1914: a root's first disk holder wrote the whole 8 GB guest, every later one
+/// skipped while it wrote, and the moments before them replayed), and for a branch of a node over
+/// it (Snapshot.base_fd the setup's: its pages the setup's but for its differences). None, a
+/// node's branches wrote their whole guest: ParadeDB's run 2098, 11 holders of 21 GB each (223 of
+/// its 298 GB on disk) where those saved against the setup's held 0.56 GB at the median.
+fn holder_origin(setup: ?*const Snapshot, setup_origin: ?holders.Origin, start: *const Snapshot, path_len: usize) ?holders.Origin {
+    const known = setup orelse return null;
+    if (path_len == 0 and known == start) return setup_origin;
+    if (start.base_fd >= 0 and start.base_fd == known.memory_fd) return setup_origin;
+    return null;
+}
+
+test holder_origin {
+    var setup: Snapshot = undefined;
+    setup.memory_fd = 5;
+    setup.base_fd = -1;
+    var node: Snapshot = undefined;
+    node.memory_fd = 9;
+    node.base_fd = 5; // Over the setup.
+    var whole: Snapshot = undefined;
+    whole.memory_fd = 11;
+    whole.base_fd = -1; // Loaded whole (from disk, before any root).
+    const origin: holders.Origin = .{ .branch = std.math.maxInt(u32), .vtime_ns = 0 };
+    try std.testing.expectEqual(origin, holder_origin(&setup, origin, &setup, 0).?);
+    try std.testing.expectEqual(origin, holder_origin(&setup, origin, &node, 2).?);
+    try std.testing.expectEqual(@as(?holders.Origin, null), holder_origin(&setup, origin, &whole, 2));
+    try std.testing.expectEqual(@as(?holders.Origin, null), holder_origin(&setup, null, &node, 2)); // Not written.
+    try std.testing.expectEqual(@as(?holders.Origin, null), holder_origin(null, origin, &node, 2)); // No setup.
 }
 
 /// The makers still making (started, not collected).
