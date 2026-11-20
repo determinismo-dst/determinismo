@@ -1019,13 +1019,27 @@
   (let [states (inherited from)]
     (swap! trace-progress assoc index {:start states :states states :history [] :best (trace-best states)})))
 
+(def trace-recent-max 40)
+
+(defn- trace-recent
+  "A timeline's last named events by a node, and its faults (what the agent reads: the strategy
+  host may not see the run's events directory)."
+  [index vtime_ns event]
+  (when (and (string? (:event event)) (or (event-node event) (= "fault" (:event event))))
+    (swap! trace-progress update-in [index :recent]
+           (fn [recent]
+             (let [recent (conj (or recent []) {:at_ns vtime_ns :event (:event event) :node (event-node event)
+                                                :details (clip (json/generate-string (:details event)) 160)})]
+               (if (> (clojure.core/count recent) trace-recent-max) (subvec recent 1) recent))))))
+
 (defn trace-target-event [state {:keys [vtime_ns event]}]
+  (trace-recent (:index @state) vtime_ns event)
   (when-let [steps (:steps @trace-target)]
     (when (and (string? (:event event)) (event-node event))
       (let [index (:index @state)]
         (swap! trace-progress
                (fn [all]
-                 (let [{:keys [states] :as now} (get all index {:start #{} :states #{} :history []})
+                 (let [{:keys [states] :as now} (merge {:start #{} :states #{} :history []} (get all index))
                        after (trace-advance steps states event)]
                    (if (= after states)
                      all
@@ -1084,20 +1098,18 @@
         (swap! trace-decisions assoc label (vec options))))))
 
 (defn- trace-stalls
-  "The furthest timelines' named events after their furthest step (from the events directory)."
+  "The furthest timelines' named events and faults after their furthest step (trace-recent)."
   [candidates]
-  (let [names (set (map :action (:steps @trace-target)))]
+  (do
     (vec (for [c (take trace-agent-stalls-max
                        (sort-by #(- (get-in @trace-progress [(:branch %) :best] 0)) candidates))
                :let [{:keys [best best_ns]} (get @trace-progress (:branch c))]
                :when (and best (pos? best))]
            {:branch (:branch c) :matched best
             :after (vec (take trace-agent-events-max
-                              (for [e (try (timeline (:branch c)) (catch Exception _ []))
-                                    :when (and (>= (or (:vtime_ns e) 0) (or best_ns 0))
-                                               (or (names (:event e)) (= "fault" (:event e))))]
-                                {:at_s (seconds (:vtime_ns e)) :event (:event e)
-                                 :node (event-node e) :details (clip (json/generate-string (:details e)) 160)})))}))))
+                              (for [e (get-in @trace-progress [(:branch c) :recent])
+                                    :when (>= (or (:at_ns e) 0) (or best_ns 0))]
+                                (-> e (dissoc :at_ns) (assoc :at_s (seconds (:at_ns e)))))))}))))
 
 (defn trace-agent-prompt [stalls]
   (str "You steer a deterministic simulation test toward a target: a sequence of a system's steps that "
