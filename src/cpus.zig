@@ -1638,8 +1638,15 @@ pub const ClaimLearning = struct {
     recent_count: u32 = 0,
     /// The run said a claim under its guests' size.
     softened: bool = false,
-    /// Memory ran short after that: its claims are its guests' size for good.
-    hard: bool = false,
+    /// Memory ran short after that: its claims are its guests' size until this many timelines
+    /// ended (as many more as it has workers), then half again more room than before each time
+    /// (margin_halves). For good, one short look cost a run its learned claim for hours.
+    backoff_until: u64 = 0,
+    /// The claim is what one held at most times (2 + margin_halves) / 2: half again at first.
+    margin_halves: u32 = 1,
+    /// What the run's last look counted (sample): timelines ended, workers.
+    ended_seen: u64 = 0,
+    jobs_seen: u32 = 0,
 
     /// A look at the run's VMs: `held`, the most one of its timeline processes holds of its own
     /// (its anonymous memory: the pages its guest wrote, its VMM's, and the explorer's it shares
@@ -1657,6 +1664,8 @@ pub const ClaimLearning = struct {
     /// ParadeDB's proptests (run 2098), 13 minutes a timeline, 4 VMs of 32 GiB for 2.5 hours,
     /// while each held its 2.6 GB of its own within its first 2 minutes (and 2.7 GB at most).
     pub fn sample(learning: *ClaimLearning, held: u64, admitted: u32, workers: u32, jobs: u32, ended: u64) void {
+        learning.ended_seen = ended;
+        learning.jobs_seen = jobs;
         if (admitted == 0 or workers < jobs) return;
         if (ended >= jobs) {
             learning.held_max = @max(learning.held_max, held);
@@ -1679,24 +1688,33 @@ pub const ClaimLearning = struct {
     pub const plateau_looks = 13;
     const plateau_growth = 50;
 
-    /// The claim to say for a VM of `guest` bytes: half again what one held at most; 0 (its
-    /// guest's size) while nothing is learned, where that is no less, and once memory ran
-    /// short.
+    /// The claim to say for a VM of `guest` bytes: half again what one held at most (more after
+    /// memory ran short); 0 (its guest's size) while nothing is learned, where that is no less,
+    /// and while memory backs off (short).
     pub fn claim(learning: *ClaimLearning, guest: u64) u64 {
-        if (learning.hard or learning.held_max == 0) return 0;
-        const learned = learning.held_max + learning.held_max / 2;
-        if (learned >= guest) return 0;
-        learning.softened = true;
-        return learned;
+        const claimed = learning.learned(guest);
+        if (claimed != 0) learning.softened = true;
+        return claimed;
+    }
+
+    /// What claim says, without saying it (a node maker's room, main.zig).
+    pub fn learned(learning: *const ClaimLearning, guest: u64) u64 {
+        if (learning.held_max == 0 or learning.ended_seen < learning.backoff_until) return 0;
+        const claimed = learning.held_max / 2 * (2 + @as(u64, learning.margin_halves));
+        return if (claimed >= guest) 0 else claimed;
     }
 
     /// Whether memory is short on a run that claimed less than its guests' size: `available`
-    /// under half the `reserve`. Its claims are its guests' size from then on; while this says
-    /// yes its explorer ends its youngest VM, one a look (it runs again once memory allows).
+    /// under half the `reserve`. Its claims are its guests' size until as many more timelines
+    /// ended as it has workers, then with half again more room (a new short after that backs off
+    /// again, with more room still); while this says yes its explorer ends its youngest VM, one
+    /// a look (it runs again once memory allows).
     pub fn short(learning: *ClaimLearning, available: u64, reserve: u64) bool {
         if (!learning.softened) return false;
         if (available == 0 or available >= reserve / 2) return false;
-        learning.hard = true;
+        // A new back-off (not one going on): more room after it.
+        if (learning.ended_seen >= learning.backoff_until) learning.margin_halves += 1;
+        learning.backoff_until = learning.ended_seen + learning.jobs_seen;
         return true;
     }
 };
@@ -1778,7 +1796,7 @@ test "before its workers' count of timelines ended, a run learns once what its V
     try std.testing.expectEqual(@as(u64, 0), idle.claim(32 * gib));
 }
 
-test "memory short under a learned claim: the guest's size for good; never said, never short" {
+test "memory short under a learned claim: the guest's size for a round of timelines, then more room" {
     const gib: u64 = 1 << 30;
     var hard: ClaimLearning = .{};
     hard.sample(4 * gib, 40, 40, 40, 400); // 4 GiB a VM: half again is past the guest.
@@ -1786,14 +1804,29 @@ test "memory short under a learned claim: the guest's size for good; never said,
     try std.testing.expect(!hard.short(2 * gib, 16 * gib)); // Its claims were its guests': not its doing.
     var learning: ClaimLearning = .{};
     learning.sample(2 * gib, 39, 40, 40, 400);
-    try std.testing.expectEqual(3 * gib, learning.claim(4 * gib));
+    try std.testing.expectEqual(3 * gib, learning.claim(16 * gib));
     try std.testing.expect(!learning.short(9 * gib, 16 * gib)); // Half the reserve is there.
     try std.testing.expect(!learning.short(0, 16 * gib)); // Unknown: never a reason.
     try std.testing.expect(learning.short(7 * gib, 16 * gib));
-    try std.testing.expectEqual(@as(u64, 0), learning.claim(4 * gib));
+    try std.testing.expectEqual(@as(u64, 0), learning.claim(16 * gib));
     try std.testing.expect(learning.short(7 * gib, 16 * gib)); // Still short: yes again.
     try std.testing.expect(!learning.short(40 * gib, 16 * gib));
-    try std.testing.expectEqual(@as(u64, 0), learning.claim(4 * gib)); // For good.
+    // The guest's size until 40 more timelines ended (its workers), then twice what one held.
+    learning.sample(2 * gib, 39, 40, 40, 439);
+    try std.testing.expectEqual(@as(u64, 0), learning.claim(16 * gib));
+    learning.sample(2 * gib, 39, 40, 40, 440);
+    try std.testing.expectEqual(4 * gib, learning.claim(16 * gib));
+    // Short again: a new back-off, then two and a half times.
+    try std.testing.expect(learning.short(7 * gib, 16 * gib));
+    try std.testing.expectEqual(@as(u64, 0), learning.claim(16 * gib));
+    learning.sample(2 * gib, 39, 40, 40, 480);
+    try std.testing.expectEqual(5 * gib, learning.claim(16 * gib));
+    // Until it would be its guest's size (twice what one held, plus 14 halves): its guest's size.
+    for (0..12) |round| {
+        try std.testing.expect(learning.short(7 * gib, 16 * gib));
+        learning.sample(2 * gib, 39, 40, 40, 520 + 40 * @as(u64, round));
+    }
+    try std.testing.expectEqual(@as(u64, 0), learning.claim(16 * gib));
 }
 
 test "a run none of whose VMs runs starts one beside its own nodes, whatever the claims" {

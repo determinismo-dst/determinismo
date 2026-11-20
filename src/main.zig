@@ -4602,8 +4602,10 @@ fn claims_look(state: *TreeState, pool: ?*cpus.Pool, running: []Running, jobs: u
             entry.short = true;
             _ = linux.kill(entry.pid, .KILL);
             say("[determinismo] memory is short ({d} MiB available) after the run claimed " ++
-                "less than its guests' size: its claims are the guests' again, and timeline {d}, its " ++
-                "youngest, ends and runs again\n", .{ cpus.memory_available() >> 20, entry.place.index });
+                "less than its guests' size: its claims are the guests' again until {d} timelines " ++
+                "ended, then with more room, and timeline {d}, its youngest, ends and runs again\n", .{
+                cpus.memory_available() >> 20, state.claims.backoff_until, entry.place.index,
+            });
         }
         return;
     }
@@ -5388,7 +5390,7 @@ fn node_charge(state: *const TreeState) u64 {
     var count: u64 = 0;
     var iterator = state.users.keyIterator();
     while (iterator.next()) |snapshot| count += @intFromBool(snapshot.* != state.setup);
-    if (count == 0) return cpus.claim_bytes;
+    if (count == 0) return vm_claim(state);
     const mean = (state.nodes_bytes -| setup) / count;
     return @min(cpus.claim_bytes, mean * 3 / 2);
 }
@@ -5856,7 +5858,7 @@ fn tree_judge_poll(arena: std.mem.Allocator, start: MakerStart, branches: Branch
     // The made prefix's branches planned now (not while holders are verified: that compares
     // the nodes first, tree_judge_end): timelines start from the first nodes as later ones come.
     if (!branches.arguments.verify_holders) try judge_plan_ready(arena, branches, state, judging);
-    try makings_start(arena, start, makings, state.jobs, runners_keep(state), &state.nodes_skipped);
+    try makings_start(arena, start, makings, state.jobs, runners_keep(state), vm_claim(state), &state.nodes_skipped);
     for (makings) |making| if (!making.ready) return false;
     return true;
 }
@@ -6154,7 +6156,7 @@ fn tree_judge_begin(
         // (the returns' order): started as room comes, the explorer's loop going on
         // (makings_start; waiting here for one in flight to answer stopped the loop for 43% of
         // etcd's 12-hour run 2007).
-        if (waiting or !maker_may_start(makings[0..making_count], state.jobs, cpus.memory_available(), runners_keep(state))) {
+        if (waiting or !maker_may_start(makings[0..making_count], state.jobs, cpus.memory_available(), runners_keep(state), vm_claim(state))) {
             waiting = true;
             makings[making_count].waiting = true;
             makings[making_count].waited = true;
@@ -6168,7 +6170,7 @@ fn tree_judge_begin(
         }
         making_count += 1;
     }
-    if (waiting) try makings_start(arena, maker_start(vm, options, branches, state), makings[0..making_count], state.jobs, runners_keep(state), &state.nodes_skipped);
+    if (waiting) try makings_start(arena, maker_start(vm, options, branches, state), makings[0..making_count], state.jobs, runners_keep(state), vm_claim(state), &state.nodes_skipped);
     // The next generation fills the spare summaries meanwhile, from those carried; this one's
     // stay the Judging's.
     const carried = summaries.count - judged;
@@ -7218,6 +7220,43 @@ test holder_origin {
     try std.testing.expectEqual(@as(?holders.Origin, null), holder_origin(null, origin, &node, 2)); // No setup.
 }
 
+test "a run's makers and the room kept for its timelines are what its VMs were learned to claim" {
+    const gib: u64 = 1 << 30;
+    const saved = cpus.claim_bytes;
+    defer cpus.claim_bytes = saved;
+    cpus.claim_bytes = 32 * gib; // ParadeDB's guests.
+    var state: TreeState = .{
+        .base = 1,
+        .total = 64,
+        .size = 16,
+        .children = 4,
+        .pipeline = 1,
+        .jobs = 1,
+        .holding = false,
+        .registry = undefined,
+        .change = null,
+        .hunks_reached = &.{},
+        .candidates = &.{},
+        .tape_buffer = undefined,
+        .io = undefined,
+        .archive = true,
+        .prefer_sometimes = true,
+        .setup = undefined,
+    };
+    // Nothing learned: a VM's guest's size.
+    try std.testing.expectEqual(32 * gib, vm_claim(&state));
+    // Run 2098's: 2.7 GiB a VM held of its own, 40 ended: half again.
+    state.claims.sample(2765 << 20, 34, 40, 40, 40);
+    const learned = vm_claim(&state);
+    try std.testing.expect(learned > 4 * gib - gib / 8 and learned < 4 * gib + gib / 8);
+    try std.testing.expect(!state.claims.softened); // Read, not said.
+    // A second maker beside one in flight: room at the learned claim, none at the guest's.
+    const makings = [_]NodeMaking{.{ .back = undefined, .parent = undefined, .pid = 1, .socket = -1 }};
+    const reserve = cpus.reserve_bytes();
+    try std.testing.expect(maker_may_start(&makings, 40, reserve + 10 * gib, 0, learned));
+    try std.testing.expect(!maker_may_start(&makings, 40, reserve + 10 * gib, 0, cpus.claim_bytes));
+}
+
 /// The makers still making (started, not collected).
 fn makings_in_flight(makings: []const NodeMaking) u32 {
     var count: u32 = 0;
@@ -7230,11 +7269,20 @@ fn makings_in_flight(makings: []const NodeMaking) u32 {
 /// With none waiting, the first of them starts whatever the memory (its own admission waits).
 /// Made while their branches waited for room, a judgment's nodes took the host: ParadeDB's run
 /// 2091, 134.5 GiB of nodes before any of their 32 GiB VMs could start.
-fn maker_may_start(makings: []const NodeMaking, jobs: u32, available: u64, keep: u64) bool {
+fn maker_may_start(makings: []const NodeMaking, jobs: u32, available: u64, keep: u64, claim: u64) bool {
     const in_flight = makings_in_flight(makings);
     if (in_flight >= jobs) return false;
     if (in_flight == 0 and keep == 0) return true;
-    return maker_room(available, cpus.reserve_bytes() + keep, cpus.claim_bytes, in_flight);
+    return maker_room(available, cpus.reserve_bytes() + keep, claim, in_flight);
+}
+
+/// What one of the run's VMs claims now, a maker's included (a branch of a node or the root, its
+/// own memory its writes): what the run learned they hold, half again (ClaimLearning.learned),
+/// else its guest's size. Its guest's size made ParadeDB's run 2098's first judgment take 725.8
+/// s, two of its makers waiting for 32 GiB of room each while its nodes came to 0.26-0.58 GiB.
+fn vm_claim(state: *const TreeState) u64 {
+    const learned = state.claims.learned(cpus.claim_bytes);
+    return if (learned != 0) learned else cpus.claim_bytes;
 }
 
 /// The room a judgment's makers leave: a VM's, while timelines it planned (not the filler's,
@@ -7242,7 +7290,7 @@ fn maker_may_start(makings: []const NodeMaking, jobs: u32, available: u64, keep:
 /// those running whatever its nodes hold (cpus.Pool.stalled_alone), so nodes come as their
 /// branches go.
 fn runners_keep(state: *const TreeState) u64 {
-    return if (state.filler_start > state.queue_head) cpus.claim_bytes else 0;
+    return if (state.filler_start > state.queue_head) vm_claim(state) else 0;
 }
 
 /// What starts a maker: the tapes' directory and the buffer a parent's tape is loaded in (one
@@ -7282,11 +7330,11 @@ fn maker_begin(arena: std.mem.Allocator, start: MakerStart, making: *NodeMaking)
 /// to 16 GB available, made its nodes 1.5 at a time and its explorer was in that wait for 43%
 /// of its time (68 gaps over 30 s in its samples, 13,901 s of 32,227 s; a drain taken up
 /// after 3 min 37 s, 405 children ended and not collected).
-fn makings_start(arena: std.mem.Allocator, start: MakerStart, makings: []NodeMaking, jobs: u32, keep: u64, skipped: *u32) !void {
+fn makings_start(arena: std.mem.Allocator, start: MakerStart, makings: []NodeMaking, jobs: u32, keep: u64, claim: u64, skipped: *u32) !void {
     var waiting = false;
     for (makings) |*making| {
         if (!making.waiting) continue;
-        if (!maker_may_start(makings, jobs, cpus.memory_available(), keep)) {
+        if (!maker_may_start(makings, jobs, cpus.memory_available(), keep, claim)) {
             waiting = true;
             break;
         }
@@ -7361,7 +7409,7 @@ test makings_stop {
 /// or a judgment made in one go).
 fn makings_finish_all(arena: std.mem.Allocator, start: MakerStart, makings: []NodeMaking, jobs: u32, skipped: *u32) !void {
     while (true) {
-        try makings_start(arena, start, makings, jobs, 0, skipped);
+        try makings_start(arena, start, makings, jobs, 0, cpus.claim_bytes, skipped);
         if (makings_in_flight(makings) == 0) break; // None waits then: the first always starts.
         makings_finish_any(makings);
     }
@@ -7426,27 +7474,27 @@ test "a maker short of room waits, not the explorer: the one in flight is left t
     // does not start, and the question comes back at once with the one in flight left alone
     // (the explorer waited for it here, its loop stopped: 2 s in this test).
     const start_ns = monotonic_ns();
-    try std.testing.expect(!maker_may_start(&makings, 40, reserve + 6 * gib, 0));
+    try std.testing.expect(!maker_may_start(&makings, 40, reserve + 6 * gib, 0, cpus.claim_bytes));
     try std.testing.expect(monotonic_ns() - start_ns < std.time.ns_per_s);
     try std.testing.expect(!makings[0].ready);
     try std.testing.expectEqual(@as(u32, 1), makings_in_flight(&makings));
     // Room for the one in flight and the next: it starts. Not for a third beside two.
-    try std.testing.expect(maker_may_start(&makings, 40, reserve + 8 * gib, 0));
+    try std.testing.expect(maker_may_start(&makings, 40, reserve + 8 * gib, 0, cpus.claim_bytes));
     makings[1].waiting = false; // Started (in flight: neither ready nor waiting).
-    try std.testing.expect(!maker_may_start(&makings, 40, reserve + 8 * gib, 0));
-    try std.testing.expect(maker_may_start(&makings, 40, reserve + 12 * gib, 0));
+    try std.testing.expect(!maker_may_start(&makings, 40, reserve + 8 * gib, 0, cpus.claim_bytes));
+    try std.testing.expect(maker_may_start(&makings, 40, reserve + 12 * gib, 0, cpus.claim_bytes));
     makings[1].waiting = true;
     // A job for each: none beside as many in flight as the run has, whatever the memory.
-    try std.testing.expect(!maker_may_start(&makings, 1, reserve + 64 * gib, 0));
+    try std.testing.expect(!maker_may_start(&makings, 1, reserve + 64 * gib, 0, cpus.claim_bytes));
     // The memory unknown: never a reason to wait.
-    try std.testing.expect(maker_may_start(&makings, 40, 0, 0));
+    try std.testing.expect(maker_may_start(&makings, 40, 0, 0, cpus.claim_bytes));
     // None in flight: the first starts whatever the memory (its own admission waits).
     node_make_finish(&makings[0]);
     try std.testing.expect(makings[0].ready);
-    try std.testing.expect(maker_may_start(&makings, 40, 1 * gib, 0));
+    try std.testing.expect(maker_may_start(&makings, 40, 1 * gib, 0, cpus.claim_bytes));
     // Timelines planned and waiting to run: a VM's room is kept for them, the first maker too.
-    try std.testing.expect(!maker_may_start(&makings, 40, reserve + 6 * gib, 4 * gib));
-    try std.testing.expect(maker_may_start(&makings, 40, reserve + 8 * gib, 4 * gib));
+    try std.testing.expect(!maker_may_start(&makings, 40, reserve + 6 * gib, 4 * gib, cpus.claim_bytes));
+    try std.testing.expect(maker_may_start(&makings, 40, reserve + 8 * gib, 4 * gib, cpus.claim_bytes));
     // Those that wait are not started in a run that starts no timeline any more.
     makings_cancel(&makings);
     for (makings) |making| try std.testing.expect(making.ready and !making.waiting);
