@@ -14,10 +14,14 @@
 //!                                     their disks synced each window; off, none (init runs it)
 //!   det-nodes samples                 each node's CPU and memory every 2 s, as events, for good
 //!                                     (init runs it)
+//!   det-nodes hold <node> <function> [--caller <f>] [--arg <reg>=<v>]   the first thread entering
+//!                                     the function held there until this command is stopped
+//!                                     (hold.zig): a race inside a process caused
 const std = @import("std");
 const assert = std.debug.assert;
 const nodes = @import("nodes.zig");
 const symbol = @import("symbol.zig");
+const hold = @import("hold.zig");
 const where = @import("where.zig");
 const sdk = @import("determinismo");
 const schema = sdk.schema;
@@ -30,6 +34,8 @@ const usage =
     \\       det-nodes exec [--coverage] <node> <command>...
     \\       det-nodes list
     \\       det-nodes symbol <node> <name> [--field <path>] [--pid <pid>]
+    \\       det-nodes hold <node> <function> [--caller <function>] [--arg <register>=<value>]
+    \\                      [--pid <pid>] [--timeout-ms <ms>]
     \\       det-nodes where <node> <address>... [--pid <pid>] [--return]
     \\       det-nodes cfi <node> <pc> <return address>... [--pid <pid>]
     \\       det-nodes writeback
@@ -78,6 +84,14 @@ pub fn main(init: std.process.Init) !void {
         const next = eql(u8, arguments[3], "next");
         if (!next and !eql(u8, arguments[3], "base")) return usage_exit();
         return nodes.upgrade(arena, &system, node, next);
+    }
+    if (eql(u8, command, "hold")) {
+        // `hold <node> <function> ...`: the first thread entering the function (with the caller
+        // and argument asked) held there until this command is stopped (hold.zig).
+        if (arguments.len < 4) return usage_exit();
+        const node = system.node(arguments[2]) orelse return error.UnknownNode;
+        const options = hold.parse(node.name, arguments[3], arguments[4..]) catch return usage_exit();
+        std.process.exit(try hold.run(arena, options));
     }
     if (eql(u8, command, "symbol")) {
         // `symbol <node> <name> [--field <path>] [--pid <pid>]`: where a variable (or function)
