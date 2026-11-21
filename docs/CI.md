@@ -117,7 +117,7 @@ when one is flaky (`--flaky-passes` counts flaky as passing).
 
 - A deterministic machine has one vCPU: a suite whose tests need many cores at once runs slower
   in each timeline than on a normal machine; shard it wider.
-- Shard verdicts, not per-test ones yet: a shard is flaky or failing as a whole; its runs' pages
-  show which test failed in each timeline.
+- Without a JUnit report (`junit`), verdicts are per shard: a shard is flaky or failing as a
+  whole, its runs' pages showing which test failed in each timeline.
 
 Try it: [examples/ci-demo](../examples/ci-demo) (three tests: one passes, one flaky, one wrong).
