@@ -160,6 +160,17 @@ Each step is a `trace_step` event (its kind, the wait drawn, how long it took to
 its end". `sdk.trace.int`, `field`, `get`, `tag` and `contains` read ITF values (bigints,
 records, maps, variants, sets).
 
+From jank, `determinismo.trace/walk` does the same (sdk/jank/determinismo/src/determinismo/trace.jank):
+the trace as EDN (`tools/itf_to_edn.py <trace.itf.json> <out.edn>`, read with `read-string`), the
+adapter a map of functions (`:kind`, `:act`, `:reached`, optionally `:prepare`, `:finish`,
+`:delay-ms-max`, `:wait-ms`, `:poll-ms`), the platform's functions as a map
+(`determinismo.core/trace-platform`):
+
+    (trace/walk adapter "two_leaders" (read-string (slurp "two_leaders.edn")) det/trace-platform)
+
+Its test runs anywhere jank does, the platform faked:
+`jank --module-path sdk/jank/determinismo/src:sdk/jank/determinismo/test run sdk/jank/determinismo/test/determinismo/trace_test.jank`.
+
 ## Limits
 
 - 65,536 events a trace. Quint takes about 5 ms an event (a 3,000-event timeline: 18 s on a

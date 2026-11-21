@@ -307,3 +307,7 @@ bool determinismo_field_is_string(std::string const &json, std::string const &ke
   "Sleeps ms of virtual time."
   [ms]
   (cpp/det_sleep_ms ms))
+
+(def trace-platform
+  "The platform's functions determinismo.trace/walk takes (a test gives its own)."
+  {:event event :sleep-ms sleep-ms :random-below-named random-below-named :sometimes sometimes})

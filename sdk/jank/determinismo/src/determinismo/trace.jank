@@ -1,0 +1,86 @@
+; SPDX-License-Identifier: MIT
+; determinismo.trace: a system walked through a spec's trace, as the Zig SDK's sdk.trace
+; (sdk/zig/trace.zig; docs/QUINT.md, "Walking a spec's trace"). The trace's states are EDN
+; (tools/itf_to_edn.py writes an ITF file's: its bigints numbers, its maps maps, sets sets,
+; tuples vectors, variants {:tag "Leader" :value ...}, a record's fields keywords). An adapter is
+; a map of functions:
+;   :kind     (fn [step] name)    a name for the step ("stands", "term_back")
+;   :act      (fn [step])         causes it (throws: the walk diverged there)
+;   :reached  (fn [step] bool)    whether the system shows it now
+; and optionally :prepare (fn [steps]) the whole trace first, :finish (fn []) at the end either
+; way, :delay-ms-max (500), :wait-ms (5000), :poll-ms (50). A step is {:index :before :after}.
+; The platform's functions come as a map (determinismo.core/trace-platform: :event :sleep-ms
+; :random-below-named :sometimes), so the walk runs anywhere a test gives its own.
+(ns determinismo.trace)
+
+(defn steps
+  "The steps of `states`: one between each two, numbered from 1 (the state each reaches)."
+  [states]
+  (vec (map-indexed (fn [i [before after]] {:index (inc i) :before before :after after})
+                    (partition 2 1 states))))
+
+(defn- thrown
+  "A thrown value as text. An ex-info by its message: jank segfaults stringifying one (str of a
+  caught ex-info), and ex-message throws on anything else."
+  [e]
+  (cond (string? e) e
+        (or (coll? e) (keyword? e) (number? e) (nil? e)) (pr-str e)
+        :else (or (ex-message e) "thrown")))
+
+(defn- attempt
+  "Calls f; nil when it returned, the thrown value as text when it threw."
+  [f]
+  (try (f) nil
+       (catch cpp/jank.runtime.object_ref e (thrown e))))
+
+(defn walk
+  "Walks the system through `states`, each step caused by the adapter and awaited: a wait drawn
+  before it by its kind (trace.<kind>.delay_ms), its control, then the system polled until it
+  shows the step or the walk diverged there. Events trace_step and trace_walked, and \"a spec
+  trace walked to its end\". Returns {:taken :total :diverged}."
+  [adapter trace-name states platform]
+  (let [{:keys [event sleep-ms random-below-named sometimes]} platform
+        all (steps states)
+        total (count all)
+        delay-max (get adapter :delay-ms-max 500)
+        wait-ms (get adapter :wait-ms 5000)
+        poll-ms (max 1 (get adapter :poll-ms 50))
+        end (fn [taken diverged reason]
+              (event "trace_walked" (cond-> {:trace trace-name :taken taken :total total :diverged diverged}
+                                      reason (assoc :reason reason)))
+              (sometimes (and (nil? diverged) (pos? total)) "a spec trace walked to its end"
+                         {:trace trace-name :taken taken :total total})
+              (when-let [finish (:finish adapter)] (finish))
+              {:taken taken :total total :diverged diverged})
+        prepared (if-let [prepare (:prepare adapter)] (attempt (fn [] (prepare all))) nil)]
+    (if prepared
+      (end 0 0 prepared)
+      (loop [remaining all
+             taken 0]
+        (if (empty? remaining)
+          (end taken nil nil)
+          (let [step (first remaining)
+                kind ((:kind adapter) step)
+                delay (if (pos? delay-max) (random-below-named (str "trace." kind ".delay_ms") (inc delay-max)) 0)
+                _ (when (pos? delay) (sleep-ms delay))
+                failed (attempt (fn [] ((:act adapter) step)))]
+            (if failed
+              (do (event "trace_step" {:trace trace-name :index (:index step) :kind kind :delay_ms delay
+                                       :acted false :reason failed})
+                  (end taken (:index step) nil))
+              (let [[shown waited] (loop [waited 0]
+                                     (let [now ((:reached adapter) step)]
+                                       (if (or now (>= waited wait-ms))
+                                         [now waited]
+                                         (do (sleep-ms poll-ms) (recur (+ waited poll-ms))))))]
+                (event "trace_step" {:trace trace-name :index (:index step) :kind kind :delay_ms delay
+                                     :acted true :shown (boolean shown) :waited_ms waited})
+                (if shown
+                  (recur (rest remaining) (inc taken))
+                  (end taken (:index step) nil))))))))))
+
+(defn node
+  "A node's record in a state whose variable `s` maps node names to records (Quint's specs as
+  determinismo lays them out: s.nodes)."
+  [state name]
+  (get-in state [:s :nodes name]))

@@ -1,0 +1,59 @@
+; SPDX-License-Identifier: MIT
+; determinismo.trace's walk against a system faked here: its nodes' roles and terms an atom the
+; adapter's act sets from the step and its reached reads back; the platform's functions recorded.
+; The trace: veil_two_leaders.edn (examples/raft-poc's Veil counterexample, by tools/itf_to_edn.py).
+;   jank --module-path sdk/jank/determinismo/src:sdk/jank/determinismo/test run \
+;     sdk/jank/determinismo/test/determinismo/trace_test.jank
+(ns determinismo.trace-test
+  (:require [determinismo.trace :as trace]))
+
+(def here "sdk/jank/determinismo/test/determinismo/")
+
+(defn roles [state]
+  (into {} (map (fn [[name record]] [name [(get-in record [:role :tag]) (:term record)]])
+                (get-in state [:s :nodes]))))
+
+(defn fake-system
+  "An adapter over an atom of node roles, deaf at step `deaf` (its act changes nothing), and a
+  platform recording what the walk says."
+  [deaf]
+  (let [system (atom nil)
+        said (atom [])
+        adapter {:kind (fn [step] (str "step" (:index step)))
+                 :prepare (fn [steps] (reset! system (roles (:before (first steps)))))
+                 :act (fn [step] (when (not= deaf (:index step)) (reset! system (roles (:after step)))))
+                 :reached (fn [step] (= @system (roles (:after step))))
+                 :wait-ms 20 :poll-ms 1}
+        platform {:event (fn [name details] (swap! said conj [name details]))
+                  :sleep-ms (fn [ms] nil)
+                  :random-below-named (fn [decision n] 0)
+                  :sometimes (fn [condition message details] (swap! said conj ["sometimes" condition]))}]
+    [adapter platform said]))
+
+(def states (read-string (slurp (str here "veil_two_leaders.edn"))))
+
+(defn check [what condition]
+  (when-not condition
+    (println "FAIL" what)
+    (throw (ex-info what {})))
+  (println "ok" what))
+
+(let [[adapter platform said] (fake-system nil)
+      done (trace/walk adapter "veil_two_leaders" states platform)]
+  (check "a whole walk takes every step" (= done {:taken 11 :total 11 :diverged nil}))
+  (check "each step said, then the walk" (= 11 (count (filter #(= "trace_step" (first %)) @said))))
+  (check "the end reached" (some #(= ["sometimes" true] %) @said)))
+
+(let [[adapter platform said] (fake-system 3)
+      done (trace/walk adapter "veil_two_leaders" states platform)]
+  (check "a step never shown is where it diverged" (= done {:taken 2 :total 11 :diverged 3}))
+  (check "the end not reached" (some #(= ["sometimes" false] %) @said)))
+
+(let [[adapter platform said] (fake-system nil)
+      done (trace/walk (assoc adapter :prepare (fn [steps] (throw (ex-info "no hold" {})))) "veil_two_leaders" states platform)
+      reason (some #(get-in % [1 :reason]) @said)]
+  (check "a prepare that throws diverges at 0" (= done {:taken 0 :total 11 :diverged 0}))
+  (check "and says why" (and (string? reason) (pos? (count reason)))))
+
+(check "a node's record by its name" (= {:tag "Follower"} (:role (trace/node (first states) "raft-node-0"))))
+(println "all passed")
