@@ -65,7 +65,7 @@ Veil's trace after a step that lays the variables out as that spec does.
 
     git clone https://github.com/verse-lab/veil && cd veil && git checkout 252208c
     git apply <determinismo>/tools/veil/replay.patch
-    lake build        # Lean through elan; about 1,300 jobs
+    lake build        # Lean through elan; about 1,300 jobs; needs unzip (cvc5 comes as a zip)
 
 A large model's checks take memory (a five-node log model passed 16 GB): run them where there is
 room, with a bound.
