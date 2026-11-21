@@ -5,6 +5,8 @@
 # run with `?record` (src/ui/index.html: the report, then each property's page, every answer it
 # reads kept), its DOM gives the recording, and the file is serve's page with the recording
 # embedded (#determinismo-report): it answers from it alone, and starts or changes nothing.
+# Beside it, stamp.json (the recording's time and the run's state): a copy of a run still going,
+# served over HTTP, reloads when a newer recording is there (re-record it to the same place).
 # Needs Chrome or Chromium (GitHub's hosted runners have Chrome) and python3.
 set -euo pipefail
 serve=${1:?usage: report-static.sh <serve-url> <run> <out.html>}
@@ -25,9 +27,9 @@ curl -fsS -m 60 "$serve/" > "$work/page.html"
 # taking their real time.
 "$chrome" --headless=new --disable-gpu --no-sandbox --user-data-dir="$work/profile" \
   --virtual-time-budget=1800000 --dump-dom "$serve/?record#$run" > "$work/dom.html" 2> "$work/chrome.log"
-python3 - "$work/page.html" "$work/dom.html" "$out" "$run" <<'EOF'
-import json, re, sys
-page_path, dom_path, out, run = sys.argv[1:5]
+python3 - "$work/page.html" "$work/dom.html" "$out" "$run" "$serve" <<'EOF'
+import json, os, re, sys
+page_path, dom_path, out, run, serve = sys.argv[1:6]
 dom = open(dom_path, encoding="utf-8").read()
 found = re.search(r'<script type="application/json" id="determinismo-report-recorded">(.*?)</script>', dom, re.S)
 if not found:
@@ -46,6 +48,16 @@ embedded = ('<script type="application/json" id="determinismo-report">'
 at = page.index("<body>") + len("<body>")
 page = page[:at] + "\n" + embedded + page[at:]
 page = page.replace("<title>determinismo</title>", f"<title>determinismo: run {run}</title>", 1)
+# Its fonts inside it (serve's /fonts/ is no copy's): one file, as it looks on serve.
+import base64, urllib.request
+for name in sorted(set(re.findall(r'url\("/fonts/([A-Za-z0-9._-]+)"\)', page))):
+    with urllib.request.urlopen(f"{serve}/fonts/{name}", timeout=60) as response:
+        data = base64.b64encode(response.read()).decode()
+    page = page.replace(f'url("/fonts/{name}")', f'url("data:font/otf;base64,{data}")')
 open(out, "w", encoding="utf-8").write(page)
+# Beside it, what an open copy of a run still going asks for each minute (the newest recording).
+info = json.loads(recording["answers"].get(f"/runs/{run}", "{}"))
+stamp = {"run": int(run), "recorded": recording["recorded"], "state": info.get("state", "")}
+json.dump(stamp, open(os.path.join(os.path.dirname(os.path.abspath(out)), "stamp.json"), "w"))
 print(f"{out}: run {run}, {len(recording['answers'])} answers, {len(page) // 1024} KB")
 EOF

@@ -4524,8 +4524,21 @@ if (reportEmbedded) {
   const note = document.createElement("div");
   note.className = "muted";
   note.style.cssText = "margin: 0 0 12px; font-size: 12px;";
-  note.textContent = `A copy of run ${reportEmbedded.run}, recorded ${String(reportEmbedded.recorded).slice(0, 16).replace("T", " ")} UTC: read only.`;
+  const info = (() => { try { return JSON.parse(reportEmbedded.answers[`/runs/${reportEmbedded.run}`]); } catch { return null; } })();
+  const going = info && info.state === "running";
+  note.textContent = `A copy of run ${reportEmbedded.run}, recorded ${String(reportEmbedded.recorded).slice(0, 16).replace("T", " ")} UTC: read only.`
+    + (going ? " The run goes on: this page takes each newer recording as it comes." : "");
   document.querySelector("aside .brand")?.after(note);
+  // A copy of a run still going: a newer recording beside it (stamp.json, written with each:
+  // infra/host/report-static.sh) reloads it; asked each minute (from a file, nothing to ask).
+  if (going && location.protocol.startsWith("http")) {
+    setInterval(async () => {
+      try {
+        const stamp = await (await fetch("stamp.json", { cache: "no-store" })).json();
+        if (stamp.recorded && stamp.recorded > reportEmbedded.recorded) location.reload();
+      } catch { /* None yet. */ }
+    }, 60000);
+  }
 }
 // ?record (see reportEmbedded): the run's report, then each property's page, each once the page
 // has asked for nothing for a while; then every answer kept, in #determinismo-report-recorded
