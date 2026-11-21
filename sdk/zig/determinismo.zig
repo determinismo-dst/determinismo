@@ -45,6 +45,7 @@ pub const tcp = @import("tcp");
 /// Transaction histories checked by Elle (see elle.zig and checkers/elle).
 pub const elle = @import("elle.zig");
 pub const replicas = @import("replicas.zig");
+pub const trace = @import("trace.zig");
 pub const payloads = @import("payloads.zig");
 pub const ring = @import("ring.zig");
 /// Open-loop load with retry policies, for metastable failures (open_loop.zig).
@@ -2394,6 +2395,7 @@ test {
     _ = system;
     _ = elle;
     _ = replicas;
+    _ = trace;
     _ = sideband;
     _ = payloads;
     _ = ring;

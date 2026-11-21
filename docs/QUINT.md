@@ -140,6 +140,26 @@ An agent does the same from its own machine with `clients/quint/trace.sh`: it re
 timeline's events from serve, writes the spec, and runs the script until it exits 0
 (examples/bank/quint has the one written so for `bank_steps`).
 
+## Walking a spec's trace through the system
+
+The other direction: a trace the spec gives (a test run's `quint test --out-itf`, a simulation's
+`quint run --out-itf`) walked through the real system, each step caused by a control and
+awaited, with `sdk.trace` (sdk/zig/trace.zig). A system's adapter maps a step (the change from
+one ITF state to the next) to its control (a hand-over, a cut, a freeze, a hold let go, or
+nothing for a step that follows by itself) and says when the system shows it; the driver
+hands the adapter the whole trace first (what a later step needs armed early), draws a wait
+before each step by its kind (`trace.<kind>.delay_ms`: the tree branches on timings, the trace
+fixes the structure), and polls until the step shows or diverges:
+
+    const states = try sdk.trace.parse(arena, @embedFile("two_leaders.itf.json"));
+    var adapter: DoubleVote = .{ .context = context };
+    const outcome = sdk.trace.walk(DoubleVote, &adapter, "two_leaders", states);
+
+Each step is a `trace_step` event (its kind, the wait drawn, how long it took to show), the end a
+`trace_walked` event (steps taken, where it diverged) and the catalog's "a spec trace walked to
+its end". `sdk.trace.int`, `field`, `get`, `tag` and `contains` read ITF values (bigints,
+records, maps, variants, sets).
+
 ## Limits
 
 - 65,536 events a trace. Quint takes about 5 ms an event (a 3,000-event timeline: 18 s on a
