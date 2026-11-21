@@ -13,6 +13,12 @@
 //! with them does). `--arg`: only a thread whose register has that value at the entry (Go's
 //! ABIInternal: rax, rbx, rcx, rdi, rsi, r8 to r11 in order, a method's receiver first; the
 //! System V ABI: rdi, rsi, rdx, rcx, r8, r9). Other entries step over the breakpoint and go on.
+//! `--arg-field <register>:<type>:<path>=<value>`: only a thread whose register points at a
+//! `<type>` (its name in the module's DWARF: Go's `github.com/hashicorp/raft.followerReplication`)
+//! whose field `<path>` (`peer.Address`, members and indexes, no pointer followed) has that value:
+//! a number for an integer, a boolean or a pointer (of its size); the text for a Go string (its
+//! pointer and length) — a call told apart by what its argument holds, not the argument itself
+//! (a replication to one follower among the leader's goroutines, all in the same function).
 //! `--repeat`: once its thread is let go, the point holds the next one that matches (a writer
 //! kept from landing again while the rest goes on). `--every`: every thread that matches is held
 //! until the end (all of a node's sends of a message kept from leaving). `--direct`: the caller
@@ -34,6 +40,7 @@ const assert = std.debug.assert;
 const linux = std.os.linux;
 const nodes = @import("nodes.zig");
 const symbol = @import("symbol.zig");
+const dwarf_types = @import("dwarf_types.zig");
 
 const ptrace_cont = 7;
 const ptrace_singlestep = 9;
@@ -53,6 +60,8 @@ const threads_max = 1024;
 const frames_max = 32;
 pub const points_max = 4;
 const threads_held_max = 64;
+/// The longest text an `--arg-field` compares.
+const field_text_max = 256;
 
 /// struct user_regs_struct: 27 registers.
 const Regs = [27]u64;
@@ -71,10 +80,23 @@ const register_names = [_]struct { name: []const u8, index: u8 }{
 
 pub const Arg = struct { index: u8, value: u64 };
 
+/// `--arg-field`, as given.
+pub const ArgField = struct { index: u8, type_name: []const u8, path: []const u8, value: []const u8 };
+
+/// `--arg-field`, resolved: where the field is from what the register points at, and what it
+/// must hold.
+const FieldMatch = struct {
+    index: u8,
+    offset: u64,
+    size: u64,
+    want: union(enum) { number: u64, text: []const u8 },
+};
+
 pub const PointOptions = struct {
     function: []const u8,
     caller: ?[]const u8 = null,
     arg: ?Arg = null,
+    field: ?ArgField = null,
     /// Once its thread is let go, the point holds the next one that matches.
     repeat: bool = false,
     /// Every thread that matches is held (until the end), not only the first.
@@ -124,6 +146,8 @@ pub fn parse(node: []const u8, function: []const u8, rest: []const []const u8) !
             point.caller = value;
         } else if (std.mem.eql(u8, name, "--arg")) {
             point.arg = try arg_parse(value);
+        } else if (std.mem.eql(u8, name, "--arg-field")) {
+            point.field = try arg_field_parse(value);
         } else if (std.mem.eql(u8, name, "--pid")) {
             options.pid = try std.fmt.parseInt(linux.pid_t, value, 10);
         } else if (std.mem.eql(u8, name, "--timeout-ms")) {
@@ -139,6 +163,54 @@ fn arg_parse(text: []const u8) !Arg {
     const equals = std.mem.indexOfScalar(u8, text, '=') orelse return error.Usage;
     const index = register_index(text[0..equals]) orelse return error.UnknownRegister;
     return .{ .index = index, .value = try std.fmt.parseInt(u64, text[equals + 1 ..], 0) };
+}
+
+/// `<register>:<type>:<path>=<value>`: the type's name has no colon (Go's and C's do not), the
+/// path no colon or equals sign; the value is the rest (an address's colon among it).
+fn arg_field_parse(text: []const u8) !ArgField {
+    const first = std.mem.indexOfScalar(u8, text, ':') orelse return error.Usage;
+    const index = register_index(text[0..first]) orelse return error.UnknownRegister;
+    const rest = text[first + 1 ..];
+    const second = std.mem.indexOfScalar(u8, rest, ':') orelse return error.Usage;
+    const field = rest[second + 1 ..];
+    const equals = std.mem.indexOfScalar(u8, field, '=') orelse return error.Usage;
+    if (second == 0 or equals == 0) return error.Usage;
+    const value = field[equals + 1 ..];
+    if (value.len > field_text_max) return error.Usage;
+    return .{ .index = index, .type_name = rest[0..second], .path = field[0..equals], .value = value };
+}
+
+/// The field's place in the module's DWARF and the value it must hold, as its kind reads it.
+fn field_match(arena: std.mem.Allocator, sections: dwarf_types.Sections, asked: ArgField) !FieldMatch {
+    const field = (try dwarf_types.member_of(arena, sections, asked.type_name, asked.path)) orelse return error.UnknownType;
+    switch (field.kind) {
+        .signed, .unsigned, .boolean, .pointer => {
+            if (field.size == 0 or field.size > 8) return error.UnsupportedField;
+            const number: u64 = if (std.mem.eql(u8, asked.value, "true"))
+                1
+            else if (std.mem.eql(u8, asked.value, "false"))
+                0
+            else if (field.kind == .signed)
+                @bitCast(try std.fmt.parseInt(i64, asked.value, 0))
+            else
+                try std.fmt.parseInt(u64, asked.value, 0);
+            return .{ .index = asked.index, .offset = field.offset, .size = field.size, .want = .{ .number = number } };
+        },
+        // A Go string: its data's pointer, then its length (Go's DWARF says `string`, a structure
+        // of `str` and `len`; a named string type is a typedef of it).
+        .aggregate => {
+            if (field.size != 16) return error.UnsupportedField;
+            return .{ .index = asked.index, .offset = field.offset, .size = 16, .want = .{ .text = asked.value } };
+        },
+        .float, .other => return error.UnsupportedField,
+    }
+}
+
+/// The low `size` bytes of `word`, sign-extended for a signed field (so `-1` matches an i32's).
+fn field_number(word: u64, size: u64) u64 {
+    if (size >= 8) return word;
+    const bits: u6 = @intCast(size * 8);
+    return word & ((@as(u64, 1) << bits) - 1);
 }
 
 fn register_index(name: []const u8) ?u8 {
@@ -185,6 +257,7 @@ const Point = struct {
     original: u8,
     caller: ?[2]u64,
     arg: ?Arg,
+    field: ?FieldMatch = null,
     repeat: bool,
     every: bool,
     direct: bool,
@@ -238,6 +311,35 @@ const Hold = struct {
         return word;
     }
 
+    fn bytes_read(hold: *const Hold, address: u64, bytes: []u8) bool {
+        const read = linux.pread(hold.memory, bytes.ptr, bytes.len, @bitCast(address));
+        return linux.errno(read) == .SUCCESS and read == bytes.len;
+    }
+
+    /// Whether the field behind a register holds the value asked for.
+    fn field_holds(hold: *const Hold, field: *const FieldMatch, regs: *const Regs) bool {
+        const base = regs[field.index];
+        if (base == 0) return false;
+        const at = std.math.add(u64, base, field.offset) catch return false;
+        switch (field.want) {
+            .number => |number| {
+                var word: u64 = 0;
+                const bytes = std.mem.asBytes(&word)[0..@intCast(field.size)];
+                if (!hold.bytes_read(at, bytes)) return false;
+                return field_number(word, field.size) == field_number(number, field.size);
+            },
+            .text => |text| {
+                const data = hold.word_read(at) orelse return false;
+                const length = hold.word_read(at + 8) orelse return false;
+                if (length != text.len) return false;
+                if (text.len == 0) return true;
+                var buffer: [field_text_max]u8 = undefined;
+                if (!hold.bytes_read(data, buffer[0..text.len])) return false;
+                return std.mem.eql(u8, buffer[0..text.len], text);
+            },
+        }
+    }
+
     /// The point whose breakpoint a thread stopped at (its rip just after the int3), if any.
     fn point_at(hold: *Hold, rip: u64) ?u32 {
         for (hold.points[0..hold.count], 0..) |point, index| {
@@ -251,6 +353,9 @@ const Hold = struct {
     fn matches(hold: *const Hold, point: *const Point, regs: *const Regs) bool {
         if (point.arg) |arg| {
             if (regs[arg.index] != arg.value) return false;
+        }
+        if (point.field) |*field| {
+            if (!hold.field_holds(field, regs)) return false;
         }
         const range = point.caller orelse return true;
         const first = hold.word_read(regs[rsp_index]) orelse return false;
@@ -414,10 +519,25 @@ pub fn run(arena: std.mem.Allocator, options: Options) !u8 {
             const site = (symbol.find(arena, hold.pid, name, null) catch null) orelse return error.UnknownCaller;
             caller = .{ site.address, site.address + site.size };
         }
+        var field: ?FieldMatch = null;
+        if (asked.field) |wanted| {
+            // The type from the DWARF of the module the function is in.
+            const module_path = std.fmt.allocPrintSentinel(arena, "/proc/{d}/root{s}", .{ hold.pid, found.module }, 0) catch return error.OutOfMemory;
+            const module = linux.open(module_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+            if (linux.errno(module) != .SUCCESS) return error.UnknownType;
+            defer _ = linux.close(@intCast(module));
+            const sections = (try dwarf_types.sections_of(arena, @intCast(module))) orelse return error.UnknownType;
+            field = field_match(arena, sections, wanted) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.UnknownType, error.UnsupportedField => |e| return e,
+                error.InvalidCharacter, error.Overflow => return error.Usage,
+                else => return error.UnknownField,
+            };
+        }
         var original: [1]u8 = undefined;
         if (linux.pread(hold.memory, &original, 1, @bitCast(found.address)) != 1) return error.Memory;
         assert(original[0] != int3);
-        hold.points[hold.count] = .{ .entry = found.address, .original = original[0], .caller = caller, .arg = asked.arg, .repeat = asked.repeat, .every = asked.every, .direct = asked.direct };
+        hold.points[hold.count] = .{ .entry = found.address, .original = original[0], .caller = caller, .arg = asked.arg, .field = field, .repeat = asked.repeat, .every = asked.every, .direct = asked.direct };
         hold.count += 1;
     }
 
@@ -522,6 +642,61 @@ test parse {
     try std.testing.expectEqual(@as(u64, 2500), options.timeout_ms);
     try std.testing.expectError(error.UnknownRegister, parse("n", "f", &.{ "--arg", "xmm0=1" }));
     try std.testing.expectError(error.Usage, parse("n", "f", &.{"--caller"}));
+}
+
+test arg_field_parse {
+    const options = try parse("n", "github.com/hashicorp/raft.(*Raft).replicateTo", &.{ "--arg-field", "rbx:github.com/hashicorp/raft.followerReplication:peer.Address=10.0.0.5:8300" });
+    const field = options.points[0].field.?;
+    try std.testing.expectEqual(@as(u8, 5), field.index);
+    try std.testing.expectEqualStrings("github.com/hashicorp/raft.followerReplication", field.type_name);
+    try std.testing.expectEqualStrings("peer.Address", field.path);
+    try std.testing.expectEqualStrings("10.0.0.5:8300", field.value);
+    try std.testing.expectError(error.Usage, parse("n", "f", &.{ "--arg-field", "rbx:T=1" }));
+    try std.testing.expectError(error.Usage, parse("n", "f", &.{ "--arg-field", "rbx:T:=1" }));
+    try std.testing.expectError(error.UnknownRegister, parse("n", "f", &.{ "--arg-field", "xmm0:T:a=1" }));
+}
+
+test field_number {
+    try std.testing.expectEqual(@as(u64, 0xffff_ffff), field_number(@bitCast(@as(i64, -1)), 4));
+    try std.testing.expectEqual(@as(u64, 0x34), field_number(0x1234, 1));
+    try std.testing.expectEqual(@as(u64, 0x1234), field_number(0x1234, 8));
+}
+
+// What a held argument points at, for the field match below: a structure whose DWARF the test
+// binary carries, by its type's name.
+const TestPeer = extern struct { id: u32, code: i32, address: extern struct { ptr: [*]const u8, len: u64 } };
+export var det_hold_test_peer: TestPeer = .{ .id = 7, .code = -3, .address = .{ .ptr = "10.0.0.5:8300", .len = 13 } };
+
+test "a field behind a register, matched as its DWARF type reads it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    std.mem.doNotOptimizeAway(&det_hold_test_peer);
+    const self = linux.open("/proc/self/exe", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(self) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.close(@intCast(self));
+    const sections = (try dwarf_types.sections_of(arena, @intCast(self))) orelse return error.SkipZigTest;
+    const memory = linux.open("/proc/self/mem", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(memory));
+    defer _ = linux.close(@intCast(memory));
+    const hold: Hold = .{ .pid = linux.getpid(), .memory = @intCast(memory) };
+    var regs: Regs = @splat(0);
+    regs[5] = @intFromPtr(&det_hold_test_peer); // rbx
+    const type_name = "hold.TestPeer";
+    const id = try field_match(arena, sections, .{ .index = 5, .type_name = type_name, .path = "id", .value = "7" });
+    try std.testing.expect(hold.field_holds(&id, &regs));
+    const other = try field_match(arena, sections, .{ .index = 5, .type_name = type_name, .path = "id", .value = "8" });
+    try std.testing.expect(!hold.field_holds(&other, &regs));
+    const code = try field_match(arena, sections, .{ .index = 5, .type_name = type_name, .path = "code", .value = "-3" });
+    try std.testing.expect(hold.field_holds(&code, &regs));
+    const address = try field_match(arena, sections, .{ .index = 5, .type_name = type_name, .path = "address", .value = "10.0.0.5:8300" });
+    try std.testing.expect(hold.field_holds(&address, &regs));
+    const elsewhere = try field_match(arena, sections, .{ .index = 5, .type_name = type_name, .path = "address", .value = "10.0.0.6:8300" });
+    try std.testing.expect(!hold.field_holds(&elsewhere, &regs));
+    regs[5] = 0;
+    try std.testing.expect(!hold.field_holds(&id, &regs)); // A nil receiver: no match.
+    try std.testing.expectError(error.UnknownType, field_match(arena, sections, .{ .index = 5, .type_name = "hold.NoSuchType", .path = "id", .value = "1" }));
+    try std.testing.expectError(error.NoSuchField, field_match(arena, sections, .{ .index = 5, .type_name = type_name, .path = "missing", .value = "1" }));
 }
 
 test releases_parse {

@@ -39,6 +39,22 @@ pub fn resolve(arena: std.mem.Allocator, sections: Sections, variable: []const u
     var types: Types = .{ .arena = arena, .sections = sections };
     try types.units_scan();
     const found = (try types.variable_find(variable)) orelse return null;
+    return try types.walk(found, path);
+}
+
+/// The field `path` of the type named `type_name` (a structure, class, union or typedef: Go's
+/// `github.com/hashicorp/raft.followerReplication`, C's `struct conn`'s `conn`), its offset from
+/// the type's start: what a pointer to one points at, for `det-nodes hold --arg-field` (a thread
+/// held only when a field behind its argument says so). Null when the module's DWARF has no type
+/// of that name.
+pub fn member_of(arena: std.mem.Allocator, sections: Sections, type_name: []const u8, path: []const u8) Error!?Field {
+    var types: Types = .{ .arena = arena, .sections = sections };
+    try types.units_scan();
+    const found = (try types.type_find(type_name)) orelse return null;
+    return try types.walk(found, path);
+}
+
+fn resolve_walk(types: *Types, found: u64, path: []const u8) Error!Field {
     var place: Field = try types.type_of(found);
     var type_offset = found;
     var steps = Steps{ .text = path };
@@ -375,6 +391,29 @@ const Types = struct {
 
     /// The type offset of the global variable named `name` (its name or its linkage name; a
     /// definition's, through the declaration it completes when that carries the type).
+    fn walk(types: *Types, found: u64, path: []const u8) Error!Field {
+        return resolve_walk(types, found, path);
+    }
+
+    /// A type by its name: a structure's, class's or union's definition, or a typedef's.
+    fn type_find(types: *Types, name: []const u8) Error!?u64 {
+        for (types.units.items) |*unit| {
+            var at = unit.dies;
+            while (at < unit.end) {
+                const die = try types.die_at(unit, at);
+                at = die.next;
+                switch (die.tag) {
+                    DW.TAG.structure_type, DW.TAG.class_type, DW.TAG.union_type, DW.TAG.typedef => {},
+                    else => continue,
+                }
+                if (die.declaration) continue;
+                const named = die.name orelse continue;
+                if (std.mem.eql(u8, named, name)) return die.offset;
+            }
+        }
+        return null;
+    }
+
     fn variable_find(types: *Types, name: []const u8) Error!?u64 {
         for (types.units.items) |*unit| {
             var at = unit.dies;
@@ -678,6 +717,19 @@ test "a variable's fields by their paths, from this test binary's DWARF" {
     try std.testing.expectError(error.IndexOutOfRange, resolve(arena, sections, "det_types_test", "table[3]"));
     try std.testing.expectError(error.NotAnArray, resolve(arena, sections, "det_types_test", "ratio[0]"));
     try std.testing.expectEqual(@as(?Field, null), try resolve(arena, sections, "det_no_such_variable", ""));
+}
+
+test "a type's field by its path, from this test binary's DWARF" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    std.mem.doNotOptimizeAway(&det_types_test);
+    const sections = (try sections_of_self(arena)) orelse return error.SkipZigTest;
+    const code = (try member_of(arena, sections, "dwarf_types.TestStats", "inner.code")).?;
+    try std.testing.expectEqual(@as(u64, @offsetOf(TestStats, "inner") + 4), code.offset);
+    try std.testing.expectEqual(Kind.signed, code.kind);
+    try std.testing.expectEqual(@as(?Field, null), try member_of(arena, sections, "dwarf_types.NoSuchType", "accepted"));
+    try std.testing.expectError(error.NoSuchField, member_of(arena, sections, "dwarf_types.TestStats", "missing"));
 }
 
 // A test function whose parameters this file reads back from the test binary's own DWARF.
