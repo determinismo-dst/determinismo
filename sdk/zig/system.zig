@@ -811,6 +811,30 @@ fn nodes_run(arguments: []const []const u8, capture: ?[]u8, captured: Captured) 
     return .{ .status = code, .output = if (capture) |buffer| buffer[0..size] else "" };
 }
 
+test "a marker a workload may never reach is no catalog entry" {
+    // The command wrapper instantiated and kept, as every workload's is: its catch arm for a
+    // full history is in a debug build (a release one may prove it dead for a workload and drop
+    // it, catalog entry and all). A cataloged sometimes never true fails the run: every run of a
+    // workload that records no history failed on this marker (raft-poc-test, run 1428).
+    const Nodes = struct { only: Node };
+    const S = System(Nodes);
+    const handlers = struct {
+        fn noop(_: *S.Context) !void {}
+        fn scenario(s: *S.Scenario) void {
+            s.parallel_driver("driver", noop);
+        }
+        const definition = .{ .describe = undefined, .scenarios = .{ .only = scenario } };
+        fn command(init: std.process.Init) !void {
+            return S.run(init, definition, "only", "driver");
+        }
+    };
+    std.mem.doNotOptimizeAway(&handlers.command);
+    var assertions = sdk.catalog_assertions();
+    while (assertions.next()) |assertion| {
+        try std.testing.expect(!std.mem.eql(u8, assertion.message, "a driver ended at its history's cap"));
+    }
+}
+
 test "scenarios and profiles are typed" {
     const Nodes = struct { redis: Node, cache: ?Node };
     const S = System(Nodes);
