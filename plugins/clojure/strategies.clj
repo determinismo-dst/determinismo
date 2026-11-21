@@ -1140,16 +1140,18 @@
 ;; A ladder target: progress as a bug's ingredients in its spec's terms, not a sequence of events (a
 ;; sequence the spec's invariants do not tell apart from ordinary runs scores them all as done: the
 ;; double vote's six events occur in that order in ordinary elections, 121 of 132 timelines of run
-;; 1422 matched all six). The double vote's (hashicorp/raft#695, the spec's term_never_goes_back,
-;; one_vote_per_term, one_leader_per_term): 1 a node's term went back, 2 a node voted twice in one
-;; term, 3 two leaders in one term. Folded over a timeline's named events, a branch starting from
+;; 1422 matched all six). The double vote's, from the spec's own test run (twoLeadersTest's
+;; expectations, in order): 1 a node's term went back (term_never_goes_back), 2 it granted a vote
+;; for an older term than its last vote's (remembered_vote_is_newest), 3 a node voted twice in one
+;; term (one_vote_per_term), 4 two leaders in one term (one_leader_per_term). Folded over a timeline's named events, a branch starting from
 ;; its parent's state at its moment. `(ladder-target! :double-vote)`, or the control port's
 ;; "target double-vote".
 
 (def ladder-steps
-  {:double-vote [{:action "term_went_back" :about "a node's term goes back (a term write landing late)"}
-                 {:action "voted_twice_in_a_term" :about "a node votes twice in one term (two candidates, or another and itself)"}
-                 {:action "two_leaders_in_a_term" :about "two nodes win the same term"}]})
+  {:double-vote [{:action "term_went_back" :about "a node's term goes back (a term write landing late): term_never_goes_back"}
+                 {:action "older_vote_after_newer" :about "a node grants a vote for an older term than its last vote's (it forgets its newer vote): remembered_vote_is_newest"}
+                 {:action "voted_twice_in_a_term" :about "a node votes twice in one term (another and itself, standing again for the term it forgot): one_vote_per_term"}
+                 {:action "two_leaders_in_a_term" :about "two nodes win the same term: one_leader_per_term"}]})
 
 (defn- address-node
   "A node's name from one of its addresses (the Raft PoC's: host .3 node-0, .4 node-1, .5 node-2 on
@@ -1172,8 +1174,12 @@
                   state)
                 "granted_vote"
                 (if (and node (integer? term))
-                  (let [candidate (address-node (:candidate details))]
-                    (update-in state [:votes [node term]] (fnil conj #{}) (if (= candidate node) "self" candidate)))
+                  (let [candidate (address-node (:candidate details))
+                        last-vote (get-in state [:last-vote node])]
+                    (cond-> (-> state
+                                (update-in [:votes [node term]] (fnil conj #{}) (if (= candidate node) "self" candidate))
+                                (assoc-in [:last-vote node] term))
+                      (and last-vote (< term last-vote)) (update :older (fnil conj #{}) node)))
                   state)
                 "vote_granted"
                 (if (and node (integer? term) (str/ends-with? node (str (:from details))))
@@ -1182,8 +1188,9 @@
                 "election_won"
                 (if (and node (integer? term)) (update-in state [:leaders term] (fnil conj #{}) node) state)
                 state)
-        level (cond (some #(> (count %) 1) (vals (:leaders state))) 3
-                    (some #(> (count %) 1) (vals (:votes state))) 2
+        level (cond (some #(> (count %) 1) (vals (:leaders state))) 4
+                    (some #(> (count %) 1) (vals (:votes state))) 3
+                    (seq (:older state)) 2
                     (seq (:back state)) 1
                     :else 0)]
     (assoc state :level (max level (:level state 0)))))

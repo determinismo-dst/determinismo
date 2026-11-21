@@ -109,7 +109,7 @@
                             {:vtime_ns (* 4 ns) :event {:output {:source "raft-node-1" :text "x [DEBUG] node-1: granted vote: term=4 candidate=10.0.0.5:8300"}}})
       (s/trace-target-event (atom {:index 25})
                             {:vtime_ns (* 5 ns) :event {:output {:source "raft-node-1" :text "x [DEBUG] node-1: granted vote: term=4 candidate=10.0.0.3:8300"}}})
-      (is (= 2 (get-in @s/trace-progress [25 :best])))
+      (is (= 3 (get-in @s/trace-progress [25 :best])) "two candidates in term 4: voted twice")
       (is (= 5 (pick)) "5's point has a climb now: two failures to 4's three"))))
 
 (deftest the-agent-arm-steers-a-timelines-next-step-with-the-options-it-chose
@@ -165,13 +165,16 @@
                       (line "raft-node-0" "node-0: granted vote: term=3 candidate=10.1.0.5:8300")
                       (line "raft-node-2" "node-2: election won: term=3 tally=2")
                       (line "raft-node-1" "node-1: pre-vote granted: from=node-1 term=4 tally=1")]))))
-    (testing "a term written late: 1; then that node's second vote in a term: 2; a second leader: 3"
+    (testing "the spec's twoLeadersTest, in the PoC's lines (1416/0 at 38.8 s): 1, 2, 3, 4"
       (let [lines [(line "raft-node-1" "node-1: updated currentTerm: term=24")
                    (line "raft-node-1" "node-1: granted vote: term=24 candidate=10.0.0.5:8300")
-                   (line "raft-node-1" "node-1: updated currentTerm: term=23")]]
-        (is (= 1 (fold lines)))
-        (is (= 2 (fold (conj lines (line "raft-node-1" "node-1: vote granted: from=node-1 term=24 tally=1")))))
-        (is (= 3 (fold (conj lines (line "raft-node-2" "node-2: election won: term=24 tally=2")
+                   (line "raft-node-1" "node-1: updated currentTerm: term=23")]
+            older (conj lines (line "raft-node-1" "node-1: granted vote: term=23 candidate=10.0.0.3:8300"))]
+        (is (= 1 (fold lines)) "its term went back")
+        (is (= 2 (fold older)) "it granted node-0's older request: its vote in 24 forgotten")
+        (is (= 3 (fold (conj older (line "raft-node-1" "node-1: vote granted: from=node-1 term=24 tally=1"))))
+            "standing for 24 again, it votes for itself: its second vote in 24")
+        (is (= 4 (fold (conj older (line "raft-node-2" "node-2: election won: term=24 tally=2")
                              (line "raft-node-1" "node-1: election won: term=24 tally=2")))))))))
 
 (deftest a-ladder-targets-progress-and-a-branchs-inheritance
@@ -190,7 +193,7 @@
       (is (= 0 (get-in @s/trace-progress [10 :best]))))
     (testing "the agent's next step is the rung after the timeline's"
       (reset! s/trace-decisions {"fault" ["pause raft-node-1" "kill raft-node-0"]})
-      (reset! s/trace-agent-steer {"voted_twice_in_a_term" {"fault" ["pause raft-node-1"]}})
+      (reset! s/trace-agent-steer {"older_vote_after_newer" {"fault" ["pause raft-node-1"]}})
       (is (= {"fault" [[0 1 0.7] [1 2 0.3]]}
              (update-vals (s/trace-agent-plan (atom {:index 4}))
                           (fn [segments] (mapv (fn [[a b w]] [a b (/ (Math/round (* 100 w)) 100.0)]) segments))))))))
