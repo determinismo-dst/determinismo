@@ -1,0 +1,11 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# The system's own workload: setup complete at once, then waits for the template's first command,
+# works for ten seconds, and reports that it did (in the Antithesis SDK's format).
+printf '%s\n' '{"antithesis_setup":{"status":"complete","details":null}}' >> "$ANTITHESIS_OUTPUT_DIR/setup.jsonl"
+while [ ! -e /workload-active ]; do sleep 0.1; done
+i=0
+while [ "$i" -lt 10 ]; do sleep 1; i=$((i + 1)); done
+printf '{"antithesis_assert":{"hit":true,"must_hit":true,"assert_type":"always","display_type":"Always","message":"the system drove itself for ten seconds after its first command","condition":true,"details":{"seconds":%s}}}\n' \
+  "$i" > "${ANTITHESIS_SDK_LOCAL_OUTPUT:-/dev/stderr}"
+exec sleep infinity

@@ -1,0 +1,4 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# The formalized Raft projects' signal: the workload starts once this file is there.
+touch /workload-active

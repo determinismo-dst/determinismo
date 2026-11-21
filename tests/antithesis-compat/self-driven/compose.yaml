@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: MIT
+# A project whose system drives itself (Antithesis's formalized Raft projects: the driver is a
+# container's own command, the template's one command first_start_workload tells it to begin):
+# no driver commands. The system's container waits for the first command's file, then reports,
+# in the Antithesis SDK's format, that it ran with the faults for a while. Run with:
+#   determinismo explore ... --compose tests/antithesis-compat/self-driven/compose.yaml --scenario main
+services:
+  system:
+    build: ./system
+    command: [/usr/local/bin/workload]
