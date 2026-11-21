@@ -52,6 +52,15 @@ Every timeline replays exactly, so a failure is evidence, not flakiness. Follow
    and methods: the agent's watches (`DETERMINISMO_WATCH` in the node's environment, docs/SDKS.md)
    say each store's value and each call's arguments as `watch` events in every timeline, read
    with `query <run> 'event=watch'` or `across`.
+   Who changed a value, by the calls alone (Turso #3217's chain, found this way on a fresh run):
+   the function looked up with `dbg/symbol-at` (a session of its own: a lookup runs the guest,
+   and a session that runs no guest command is the recording); `dbg/calls` just before the
+   failure for the failing call's arguments (`:params` by their DWARF names: the object, its
+   address space `:cr3`); `dbg/moment-when` to bisect the recording to the first moment a look
+   holds (the field's word non-zero; to the millisecond, then the taken branch); there,
+   `dbg/watch` on the word with its `:cr3` and `dbg/continue` to stop at the write, and
+   `dbg/frames` for the stack at it (unwound by the module's `.eh_frame`, exact for Rust and
+   C++ release code: `OnceLock::initialize <- Completion::error <- Statement::run_once ...`).
 5. **Shrink its faults**: `determinismo script <events>` then `determinismo shrink <explore
    options> --script <script.json> --property '<message>'`: the fewest faults that still make it
    fail (or that it needs none), judged over 16 seeds, and the shrunk script for `--script`.
