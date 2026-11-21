@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
-# Builds the guest kernel from the Debian linux-source tarball (the host kernel's version) with
+# Builds the guest kernel from Debian's linux-source tarball (apt's, on a Debian host; on another,
+# Ubuntu as GitHub's hosted runners run, Debian's package at a pinned version) with
 # guest/kernel/patches applied and x86_64_defconfig plus guest/kernel/determinismo.config, and
 # det_guest.ko against it.
 # Runs on the Linux host. Usage: guest/kernel/build.sh <out-dir>
@@ -10,7 +11,20 @@ out=${1:?usage: $0 <out-dir>}
 here=$(cd "$(dirname "$0")" && pwd)
 version=6.12
 tarball=/usr/src/linux-source-$version.tar.xz
-[ -f "$tarball" ] || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q linux-source-$version
+# Debian's package where apt has none (Ubuntu): pinned, checked, unpacked over /.
+debian_deb=linux-source-6.12_6.12.117-1_all.deb
+debian_sha256=9141325315c7f1eca682113d185a8c77c82814aa6e32f7e127e61d6106403835
+if [ ! -f "$tarball" ]; then
+  if apt-cache show "linux-source-$version" > /dev/null 2>&1; then
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q linux-source-$version
+  else
+    deb=$(mktemp --suffix=.deb)
+    curl -fsSL -o "$deb" "https://deb.debian.org/debian/pool/main/l/linux/$debian_deb"
+    echo "$debian_sha256  $deb" | sha256sum -c --status || { echo "error: $debian_deb is not the pinned one" >&2; exit 1; }
+    sudo dpkg -x "$deb" /
+    rm -f "$deb"
+  fi
+fi
 work=${DETERMINISMO_GUEST_KERNEL:-$HOME/guest-kernel}
 mkdir -p "$work" "$out"
 tree="$work/linux-source-$version"
