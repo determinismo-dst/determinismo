@@ -53,7 +53,11 @@ memory and breakpoints and commands inside its nodes (determinismo.debug), a nod
 moment, a file put into a node at a moment with the timeline going on (a fix tried on the
 system itself), new timelines from a moment, causality, shrinking and explaining, and Quint
 (determinismo.quint). A session stays at its moment between calls, so questions about one moment
-cost one replay. The window draws each evaluation, for whoever watches.
+cost one replay. The window draws each evaluation, for whoever watches. Who changed a value:
+`symbol-at`, `calls` (arguments by their DWARF names), `moment-when` (the first moment a look
+holds, bisected), `watch` and `continue` (a stop at the write), `frames` (its stack, unwound by
+`.eh_frame`): the determinismo-debug skill's recipe. The same REPL serves exploration strategies
+(determinismo.strategy, docs/PLUGINS.md): functions redefined while a run asks them.
 
 ## Skills
 
