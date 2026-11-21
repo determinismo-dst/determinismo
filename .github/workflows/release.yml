@@ -34,4 +34,6 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" "$NAME.tar.gz" "$NAME.tar.gz.sha256" --title "$GITHUB_REF_NAME" --notes "determinismo $GITHUB_REF_NAME (${GITHUB_SHA::12}): Linux x86-64 binaries. Deterministic VMs need a bare-metal x86-64 host with KVM."
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$NAME.tar.gz" "$NAME.tar.gz.sha256" --title "$GITHUB_REF_NAME" \
+            --notes "determinismo $GITHUB_REF_NAME (${GITHUB_SHA::12}): Linux x86-64 binaries. Deterministic VMs need a bare-metal x86-64 host with KVM."
