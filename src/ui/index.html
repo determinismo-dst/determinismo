@@ -441,15 +441,42 @@ function efficiencyOf(run, key, format) {
 const quote = (text) => '"' + String(text).replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
 const sqlString = (text) => "'" + String(text).replace(/'/g, "''") + "'";
 
+// A run's report as one file, read only, no serve behind it (infra/host/report-static.sh):
+// loaded with `?record`, the page keeps every answer it reads while it shows a run, its report
+// and each property's page (reportRecord), and puts them in #determinismo-report-recorded; a
+// page with them embedded (#determinismo-report, inside <body> before this script) answers from
+// them alone, and does nothing that writes.
+const reportEmbedded = (() => {
+  const node = document.getElementById("determinismo-report");
+  if (!node) return null;
+  try { return JSON.parse(node.textContent); } catch { return null; }
+})();
+const reportRecording = !reportEmbedded && new URLSearchParams(location.search).has("record") ? new Map() : null;
+const reportKey = (path, body) => body === undefined ? path : path + "\n" + JSON.stringify(body);
+// Reads a recording keeps: the GETs and the database's answers (a section's SQL, a query).
+const reportReads = /^\/runs\/\d+\/(sql|query)\b/;
+let reportInFlight = 0;
+
 // (A section's own SQL goes to /runs/<id>/sql?page=1: what is ingested, never an ingest of its
 // own on a running run, as the page's other answers.)
 async function api(path, body) {
-  const response = await fetch(path, body === undefined ? {} : {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-  });
-  const text = await response.text();
-  if (!response.ok) throw new Error(text);
-  return text;
+  if (reportEmbedded) {
+    const key = reportKey(path, body);
+    if (Object.hasOwn(reportEmbedded.answers, key)) return reportEmbedded.answers[key];
+    throw new Error("not in this report: a copy of the run, read only, no serve behind it");
+  }
+  reportInFlight += 1;
+  try {
+    const response = await fetch(path, body === undefined ? {} : {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    const text = await response.text();
+    if (!response.ok) throw new Error(text);
+    if (reportRecording && (body === undefined || reportReads.test(path))) reportRecording.set(reportKey(path, body), text);
+    return text;
+  } finally {
+    reportInFlight -= 1;
+  }
 }
 const apiJson = async (path, body) => JSON.parse(await api(path, body));
 const lines = (text) => text.split("\n").filter((line) => line.trim()).map((line) => JSON.parse(line));
@@ -610,7 +637,9 @@ function stateBadge(name) {
 // multiverse tree, logs), the explorer's output, the notebook. Only the open one is drawn and
 // kept up to date: one page holding all of them (the tree alone 100,000 SVG elements in a run of
 // 2,500 timelines) was busy 70% of the time with its refreshes.
-const views = [["report", "Report"], ["explorer", "Logs explorer"], ["output", "Output"], ["notebook", "Notebook"]];
+// A copy has no notebook (it evaluates in a live REPL).
+const views = [["report", "Report"], ["explorer", "Logs explorer"], ["output", "Output"], ["notebook", "Notebook"]]
+  .filter(([name]) => !(reportEmbedded && name === "notebook"));
 // A property has a page of its own (#<id>/property/<its message>): its examples, the
 // statistic of what its failures drew and the lead-up of one, which in the list made a long
 // page hard to follow; the list stays one line a property.
@@ -657,6 +686,7 @@ async function runOpen(id, view, property = null, timeline = null) {
   if (timeline !== null && state.run && state.runId === id) timelineOpen(timeline);
   // While it runs: again 2 s after a refresh, or five times as long as the last took (serve
   // answers from the run's database, on the hunt's CPUs: 0.6 s a refresh at 3,000 timelines).
+  if (reportEmbedded || reportRecording) return; // A copy: nothing changes; a recording: once.
   const poll = async () => {
     if (state.runId !== id) return;
     const started = performance.now();
@@ -4452,7 +4482,9 @@ $("#run-form").addEventListener("submit", async (event) => {
 });
 
 runsRefresh();
-setInterval(runsRefresh, 5000);
+if (!reportEmbedded && !reportRecording) setInterval(runsRefresh, 5000);
+// A copy opens at its run.
+if (reportEmbedded && !routeOf(location.hash).id) history.replaceState(null, "", `#${reportEmbedded.run}`);
 const fromHash = routeOf(location.hash);
 // A property's link (the ⧉ on its row, Antithesis's link to a finding): the run's page opened
 // at it, its examples shown; the query string dropped once used.
@@ -4480,6 +4512,52 @@ window.addEventListener("hashchange", () => {
   const row = from && route.view === "report" ? [...document.querySelectorAll("#properties .property")].find((p) => p.dataset.message === from) : null;
   if (row) row.scrollIntoView({ block: "center" });
 });
+</script>
+<script>
+"use strict";
+// A copy says so, and starts no run.
+if (reportEmbedded) {
+  const button = document.getElementById("new-run");
+  if (button) button.hidden = true;
+  // Nothing that starts a run or runs a command.
+  document.head.insertAdjacentHTML("beforeend", "<style>#run-again, [data-output] { display: none; }</style>");
+  const note = document.createElement("div");
+  note.className = "muted";
+  note.style.cssText = "margin: 0 0 12px; font-size: 12px;";
+  note.textContent = `A copy of run ${reportEmbedded.run}, recorded ${String(reportEmbedded.recorded).slice(0, 16).replace("T", " ")} UTC: read only.`;
+  document.querySelector("aside .brand")?.after(note);
+}
+// ?record (see reportEmbedded): the run's report, then each property's page, each once the page
+// has asked for nothing for a while; then every answer kept, in #determinismo-report-recorded
+// (headless Chrome's --dump-dom reads it: infra/host/report-static.sh).
+if (reportRecording) (async () => {
+  const quiet = async () => {
+    let still = 0;
+    while (still < 15) {
+      await new Promise((done) => setTimeout(done, 200));
+      still = reportInFlight === 0 ? still + 1 : 0;
+    }
+  };
+  const id = routeOf(location.hash).id;
+  if (!id) return;
+  await quiet();
+  for (const property of (state.run && state.run.properties) || []) {
+    location.hash = `#${id}/property/${encodeURIComponent(property.message)}`;
+    await quiet();
+  }
+  for (const view of ["explorer", "output"]) {
+    location.hash = `#${id}/${view}`;
+    await quiet();
+  }
+  location.hash = `#${id}`;
+  await quiet();
+  const recorded = document.createElement("script");
+  recorded.type = "application/json";
+  recorded.id = "determinismo-report-recorded";
+  recorded.textContent = JSON.stringify({ run: id, recorded: new Date().toISOString(), answers: Object.fromEntries(reportRecording) })
+    .replace(/</g, "\\u003c");
+  document.body.appendChild(recorded);
+})();
 </script>
 </body>
 </html>
