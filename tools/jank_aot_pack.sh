@@ -17,16 +17,21 @@ ldd "$work/target/program" | awk '/=>/ {print $3}' | grep -v libdeterminismo | w
 cp -L "$lib/libdeterminismo.so" "$work/payload/"
 cp -L /lib64/ld-linux-x86-64.so.2 "$work/payload/"
 (cd "$work/payload" && tar cf ../payload.tar .)
-cat > "$out" <<'HEADER'
+# The header names the payload's byte offset (fixed width, filled in below): extracted with tail
+# and tar, no scan of the file for a marker (a sed over 15 MB was most of a short timeline).
+cat > "$work/header" <<'HEADER'
 #!/bin/sh
 # A jank workload compiled ahead of time (tools/jank_aot_pack.sh): its libraries and loader after
-# this script's marker (a tar), extracted once a file and run through the bundled loader.
+# this header (a tar at byte OFFSET_), extracted once a file and run through the bundled loader.
 dir=/tmp/jank-program-$(stat -c %s "$0")
 if [ ! -x "$dir/program" ]; then
-  mkdir -p "$dir.part" && sed '1,/^__PAYLOAD__$/d' "$0" | tar xf - -C "$dir.part" && mv "$dir.part" "$dir"
+  mkdir -p "$dir.part" && tail -c +OFFSET_ "$0" | tar xf - -C "$dir.part" && mv "$dir.part" "$dir"
 fi
 exec "$dir/ld-linux-x86-64.so.2" --library-path "/opt/determinismo/lib:$dir" "$dir/program" "$@"
-__PAYLOAD__
 HEADER
+size=$(stat -c %s "$work/header")
+offset=$(printf "%07d" $((size + 1)))
+sed "s/OFFSET_/$offset/g" "$work/header" > "$out"
+[ "$(stat -c %s "$out")" = "$size" ] || { echo "jank_aot_pack: header size changed"; exit 1; }
 cat "$work/payload.tar" >> "$out"
 chmod +x "$out"
