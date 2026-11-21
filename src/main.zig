@@ -9205,6 +9205,7 @@ test {
     _ = @import("bandit.zig");
     _ = @import("core").replay_snapshots;
     _ = @import("bundle.zig");
+    _ = @import("timeline_limit.zig");
 }
 
 test "a judged generation's plan starts before the filler, whenever it is judged" {
