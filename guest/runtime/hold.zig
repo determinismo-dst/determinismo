@@ -278,6 +278,9 @@ fn on_alarm(_: linux.SIG) callconv(.c) void {
 /// SIGCHLD (a tracee stopped or exited): only to wake the wait below.
 fn on_child(_: linux.SIG) callconv(.c) void {}
 
+/// x86-64's longest instruction.
+const instruction_size_max = 15;
+
 const Point = struct {
     entry: u64,
     original: u8,
@@ -295,6 +298,10 @@ const Point = struct {
     others_count: u32 = 0,
     /// Held once and let go: the point is done (its byte stays restored).
     done: bool = false,
+    /// A thread stepped over the entry (let go, or not one to hold) whose step went into a
+    /// signal handler instead (a signal pending, as Go's preemption leaves on a thread held a
+    /// while): back at the entry from the handler it is stepped over again, never held.
+    passing: ?linux.pid_t = null,
 };
 
 const Hold = struct {
@@ -415,6 +422,15 @@ const Hold = struct {
         const point = &hold.points[index];
         regs[rip_index] = point.entry;
         _ = linux.ptrace(ptrace_setregs, tid, 0, @intFromPtr(regs), 0);
+        if (point.passing != null and point.passing.? == tid) {
+            point.passing = null;
+            if (point.inserted) {
+                if (!hold.byte_write(point.entry, point.original)) return;
+                point.inserted = false;
+                hold.step_over(tid, point);
+                return;
+            }
+        }
         if (!point.inserted) {
             _ = linux.ptrace(ptrace_cont, tid, 0, 0, 0);
             return;
@@ -446,20 +462,31 @@ const Hold = struct {
     }
 
     /// A thread at a point's entry (its byte restored) past its first instruction, the
-    /// breakpoint put back, and on.
+    /// breakpoint put back, and on. A signal pending is given with the step, which then stops
+    /// at its handler's first instruction, the entry's not run: the thread is `passing` (the
+    /// handler returns to the entry, its breakpoint back by then).
     fn step_over(hold: *Hold, tid: linux.pid_t, point: *Point) void {
         var signal: usize = 0;
+        var gone = false;
         while (true) {
             if (linux.errno(linux.ptrace(ptrace_singlestep, tid, 0, signal, 0)) != .SUCCESS) return;
             var status: i32 = 0;
             if (linux.errno(linux.wait4(tid, &status, wait_all, null)) != .SUCCESS) return;
             if (!linux.W.IFSTOPPED(@bitCast(status))) {
                 hold.forget(tid);
+                gone = true;
                 break;
             }
             const stop: u32 = @intFromEnum(linux.W.STOPSIG(@bitCast(status)));
             if (stop == signal_trap) break;
             signal = stop; // A signal came first: given with the step.
+        }
+        if (signal != 0 and !gone) {
+            // Past the entry's instruction (within the function's first bytes), or in a handler.
+            var regs: Regs = undefined;
+            const read = linux.errno(linux.ptrace(ptrace_getregs, tid, 0, @intFromPtr(&regs), 0)) == .SUCCESS;
+            const past = read and regs[rip_index] > point.entry and regs[rip_index] <= point.entry + instruction_size_max;
+            if (!past) point.passing = tid;
         }
         if (hold.byte_write(point.entry, int3)) point.inserted = true;
         _ = linux.ptrace(ptrace_cont, tid, 0, 0, 0);

@@ -7308,10 +7308,24 @@ fn check_hold(context: *Context) !void {
     var branches: [timelines]Branch = undefined;
     const count = parse_branches(report, &branches);
     const crashed = failing_in(report, "no process crashes: race-held") orelse 0;
+    // One point let go alone (release_point on a --repeat hold), the others' way: its thread
+    // goes on and the next is held.
+    const released_report = try explore(context, &.{
+        "--program", program, "--profile",  "held", "--scenario", "held_release",
+        "--seed",    "1",     "--branches", "4",
+    });
+    var released_branches: [timelines]Branch = undefined;
+    const released_count = parse_branches(released_report, &released_branches);
+    const property = "a hold point let go alone holds the next thread";
+    const released_line = for_line(released_report, property);
+    const released_hit = if (released_line) |text| hit_count(text) else 0;
+    const released_failing = failing_in(released_report, property);
     expect_all(context, &.{
         .{ "every timeline explored", count == timelines },
         .{ "every timeline has the race", count > 0 and crashed == count },
-    }, "hold: {d} of {d} timelines failing \"no process crashes: race-held\"", .{ crashed, count });
+        .{ "a point let go alone: every timeline explored", released_count == timelines },
+        .{ "its thread went on and the next was held, in every timeline", released_hit == timelines and released_failing != null and released_failing.? == 0 },
+    }, "hold: {d} of {d} timelines failing \"no process crashes: race-held\"; a point let go alone: {d} timelines, the next held in {d}", .{ crashed, count, released_count, released_hit - (released_failing orelse released_hit) });
 }
 
 /// Thread pausing at the instrumentation's callbacks, in every language instrumented by

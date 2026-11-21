@@ -23,12 +23,13 @@
 //!     [--profile instrumented|go|java|python|javascript|dotnet|rust|zig]
 const std = @import("std");
 const sdk = @import("determinismo");
+const linux = std.os.linux;
 
 const Nodes = struct { race: sdk.Node };
 const System = sdk.System(Nodes);
 
 pub fn main(init: std.process.Init) !void {
-    return System.main(init, .{ .describe = describe, .scenarios = .{ .race = race, .held = held } });
+    return System.main(init, .{ .describe = describe, .scenarios = .{ .race = race, .held = held, .held_release = held_release } });
 }
 
 fn describe(d: *System.Describe) !void {
@@ -112,6 +113,68 @@ fn hold_both(context: *System.Context) !void {
     // The program's run goes on from the threads' release to its check (and panic) within the
     // timeline: a driver that returned at once ended it first.
     sdk.sleep_ms(1000);
+}
+
+/// Scenario `held_release` (profile `held`): Node.hold on `race_held.check` with `--repeat`, its
+/// first thread let go alone (release_point) with a signal pending (race_held.zig's signaller,
+/// as Go's preemption): that thread finishes its run (it checks after the other incremented: no
+/// race), the program's next runs enter `check` again, and the point holds another thread. Back at the entry from its signal handler, the
+/// first was held again instead (det-nodes hold's step over the entry went into the handler):
+/// its run never ended, and no other thread came (a hashicorp/raft walk's late write never
+/// landed: two_leaders_trace's step 8).
+fn held_release(s: *System.Scenario) void {
+    s.faults = false;
+    s.singleton_driver("hold", hold_release_one);
+}
+
+/// The next thread held at point 0 in the hold's lines (`{"held":<tid>,"point":0}`); null at
+/// their end.
+fn held_thread(hold: anytype) ?i64 {
+    while (true) {
+        var buffer: [256]u8 = undefined;
+        var size: usize = 0;
+        while (size < buffer.len) {
+            const result = linux.read(hold.output, buffer[size..].ptr, 1);
+            if (linux.errno(result) != .SUCCESS or result == 0) break;
+            if (buffer[size] == '\n') break;
+            size += 1;
+        }
+        const said = buffer[0..size];
+        if (said.len == 0 or std.mem.startsWith(u8, said, "{\"held\":null")) return null;
+        const prefix = "{\"held\":";
+        const suffix = ",\"point\":0}";
+        if (!std.mem.startsWith(u8, said, prefix) or !std.mem.endsWith(u8, said, suffix)) continue;
+        return std.fmt.parseInt(i64, said[prefix.len .. said.len - suffix.len], 10) catch continue;
+    }
+}
+
+fn hold_release_one(context: *System.Context) !void {
+    sdk.sleep_ms(200 + sdk.random_below(800));
+    const hold = try context.nodes.race.hold(&.{ "race_held.check", "--repeat" }, 10_000);
+    if (!hold.armed()) {
+        hold.release();
+        return error.NotArmed;
+    }
+    const first = held_thread(hold);
+    // Held a while (signals pending), then let go alone.
+    sdk.sleep_ms(100);
+    if (first != null) hold.release_point(0);
+    sdk.sleep_ms(2000);
+    // Stopped, its lines read to their end: another thread held, or the first again, or none.
+    _ = linux.kill(hold.pid, .TERM);
+    var again: ?i64 = null;
+    var first_again = false;
+    while (held_thread(hold)) |tid| {
+        if (first != null and tid == first.?) {
+            first_again = true;
+            continue;
+        }
+        again = tid;
+        break;
+    }
+    hold.release();
+    sdk.event("race_held_release", .{ .first = first, .again = again, .first_again = first_again });
+    sdk.always(first != null and again != null, "a hold point let go alone holds the next thread", .{ .first = first, .first_again = first_again });
 }
 
 fn race(s: *System.Scenario) void {
