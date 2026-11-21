@@ -5917,7 +5917,7 @@ const Judging = struct {
     makings: []NodeMaking,
     making_count: u32,
     reached_count: usize,
-    /// The makings whose branches are planned (a prefix: judge_plan_ready), the branches so far,
+    /// How many makings have their branches planned (judge_plan_ready), the branches so far,
     /// and the nodes made by where from (a holder in memory, one on disk, or a replay from the
     /// parent's start, along its path from the setup snapshot for an earlier generation's).
     planned: u32 = 0,
@@ -5973,15 +5973,20 @@ fn maker_start(vm: *VM, options: *const VM.Options, branches: Branches, state: *
     };
 }
 
-/// The judgment's nodes made so far, their branches planned, in the makings' order: the made
-/// prefix not planned yet, each node's branches at the queue's planned end. Planned as they come
-/// (tree_judge_poll), timelines start from a judgment's first nodes while its later ones are
-/// made, where before every one waited for all: ParadeDB's run 2091, its generation's 6 nodes
-/// (134.5 GiB) made before any of their 32 branches could start beside them.
+/// The judgment's nodes made so far, their branches planned: every made one not planned yet, in
+/// the makings' order among them, each node's branches at the queue's planned end. Planned as
+/// they come (tree_judge_poll), timelines start from a judgment's nodes while its others are
+/// made, where before every one waited for all (ParadeDB's run 2091, its generation's 6 nodes,
+/// 134.5 GiB, made before any of their 32 branches could start beside them), and then for every
+/// one before it (run 2114: a first node replayed 806 s, the five made in seconds behind it).
+/// Their indices go as they are planned, as a filler's do while a judgment runs: the run's
+/// numbering follows the host's timing either way; each timeline replays from its own tape.
 fn judge_plan_ready(arena: std.mem.Allocator, branches: Branches, state: *TreeState, judging: *Judging) !void {
-    const makings = judging.makings[0..judging.making_count];
-    while (judging.planned < makings.len and makings[judging.planned].ready) : (judging.planned += 1) {
-        try judge_plan_one(arena, branches, state, judging, &makings[judging.planned]);
+    for (judging.makings[0..judging.making_count]) |*making| {
+        if (!making.ready or making.planned) continue;
+        making.planned = true;
+        judging.planned += 1;
+        try judge_plan_one(arena, branches, state, judging, making);
     }
 }
 
@@ -7148,6 +7153,8 @@ const NodeMaking = struct {
     snapshot: ?*const Snapshot = null,
     /// Nothing to make (a resumed run's return whose timelines are recorded).
     ready: bool = false,
+    /// Its branches planned (judge_plan_ready): once, whenever it was made among the others.
+    planned: bool = false,
     /// Not started yet: short of room for its VM beside the makers in flight, or of a job
     /// (maker_may_start) when its judgment began. The judgment's poll starts it as room comes,
     /// the explorer's loop going on meanwhile (makings_start).
