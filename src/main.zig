@@ -41,6 +41,7 @@ const query = @import("query.zig");
 const runs_cli = @import("runs_cli.zig");
 const bundle = @import("bundle.zig");
 const cpus = @import("cpus.zig");
+const timeline_limit = @import("timeline_limit.zig");
 const checks = @import("checks.zig");
 const causality = @import("causality.zig");
 const explain = @import("explain.zig");
@@ -153,6 +154,9 @@ const usage =
     \\                            or a multiple of it for machines with more CPUs)
     \\                            [--timeline-limit <duration>]   (1h: a timeline not finished by
     \\                            then, in virtual time, ends as hung)
+    \\                            [--timeline-limit-learned <multiple>]   (2: a tree's timeline
+    \\                            stops, cut short and without a verdict, this many times the
+    \\                            longest normal end past its branch point, once 40 ended; 0: off)
     \\                            [--retroactive '<text>']...   (output lines with it are left out
     \\                            of the events; a replay of a timeline writes them)
     \\                            [--changed <diff file | git range>]   (a targeted run: the tree
@@ -537,6 +541,9 @@ const Arguments = struct {
     changed_repository: ?[]const u8 = null,
     /// A timeline's ceiling of virtual time: one that has not finished by then ends as hung.
     timeline_limit_ns: ?u64 = std.time.ns_per_hour,
+    /// The learned timeline limit's multiple of the longest normal end (timeline_limit.zig); 0:
+    /// the explicit limit alone.
+    timeline_limit_learned: u32 = (timeline_limit.Learner{}).multiple,
     /// Retroactive logging: output lines with these texts are left out of an exploration's
     /// events (a replay of one timeline writes them).
     retroactive: [retroactive_max][]const u8 = undefined,
@@ -2761,6 +2768,7 @@ fn command_explore(
             say("[determinismo] {s}: {s}\n", .{ if (rejudged) "judged anew" else "did not replay", line });
         }
     }
+    try multiverse.learned_limit_judge(learned_stopped, learned_cuts, learned_cut_first);
     multiverse.summarize(monotonic_ns() - time_start_ns);
     // Not a pass: nothing was judged.
     if (multiverse.branches == 0) return error.NoTimelineFinished;
@@ -3330,6 +3338,12 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         if (position >= total) break;
         var place = branch_place(branches, first + position, single, position) orelse continue;
         const index = place.index;
+        // Where it stops: its horizon, a replay's (the horizon it was cut at), else the run's
+        // learned limit past its branch point, so a timeline a crash left hanging ends cut short
+        // there, not as hung at the explicit limit. The learned one is not its horizon: its
+        // holders stay spaced over the timelines' usual length.
+        const stop_ns = place.horizon_ns orelse branches.arguments.stop_ns orelse learned_stop(place);
+        const stop_learned = place.horizon_ns == null and branches.arguments.stop_ns == null and stop_ns != null;
         maker.index = index;
         if (exploration.done) |resumed| {
             if (resumed.done.contains(index)) continue;
@@ -3369,8 +3383,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         options.seed = place.seed;
         Events.ranges_salt = place.seed; // Its own draw over the range buckets (events.zig).
         const moment_ms = branches.arguments.moment_vtime_ms;
-        const horizon_ns = place.horizon_ns orelse branches.arguments.stop_ns;
-        options.moment_vtime_ns = if (moment_ms) |ms| ms * std.time.ns_per_ms else horizon_ns;
+        options.moment_vtime_ns = if (moment_ms) |ms| ms * std.time.ns_per_ms else stop_ns;
         options.moment_command = try timeline_substituted(context.arena, branches.arguments.moment_command, index);
         options.moment_continue = branches.arguments.moment_continue;
         options.moment_held = branches.arguments.moment_held;
@@ -3582,7 +3595,12 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         // A tree timeline's summary on disk before its line in the record: killed between the
         // two, the resumed run runs it again (once), never takes it as recorded without one.
         if (branches.summaries) |summaries| {
-            summaries.note(vm, place, outcome, if (branches.holders != null) owner.holders() else &.{}, advice.uses[0..advice.use_count], advice.again_ns);
+            var stopped = place; // Cut at its stop: a learned one as a horizon would be.
+            stopped.horizon_ns = stop_ns;
+            summaries.note(vm, stopped, outcome, if (branches.holders != null) owner.holders() else &.{}, advice.uses[0..advice.use_count], advice.again_ns);
+            const noted = &summaries.items[summaries.count - 1];
+            noted.learned_stop = stop_learned;
+            noted.learned_cut = stop_learned and outcome == .moment_reached;
             if (tree_summaries_fd) |fd| summary_write(fd, &summaries.items[summaries.count - 1]);
         }
         const vtime_before_ns = branches.multiverse.vtime_ns;
@@ -3596,7 +3614,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
             .path = lineage,
             .extends = if (exploration.extend) |extend| extend.extends else null,
             .generation = place.generation,
-            .horizon_ns = place.horizon_ns orelse branches.arguments.stop_ns,
+            .horizon_ns = stop_ns,
             .why = if (exploration.extend) |extend| try std.fmt.allocPrint(context.arena, "A session's: timeline {d} up to {d:.3} s, its own from there (its steps, what came from outside).", .{
                 extend.extends.branch, @as(f64, @floatFromInt(extend.extends.vtime_ns)) / 1e9,
             }) else place.why,
@@ -3719,6 +3737,13 @@ const Summary = struct {
     last_pull_ns: u64,
     /// Stopped at its horizon: it can be extended (returned to at its end), its future unknown.
     cut: bool,
+    /// Past the timeline limit without finishing (VM.Outcome.hung). Not on disk: a resumed run's
+    /// recorded timelines teach the learned limit nothing.
+    hung: bool = false,
+    /// It ran with a stop from the run's learned limit (learned_stop), and was cut there. Not on
+    /// disk either.
+    learned_stop: bool = false,
+    learned_cut: bool = false,
     /// Ended by the strategy (VM.Outcome.strategy_ended): not extended, nor counted in the
     /// timelines' usual length. Not on disk: a resumed run takes it as ended.
     ended_early: bool = false,
@@ -3771,6 +3796,7 @@ const Summaries = struct {
         summary.trace_hash = vm.events.hash.final();
         summary.last_pull_ns = @min(vm.last_pull_ns, vm.events.checks_start_ns orelse std.math.maxInt(u64));
         summary.cut = place.horizon_ns != null and outcome == .moment_reached;
+        summary.hung = outcome == .hung;
         summary.ended_early = outcome == .strategy_ended;
         summary.drive_end_ns = vm.events.drive_end_ns;
         summary.again_ns = again_ns;
@@ -3852,6 +3878,7 @@ fn explore_tree(
 ) !void {
     const arena = context.arena;
     own_cpu.give(); // Its timelines and node makers take their own.
+    timeline_learner = .{ .multiple = branches.arguments.timeline_limit_learned };
     const exploration = branches.exploration;
     const size = branches.arguments.generation_size;
     if (!tree.fits(size, branches.arguments.return_branches)) {
@@ -4658,6 +4685,39 @@ var returns_started: u32 = 0;
 /// with the workers, mapped by the explorer before its first fork; a slot a running timeline.
 var timeline_vtimes: ?*[jobs_max]u64 = null;
 var timeline_slots: std.StaticBitSet(jobs_max) = .empty;
+/// The run's learned timeline limit (timeline_limit.zig): the explorer's, fed each timeline's
+/// summary as it arrives (timeline_wait); a tree's worker, forked for its one timeline, reads the
+/// explorer's as it was then (learned_stop).
+var timeline_learner: timeline_limit.Learner = .{};
+/// The learned limit's property (report.learned_limit_property), counted by the explorer as
+/// summaries arrive: timelines that ran with a learned stop, those cut there, the first of them.
+var learned_stopped: u32 = 0;
+var learned_cuts: u32 = 0;
+var learned_cut_first: ?u32 = null;
+
+/// Where a timeline with no horizon of its own stops, learned: its branch point plus the run's
+/// learned limit, or null while there is none.
+fn learned_stop(place: Planned) ?u64 {
+    const limit = timeline_learner.limit_ns() orelse return null;
+    return place.snapshot.tsc / (cpuid_tsc_hz / std.time.ns_per_s) + limit;
+}
+
+/// A finished timeline's summary for the learner: a normal end teaches it its length from the
+/// branch point; a hang, a cut and a strategy's end teach it nothing.
+fn learner_note(summary: *const Summary) void {
+    const end: timeline_limit.Learner.End = if (summary.cut or summary.ended_early or summary.learned_cut)
+        .cut_short
+    else if (summary.hung)
+        .hung
+    else
+        .normal;
+    timeline_learner.note(end, summary.end_ns -| summary.start_ns);
+    if (!summary.learned_stop) return;
+    learned_stopped += 1;
+    if (!summary.learned_cut) return;
+    learned_cuts += 1;
+    learned_cut_first = @min(learned_cut_first orelse summary.index, summary.index);
+}
 
 fn timeline_vtimes_map() !*[jobs_max]u64 {
     if (timeline_vtimes) |known| return known;
@@ -5034,6 +5094,7 @@ fn timeline_wait(running: []const Running, multiverse: *report.Multiverse, summa
         // Counted once read whole: a worker killed while it wrote leaves part of one (its
         // holders' pids among the slot's old bytes).
         received = read_exact(timeline.results, std.mem.asBytes(slot));
+        if (received) learner_note(slot);
         if (received and room) summaries.count += 1;
         // Dropped: its holders, which no generation will take, go now.
         if (received and !room) for (slot.holders[0..@min(slot.holder_count, slot.holders.len)]) |held| {
@@ -8635,6 +8696,8 @@ fn parse_option(
         arguments.time_budget_text = value;
     } else if (eql(u8, flag, "--timeline-limit")) {
         arguments.timeline_limit_ns = try duration_parse(value);
+    } else if (eql(u8, flag, "--timeline-limit-learned")) {
+        arguments.timeline_limit_learned = try std.fmt.parseInt(u32, value, 10);
     } else if (eql(u8, flag, "--retroactive")) {
         if (arguments.retroactive_count == retroactive_max) return error.Usage;
         arguments.retroactive[arguments.retroactive_count] = value;

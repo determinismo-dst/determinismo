@@ -23,6 +23,8 @@
 //!              graceful stop and a one-way partition, each taking the node away and giving it
 //!              back; a clock skew, the node's realtime clock 5 s behind while it lasts
 //!   hang       a driver that never ends: the timeline's ceiling of virtual time ends it, hung
+//!   hang_sometimes  one timeline in eight hangs as `hang` does, the rest end within seconds: the
+//!              run's learned timeline limit cuts the hanging ones short once it has learned
 //!   readdress  (profile "movable") restarts the scenario asks for: the node answers at its
 //!              name each time, and sometimes came back at a new address
 //!   file_error (profile "durable") write errors the scenario asks for on the echo node's disk:
@@ -143,6 +145,7 @@ pub fn main(init: std.process.Init) !void {
             .syscall_error = syscall_error_scenario,
             .file_error = file_error_scenario,
             .hang = hang,
+            .hang_sometimes = hang_sometimes,
             .egress = egress_scenario,
             .ingress = ingress_scenario,
             .stress = stress,
@@ -2200,6 +2203,16 @@ fn hang(s: *System.Scenario) void {
 /// A driver that never ends (an hour of sleep): the timeline's ceiling ends it as hung.
 fn forever(_: *System.Context) !void {
     sdk.sleep_ms(std.time.ms_per_hour);
+}
+
+fn hang_sometimes(s: *System.Scenario) void {
+    s.singleton_driver("maybe_forever", maybe_forever);
+}
+
+/// An hour asleep in one timeline of eight, else one to three seconds.
+fn maybe_forever(_: *System.Context) !void {
+    if (sdk.random_below(8) == 0) return sdk.sleep_ms(std.time.ms_per_hour);
+    sdk.sleep_ms(1000 + sdk.random_below(2000));
 }
 
 fn readdress(s: *System.Scenario) void {

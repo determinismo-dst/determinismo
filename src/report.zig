@@ -241,6 +241,9 @@ test rarely_true {
 
 const logging_property = "logging output stays under 200 MB per hour of virtual time";
 pub const replays_property = "timelines replay to their recorded history";
+/// The run's learned timeline limit (timeline_limit.zig) cuts a timeline short without a verdict:
+/// this says so, so a deadlock it cut is never hidden (a slow but sound timeline fails it too).
+pub const learned_limit_property = "timelines end within the run's learned limit (twice its longest normal end past a branch point)";
 const logging_bytes_per_hour_max = 200 * 1000 * 1000;
 
 /// Properties across all branches of an exploration.
@@ -598,6 +601,24 @@ pub const Multiverse = struct {
 
     /// determinismo's own property: the timelines replayed while the run explored
     /// (replays.zig) had the histories the run recorded.
+    /// The learned limit's property: of the timelines that ran with a learned stop, those cut
+    /// there fail it, the first named.
+    pub fn learned_limit_judge(multiverse: *Multiverse, stopped: u32, cut: u32, first_cut: ?u32) !void {
+        if (stopped == 0) return;
+        var property = Events.Property{
+            .kind = .always,
+            .message = undefined,
+            .message_size = learned_limit_property.len,
+        };
+        @memcpy(property.message[0..learned_limit_property.len], learned_limit_property);
+        const aggregate = try multiverse.aggregate_find(&property);
+        aggregate.branches_hit = stopped;
+        aggregate.branches_true = stopped - cut;
+        aggregate.branches_failing = cut;
+        aggregate.run_failing = cut > 0;
+        aggregate.first_failing_branch = first_cut;
+    }
+
     pub fn replays_judge(multiverse: *Multiverse, replayed: u32, same: u32, first_different: ?u32) !void {
         if (replayed == 0) return;
         var property = Events.Property{
