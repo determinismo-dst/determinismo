@@ -267,8 +267,9 @@ const usage =
     \\       determinismo tla     --spec <Spec.tla> --events <events.jsonl> [--tla2tools <jar>]
     \\       determinismo quint   --spec <Spec.qnt> --events <events.jsonl[.zst] | directory>
     \\                            [--branch <n>] [--main <module>] [--invariant <name>]
-    \\                            [--quint <command>]   (a timeline's own events, those named
-    \\                            like an action of the spec, as a run of it: docs/QUINT.md)
+    \\                            [--quint <command>] [--piece <steps>]   (a timeline's own
+    \\                            events, those named like an action of the spec, as a run of
+    \\                            it, a long one in pieces: docs/QUINT.md)
     \\       determinismo runs    list | show <id> | properties <id> [--details] |
     \\                            logs <id> <timeline> <seconds> | search <id> '<condition>' |
     \\                            export <id> <timeline> <seconds | failure> [--property <message>] [--html] |

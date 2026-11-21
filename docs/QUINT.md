@@ -4,13 +4,19 @@
 events the program emitted, in the order they happened, must be a run of the spec's actions.
 
     determinismo quint --spec bank.qnt --events <a timeline's events> [--branch <n>]
-                       [--main <module>] [--invariant <name>] [--quint <command>]
+                       [--main <module>] [--invariant <name>] [--quint <command>] [--piece <steps>]
 
 - `--events`: a timeline's events file (`branch-<n>.jsonl`, or `.jsonl.zst` once it ended), or
   a directory of them with `--branch <n>` (a run's `events`, an `--events-dir`).
 - `--main`: the spec's module, when it is not named like its file.
 - `--quint`: Quint's command (`quint` by default). `npm install -g @informalsystems/quint`
   installs it; `--quint "npx -y @informalsystems/quint"` runs it without installing.
+- `--piece`: the trace checked in pieces of this many events, each from the state the one
+  before ended in (written back as an assignment of the spec's variables); by default pieces of
+  250 above 2,000 events. Quint holds and returns one piece's states only: whole, a timeline of
+  22,549 events overflowed its output. A refusal is numbered in the whole trace; the states file
+  then holds the last piece's. Quint's Node may need more heap for a long run's states:
+  `--quint "env NODE_OPTIONS=--max-old-space-size=6144 quint"`.
 
 ## What is checked
 
