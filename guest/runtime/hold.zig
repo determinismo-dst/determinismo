@@ -76,6 +76,8 @@ const field_text_max = 256;
 /// struct user_regs_struct: 27 registers.
 const Regs = [27]u64;
 const rbp_index = 4;
+/// Go's ABIInternal keeps the running goroutine (its g) in r14.
+const r14_index = 1;
 const rip_index = 16;
 const rsp_index = 19;
 
@@ -321,6 +323,11 @@ const Point = struct {
     /// signal handler instead (a signal pending, as Go's preemption leaves on a thread held a
     /// while): back at the entry from the handler it is stepped over again, never held.
     passing: ?linux.pid_t = null,
+    /// In a Go process, the passing thread's goroutine (r14): Go's preemption handler can return
+    /// through asyncPreempt and the goroutine go on on another thread, back at the entry there
+    /// (a raft walk's late write: 42 of 42 misses, a second thread held as the first went into
+    /// its handler; jtl-data run 12's `hold` events).
+    passing_g: u64 = 0,
 };
 
 const Hold = struct {
@@ -328,6 +335,8 @@ const Hold = struct {
     memory: linux.fd_t,
     /// For its events (`hold`): what it did, in the timeline beside the nodes' own.
     node: []const u8 = "",
+    /// A Go process (runtime.main defined): a passing goroutine is known by its g (r14).
+    go: bool = false,
     points: [points_max]Point = undefined,
     count: u32 = 0,
     tids: [threads_max]linux.pid_t = undefined,
@@ -443,9 +452,12 @@ const Hold = struct {
         const point = &hold.points[index];
         regs[rip_index] = point.entry;
         _ = linux.ptrace(ptrace_setregs, tid, 0, @intFromPtr(regs), 0);
-        if (point.passing != null and point.passing.? == tid) {
+        const same_thread = point.passing != null and point.passing.? == tid;
+        const same_goroutine = hold.go and point.passing_g != 0 and regs[r14_index] == point.passing_g;
+        if (same_thread or same_goroutine) {
             point.passing = null;
-            hold.note("passing_back", index, tid, 0);
+            point.passing_g = 0;
+            hold.note(if (same_thread) "passing_back" else "passing_moved", index, tid, 0);
             if (point.inserted) {
                 if (!hold.byte_write(point.entry, point.original)) return;
                 point.inserted = false;
@@ -510,7 +522,10 @@ const Hold = struct {
             var regs: Regs = undefined;
             const read = linux.errno(linux.ptrace(ptrace_getregs, tid, 0, @intFromPtr(&regs), 0)) == .SUCCESS;
             const past = read and regs[rip_index] > point.entry and regs[rip_index] <= point.entry + instruction_size_max;
-            if (!past) point.passing = tid;
+            if (!past) {
+                point.passing = tid;
+                point.passing_g = if (read and hold.go) regs[r14_index] else 0;
+            }
             hold.note(if (past) "stepped_signal" else "into_handler", hold.index_of(point), tid, @intCast(signal));
         }
         if (hold.byte_write(point.entry, int3)) point.inserted = true;
@@ -620,6 +635,9 @@ pub fn run(arena: std.mem.Allocator, options: Options) !u8 {
     if (linux.errno(fd) != .SUCCESS) return error.Memory;
     var hold: Hold = .{ .pid = first.pid, .memory = @intCast(fd), .node = options.node };
     defer _ = linux.close(hold.memory);
+    // runtime.main, a Go function every Go program has (runtime.goexit is assembly: its symbol
+    // runtime.goexit.abi0, not found by that name, and no goroutine was ever matched).
+    hold.go = ((symbol.find(arena, hold.pid, "runtime.main", null) catch null) orelse null) != null;
     for (options.points[0..options.count]) |asked| {
         const found = (symbol.find(arena, hold.pid, asked.function, null) catch null) orelse return error.UnknownFunction;
         var caller: ?[2]u64 = null;
@@ -692,6 +710,7 @@ pub fn run(arena: std.mem.Allocator, options: Options) !u8 {
     }
     for (hold.tids[0..hold.threads]) |tid| _ = linux.ptrace(ptrace_cont, tid, 0, 0, 0);
     out("{{\"armed\":{d},\"threads\":{d},\"breakpoints\":{d}}}\n", .{ hold.pid, hold.threads, inserted });
+    hold.note(if (hold.go) "start_go" else "start", 0, hold.pid, 0);
 
     while (!release_all.load(.acquire)) {
         if (timed_out.load(.acquire) and !hold.held_any()) break;
