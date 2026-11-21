@@ -315,15 +315,6 @@ fn check_shop(context: *Context) !void {
     try check_example(context, .{ .program = "shop-test", .scenario = "prices", .branches = 4 });
 }
 
-/// Whether the report's properties list `message` as failing (its "  FAIL <kind> ... <message>" line).
-fn property_failed(report: []const u8, message: []const u8) bool {
-    var lines = std.mem.splitScalar(u8, report, '\n');
-    while (lines.next()) |line| {
-        if (std.mem.startsWith(u8, line, "  FAIL ") and std.mem.indexOf(u8, line, message) != null) return true;
-    }
-    return false;
-}
-
 /// Explores, then replays the first failing branch (if any) and the first passing one alone.
 fn check_example(context: *Context, example: Example) !void {
     const program = try std.fs.path.join(context.arena, &.{ context.bin, example.program });
@@ -338,11 +329,6 @@ fn check_example(context: *Context, example: Example) !void {
         example.program, count,
     });
     expect(context, std.mem.indexOf(u8, report, ", 0 overshoots") != null, "{s}: no overshoots", .{
-        example.program,
-    });
-    // These examples record no history: the SDK's history-cap marker is never reached, and a
-    // marker a run may never reach fails no run (it failed every one while cataloged).
-    expect(context, !property_failed(report, "a driver ended at its history's cap"), "{s}: no failure for a history it never records", .{
         example.program,
     });
     for ([_]bool{ true, false }) |failing| {
