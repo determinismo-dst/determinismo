@@ -456,7 +456,11 @@ pub fn main(init: std.process.Init) !void {
     if (composer.node != null and composer.program == null) invalid_report(scenario.invalid);
     const drivers = composer.kind_count(.parallel_driver) + composer.kind_count(.serial_driver);
     const singletons = composer.kind_count(.singleton_driver);
-    if (drivers + singletons + composer.kind_count(.anytime) == 0) return error.NoDriverCommands;
+    // A test template without driver commands is the system driving itself, as Antithesis runs
+    // it (the formalized Raft projects: the driver a container's command, first_start_workload
+    // its signal). A program of ours without drivers is a mistake, said.
+    const self_driven = drivers + singletons + composer.kind_count(.anytime) == 0;
+    if (self_driven and (composer.node == null or composer.program != null)) return error.NoDriverCommands;
 
     sdk.event("composer_start", .{ .commands = composer.command_count });
     drivers_cpu_draw();
@@ -468,12 +472,20 @@ pub fn main(init: std.process.Init) !void {
     if (composer.kind_count(.first) > 0) composer.run_to_completion(composer.pick(.first));
     const singleton_timeline = singletons > 0 and (drivers == 0 or singleton_drawn());
     swarm_seed_write();
-    if (!singleton_timeline) composer.swarm_commands();
+    if (!singleton_timeline and !self_driven) composer.swarm_commands();
     sdk.event("faults_phase", .{ .state = "start" });
     composer.faults_start();
     const drive_start_ns = now_ns();
     var length_end_ns: ?u64 = null;
-    if (singleton_timeline) {
+    if (self_driven) {
+        // Its length as a driver phase's (--timeline, else drawn to its longest, 20 minutes
+        // unless asked), else half the timeline limit: the system runs that long with the faults.
+        const length_ns = timeline_length_ns() orelse
+            drive_drawn_ns(scenario.drive_ms_max orelse drive_max_default_ms()) orelse
+            (timeline_limit_ns() orelse return error.NoDriverCommands) / 2;
+        sdk.event("self_driven", .{ .ms = length_ns / std.time.ns_per_ms });
+        sleep_until(drive_start_ns + length_ns);
+    } else if (singleton_timeline) {
         run_singleton(&composer);
     } else {
         length_end_ns = run_drivers(&composer, scenario.drive_ms_max orelse drive_max_default_ms(), scenario.parallel_max);
