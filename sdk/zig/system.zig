@@ -179,6 +179,8 @@ pub fn NodeSpec(comptime Name: type) type {
         privileged: bool = false,
         /// Process limits (Docker's names: .{ .name = "nofile", .soft = 65536, .hard = 65536 }).
         ulimits: ?[]const schema.Ulimit = null,
+        /// Kernel settings of its own namespaces, "key=value" (schema.Node.sysctls).
+        sysctls: ?[]const []const u8 = null,
         /// Settings drawn as it starts (schema.Knob: FoundationDB's knobs), e.g.
         /// `.{ .name = "snapshot", .choices = &.{ &.{"ETCD_SNAPSHOT_COUNT=10"}, &.{"ETCD_SNAPSHOT_COUNT=1000"} } }`.
         knobs: []const schema.Knob = &.{},
@@ -629,6 +631,7 @@ pub fn node_convert(arena: std.mem.Allocator, name: []const u8, spec: NodeSpec([
         .memory_max_mib = spec.memory_max_mib,
         .privileged = spec.privileged,
         .ulimits = spec.ulimits,
+        .sysctls = spec.sysctls,
         .crashes_known = spec.crashes_known,
         .writeback_s = spec.writeback_s,
         .exits_known = spec.exits_known,

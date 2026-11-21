@@ -29,8 +29,6 @@ const ignored_fields = [_][]const u8{
     "env_file", "cap_add",     "cap_drop",
     "init",     "stop_signal", "platform",
     "tty",      "stdin_open",  "security_opt",
-    // Namespaced kernel settings (net.unix.max_dgram_qlen): not applied in a node yet.
-    "sysctls",
 };
 
 /// The profile ("default") of the Compose file at `path`. Relative build contexts are taken
@@ -219,6 +217,7 @@ fn node_from_service(
     if (fields.get("entrypoint")) |value| node.entrypoint = try words(arena, value);
     if (fields.get("command")) |value| node.command = try words(arena, value);
     if (fields.get("working_dir")) |value| node.workdir = try scalar(value);
+    if (fields.get("sysctls")) |value| node.sysctls = try sysctls(arena, value);
     if (fields.get("user")) |value| node.user = try scalar(value);
     node.env = try environment(arena, fields.get("environment"));
     try labels_apply(arena, service.key, &node.faults, fields.get("labels"));
@@ -653,6 +652,46 @@ test ulimits {
     try std.testing.expectEqual(20000, parsed[2].soft);
     try std.testing.expectEqual(40000, parsed[2].hard);
     try std.testing.expectEqual(null, try ulimits(arena, null));
+}
+
+/// A service's `sysctls` (a map, or a list of "key=value"), as "key=value": only the namespaced
+/// ones, as Docker allows (schema.sysctl_namespaced); a machine-wide one is refused, not dropped.
+fn sysctls(arena: std.mem.Allocator, value: yaml.Value) ![]const []const u8 {
+    var entries: std.ArrayList([]const u8) = .empty;
+    switch (value) {
+        .sequence => |items| for (items) |item| try entries.append(arena, try scalar(item)),
+        .mapping => |fields| for (fields) |field| {
+            try entries.append(arena, try std.fmt.allocPrint(arena, "{s}={s}", .{ field.key, try scalar(field.value) }));
+        },
+        .empty => {},
+        .scalar => return error.BadSysctls,
+    }
+    if (entries.items.len > schema.sysctls_max) return error.TooManySysctls;
+    for (entries.items) |entry| {
+        const equals = std.mem.indexOfScalar(u8, entry, '=') orelse return error.BadSysctls;
+        if (!schema.sysctl_namespaced(entry[0..equals]) or equals + 1 == entry.len) return error.SysctlNotNamespaced;
+    }
+    return entries.items;
+}
+
+test sysctls {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try yaml.parse(arena,
+        \\mapped:
+        \\  net.unix.max_dgram_qlen: "4096"
+        \\  net.core.somaxconn: 1024
+        \\listed: [kernel.shmmax=68719476736]
+        \\machine:
+        \\  vm.max_map_count: 262144
+        \\
+    );
+    const mapped = try sysctls(arena, root.get("mapped").?);
+    try std.testing.expectEqual(2, mapped.len);
+    try std.testing.expectEqualStrings("net.unix.max_dgram_qlen=4096", mapped[0]);
+    try std.testing.expectEqualStrings("kernel.shmmax=68719476736", (try sysctls(arena, root.get("listed").?))[0]);
+    try std.testing.expectError(error.SysctlNotNamespaced, sysctls(arena, root.get("machine").?));
 }
 
 /// A Compose byte value ("64m", "1g", "512mb", "1048576") in MiB, rounded up.

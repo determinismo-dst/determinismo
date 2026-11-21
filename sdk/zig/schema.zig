@@ -198,6 +198,10 @@ pub const Node = struct {
     /// Process limits of its processes and of commands run in it (Compose's `ulimits`); null:
     /// Docker's (open files 1048576, the kernel's for the rest).
     ulimits: ?[]const Ulimit = null,
+    /// Kernel settings of its own namespaces, "key=value" (Compose's `sysctls`:
+    /// "net.unix.max_dgram_qlen=4096"), set before its command starts. Only the namespaced ones
+    /// (sysctl_namespaced), as Docker allows; null: the kernel's.
+    sysctls: ?[]const []const u8 = null,
     /// Antithesis's native library at /usr/lib/libvoidstar.so (determinismo's): Antithesis's
     /// SDKs then send through it, and instrumented programs report coverage. Imported Compose
     /// projects have it, as on Antithesis. Off by default: a static program with Antithesis's
@@ -421,6 +425,23 @@ pub const Ulimit = struct {
     pub const unlimited = std.math.maxInt(u64);
 };
 pub const ulimits_max = 16;
+pub const sysctls_max = 16;
+
+/// Whether a kernel setting is a node's own (its network or IPC namespace's), as Docker accepts in
+/// a container: the rest are the whole machine's.
+pub fn sysctl_namespaced(key: []const u8) bool {
+    const prefixes = [_][]const u8{ "net.", "fs.mqueue.", "kernel.msg", "kernel.sem", "kernel.shm" };
+    for (prefixes) |prefix| if (std.mem.startsWith(u8, key, prefix)) return key.len > prefix.len;
+    return false;
+}
+
+test sysctl_namespaced {
+    try std.testing.expect(sysctl_namespaced("net.unix.max_dgram_qlen"));
+    try std.testing.expect(sysctl_namespaced("kernel.shmmax"));
+    try std.testing.expect(!sysctl_namespaced("vm.max_map_count"));
+    try std.testing.expect(!sysctl_namespaced("kernel.pid_max"));
+    try std.testing.expect(!sysctl_namespaced("net."));
+}
 
 /// The Linux resource number (RLIMIT_*) of a Docker ulimit name; null for another name.
 pub fn ulimit_resource(name: []const u8) ?u32 {
@@ -752,6 +773,7 @@ pub const Resolved = struct {
     memory_max_mib: ?u32 = null,
     privileged: bool = false,
     ulimits: ?[]const Ulimit = null,
+    sysctls: ?[]const []const u8 = null,
     antithesis_library: bool = false,
     crashes_known: []const []const u8 = &.{},
     writeback_s: ?u32 = null,

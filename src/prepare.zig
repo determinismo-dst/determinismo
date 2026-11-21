@@ -405,6 +405,7 @@ fn node_resolve(
         .memory_max_mib = node.memory_max_mib,
         .privileged = node.privileged,
         .ulimits = node.ulimits,
+        .sysctls = node.sysctls,
         .antithesis_library = node.antithesis_library,
         .crashes_known = node.crashes_known,
         .writeback_s = node.writeback_s,

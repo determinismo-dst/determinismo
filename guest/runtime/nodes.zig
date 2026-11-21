@@ -3694,11 +3694,15 @@ const Launch = struct {
     /// The node's process limits (Compose's `ulimits`), resource numbers resolved.
     limits: [schema.ulimits_max]Limit = undefined,
     limit_count: u32 = 0,
+    /// Its kernel settings (Compose's `sysctls`): each one's /proc/sys path and value.
+    sysctls: [schema.sysctls_max]Sysctl = undefined,
+    sysctl_count: u32 = 0,
     /// Its shared volumes (schema.Volume.shared): each one's directory bound at its path.
     volumes: [schema.volumes_max]Bind = undefined,
     volume_count: u32 = 0,
 
     const Limit = struct { resource: u32, value: linux.rlimit };
+    const Sysctl = struct { path: [:0]const u8, value: []const u8 };
     const Bind = struct { source: [:0]const u8, target: [:0]const u8, read_only: bool };
 
     /// `.start` draws the start's number (start_draw_name) for its script; `.exec` (a command in
@@ -3812,7 +3816,30 @@ const Launch = struct {
             } };
             launch.limit_count += 1;
         }
+        const proc_sys = "/proc/sys/";
+        for (node.sysctls orelse &.{}) |entry| {
+            if (launch.sysctl_count == schema.sysctls_max) return error.TooManySysctls;
+            const equals = std.mem.indexOfScalar(u8, entry, '=') orelse return error.BadSysctl;
+            const key = entry[0..equals];
+            if (!schema.sysctl_namespaced(key)) return error.SysctlNotNamespaced;
+            const path = try arena.allocSentinel(u8, proc_sys.len + key.len, 0);
+            @memcpy(path[0..proc_sys.len], proc_sys);
+            for (key, path[proc_sys.len..]) |byte, *out| out.* = if (byte == '.') '/' else byte;
+            launch.sysctls[launch.sysctl_count] = .{ .path = path, .value = entry[equals + 1 ..] };
+            launch.sysctl_count += 1;
+        }
         return launch;
+    }
+
+    /// One kernel setting of the node's own namespaces: the guest's /proc resolves a network or
+    /// IPC setting by the writer's namespace, the node's now. A setting that does not take stops
+    /// the node, as Docker refuses the container.
+    fn sysctl_set(sysctl: Sysctl) void {
+        const fd = linux.open(sysctl.path, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(fd) != .SUCCESS) die(sysctl.path, error.SysctlOpen);
+        defer _ = linux.close(@intCast(fd));
+        const written = linux.write(@intCast(fd), sysctl.value.ptr, sysctl.value.len);
+        if (linux.errno(written) != .SUCCESS or written != sysctl.value.len) die(sysctl.path, error.SysctlWrite);
     }
 
     /// In the child, PID 1 of the node's namespaces.
@@ -3823,6 +3850,8 @@ const Launch = struct {
         _ = linux.dup2(stdout, 1);
         _ = linux.dup2(stderr, 2);
         if (linux.errno(null_input) == .SUCCESS) _ = linux.dup2(@intCast(null_input), 0);
+        // Before its mounts, which may give it a /proc whose sys is read-only.
+        for (launch.sysctls[0..launch.sysctl_count]) |sysctl| sysctl_set(sysctl);
         launch.mounts() catch |err| die("mounts", err);
         _ = linux.syscall2(.sethostname, @intFromPtr(launch.hostname.ptr), launch.hostname.len);
         launch.exec_in_root(exits);
