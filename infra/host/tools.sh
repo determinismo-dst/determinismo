@@ -6,15 +6,19 @@
 # host) and a JDK 25 (the guest's JVM coverage agent).
 # Idempotent.
 # Runs on the host as the user.
-# Usage: infra/host/tools.sh [--build]
+# Usage: infra/host/tools.sh [--build | --no-jank]
 # --build: only what `zig build` needs (Zig, DuckDB, the JDK), as GitHub's CI runners install it
 # (.github/workflows/ci.yml); jank's rolling package, pinned by the copy shipped from your
 # machine, is not fetched there.
+# --no-jank: everything but jank, for a host that runs no test program in jank (setup.sh
+# --no-jank: a machine set up from a CI runner, which has no kept copy of jank's pinned build).
 set -euo pipefail
 opt=$HOME/opt
 mkdir -p "$opt"
 build_only=0
+jank=1
 [ "${1:-}" = --build ] && build_only=1
+[ "${1:-}" = --no-jank ] && jank=0
 
 # fetch <url> <sha256> <file>: downloads unless the file is there with that checksum.
 fetch() {
@@ -103,6 +107,10 @@ jank_deb=jank_0.1-noble_amd64.deb
 jank_sha256=68f6d0d8f0f85bbed76ba7c04d38de0abbb50db4ae9adba214117e4e2eafd983
 if [ $build_only = 1 ]; then
   echo "zig $("$opt/zig/zig" version), duckdb v2.0.0, jdk 25.0.5"
+  exit 0
+fi
+if [ $jank = 0 ]; then
+  echo "zig $("$opt/zig/zig" version), $("$opt/bb/bb" --version), duckdb v2.0.0, tla2tools v1.7.4, no jank"
   exit 0
 fi
 if [ "$(cat "$opt/jank/.sha256" 2>/dev/null)" != "$jank_sha256" ]; then

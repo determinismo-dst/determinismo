@@ -10,6 +10,9 @@
 #   --inspect: a machine that only opens bundles (infra/aws/inspect.sh): up to our KVM, then the
 #   AWS CLI, zstd and podman (a bundle's host checks start their services from its checkers/); no guest, build, end-to-end check or serve (a bundle carries its guest, its
 #   system and the run's own explorer).
+#   --no-jank: no jank (tools.sh --no-jank, nothing shipped by tools-ship.sh): a host that runs no
+#   test program in jank, set up from a machine without the kept copy of jank's pinned build (a
+#   CI runner: jank's package is republished under the same name several times a day).
 #   --guest-from: the guest kernel and module copied from that host instead of built here, so
 #   every host runs the same guest (the same run inputs, for replays across hosts).
 #   --reserved-cores: N cores for your own sessions, the rest for runs (serve.sh); kept for the
@@ -23,9 +26,11 @@ hostname=determinismo
 guest_from=
 reserved=
 inspect=false
+jank=true
 while [ $# -gt 0 ]; do
   case $1 in
     --inspect) inspect=true; shift; continue ;;
+    --no-jank) jank=false; shift; continue ;;
     --user) user=$2 ;;
     --hostname) hostname=$2 ;;
     --guest-from) guest_from=$2 ;;
@@ -89,12 +94,13 @@ commit=$(commit_of "$repo")
 # Quoted for the remote shell: ssh joins its arguments into one command line, where an empty
 # --reserved-cores vanished and the commit took its place (an EC2 setup, 2026-11-07).
 # jank's rolling package, from your machine's kept copy (tools-ship.sh).
-"$repo/infra/host/tools-ship.sh" "$user@$ip" "${ssh_opts[@]}"
-ssh "${ssh_opts[@]}" "$user@$ip" "bash -s -- $(printf '%q ' "$reserved" "$commit" "$inspect")" <<'EOF'
+if $jank; then "$repo/infra/host/tools-ship.sh" "$user@$ip" "${ssh_opts[@]}"; fi
+ssh "${ssh_opts[@]}" "$user@$ip" "bash -s -- $(printf '%q ' "$reserved" "$commit" "$inspect" "$jank")" <<'EOF'
 set -euo pipefail
 reserved=${1:-}
 commit=${2:-unknown}
 inspect=${3:-false}
+jank=${4:-true}
 cd ~/determinismo
 echo "== serve stopped (and its runs): the build and KVM change under them"
 sudo infra/host/serve.sh "$USER" stop
@@ -107,7 +113,7 @@ everywhere() {
     --setenv=HOME="$HOME" --setenv=PATH="$PATH" "$@"
 }
 echo "== toolchain"
-infra/host/tools.sh
+if $jank; then infra/host/tools.sh; else infra/host/tools.sh --no-jank; fi
 echo "== hardware qualification"
 sudo systemd-run --quiet --wait --pipe --collect -p "AllowedCPUs=0-$(( $(nproc --all) - 1 ))" \
   --working-directory="$PWD" infra/host/m0-check.sh # As root, on every CPU.
