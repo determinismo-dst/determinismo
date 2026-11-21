@@ -104,3 +104,184 @@
   "A quiet period: no fault for duration-ns of virtual time."
   [duration-ns]
   (cpp/det_stop_faults duration-ns))
+
+;; The runner, decisions and sleeps, as Clojure's determinismo.workload has them: what a walk is
+;; made of (a node's lifecycle, its links, a command in it; a hold, through the runner's
+;; sessions). libdeterminismo's det_runner and det_runner_reply; the replies' few fields read in
+;; C++ (an id, a line, a status, an output), handed to jank as strings and numbers.
+
+(cpp/raw "
+#include <cstdint>
+#include <string>
+
+std::string determinismo_runner(std::string const &request) {
+  if (det_runner(request.data(), request.size()) != 0) return std::string();
+  std::string reply(65536, '\\0');
+  uint64_t size = det_runner_reply(reinterpret_cast<uint8_t *>(reply.data()), reply.size());
+  if (size > reply.size()) {
+    reply.assign(size, '\\0');
+    size = det_runner_reply(reinterpret_cast<uint8_t *>(reply.data()), reply.size());
+  }
+  reply.resize(size < reply.size() ? size : reply.size());
+  return reply;
+}
+
+static size_t determinismo_field_at(std::string const &json, std::string const &key) {
+  std::string pattern = \"\\\"\" + key + \"\\\":\";
+  size_t at = json.find(pattern);
+  if (at == std::string::npos) return std::string::npos;
+  at += pattern.size();
+  while (at < json.size() && json[at] == ' ') at++;
+  return at < json.size() ? at : std::string::npos;
+}
+
+static void determinismo_utf8(std::string &out, unsigned v) {
+  if (v < 0x80) {
+    out += char(v);
+  } else if (v < 0x800) {
+    out += char(0xC0 | (v >> 6));
+    out += char(0x80 | (v & 0x3F));
+  } else {
+    out += char(0xE0 | (v >> 12));
+    out += char(0x80 | ((v >> 6) & 0x3F));
+    out += char(0x80 | (v & 0x3F));
+  }
+}
+
+/* A reply's string field, its escapes decoded; \"\" when absent or not a string. */
+std::string determinismo_field_string(std::string const &json, std::string const &key) {
+  size_t at = determinismo_field_at(json, key);
+  if (at == std::string::npos || json[at] != '\"') return std::string();
+  std::string out;
+  at++;
+  while (at < json.size() && json[at] != '\"') {
+    char c = json[at++];
+    if (c != '\\\\' || at >= json.size()) {
+      out += c;
+      continue;
+    }
+    char e = json[at++];
+    switch (e) {
+    case 'n': out += '\\n'; break;
+    case 't': out += '\\t'; break;
+    case 'r': out += '\\r'; break;
+    case 'b': out += '\\b'; break;
+    case 'f': out += '\\f'; break;
+    case 'u':
+      if (at + 4 <= json.size()) {
+        determinismo_utf8(out, unsigned(std::stoul(json.substr(at, 4), nullptr, 16)));
+        at += 4;
+      }
+      break;
+    default: out += e;
+    }
+  }
+  return out;
+}
+
+/* A reply's integer field; -1 when absent. */
+int64_t determinismo_field_int(std::string const &json, std::string const &key) {
+  size_t at = determinismo_field_at(json, key);
+  if (at == std::string::npos || !(json[at] == '-' || (json[at] >= '0' && json[at] <= '9'))) return -1;
+  return std::stoll(json.substr(at));
+}
+
+/* Whether a reply's field is a string (not null, not absent). */
+bool determinismo_field_is_string(std::string const &json, std::string const &key) {
+  size_t at = determinismo_field_at(json, key);
+  return at != std::string::npos && json[at] == '\"';
+}
+")
+
+(defn- words [argv] (mapv #(if (keyword? %) (name %) (str %)) argv))
+
+(defn runner
+  "A command run by the guest's runner, which sees every node (det-nodes start, stop, kill, crash,
+  pause, link, exec, hold; the network, the disks), from this program in its node: argv as
+  words. {:status :stdout :stderr}, each request a runner_request event."
+  [argv]
+  (let [reply (cpp/determinismo_runner (->json {:argv (words argv)}))]
+    {:status (cpp/determinismo_field_int reply "status")
+     :stdout (cpp/determinismo_field_string reply "stdout")
+     :stderr (cpp/determinismo_field_string reply "stderr")}))
+
+(defn node!
+  "A node's lifecycle, from any node: action :start, :stop, :kill, :crash (a power loss), :wipe,
+  :pause or :resume."
+  [action node]
+  (runner ["det-nodes" action node]))
+
+(defn link!
+  "The link between two nodes (or a node and \"runner\"): :up or :down."
+  [a b state]
+  (runner ["det-nodes" "link" a b state]))
+
+(defn node-exec
+  "A command in another node, as docker exec: {:status :stdout :stderr}."
+  [node & argv]
+  (runner (into ["det-nodes" "exec" node] argv)))
+
+(defn session
+  "A runner command that outlives one request (det-runner's sessions: det-nodes hold, a tail),
+  opened: its id, for session-read, session-write and session-close."
+  [argv]
+  (cpp/determinismo_field_int (cpp/determinismo_runner (->json {:argv (words argv) :session "open"})) "session"))
+
+(defn session-read
+  "A session's next line of output; nil at its end."
+  [id]
+  (let [reply (cpp/determinismo_runner (->json {:session "read" :id id}))]
+    (when (cpp/determinismo_field_is_string reply "line")
+      (cpp/determinismo_field_string reply "line"))))
+
+(defn session-write
+  "Writes input to a session's command and sends it signal (\"USR1\", \"TERM\", ... or nil)."
+  [id input signal]
+  (cpp/determinismo_runner (->json (cond-> {:session "write" :id id}
+                                     input (assoc :input input)
+                                     signal (assoc :signal signal)))))
+
+(defn session-close
+  "Signals a session's command (TERM) and forgets it."
+  [id]
+  (cpp/determinismo_runner (->json {:session "close" :id id :signal "TERM"})))
+
+(defn hold
+  "Holds threads of a node's process where points say (det-nodes hold: a function, then --caller,
+  --arg, --repeat, --every, --direct, --and <function> ...), as the Zig SDK's Node.hold, armed
+  before it returns: {:session :armed}; then held?, release-point, release."
+  [node points timeout-ms]
+  (let [id (session (concat ["det-nodes" "hold" (name node)] points ["--timeout-ms" (str timeout-ms)]))
+        line (session-read id)]
+    {:session id :armed (boolean (and line (string/starts-with? line "{\"armed\":")))}))
+
+(defn held?
+  "Waits until a thread is held at point (0, 1, ...): true, or false when none will be."
+  [{:keys [session]} point]
+  (loop [line (session-read session)]
+    (cond
+      (or (nil? line) (string/starts-with? line "{\"held\":null")) false
+      (and (string/starts-with? line "{\"held\":") (string/ends-with? line (str "\"point\":" point "}"))) true
+      :else (recur (session-read session)))))
+
+(defn release-point
+  "Lets point's held thread go on, the others held still."
+  [{:keys [session]} point]
+  (session-write session (str "release " point "\n") "USR1"))
+
+(defn release
+  "Lets every held thread go and ends the hold."
+  [{:keys [session]}]
+  (session-close session))
+
+(defn decide
+  "One of options, a named decision (strategies steer it, replays repeat it)."
+  [decision options]
+  (let [decision (str decision)
+        lines (string/join "\n" (map str options))]
+    (nth options (cpp/det_decide decision (count decision) lines (count lines)))))
+
+(defn sleep-ms
+  "Sleeps ms of virtual time."
+  [ms]
+  (cpp/det_sleep_ms ms))
