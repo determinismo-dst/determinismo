@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: MIT
+# A release: on a version tag (v*), the release build (determinismo, the guest's programs, the
+# self test) on GitHub's hosted runners, published as the tag's GitHub Release, one tarball of
+# zig-out/bin and its checksum. What users and determinismo-workloads pin.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/opt
+          key: tools-${{ hashFiles('infra/host/tools.sh') }}
+      - name: Toolchain (Zig, DuckDB, the JDK, pinned by infra/host/tools.sh)
+        run: infra/host/tools.sh --build
+      - name: Build
+        run: ~/opt/zig/zig build determinismo guest selftest -Drelease -Dduckdb="$HOME/opt/duckdb" -Djdk="$HOME/opt/jdk-25" -Dcommit="${GITHUB_SHA::12}"
+      - name: Package
+        run: |
+          name=determinismo-${GITHUB_REF_NAME}-linux-x86_64
+          tar -czf "$name.tar.gz" -C zig-out bin
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          echo "NAME=$name" >> "$GITHUB_ENV"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" "$NAME.tar.gz" "$NAME.tar.gz.sha256" --title "$GITHUB_REF_NAME" --notes "determinismo $GITHUB_REF_NAME (${GITHUB_SHA::12}): Linux x86-64 binaries. Deterministic VMs need a bare-metal x86-64 host with KVM."
