@@ -50,7 +50,9 @@ user_login=false
 waited=0
 until { ssh "${ssh_opts[@]}" "$user@$ip" true 2>/dev/null && user_login=true; } \
    || ssh "${ssh_opts[@]}" "root@$ip" true 2>/dev/null; do
-  last=$(ssh "${ssh_opts[@]}" "$user@$ip" true 2>&1 | tail -1)
+  # Its error line only: under pipefail the failed ssh would end the script at its first try
+  # (an EC2 machine still booting, 2026-11-21: setup gave up in 30 s).
+  last=$(ssh "${ssh_opts[@]}" "$user@$ip" true 2>&1 | tail -1 || true)
   case $last in
     *"REMOTE HOST IDENTIFICATION HAS CHANGED"*|*"Host key verification failed"*)
       echo "error: $ip's host key changed (an address used before): ssh-keygen -R $ip, then again" >&2; exit 1 ;;
