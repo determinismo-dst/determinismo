@@ -9402,7 +9402,6 @@ test "a judgment's made nodes start their branches whatever their order: a slow 
     // (a return to 995 s of a generation-0 timeline, no holder left) while its other five were
     // made in seconds; planned as a prefix, none of their branches could start, and the judgment
     // waited 807 s with the CPUs on fillers.
-    const arena = std.testing.allocator;
     var state: TreeState = undefined;
     state.queue = .empty;
     state.queue_head = 0;
@@ -9413,8 +9412,7 @@ test "a judgment's made nodes start their branches whatever their order: a slow 
     state.next_index = 100;
     state.total = 200;
     state.tape_directory = null;
-    defer state.queue.deinit(arena);
-    defer state.users.deinit(arena);
+    // The queue and its users grow by the planner's allocator (the run's arena): the test's own.
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     var arguments: Arguments = .{ .command = .explore };
