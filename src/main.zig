@@ -627,6 +627,9 @@ const Arguments = struct {
     jobs: ?u32 = null,
     /// Multiverse debugging: stop the (single) branch at this virtual time, run this there.
     moment_vtime_ms: ?u64 = null,
+    /// A replay's (replays.zig, `--stop-at-ns`): where the timeline it replays was to stop, its
+    /// horizon, to the nanosecond as it was drawn. Its own moment, as the horizon was.
+    stop_ns: ?u64 = null,
     /// With --until: the moment this long (virtual time) before the condition first holds.
     rewind_ms: ?u64 = null,
     moment_command: ?[]const u8 = null,
@@ -3366,7 +3369,8 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         options.seed = place.seed;
         Events.ranges_salt = place.seed; // Its own draw over the range buckets (events.zig).
         const moment_ms = branches.arguments.moment_vtime_ms;
-        options.moment_vtime_ns = if (moment_ms) |ms| ms * std.time.ns_per_ms else place.horizon_ns;
+        const horizon_ns = place.horizon_ns orelse branches.arguments.stop_ns;
+        options.moment_vtime_ns = if (moment_ms) |ms| ms * std.time.ns_per_ms else horizon_ns;
         options.moment_command = try timeline_substituted(context.arena, branches.arguments.moment_command, index);
         options.moment_continue = branches.arguments.moment_continue;
         options.moment_held = branches.arguments.moment_held;
@@ -3592,6 +3596,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
             .path = lineage,
             .extends = if (exploration.extend) |extend| extend.extends else null,
             .generation = place.generation,
+            .horizon_ns = place.horizon_ns orelse branches.arguments.stop_ns,
             .why = if (exploration.extend) |extend| try std.fmt.allocPrint(context.arena, "A session's: timeline {d} up to {d:.3} s, its own from there (its steps, what came from outside).", .{
                 extend.extends.branch, @as(f64, @floatFromInt(extend.extends.vtime_ns)) / 1e9,
             }) else place.why,
@@ -8776,6 +8781,8 @@ fn parse_option(
         arguments.draws_out = value;
     } else if (eql(u8, flag, "--at-vtime-ms")) {
         arguments.moment_vtime_ms = try std.fmt.parseInt(u64, value, 10);
+    } else if (eql(u8, flag, "--stop-at-ns")) {
+        arguments.stop_ns = try std.fmt.parseInt(u64, value, 10);
     } else if (eql(u8, flag, "--data")) {
         arguments.data_directory = value;
     } else if (eql(u8, flag, "--run-directory")) {

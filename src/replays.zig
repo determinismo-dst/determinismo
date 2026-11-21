@@ -345,7 +345,7 @@ fn verify_loop(
         var lines = std.mem.tokenizeScalar(u8, text, '\n');
         while (lines.next()) |line| {
             if (!std.mem.startsWith(u8, line, "{\"branch\":")) continue;
-            const Line = struct { branch: struct { index: u32, events_hash: []const u8, guest_hash: []const u8 = "" } };
+            const Line = struct { branch: struct { index: u32, events_hash: []const u8, guest_hash: []const u8 = "", horizon_ns: ?u64 = null } };
             const parsed = std.json.parseFromSliceLeaky(Line, arena, line, .{ .ignore_unknown_fields = true }) catch continue;
             if (seen.contains(parsed.branch.index)) continue;
             if (!sampled(parsed.branch.index, share)) continue;
@@ -353,6 +353,7 @@ fn verify_loop(
                 .index = parsed.branch.index,
                 .hash = parsed.branch.events_hash,
                 .guest = parsed.branch.guest_hash,
+                .stop_ns = parsed.branch.horizon_ns,
             }) catch return;
         }
         std.mem.sort(Pending, ready.items, {}, struct {
@@ -371,7 +372,8 @@ fn verify_loop(
 
 /// A timeline to replay: its recorded history's hash, and its guest's alone (before the host
 /// checks' verdicts; "" in a record from before it was kept).
-const Pending = struct { index: u32, hash: []const u8, guest: []const u8 = "" };
+/// A timeline to replay: its recorded hashes, and where it was to stop (its horizon), if it was.
+const Pending = struct { index: u32, hash: []const u8, guest: []const u8 = "", stop_ns: ?u64 = null };
 
 /// The share replayed now: `percent` until `confident_after` replays came back the same and none
 /// differed, then a quarter of it (at least 1); all of them when asked for all.
@@ -452,9 +454,9 @@ fn finish_pending(
     var lines = std.mem.tokenizeScalar(u8, text, '\n');
     while (lines.next()) |line| {
         if (!std.mem.startsWith(u8, line, "{\"branch\":")) continue;
-        const Line = struct { branch: struct { index: u32, events_hash: []const u8, guest_hash: []const u8 = "", failing: []const []const u8 = &.{} } };
+        const Line = struct { branch: struct { index: u32, events_hash: []const u8, guest_hash: []const u8 = "", failing: []const []const u8 = &.{}, horizon_ns: ?u64 = null } };
         const parsed = std.json.parseFromSliceLeaky(Line, arena, line, .{ .ignore_unknown_fields = true }) catch continue;
-        const timeline: Pending = .{ .index = parsed.branch.index, .hash = parsed.branch.events_hash, .guest = parsed.branch.guest_hash };
+        const timeline: Pending = .{ .index = parsed.branch.index, .hash = parsed.branch.events_hash, .guest = parsed.branch.guest_hash, .stop_ns = parsed.branch.horizon_ns };
         for (parsed.branch.failing) |property| {
             const entry = examples.getOrPut(arena, property) catch return;
             if (!entry.found_existing or timeline.index < entry.value_ptr.index) entry.value_ptr.* = timeline;
@@ -510,6 +512,9 @@ fn replay_one(
     } else {
         try argv.appendSlice(arena, &.{ "--tape", try std.fmt.allocPrint(arena, "{s}/branch-{d}.jsonl", .{ tapes, index }) });
     }
+    // Where it was cut (its horizon): the tape records no stop, and --horizon is the run's
+    // exploration, left out above.
+    if (timeline.stop_ns) |stop| try argv.appendSlice(arena, &.{ "--stop-at-ns", try std.fmt.allocPrint(arena, "{d}", .{stop}) });
     // Its events beside the tapes, while the run has its own to compare them with: kept when it
     // parts from the run, as the evidence.
     const replay_events: ?[]const u8 = if (replayer.events != null)

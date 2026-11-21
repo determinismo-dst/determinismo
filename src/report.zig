@@ -314,6 +314,9 @@ pub const Multiverse = struct {
         extends: ?tape.Extends = null,
         generation: u32 = 0,
         why: []const u8 = "",
+        /// Where it was to stop (virtual time), its horizon (Planned.horizon_ns): a replay of it
+        /// stops there too (replays.zig), or it runs on past where the timeline was cut.
+        horizon_ns: ?u64 = null,
         /// How long its CPU waited for the host's memory before it started, and for the CPU
         /// (cpus.Held).
         memory_wait_ns: u64 = 0,
@@ -437,6 +440,7 @@ pub const Multiverse = struct {
             .extends = branch.extends,
             .generation = branch.generation,
             .why = branch.why,
+            .horizon_ns = branch.horizon_ns,
             // What judges logging volume (logging_judge), for serve's properties too.
             .output_bytes = vm.events.output_bytes,
             .output_span_ns = vm.events.output_span_ns(state.tsc / tsc_per_ns),
