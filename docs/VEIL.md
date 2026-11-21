@@ -33,6 +33,19 @@ enumerates every action's arguments, so a term is not one (count what the lines 
 a node's leaderships). A protocol-shaped model, written to be model checked and proved, is a
 separate module.
 
+## Walking a Veil counterexample
+
+A counterexample of Veil's checker is a trace like a Quint run's, and the trace drivers walk it the
+same way (docs/QUINT.md, "Walking a spec's trace": sdk.trace in Zig, determinismo.trace in jank):
+
+    python3 tools/veil/veil_to_itf.py <checker result> <trace.itf.json>
+
+The input is the compiled checker's JSON result on its standard output, or the trace
+`#model_check` prints. Each state's variables become ITF variables (maps, sets, records, integers
+as bigints, `some x`/`none` as Option variants), and the transition taken and its arguments become
+`mbt::actionTaken` and `mbt::nondetPicks`. An adapter written for a Quint spec's layout reads
+Veil's trace after a step that lays the variables out as that spec does.
+
 ## Setup
 
 `#replay` is a patch to Veil (tools/veil/replay.patch, against Veil 252208c):
