@@ -3626,7 +3626,7 @@ fn check_repl(context: *Context) !void {
         .{ "through nrepl-proxy.py: det-checkpoint saved", std.mem.indexOf(u8, proxied, "checkpoint {\"name\":\"proxy\"") != null and std.mem.indexOf(u8, proxied, "\"saved\":true") != null },
         .{ "and det-resume back there: defined before it, not after", std.mem.indexOf(u8, proxied, "back [1 nil]") != null },
     }, "repl: a session {d}, (+ 1 2) = {s}, the bank's total {s}, the peer {s} {s} {s} {s}, serve {s} {s}, the fork {s}, its server's death answered in {d:.1} s, the total at the checkpoint {s}, the runner session {s} {s}, a timed read {s}", .{
-        session,    values[0],                                                                       values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8], halt_s, resumed_total,
+        session,    values[0],                                                                       values[1],  values[2], values[3], values[4], values[5], values[6], values[7], values[8], halt_s, resumed_total,
         values[10], nrepl_field(outputs[10], "err") orelse nrepl_field(outputs[10], "ex") orelse "", values[11],
     });
 }
@@ -7539,8 +7539,11 @@ fn check_learned_limit(context: *Context) !void {
         // Its stop five minutes past its branch point (a fresh one's: the setup's moment, which
         // the record does not say; under a minute), where it ended.
         const start = if (timeline.path.len > 0) timeline.path[timeline.path.len - 1].vtime_ns else 0;
+        // A millisecond's leeway below: the stop counts from its node's snapshot, its clock's TSC
+        // turned to nanoseconds, the record's moment in nanoseconds (470 ns short on f0's batch
+        // of efcf741: timelines 66 and 86, each 299.99999953 s past its recorded moment).
         const past = stop -| start;
-        if (past >= 5 * std.time.ns_per_min and past <= 6 * std.time.ns_per_min and timeline.vtime_ns >= stop) cut_at_limit += 1;
+        if (past + std.time.ns_per_ms >= 5 * std.time.ns_per_min and past <= 6 * std.time.ns_per_min and timeline.vtime_ns >= stop) cut_at_limit += 1;
     }
     const property = "timelines replay to their recorded history";
     const failing = failing_in(report, property);
