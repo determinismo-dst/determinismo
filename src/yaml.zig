@@ -2,8 +2,10 @@
 //! The subset of YAML that Compose files use, read into a tree: block mappings and sequences by
 //! indentation, flow sequences `[a, b]` and mappings `{a: b}` (over several lines too: Compose's
 //! `test:` lists, a trailing comma allowed), plain and quoted scalars (over several lines
-//! too, folded), block scalars (`|`, `>`), comments. No anchors, tags or multi-document streams (rejected, not
-//! misread).
+//! too, folded), block scalars (`|`, `>`), comments, anchors (`&name`) and their aliases (`*name`)
+//! with merge keys (`<<: *name`, `<<: [*a, *b]`: the mapping's own keys first), as Compose files
+//! share settings through `x-` fields. No tags, aliases inside a flow collection's scalars, or
+//! multi-document streams (rejected, not misread).
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
@@ -66,6 +68,8 @@ const Parser = struct {
     /// Owned: a "- key: value" line is rewritten in place as "key: value", one level deeper.
     lines: []Line,
     index: usize = 0,
+    /// Anchored values by name, as read so far: an alias names one before it.
+    anchors: std.StringHashMapUnmanaged(Value) = .empty,
 
     /// Says where the file stopped being read: the line the parser was at (a value's own
     /// lines are consumed before what follows them is judged, so it is that line or the one
@@ -126,6 +130,7 @@ const Parser = struct {
 
     fn mapping(parser: *Parser, indent: u32, depth: u32) anyerror!Value {
         var entries: std.ArrayList(Value.Entry) = .empty;
+        var merged: std.ArrayList(Value) = .empty;
         while (true) {
             parser.skip_blank();
             if (parser.index == parser.lines.len) break;
@@ -139,9 +144,31 @@ const Parser = struct {
                 try parser.nested(indent, depth)
             else
                 try parser.scalar_or_flow(split.value, indent, depth);
+            // A merge key's mappings, taken after: the mapping's own keys stand wherever they are.
+            if (std.mem.eql(u8, split.key, "<<")) {
+                try merged.append(parser.arena, value);
+                continue;
+            }
             try entries.append(parser.arena, .{ .key = key, .value = value });
         }
+        for (merged.items) |value| switch (value) {
+            .mapping => |fields| try merge(parser.arena, &entries, fields),
+            .sequence => |items| for (items) |item| {
+                if (item != .mapping) return error.BadMerge;
+                try merge(parser.arena, &entries, item.mapping);
+            },
+            else => return error.BadMerge,
+        };
         return .{ .mapping = entries.items };
+    }
+
+    /// A merged mapping's entries whose keys the mapping does not have yet (its own, or an earlier
+    /// merged one's: the first in a merge list wins, as YAML has it).
+    fn merge(arena: std.mem.Allocator, entries: *std.ArrayList(Value.Entry), fields: []const Value.Entry) !void {
+        next: for (fields) |field| {
+            for (entries.items) |entry| if (std.mem.eql(u8, entry.key, field.key)) continue :next;
+            try entries.append(arena, field);
+        }
     }
 
     /// What follows "key:" or "-" on the next lines: a deeper block, or nothing. Compose also
@@ -167,10 +194,27 @@ const Parser = struct {
         }
         const value = strip_comment(text);
         if (value.len == 0) return .empty;
-        if (value[0] == '&' or value[0] == '*' or value[0] == '!') return error.UnsupportedYaml;
+        if (value[0] == '!') return error.UnsupportedYaml;
+        if (value[0] == '*') {
+            const name = std.mem.trimEnd(u8, value[1..], " ");
+            return parser.anchors.get(name) orelse error.UnknownAlias;
+        }
+        if (value[0] == '&') {
+            // `&name`, then its value: on the line, or the block below.
+            const end = std.mem.indexOfScalar(u8, value, ' ') orelse value.len;
+            const name = value[1..end];
+            if (name.len == 0) return error.UnsupportedYaml;
+            const rest = std.mem.trimStart(u8, value[end..], " ");
+            const anchored = if (rest.len == 0)
+                try parser.nested(indent, depth)
+            else
+                try parser.scalar_or_flow(rest, indent, depth);
+            try parser.anchors.put(parser.arena, name, anchored);
+            return anchored;
+        }
         if (value[0] == '|' or value[0] == '>') return parser.block_scalar(value[0] == '>', indent);
         if (value[0] == '[' or value[0] == '{') {
-            var flow = Flow{ .arena = parser.arena, .text = try parser.flow_text(value) };
+            var flow = Flow{ .arena = parser.arena, .text = try parser.flow_text(value), .aliases = &parser.anchors };
             const parsed = try flow.value(depth);
             flow.skip_spaces();
             if (flow.position != flow.text.len) return error.TrailingCharacters;
@@ -284,6 +328,8 @@ const Flow = struct {
     arena: std.mem.Allocator,
     text: []const u8,
     position: usize = 0,
+    /// The block parser's anchors, for aliases in the collection (a merge list `[*a, *b]`).
+    aliases: ?*const std.StringHashMapUnmanaged(Value) = null,
 
     fn skip_spaces(flow: *Flow) void {
         while (flow.position < flow.text.len and flow.text[flow.position] == ' ') {
@@ -325,6 +371,15 @@ const Flow = struct {
                 }
                 return .{ .mapping = entries.items };
             },
+            // An alias (a merge list `[*a, *b]`); an anchor or a tag here is not read (rejected,
+            // not misread).
+            '*' => {
+                flow.position += 1;
+                const name = try flow.scalar(",]}");
+                const anchors = flow.aliases orelse return error.UnsupportedYaml;
+                return anchors.get(name) orelse error.UnknownAlias;
+            },
+            '&', '!' => return error.UnsupportedYaml,
             else => return .{ .scalar = try flow.scalar(",]}") },
         }
     }
@@ -563,10 +618,51 @@ test "sequences of mappings" {
     try std.testing.expectEqualStrings("x", volumes[1].get("name").?.scalar);
 }
 
-test "anchors are rejected" {
+test "anchors, aliases and merge keys, as Compose files share settings" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
-    try std.testing.expectError(error.UnsupportedYaml, parse(arena_state.allocator(), "a: &x 1"));
+    const arena = arena_state.allocator();
+    // Antithesis's formalized Raft projects' shape: x- fields anchored, merged into each service,
+    // its own keys over the merged ones wherever they stand.
+    const root = try parse(arena,
+        \\x-raft: &raft
+        \\  platform: linux/amd64
+        \\  image: hashicorp-raft:latest
+        \\x-env: &env
+        \\  PEERS: raft1=raft1:7000
+        \\  NODE_ID: none
+        \\port: &port 7000
+        \\services:
+        \\  raft1:
+        \\    image: own:1
+        \\    <<: *raft
+        \\    environment:
+        \\      <<: *env
+        \\      NODE_ID: raft1
+        \\  raft2:
+        \\    <<: [*raft, {hostname: two}]
+        \\    port: *port
+        \\
+    );
+    const services = root.get("services").?;
+    const raft1 = services.get("raft1").?;
+    try std.testing.expectEqualStrings("own:1", raft1.get("image").?.scalar);
+    try std.testing.expectEqualStrings("linux/amd64", raft1.get("platform").?.scalar);
+    const environment = raft1.get("environment").?;
+    try std.testing.expectEqualStrings("raft1", environment.get("NODE_ID").?.scalar);
+    try std.testing.expectEqualStrings("raft1=raft1:7000", environment.get("PEERS").?.scalar);
+    try std.testing.expectEqual(@as(usize, 2), environment.mapping.len); // NODE_ID once.
+    const raft2 = services.get("raft2").?;
+    try std.testing.expectEqualStrings("hashicorp-raft:latest", raft2.get("image").?.scalar);
+    try std.testing.expectEqualStrings("two", raft2.get("hostname").?.scalar);
+    try std.testing.expectEqualStrings("7000", raft2.get("port").?.scalar);
+    // An alias in a flow collection too; never misread: an alias of no anchor, an anchor inside a
+    // flow collection, a tag.
+    const flow = try parse(arena, "a: &x 1\nb: [*x, y]");
+    try std.testing.expectEqualStrings("1", flow.get("b").?.sequence[0].scalar);
+    try std.testing.expectError(error.UnknownAlias, parse(arena, "a: *nothing"));
+    try std.testing.expectError(error.UnsupportedYaml, parse(arena, "a: [&x 1]"));
+    try std.testing.expectError(error.UnsupportedYaml, parse(arena, "a: !tag 1"));
 }
 
 test "a plain scalar over several lines is one, folded" {
