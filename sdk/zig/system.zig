@@ -452,9 +452,11 @@ pub fn System(comptime Nodes: type) type {
             // What its operations looked like, said as the start ends (elle.operations_flush).
             defer elle.operations_flush();
             // A history at its cap (elle.history_size_max): the driver's work is done, not failed.
+            // Not cataloged (assert_computed): a workload recording no history never reaches it,
+            // and a cataloged sometimes never true fails the run.
             return handler(&context) catch |err| switch (err) {
                 error.HistoryFull => {
-                    sdk.sometimes(true, "a driver ended at its history's cap", .{});
+                    sdk.assert_computed(.sometimes, true, "a driver ended at its history's cap", .{});
                     return;
                 },
                 else => return err,
