@@ -626,6 +626,7 @@ const platform_events = std.StaticStringMap(void).initComptime(.{
     .{"output_dropped"},
     .{"persist_trace_failed"},
     .{"runner_request"},
+    .{"runner_session"},
     .{"scenario_end"},
     .{"sdk_setup_missing"},
     .{"session_checkpoint"},
