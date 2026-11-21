@@ -33,6 +33,15 @@ enumerates every action's arguments, so a term is not one (count what the lines 
 a node's leaderships). A protocol-shaped model, written to be model checked and proved, is a
 separate module.
 
+## From another machine, an agent, the run's page
+
+- serve: `POST /runs/<run>/veil` with `{"branch": <n>, "map": {...}}` answers the timeline's labels
+  (`labels`, the file `#replay` reads, as `file`), how many lines became labels by action, and
+  the line to put in the module, for a model and a Veil that are not where the run is.
+- For an agent where determinismo runs: the MCP server's `veil` tool (`determinismo mcp`).
+- From the run's page: a timeline's logs have "Labels for Veil": the map pasted (kept for the
+  next timeline), the labels file downloaded, the `#replay` line said.
+
 ## Walking a Veil counterexample
 
 A counterexample of Veil's checker is a trace like a Quint run's, and the trace drivers walk it the

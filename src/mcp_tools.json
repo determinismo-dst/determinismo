@@ -589,5 +589,54 @@
         "spec"
       ]
     }
+  },
+  {
+    "name": "veil",
+    "description": "Check a timeline against a Veil model (docs/VEIL.md): the timeline's output lines that match an action of the map become the module's action labels, each with the node the line came from, and Veil's #replay takes them in order from the instance's initial states. Answers whether the timeline is a run of the model; if not, the first label no successor takes, or the property broken and the label after which it broke, with its moment, node and line. Needs a Veil checkout with tools/veil/replay.patch applied and built, and Lean's lake.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "events_dir": {
+          "type": "string",
+          "description": "The exploration's events directory (a run's `events`, an --events-dir)"
+        },
+        "branch": {
+          "type": "integer",
+          "description": "The timeline"
+        },
+        "module": {
+          "type": "string",
+          "description": "The Veil module's path (<Name>.lean, `veil module <Name>`)"
+        },
+        "map": {
+          "type": "string",
+          "description": "The map's path: {\"node_arg\": \"n\", \"actions\": [{\"name\", \"match\", \"unless\"?}, ...]}"
+        },
+        "instance": {
+          "type": "string",
+          "description": "The instance the module is replayed in (`{ node := Fin 3 }`)"
+        },
+        "veil": {
+          "type": "string",
+          "description": "The Veil checkout (patched and built)"
+        },
+        "theory": {
+          "type": "string",
+          "description": "The theory (immutable individuals), default `{}`"
+        },
+        "lake": {
+          "type": "string",
+          "description": "Lake's command (default `lake`)"
+        }
+      },
+      "required": [
+        "events_dir",
+        "branch",
+        "module",
+        "map",
+        "instance",
+        "veil"
+      ]
+    }
   }
 ]

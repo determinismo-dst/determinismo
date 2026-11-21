@@ -212,6 +212,29 @@ fn tool_call(
         const result = try std.process.run(arena, io, .{ .argv = argv.items });
         return result.stderr;
     }
+    // A timeline's lines replayed as a Veil model's actions (veil.zig, docs/VEIL.md).
+    if (eql(u8, name, "veil")) {
+        const Veil = struct {
+            events_dir: []const u8,
+            branch: u32,
+            module: []const u8,
+            map: []const u8,
+            instance: []const u8,
+            veil: []const u8,
+            theory: ?[]const u8 = null,
+            lake: ?[]const u8 = null,
+        };
+        const asked = try std.json.parseFromValueLeaky(Veil, arena, value, .{ .ignore_unknown_fields = true });
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(arena, &.{
+            options.self,    "veil",          "--module", asked.module, "--map",    asked.map, "--instance", asked.instance,
+            "--events",      asked.events_dir, "--branch", try number(arena, asked.branch), "--veil", asked.veil,
+        });
+        if (asked.theory) |theory| try argv.appendSlice(arena, &.{ "--theory", theory });
+        if (asked.lake) |lake| try argv.appendSlice(arena, &.{ "--lake", lake });
+        const result = try std.process.run(arena, io, .{ .argv = argv.items });
+        return result.stderr;
+    }
     const arguments = try std.json.parseFromValueLeaky(Arguments, arena, value, .{
         .ignore_unknown_fields = true,
     });

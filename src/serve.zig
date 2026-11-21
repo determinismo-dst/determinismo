@@ -100,6 +100,7 @@ const assert = std.debug.assert;
 const linux = std.os.linux;
 const query = @import("query.zig");
 const quint = @import("quint.zig");
+const veil = @import("veil.zig");
 /// Where sessions' timelines begin in a run's indices (tape.zig).
 const event_sets = @import("event_sets.zig");
 const extract = @import("extract.zig");
@@ -1474,6 +1475,19 @@ fn run_route(
         const events = try std.fs.path.join(server.arena, &.{ try run_directory(server, run.id), "events" });
         quint.answer(server.arena, server.io, events, asked, out) catch |err| switch (err) {
             error.BadRequest, error.FieldNotAnIdentifier, error.EmptyRecord, error.UnsupportedValue, error.DetailsNotARecord => return error.BadRequest,
+            error.FileNotFound => return error.NotFound,
+            else => return err,
+        };
+        return 200;
+    }
+    // A timeline's lines as a Veil model's action labels through a map (docs/VEIL.md): the file
+    // `#replay` reads, for a model and a Veil that are somewhere else.
+    if (eql(u8, action, "veil")) {
+        if (!eql(u8, request.method, "POST")) return error.NotFound;
+        const asked = std.json.parseFromSliceLeaky(veil.Asked, server.arena, request.body, .{ .ignore_unknown_fields = true }) catch return error.BadRequest;
+        const events = try std.fs.path.join(server.arena, &.{ try run_directory(server, run.id), "events" });
+        veil.answer(server.arena, server.io, events, asked, out) catch |err| switch (err) {
+            error.BadRequest => return error.BadRequest,
             error.FileNotFound => return error.NotFound,
             else => return err,
         };

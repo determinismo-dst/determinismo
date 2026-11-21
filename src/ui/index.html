@@ -3837,7 +3837,10 @@ function logsBody() {
       <div style="display:flex;gap:8px;margin-top:8px;align-items:center"><input id="quint-prefix" style="width:200px" placeholder="events named like… (bank_)" title="This timeline's own events whose name starts with this are the trace: one step an event, its name the spec's action, its details the argument">
         <input id="quint-main" style="width:140px" placeholder="the spec's module" title="The Quint module the run imports (bank, for bank.qnt)">
         <button id="quint-run">Trace for Quint</button></div>
-      <div class="muted" id="quint-status">This timeline's events as a run of a Quint spec's actions, to check with <span class="mono">quint test</span> beside the spec (docs/QUINT.md). With no name: the names its events have.</div></div>`;
+      <div class="muted" id="quint-status">This timeline's events as a run of a Quint spec's actions, to check with <span class="mono">quint test</span> beside the spec (docs/QUINT.md). With no name: the names its events have.</div>
+      <div style="display:flex;gap:8px;margin-top:8px;align-items:center"><input id="veil-map" class="mono" style="flex:1" placeholder='{"actions": [{"name": "EnterLeader", "match": "entering leader state"}, …]}' title="The map: each output line holding an action's match (and not its unless) is that action, its node the line's source">
+        <button id="veil-run">Labels for Veil</button></div>
+      <div class="muted" id="veil-status">This timeline's lines as a Veil model's action labels, for its <span class="mono">#replay</span> (docs/VEIL.md).</div></div>`;
 }
 function logsWire() {
   const apply = $("#logs-apply");
@@ -3935,6 +3938,37 @@ function logsWire() {
       $("#quint-status").textContent = `${given.events} events (${named.map((kind) => `${kind.name} ${kind.count}`).join(", ")}) in ${given.file}. Beside ${main}.qnt: ${given.command}`;
     } catch (error) {
       $("#quint-status").textContent = String(error.message || error);
+    }
+  });
+  // This timeline's lines as a Veil model's action labels (serve's POST /runs/<id>/veil): the
+  // labels file downloaded, the line that replays it said. The map kept for the next timeline.
+  try { $("#veil-map").value = localStorage.getItem("determinismo.veil-map") || ""; } catch (error) {}
+  $("#veil-run").addEventListener("click", async () => {
+    let map;
+    try { map = JSON.parse($("#veil-map").value); } catch (error) {
+      $("#veil-status").textContent = `The map is not JSON: ${error.message}`;
+      return;
+    }
+    try { localStorage.setItem("determinismo.veil-map", $("#veil-map").value); } catch (error) {}
+    $("#veil-status").textContent = "Reading the timeline's lines…";
+    try {
+      const response = await fetch(`/runs/${state.runId}/veil`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ branch: state.logs.branch, map }),
+      });
+      if (!response.ok) throw new Error(await response.text() || `serve answered ${response.status}`);
+      const given = await response.json();
+      if (given.count === 0) {
+        $("#veil-status").textContent = "No line of this timeline matches an action of the map.";
+        return;
+      }
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(new Blob([JSON.stringify(given.labels)], { type: "application/json" }));
+      link.download = given.file;
+      link.click();
+      $("#veil-status").textContent = `${given.count} labels (${given.actions.map((action) => `${action.name} ${action.count}`).join(", ")}) in ${given.file}. In the module, before its end: ${given.replay}`;
+    } catch (error) {
+      $("#veil-status").textContent = String(error.message || error);
     }
   });
   // A port into a node at this moment: a live session with ingress (serve's POST /runs/<id>/session),

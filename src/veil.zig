@@ -107,6 +107,40 @@ pub fn check(arena: std.mem.Allocator, io: std.Io, arguments: []const [:0]const 
     return report(verdict, labels);
 }
 
+/// What serve's POST /runs/<id>/veil asks: a timeline and a map.
+pub const Asked = struct { branch: u32, map: Map };
+
+/// serve's answer for a timeline and a map, a JSON object: the labels file's name and content
+/// (`labels`, for `#replay`'s `file`), how many lines became labels, by action, and the line to
+/// put in the module (its instance left to the module's author: `<instance>`).
+pub fn answer(arena: std.mem.Allocator, io: std.Io, events_directory: []const u8, asked: Asked, out: *std.Io.Writer) !void {
+    if (asked.map.actions.len == 0) return error.BadRequest;
+    for (asked.map.actions) |action| if (action.name.len == 0 or action.match.len == 0) return error.BadRequest;
+    const source = try event_files.read(arena, io, events_directory, asked.branch, .limited(events_size_max));
+    const labels = try labels_of(arena, source, asked.map);
+    const Count = struct { name: []const u8, count: u64 };
+    var counts: std.ArrayList(Count) = .empty;
+    for (asked.map.actions) |action| {
+        var count: u64 = 0;
+        for (labels) |label| count += @intFromBool(std.mem.eql(u8, label.name, action.name));
+        try counts.append(arena, .{ .name = action.name, .count = count });
+    }
+    const Raw = struct {
+        text: []const u8,
+        pub fn jsonStringify(raw: @This(), writer: anytype) !void {
+            try writer.print("{s}", .{raw.text});
+        }
+    };
+    try std.json.Stringify.value(.{
+        .file = labels_file,
+        .count = labels.len,
+        .actions = counts.items,
+        .replay = "#replay interpreted <instance> {} (file := \"" ++ labels_file ++ "\")",
+        .labels = Raw{ .text = try labels_json(arena, labels, asked.map.node_arg) },
+    }, .{}, out);
+    try out.writeAll("\n");
+}
+
 /// A module's name: what `veil module <Name>` declares.
 fn name_of(text: []const u8) ?[]const u8 {
     const key = "veil module ";
@@ -246,6 +280,38 @@ test "a timeline's lines as labels, a node from each line's source" {
     try std.testing.expectEqualStrings("TransferTimeout", labels[1].name);
     try std.testing.expectEqual(@as(u64, 0), labels[1].node);
     try std.testing.expectEqualStrings("{\"labels\":[{\"name\":\"EnterLeader\",\"args\":[{\"name\":\"n\",\"value\":2}]},{\"name\":\"TransferTimeout\",\"args\":[{\"name\":\"n\",\"value\":0}]}]}", try labels_json(arena, labels, "n"));
+}
+
+test "serve's answer: a timeline's labels for a map" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var directory_buffer: [4096]u8 = undefined;
+    const directory = directory_buffer[0..try tmp.dir.realPathFile(io, ".", &directory_buffer)];
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var path_buffer: [4096]u8 = undefined;
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try event_files.path(&path_buffer, directory, 2, .running), .data =
+        \\{"seq":1,"vtime_ns":1,"event":{"output":{"source":"raft-node-1","text":"entering leader state"}}}
+        \\{"seq":2,"vtime_ns":2,"event":{"output":{"source":"raft-node-0","text":"entering follower state"}}}
+        \\{"seq":3,"vtime_ns":3,"event":{"output":{"source":"raft-node-1","text":"entering leader state"}}}
+        \\
+    });
+    const map: Map = .{ .actions = &.{
+        .{ .name = "EnterLeader", .match = "entering leader state" },
+        .{ .name = "EnterFollower", .match = "entering follower state" },
+    } };
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try answer(arena, io, directory, .{ .branch = 2, .map = map }, &out.writer);
+    const Answer = struct { file: []const u8, count: u64, actions: []const struct { name: []const u8, count: u64 }, labels: std.json.Value };
+    const parsed = try std.json.parseFromSliceLeaky(Answer, arena, out.written(), .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings(labels_file, parsed.file);
+    try std.testing.expectEqual(@as(u64, 3), parsed.count);
+    try std.testing.expectEqual(@as(u64, 2), parsed.actions[0].count);
+    try std.testing.expectEqual(@as(u64, 1), parsed.actions[1].count);
+    try std.testing.expectEqual(@as(usize, 3), parsed.labels.object.get("labels").?.array.items.len);
+    try std.testing.expectError(error.BadRequest, answer(arena, io, directory, .{ .branch = 2, .map = .{ .actions = &.{} } }, &out.writer));
 }
 
 test "Veil's verdict line" {
