@@ -1,0 +1,21 @@
+; SPDX-License-Identifier: MIT
+; A jank workload compiled ahead of time and run in the guest's runner, as a Zig one: one node, one
+; driver emitting an event, an assertion, and a runner command (det-nodes list).
+(ns aot-hello.main
+  (:require [determinismo.workload :as w]
+            [determinismo.core :as det]))
+
+(defn hello [_]
+  (det/event "aot_hello" {:from "jank in the runner"})
+  (det/always true "jank AOT runs its commands" {})
+  (let [listed (det/runner ["det-nodes" "list"])]
+    (det/event "aot_runner" {:status (:status listed) :stdout (:stdout listed)})))
+
+(def program
+  {:profiles [{:name "default"
+               :nodes [[:box {:image "docker.io/library/debian:bookworm-slim"
+                              :command ["sleep" "3600"]}]]}]
+   :scenarios [{:name "hello"
+                :commands [(w/singleton-driver "hello" hello)]}]})
+
+(defn -main [& arguments] (w/main program arguments))

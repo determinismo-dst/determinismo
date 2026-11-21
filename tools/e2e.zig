@@ -280,6 +280,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "hangup", check_hangup },                         .{ "frozen-step", check_frozen_step },
         .{ "templates", check_templates },                   .{ "volumes", check_volumes },
         .{ "setup-mode", check_setup_mode },                 .{ "jank", check_jank_repl },
+        .{ "jank-aot", check_jank_aot },
         .{ "bank-steps", check_bank_steps },                 .{ "checkpoint", check_session_checkpoint },
         .{ "ingress-checkpoint", check_ingress_checkpoint }, .{ "ingress-crash", check_ingress_crash },
         .{ "draws", check_draws },                           .{ "exit-stack", check_exit_stack },
@@ -3651,6 +3652,40 @@ fn check_repl(context: *Context) !void {
 /// A jank REPL inside the guest, as the Clojure one: jank 0.1's own nREPL server (examples/nrepl's
 /// jank profile, warm: its node's command), a session at its scenario's start, the relay to it,
 /// and evaluations through the relay, state kept between them.
+/// A jank workload in the runner, as a Zig one: tests/jank-aot compiled ahead of time and packed
+/// with its libraries (tools/jank_aot_pack.sh), explored two timelines: its driver's assertion
+/// holds, and its runner command (det-nodes list, from jank) answers with its node.
+fn check_jank_aot(context: *Context) !void {
+    const arena = context.arena;
+    const jank = context.jank orelse {
+        std.debug.print("SKIP jank-aot: no jank ($DETERMINISMO_JANK or --jank)\n", .{});
+        return;
+    };
+    const program = try std.fs.path.join(arena, &.{ context.scratch, "aot-hello" });
+    const packed_run = try run_kept(context, &.{ "bash", "tools/jank_aot_pack.sh", jank, context.bin, program, "aot-hello.main", "tests/jank-aot/src:sdk/jank/determinismo/src" });
+    const packed_ok = switch (packed_run.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!packed_ok) std.debug.print("{s}{s}\n", .{ packed_run.stdout, packed_run.stderr });
+    const events = try std.fmt.allocPrint(arena, "{s}/jank-aot", .{context.scratch});
+    const report = if (packed_ok) try explore(context, &.{
+        "--program", program, "--scenario",   "hello", "--seed", "1",
+        "--branches", "2",    "--events-dir", events,
+    }) else "";
+    var branches: [2]Branch = undefined;
+    const count = parse_branches(report, &branches);
+    try events_plain(context, events);
+    const listed = try run_kept(context, &.{ "sh", "-c", try std.fmt.allocPrint(arena, "grep -l 'aot_runner.*name.*box' {s}/branch-*.jsonl | wc -l", .{events}) });
+    const answered = std.fmt.parseInt(u32, std.mem.trim(u8, listed.stdout, " \n"), 10) catch 0;
+    expect_all(context, &.{
+        .{ "packed", packed_ok },
+        .{ "two timelines explored", count == 2 },
+        .{ "its assertion holds", count == 2 and (failing_in(report, "jank AOT runs its commands") orelse 0) == 0 and std.mem.indexOf(u8, report, "jank AOT runs its commands") != null },
+        .{ "det-nodes answers it in each", answered == 2 },
+    }, "jank-aot: {d} timelines, {d} with the runner's answer", .{ count, answered });
+}
+
 fn check_jank_repl(context: *Context) !void {
     const arena = context.arena;
     const address = "127.0.0.1:7893";
