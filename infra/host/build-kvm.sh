@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
-# Builds kvm.ko and kvm-intel.ko out-of-tree from the Debian source matching the running kernel,
-# applying kernel/patches/*.patch (if any). Runs on the host as a sudo-capable user.
+# Builds kvm.ko and kvm-intel.ko out-of-tree from the source of the running kernel's very version
+# (Debian's linux-source package; on Ubuntu, as GitHub's hosted runners run it, its kernel's
+# source package from deb-src), applying the kernel series' patches. Runs on the host as a
+# sudo-capable user.
 # Usage: build-kvm.sh [workdir]   Output: <workdir>/linux-<ver>/arch/x86/kvm/{kvm,kvm-intel}.ko
 set -euo pipefail
 
@@ -17,16 +19,32 @@ if [ ! -f "$tree/.prepared" ]; then
   # The source of the running kernel's very version: older than the newest once Debian moved on
   # (provision.sh's full-upgrade takes linux-source to it; srv4, 2026-11-07), hence downgrades
   # allowed. A prepared tree needs it no more.
-  pkgver=$(dpkg-query -W -f='${Version}' "linux-image-$krel")
-  if ! dpkg-query -W -f='${Version}' "linux-source-$series" 2>/dev/null | grep -qx "$pkgver"; then
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --allow-downgrades "linux-source-$series=$pkgver"
-  fi
   rm -rf "$tree"; mkdir -p "$work"
-  tar -C "$work" -xaf "/usr/src/linux-source-$series.tar.xz"
-  mv "$work/linux-source-$series" "$tree"
+  if dpkg-query -W "linux-image-unsigned-$krel" > /dev/null 2>&1; then
+    # Ubuntu: its kernel's source package at the running version, from deb-src (turned on
+    # here), and what its config builds with (gendwarfksyms needs libdw).
+    if ! grep -qs '^Types: deb deb-src' /etc/apt/sources.list.d/ubuntu.sources; then
+      sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+      sudo apt-get update -q > /dev/null
+    fi
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q dpkg-dev flex bison libelf-dev libssl-dev bc libdw-dev dwarves > /dev/null
+    source_package=$(dpkg-query -W -f='${source:Package}' "linux-image-unsigned-$krel")
+    source_version=$(dpkg-query -W -f='${source:Version}' "linux-image-unsigned-$krel")
+    (cd "$work" && rm -rf src && mkdir src && cd src && apt-get source -q "$source_package=$source_version" > ../source.log 2>&1) \
+      || { tail -5 "$work/source.log" >&2; exit 1; }
+    mv "$(ls -d "$work"/src/linux-*/ | head -1)" "$tree"
+    rm -rf "$work/src"
+  else
+    pkgver=$(dpkg-query -W -f='${Version}' "linux-image-$krel")
+    if ! dpkg-query -W -f='${Version}' "linux-source-$series" 2>/dev/null | grep -qx "$pkgver"; then
+      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --allow-downgrades "linux-source-$series=$pkgver"
+    fi
+    tar -C "$work" -xaf "/usr/src/linux-source-$series.tar.xz"
+    mv "$work/linux-source-$series" "$tree"
+  fi
   cp "/boot/config-$krel" "$tree/.config"
   cp "/usr/src/linux-headers-$krel/Module.symvers" "$tree/"
-  # Debian's signing-key paths don't exist outside their build; modules_prepare doesn't need them.
+  # The distribution's signing-key paths don't exist outside its build; modules_prepare doesn't need them.
   "$tree/scripts/config" --file "$tree/.config" --set-str SYSTEM_TRUSTED_KEYS "" \
     --set-str SYSTEM_REVOCATION_KEYS "" --set-str MODULE_SIG_KEY ""
   make -C "$tree" -s olddefconfig
