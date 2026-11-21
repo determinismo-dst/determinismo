@@ -3495,6 +3495,9 @@ fn check_repl(context: *Context) !void {
         // A runner command that outlives a request (det-runner's sessions, holds' channel):
         // cat opened, a line written to it and read back, closed.
         "(let [s (w/session [\"cat\"])] (w/session-write s {:input \"echoed\\n\"}) (let [line (w/session-read s)] (w/session-close s) line))",
+        // A read that waits at most a while (held-within?'s): a line a second late is a timeout
+        // at 100 ms, then read within 5 s.
+        "(let [s (w/session [\"sh\" \"-c\" \"sleep 1; echo late\"]) early (w/session-read s 100) line (w/session-read s 5000)] (w/session-close s) (pr-str [early line]))",
     };
     var values: [forms.len][]const u8 = undefined;
     var outputs: [forms.len][]const u8 = undefined;
@@ -3612,6 +3615,7 @@ fn check_repl(context: *Context) !void {
         .{ "its two futures ran from the clone, a run of serve's, each knowing it is one", futures_ran and std.mem.indexOf(u8, forks, "\"run\":") != null },
         .{ "the REPL finds its fork's run from inside the machine", std.mem.eql(u8, values[9], "1") },
         .{ "a runner session echoes a line back (det-runner's sessions)", std.mem.eql(u8, values[10], "\"echoed\"") },
+        .{ "a session's read with a wait: a timeout, then the late line", std.mem.eql(u8, values[11], "\"[:timeout \\\"late\\\"]\"") },
         // No value: what reached the client during that step is the exact timeline's (on srv4
         // after 43e4d4b9's guest image, an earlier request's late "state" status, id 11,
         // cider's changed-namespaces: no reply at all was asked, and it failed).
@@ -3621,9 +3625,9 @@ fn check_repl(context: *Context) !void {
         .{ "and the REPL is back there, its bank with it", std.mem.eql(u8, resumed_total, values[1]) },
         .{ "through nrepl-proxy.py: det-checkpoint saved", std.mem.indexOf(u8, proxied, "checkpoint {\"name\":\"proxy\"") != null and std.mem.indexOf(u8, proxied, "\"saved\":true") != null },
         .{ "and det-resume back there: defined before it, not after", std.mem.indexOf(u8, proxied, "back [1 nil]") != null },
-    }, "repl: a session {d}, (+ 1 2) = {s}, the bank's total {s}, the peer {s} {s} {s} {s}, serve {s} {s}, the fork {s}, its server's death answered in {d:.1} s, the total at the checkpoint {s}, the runner session {s} {s}", .{
+    }, "repl: a session {d}, (+ 1 2) = {s}, the bank's total {s}, the peer {s} {s} {s} {s}, serve {s} {s}, the fork {s}, its server's death answered in {d:.1} s, the total at the checkpoint {s}, the runner session {s} {s}, a timed read {s}", .{
         session,    values[0],                                                                       values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8], halt_s, resumed_total,
-        values[10], nrepl_field(outputs[10], "err") orelse nrepl_field(outputs[10], "ex") orelse "",
+        values[10], nrepl_field(outputs[10], "err") orelse nrepl_field(outputs[10], "ex") orelse "", values[11],
     });
 }
 

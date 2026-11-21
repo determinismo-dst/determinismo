@@ -254,9 +254,15 @@
   (:session (runner-raw {:argv (mapv #(if (keyword? %) (name %) (str %)) argv) :session "open"})))
 
 (defn session-read
-  "A session's next line of output; nil at its end."
-  [id]
-  (:line (runner-raw {:session "read" :id id})))
+  "A session's next line of output; nil at its end. With wait-ms, :timeout when no line began
+  within it."
+  ([id]
+   (:line (runner-raw {:session "read" :id id})))
+  ([id wait-ms]
+   (let [reply (runner-raw {:session "read" :id id :wait_ms wait-ms})]
+     (cond (string? (:line reply)) (:line reply)
+           (:timeout reply) :timeout
+           :else nil))))
 
 (defn session-write
   "Writes :input to a session's command and sends it :signal (\"USR1\", \"TERM\", ...)."
@@ -271,7 +277,7 @@
 (defn hold
   "Holds threads of a node's process where points say (det-nodes hold: a function, then --caller,
   --arg, --repeat, --every, --direct, --and <function> ...), as the Zig SDK's Node.hold: armed
-  before it returns. {:session :armed}; then held?, release-point, release."
+  before it returns. {:session :armed}; then held?, held-within?, release-point, release."
   [node points timeout-ms]
   (let [id (session (concat ["det-nodes" "hold" (name node)] points ["--timeout-ms" (str timeout-ms)]))
         line (session-read id)]
@@ -286,6 +292,20 @@
         (or (nil? line) (.startsWith ^String line "{\"held\":null")) false
         (and (.startsWith ^String line "{\"held\":") (.endsWith ^String line (str "\"point\":" point "}"))) true
         :else (recur)))))
+
+(defn held-within?
+  "As held?, at most wait-ms of lines not begun (a point that may never match: its line never
+  comes, and a hold holding another point does not end at its timeout), as the Zig SDK's."
+  [{:keys [session]} point wait-ms]
+  (loop [waited 0]
+    (if (>= waited wait-ms)
+      false
+      (let [line (session-read session 100)]
+        (cond
+          (= line :timeout) (recur (+ waited 100))
+          (or (nil? line) (.startsWith ^String line "{\"held\":null")) false
+          (and (.startsWith ^String line "{\"held\":") (.endsWith ^String line (str "\"point\":" point "}"))) true
+          :else (recur waited))))))
 
 (defn release-point
   "Lets point's held thread go on, the others held still."

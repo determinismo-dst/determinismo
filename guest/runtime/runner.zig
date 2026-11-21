@@ -10,7 +10,8 @@
 //!
 //! Sessions, for what outlives one request (det-nodes hold: armed, a thread held, released):
 //! {"argv": [...], "session": "open"} starts the command and answers {"session": <id>} at once;
-//! {"session": "read", "id": N} its next line of output ({"line": "..."}, null at its end);
+//! {"session": "read", "id": N, "wait_ms"?: W} its next line of output ({"line": "..."}, null at
+//! its end; with wait_ms, {"line": null, "timeout": true} when none began within W ms);
 //! {"session": "write", "id": N, "input"?: "...", "signal"?: "USR1|TERM|INT|KILL"} writes to its
 //! input and signals it ({"ok": true}); {"session": "close", "id": N, "signal"?: ...} signals it
 //! (TERM by default) and forgets it. This process opens and closes them (their commands its
@@ -43,6 +44,7 @@ const Request = struct {
     id: ?u32 = null,
     input: ?[]const u8 = null,
     signal: ?[]const u8 = null,
+    wait_ms: ?u32 = null,
 };
 
 const sessions_max = 32;
@@ -170,6 +172,19 @@ fn session_handler(arena: std.mem.Allocator, connection: linux.fd_t, request: Re
     if (id >= sessions_max or sessions[id] == null) return text_write(arena, connection, "{{\"error\":\"no session {d}\"}}", .{id});
     const session = sessions[id].?;
     if (std.mem.eql(u8, op, "read")) {
+        // A line not begun within wait_ms: a timeout, nothing read (a line, once begun, is read
+        // whole: det-nodes hold writes each at once).
+        if (request.wait_ms) |wait_ms| {
+            var ready = [1]linux.pollfd{.{ .fd = session.output, .events = linux.POLL.IN, .revents = 0 }};
+            while (true) {
+                const polled = linux.poll(&ready, 1, @intCast(@min(wait_ms, std.math.maxInt(i32))));
+                if (linux.errno(polled) == .INTR) continue;
+                if (linux.errno(polled) == .SUCCESS and polled == 0) {
+                    return text_write(arena, connection, "{{\"line\":null,\"timeout\":true}}", .{});
+                }
+                break;
+            }
+        }
         var line: std.ArrayList(u8) = .empty;
         var ended = true;
         while (line.items.len < output_size_max) {
