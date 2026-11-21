@@ -175,7 +175,20 @@
         (is (= 3 (fold (conj older (line "raft-node-1" "node-1: vote granted: from=node-1 term=24 tally=1"))))
             "standing for 24 again, it votes for itself: its second vote in 24")
         (is (= 4 (fold (conj older (line "raft-node-2" "node-2: election won: term=24 tally=2")
-                             (line "raft-node-1" "node-1: election won: term=24 tally=2")))))))))
+                             (line "raft-node-1" "node-1: election won: term=24 tally=2")))))))
+    (testing "its term back, a node pre-campaigning for a term it voted in for another: one step
+             from voting twice (its campaign votes for itself unchecked); runs 1422 and 1423 had
+             it in 13 of 156 and 7 of 86 timelines, none granting an older vote"
+      (let [back [(line "raft-node-1" "node-1: updated currentTerm: term=24")
+                  (line "raft-node-1" "node-1: granted vote: term=24 candidate=10.0.0.5:8300")
+                  (line "raft-node-1" "node-1: updated currentTerm: term=23")]
+            asks (line "raft-node-1" "node-1: asking for pre-vote: term=24 from=node-0 address=raft-node-0:8300")]
+        (is (= 2 (fold (conj back asks))))
+        (is (= 1 (fold [(line "raft-node-1" "node-1: updated currentTerm: term=24")
+                        (line "raft-node-1" "node-1: vote granted: from=node-1 term=24 tally=1")
+                        (line "raft-node-1" "node-1: updated currentTerm: term=23")
+                        asks]))
+            "a term it voted in for itself alone: standing again is no second vote")))))
 
 (deftest a-ladder-targets-progress-and-a-branchs-inheritance
   (s/ladder-target! :double-vote)

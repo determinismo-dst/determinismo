@@ -1149,7 +1149,7 @@
 
 (def ladder-steps
   {:double-vote [{:action "term_went_back" :about "a node's term goes back (a term write landing late): term_never_goes_back"}
-                 {:action "older_vote_after_newer" :about "a node grants a vote for an older term than its last vote's (it forgets its newer vote): remembered_vote_is_newest"}
+                 {:action "older_vote_after_newer" :about "one step from voting twice: a node grants a vote for an older term than its last vote's (it forgets its newer vote: remembered_vote_is_newest), or, its term back, asks pre-votes for a term it voted in for another (its campaign then votes for itself unchecked)"}
                  {:action "voted_twice_in_a_term" :about "a node votes twice in one term (another and itself, standing again for the term it forgot): one_vote_per_term"}
                  {:action "two_leaders_in_a_term" :about "two nodes win the same term: one_leader_per_term"}]})
 
@@ -1187,15 +1187,22 @@
                   state)
                 "election_won"
                 (if (and node (integer? term)) (update-in state [:leaders term] (fnil conj #{}) node) state)
+                ;; Its term back below a term it voted in for another, standing for that term: the
+                ;; pre-campaign before a campaign whose vote for itself is its second in the term
+                ;; (runs 1422 and 1423: 13 of 156 and 7 of 86 timelines, none granting an older vote).
+                "asking_for_pre_vote"
+                (if (and node (integer? term) (some #(not= "self" %) (get-in state [:votes [node term]])))
+                  (update state :prevote (fnil conj #{}) node)
+                  state)
                 state)
         level (cond (some #(> (count %) 1) (vals (:leaders state))) 4
                     (some #(> (count %) 1) (vals (:votes state))) 3
-                    (seq (:older state)) 2
+                    (or (seq (:older state)) (seq (:prevote state))) 2
                     (seq (:back state)) 1
                     :else 0)]
     (assoc state :level (max level (:level state 0)))))
 
-(def ^:private ladder-names #{"updated_currentterm" "granted_vote" "vote_granted" "election_won"})
+(def ^:private ladder-names #{"updated_currentterm" "granted_vote" "vote_granted" "election_won" "asking_for_pre_vote"})
 
 (defn ladder-target! [kind]
   (reset! trace-target {:steps (get ladder-steps kind) :ladder kind :source (name kind)})
