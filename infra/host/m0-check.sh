@@ -66,14 +66,17 @@ else bad "ECC (EDAC)" "(not detected)"; fi
 
 echo "== Branch-count repeatability (user mode, 50 runs, each CPU)"
 src=$(dirname "$0")/../../bench/pmu/count_repeat.c
-# Built beside this script, not in /tmp: a host may mount /tmp noexec (an EC2 machine from our
-# base image, 2026-11-21: every CPU "Permission denied"). Executable whatever mode the file had.
-bin=$(mktemp -p "$(dirname "$0")" .m0-check.XXXXXX); cc -O1 -o "$bin" "$src"; chmod 755 "$bin"
-trap 'rm -f "$bin"' EXIT
-for cpu in $(seq 0 $(( $(nproc) - 1 ))); do
-  out=$(taskset -c "$cpu" "$bin" 50 | tail -1)
-  case $out in *IDENTICAL*) ok "cpu $cpu" "${out%% ->*}";; *) bad "cpu $cpu" "$out";; esac
-done
+bin=$(mktemp)
+# Unbuilt, said so (an EC2 setup from the platform alone, 2026-11-21: the source had stayed in the
+# private repository at the split, and each CPU failed with an empty file's "Permission denied").
+if cc -O1 -o "$bin" "$src"; then
+  for cpu in $(seq 0 $(( $(nproc) - 1 ))); do
+    out=$(taskset -c "$cpu" "$bin" 50 | tail -1)
+    case $out in *IDENTICAL*) ok "cpu $cpu" "${out%% ->*}";; *) bad "cpu $cpu" "$out";; esac
+  done
+else
+  bad "branch-count probe built" "($src)"
+fi
 rm -f "$bin"
 
 exit $fail
