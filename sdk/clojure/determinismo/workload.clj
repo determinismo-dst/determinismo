@@ -243,6 +243,60 @@
   [node & argv]
   (runner (list* "det-nodes" "exec" node argv)))
 
+(defn- runner-raw [request]
+  (ffi/runner request)
+  (json/read-str (String. ^bytes (ffi/runner-reply 65536) "UTF-8")))
+
+(defn session
+  "A runner command that outlives one request (det-runner's sessions: det-nodes hold, a tail of a
+  log), opened: its id, for session-read, session-write and session-close."
+  [argv]
+  (get (runner-raw {:argv (mapv #(if (keyword? %) (name %) (str %)) argv) :session "open"}) "session"))
+
+(defn session-read
+  "A session's next line of output; nil at its end."
+  [id]
+  (get (runner-raw {:session "read" :id id}) "line"))
+
+(defn session-write
+  "Writes :input to a session's command and sends it :signal (\"USR1\", \"TERM\", ...)."
+  [id {:keys [input signal]}]
+  (runner-raw (cond-> {:session "write" :id id} input (assoc :input input) signal (assoc :signal signal))))
+
+(defn session-close
+  "Signals a session's command (TERM unless given) and forgets it."
+  ([id] (session-close id "TERM"))
+  ([id signal] (runner-raw {:session "close" :id id :signal signal})))
+
+(defn hold
+  "Holds threads of a node's process where points say (det-nodes hold: a function, then --caller,
+  --arg, --repeat, --every, --direct, --and <function> ...), as the Zig SDK's Node.hold: armed
+  before it returns. {:session :armed}; then held?, release-point, release."
+  [node points timeout-ms]
+  (let [id (session (concat ["det-nodes" "hold" (name node)] points ["--timeout-ms" (str timeout-ms)]))
+        line (session-read id)]
+    {:session id :armed (boolean (and line (.startsWith ^String line "{\"armed\":")))}))
+
+(defn held?
+  "Waits until a thread is held at point (0, 1, ...): true, or false when none will be."
+  [{:keys [session]} point]
+  (loop []
+    (let [line (session-read session)]
+      (cond
+        (or (nil? line) (.startsWith ^String line "{\"held\":null")) false
+        (and (.startsWith ^String line "{\"held\":") (.endsWith ^String line (str "\"point\":" point "}"))) true
+        :else (recur)))))
+
+(defn release-point
+  "Lets point's held thread go on, the others held still."
+  [{:keys [session]} point]
+  (session-write session {:input (str "release " point "\n") :signal "USR1"}))
+
+(defn release
+  "Lets every held thread go and ends the hold."
+  [{:keys [session]}]
+  (session-close session))
+
 ;; serve, from inside a session ---------------------------------------------------------------
 
 (defn serve

@@ -8,6 +8,14 @@
 //! mechanic made in another language is built from: its choices drawn from the platform's
 //! decisions, its effects these commands, each one a `runner_request` event.
 //!
+//! Sessions, for what outlives one request (det-nodes hold: armed, a thread held, released):
+//! {"argv": [...], "session": "open"} starts the command and answers {"session": <id>} at once;
+//! {"session": "read", "id": N} its next line of output ({"line": "..."}, null at its end);
+//! {"session": "write", "id": N, "input"?: "...", "signal"?: "USR1|TERM|INT|KILL"} writes to its
+//! input and signals it ({"ok": true}); {"session": "close", "id": N, "signal"?: ...} signals it
+//! (TERM by default) and forgets it. This process opens and closes them (their commands its
+//! children, their pipes its own); a read or a write is a handler's, which inherits the pipes.
+//!
 //! Started by det-init with the guest's other services; asleep in accept() unless asked.
 const std = @import("std");
 const assert = std.debug.assert;
@@ -28,7 +36,18 @@ const environment = [_:null]?[*:0]const u8{
     "HOME=/root",
 };
 
-const Request = struct { argv: []const []const u8, stdin: []const u8 = "" };
+const Request = struct {
+    argv: []const []const u8 = &.{},
+    stdin: []const u8 = "",
+    session: ?[]const u8 = null,
+    id: ?u32 = null,
+    input: ?[]const u8 = null,
+    signal: ?[]const u8 = null,
+};
+
+const sessions_max = 32;
+const Session = struct { pid: linux.pid_t, input: linux.fd_t, output: linux.fd_t };
+var sessions: [sessions_max]?Session = @splat(null);
 
 pub fn main(init: std.process.Init) !void {
     _ = init;
@@ -44,6 +63,22 @@ pub fn main(init: std.process.Init) !void {
             else => return error.AcceptFailed,
         }
         const connection: linux.fd_t = @intCast(accepted);
+        // The request read here: a session's open and close are this process's own.
+        var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const line = request_read(arena, connection) catch {
+            _ = linux.close(connection);
+            continue;
+        };
+        const request = std.json.parseFromSliceLeaky(Request, arena, line, .{ .ignore_unknown_fields = true }) catch null;
+        if (request) |asked| if (asked.session) |op| {
+            if (std.mem.eql(u8, op, "open") or std.mem.eql(u8, op, "close")) {
+                session_main(arena, connection, asked, op) catch |err| std.debug.print("[det-runner] a session: {t}\n", .{err});
+                _ = linux.close(connection);
+                continue;
+            }
+        };
         const pid = linux.fork();
         if (linux.errno(pid) != .SUCCESS) {
             _ = linux.close(connection);
@@ -53,7 +88,7 @@ pub fn main(init: std.process.Init) !void {
             _ = linux.close(listener);
             const default: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.DFL }, .mask = linux.sigemptyset(), .flags = 0 };
             _ = linux.sigaction(linux.SIG.CHLD, &default, null);
-            handle(connection) catch |err| std.debug.print("[det-runner] a request: {t}\n", .{err});
+            handle(arena, connection, request) catch |err| std.debug.print("[det-runner] a request: {t}\n", .{err});
             linux.exit_group(0);
         }
         _ = linux.close(connection);
@@ -73,20 +108,105 @@ fn listen(path: [:0]const u8) !linux.fd_t {
     return fd;
 }
 
-fn handle(connection: linux.fd_t) !void {
-    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const line = try request_read(arena, connection);
-    const request = std.json.parseFromSliceLeaky(Request, arena, line, .{ .ignore_unknown_fields = true }) catch {
+fn handle(arena: std.mem.Allocator, connection: linux.fd_t, parsed: ?Request) !void {
+    const request = parsed orelse {
         return reply_write(arena, connection, .{ .status = 2, .stdout = "", .stderr = "det-runner: not a request: {\"argv\": [...], \"stdin\"?: \"...\"}", .truncated = false });
     };
+    if (request.session) |op| return session_handler(arena, connection, request, op);
     if (request.argv.len == 0 or request.argv.len > argv_count_max) {
         return reply_write(arena, connection, .{ .status = 2, .stdout = "", .stderr = "det-runner: argv: 1 to 64 words", .truncated = false });
     }
     const result = try command_run(arena, request);
     sdk.event("runner_request", .{ .argv = request.argv, .status = result.status });
     try reply_write(arena, connection, result);
+}
+
+/// A session opened or closed (this process's: its commands are its children, their pipes kept
+/// here for the handlers that inherit them).
+fn session_main(arena: std.mem.Allocator, connection: linux.fd_t, request: Request, op: []const u8) !void {
+    if (std.mem.eql(u8, op, "close")) {
+        const id = request.id orelse return text_write(arena, connection, "{{\"error\":\"no id\"}}", .{});
+        if (id >= sessions_max or sessions[id] == null) return text_write(arena, connection, "{{\"error\":\"no session {d}\"}}", .{id});
+        const session = sessions[id].?;
+        sessions[id] = null;
+        _ = linux.kill(session.pid, signal_of(request.signal) orelse .TERM);
+        _ = linux.close(session.input);
+        _ = linux.close(session.output);
+        sdk.event("runner_session", .{ .op = "close", .id = id });
+        return text_write(arena, connection, "{{\"ok\":true}}", .{});
+    }
+    if (request.argv.len == 0 or request.argv.len > argv_count_max) return text_write(arena, connection, "{{\"error\":\"argv: 1 to 64 words\"}}", .{});
+    const slot = for (&sessions, 0..) |*slot, index| {
+        if (slot.* == null) break index;
+    } else return text_write(arena, connection, "{{\"error\":\"{d} sessions open\"}}", .{sessions_max});
+    const path = try executable_find(arena, request.argv[0]) orelse return text_write(arena, connection, "{{\"error\":\"not found\"}}", .{});
+    var argv: [argv_count_max:null]?[*:0]const u8 = @splat(null);
+    argv[0] = path;
+    for (request.argv[1..], 1..) |word, index| argv[index] = try arena.dupeSentinel(u8, word, 0);
+    var input: [2]i32 = undefined;
+    var output: [2]i32 = undefined;
+    for ([_]*[2]i32{ &input, &output }) |pipe| {
+        if (linux.errno(linux.pipe2(pipe, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
+    }
+    const pid = linux.fork();
+    if (linux.errno(pid) != .SUCCESS) return error.ForkFailed;
+    if (pid == 0) {
+        _ = linux.dup2(input[0], 0);
+        _ = linux.dup2(output[1], 1);
+        _ = linux.execve(path, &argv, &environment);
+        linux.exit_group(127);
+    }
+    _ = linux.close(input[0]);
+    _ = linux.close(output[1]);
+    sessions[slot] = .{ .pid = @intCast(pid), .input = input[1], .output = output[0] };
+    sdk.event("runner_session", .{ .op = "open", .id = slot, .argv = request.argv });
+    return text_write(arena, connection, "{{\"session\":{d}}}", .{slot});
+}
+
+/// A session's read (its next line of output) or write (to its input, and a signal): a
+/// handler's, the pipes inherited.
+fn session_handler(arena: std.mem.Allocator, connection: linux.fd_t, request: Request, op: []const u8) !void {
+    const id = request.id orelse return text_write(arena, connection, "{{\"error\":\"no id\"}}", .{});
+    if (id >= sessions_max or sessions[id] == null) return text_write(arena, connection, "{{\"error\":\"no session {d}\"}}", .{id});
+    const session = sessions[id].?;
+    if (std.mem.eql(u8, op, "read")) {
+        var line: std.ArrayList(u8) = .empty;
+        var ended = true;
+        while (line.items.len < output_size_max) {
+            var byte: [1]u8 = undefined;
+            const result = linux.read(session.output, &byte, 1);
+            if (linux.errno(result) == .INTR) continue;
+            if (linux.errno(result) != .SUCCESS or result == 0) break;
+            if (byte[0] == '\n') {
+                ended = false;
+                break;
+            }
+            try line.append(arena, byte[0]);
+        }
+        if (ended and line.items.len == 0) return text_write(arena, connection, "{{\"line\":null}}", .{});
+        return text_write(arena, connection, "{{\"line\":{f}}}", .{std.json.fmt(try utf8_valid(arena, line.items), .{})});
+    }
+    if (std.mem.eql(u8, op, "write")) {
+        if (request.input) |input| write_all(session.input, input) catch {};
+        if (signal_of(request.signal)) |signal| _ = linux.kill(session.pid, signal);
+        return text_write(arena, connection, "{{\"ok\":true}}", .{});
+    }
+    return text_write(arena, connection, "{{\"error\":\"session: open, read, write or close\"}}", .{});
+}
+
+fn signal_of(name: ?[]const u8) ?linux.SIG {
+    const given = name orelse return null;
+    const names = [_]struct { name: []const u8, signal: linux.SIG }{
+        .{ .name = "USR1", .signal = .USR1 }, .{ .name = "USR2", .signal = .USR2 },
+        .{ .name = "TERM", .signal = .TERM }, .{ .name = "INT", .signal = .INT },
+        .{ .name = "KILL", .signal = .KILL },
+    };
+    for (names) |known| if (std.mem.eql(u8, known.name, given)) return known.signal;
+    return null;
+}
+
+fn text_write(arena: std.mem.Allocator, fd: linux.fd_t, comptime format: []const u8, arguments: anytype) !void {
+    try write_all(fd, try std.fmt.allocPrint(arena, format ++ "\n", arguments));
 }
 
 /// The request's line: up to its newline or the connection's end.
@@ -250,6 +370,12 @@ test utf8_valid {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     try std.testing.expectEqualStrings("a\u{FFFD}b", try utf8_valid(arena_state.allocator(), "a\xffb"));
+}
+
+test signal_of {
+    try std.testing.expectEqual(linux.SIG.USR1, signal_of("USR1").?);
+    try std.testing.expect(signal_of("HUP") == null);
+    try std.testing.expect(signal_of(null) == null);
 }
 
 test executable_find {

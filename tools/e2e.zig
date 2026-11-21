@@ -3514,6 +3514,9 @@ fn check_repl(context: *Context) !void {
         // written (by a copy-on-write child, after the fork's evaluation returned): looked for
         // again as a person at the REPL would.
         "(loop [tries 0] (let [n (count (w/fork-runs 1))] (if (or (pos? n) (= tries 300)) n (do (Thread/sleep 100) (recur (inc tries))))))",
+        // A runner command that outlives a request (det-runner's sessions, holds' channel):
+        // cat opened, a line written to it and read back, closed.
+        "(let [s (w/session [\"cat\"])] (w/session-write s {:input \"echoed\\n\"}) (let [line (w/session-read s)] (w/session-close s) line))",
     };
     var values: [forms.len][]const u8 = undefined;
     var outputs: [forms.len][]const u8 = undefined;
@@ -3630,6 +3633,7 @@ fn check_repl(context: *Context) !void {
         .{ "a fork from the REPL answers 0 where it was asked", std.mem.eql(u8, values[8], "0") },
         .{ "its two futures ran from the clone, a run of serve's, each knowing it is one", futures_ran and std.mem.indexOf(u8, forks, "\"run\":") != null },
         .{ "the REPL finds its fork's run from inside the machine", std.mem.eql(u8, values[9], "1") },
+        .{ "a runner session echoes a line back (det-runner's sessions)", std.mem.eql(u8, values[10], "\"echoed\"") },
         // No value: what reached the client during that step is the exact timeline's (on srv4
         // after 43e4d4b9's guest image, an earlier request's late "state" status, id 11,
         // cider's changed-namespaces: no reply at all was asked, and it failed).
