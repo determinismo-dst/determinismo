@@ -112,15 +112,24 @@
 
 (cpp/raw "
 #include <cstdint>
+#include <dlfcn.h>
 #include <string>
 
+/* det_runner and det_runner_reply looked up as they are first called (the program's own
+   libdeterminismo, loaded with it): jank's JIT, which evaluates the namespaces as it compiles
+   them, links C++ here against no library, so a direct call missed their symbols there. */
 std::string determinismo_runner(std::string const &request) {
-  if (det_runner(request.data(), request.size()) != 0) return std::string();
+  using runner_fn = int32_t (*)(const char *, size_t);
+  using reply_fn = uint64_t (*)(uint8_t *, size_t);
+  static runner_fn runner = reinterpret_cast<runner_fn>(dlsym(RTLD_DEFAULT, \"det_runner\"));
+  static reply_fn reply_of = reinterpret_cast<reply_fn>(dlsym(RTLD_DEFAULT, \"det_runner_reply\"));
+  if (runner == nullptr || reply_of == nullptr) return std::string();
+  if (runner(request.data(), request.size()) != 0) return std::string();
   std::string reply(65536, '\\0');
-  uint64_t size = det_runner_reply(reinterpret_cast<uint8_t *>(reply.data()), reply.size());
+  uint64_t size = reply_of(reinterpret_cast<uint8_t *>(reply.data()), reply.size());
   if (size > reply.size()) {
     reply.assign(size, '\\0');
-    size = det_runner_reply(reinterpret_cast<uint8_t *>(reply.data()), reply.size());
+    size = reply_of(reinterpret_cast<uint8_t *>(reply.data()), reply.size());
   }
   reply.resize(size < reply.size() ? size : reply.size());
   return reply;
@@ -273,6 +282,19 @@ bool determinismo_field_is_string(std::string const &json, std::string const &ke
   "Lets every held thread go and ends the hold."
   [{:keys [session]}]
   (session-close session))
+
+(defn field-string
+  "A JSON object's string field (a reply's), its escapes decoded; \"\" when absent or not a
+  string."
+  [json key]
+  (cpp/determinismo_field_string json (name key)))
+
+(defn field-int
+  "A JSON object's non-negative integer field (a term, an index, a status); nil when absent,
+  negative or not an integer."
+  [json key]
+  (let [value (cpp/determinismo_field_int json (name key))]
+    (when-not (neg? value) value)))
 
 (defn decide
   "One of options, a named decision (strategies steer it, replays repeat it)."

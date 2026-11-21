@@ -1,0 +1,121 @@
+; SPDX-License-Identifier: MIT
+; A line protocol's client from jank, as the Zig SDK's tcp.request_line_with: one request on a new
+; connection, its first line of reply, each step bounded by a timeout (virtual time in the
+; guest). A node's address is read from /etc/hosts at each request, the last line naming it, as
+; the Zig SDK's address_now (the runner rewrites the file as nodes move).
+(ns determinismo.tcp)
+
+(cpp/raw "
+#include <arpa/inet.h>
+#include <cerrno>
+#include <cstdint>
+#include <ctime>
+#include <fcntl.h>
+#include <fstream>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sstream>
+#include <string>
+#include <sys/socket.h>
+#include <unistd.h>
+
+/* A name's IPv4 address: itself when it is one, else /etc/hosts' last line naming it; \"\" when
+   none. */
+std::string determinismo_tcp_address(std::string const &name) {
+  in_addr parsed;
+  if (inet_pton(AF_INET, name.c_str(), &parsed) == 1) return name;
+  std::ifstream hosts(\"/etc/hosts\");
+  std::string line, found;
+  while (std::getline(hosts, line)) {
+    std::istringstream fields(line);
+    std::string address, alias;
+    if (!(fields >> address)) continue;
+    while (fields >> alias)
+      if (alias == name) found = address;
+  }
+  return found;
+}
+
+static int64_t determinismo_tcp_now_ms() {
+  timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return int64_t(now.tv_sec) * 1000 + now.tv_nsec / 1000000;
+}
+
+/* Waits for events on fd until the deadline: whether they came. */
+static bool determinismo_tcp_wait(int fd, short events, int64_t deadline) {
+  for (;;) {
+    int64_t left = deadline - determinismo_tcp_now_ms();
+    if (left <= 0) return false;
+    pollfd p{fd, events, 0};
+    int n = poll(&p, 1, int(left));
+    if (n > 0) return true;
+    if (n == 0) return false;
+    if (errno != EINTR) return false;
+  }
+}
+
+/* The request written on a new connection to name:port, the reply's first line (without its
+   newline) returned; \"\" when it failed: no address, refused, a timeout, the connection closed
+   before a newline. Each step (connect, write, read) bounded by timeout_ms. */
+std::string determinismo_tcp_request_line(std::string const &name, int64_t port, std::string const &request, int64_t timeout_ms) {
+  std::string address = determinismo_tcp_address(name);
+  if (address.empty()) return std::string();
+  sockaddr_in to{};
+  to.sin_family = AF_INET;
+  to.sin_port = htons(uint16_t(port));
+  if (inet_pton(AF_INET, address.c_str(), &to.sin_addr) != 1) return std::string();
+  int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+  if (fd < 0) return std::string();
+  std::string reply;
+  bool ok = false;
+  do {
+    if (connect(fd, reinterpret_cast<sockaddr *>(&to), sizeof to) != 0) {
+      if (errno != EINPROGRESS) break;
+      if (!determinismo_tcp_wait(fd, POLLOUT, determinismo_tcp_now_ms() + timeout_ms)) break;
+      int error = 0;
+      socklen_t size = sizeof error;
+      if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) != 0 || error != 0) break;
+    }
+    size_t sent = 0;
+    int64_t deadline = determinismo_tcp_now_ms() + timeout_ms;
+    while (sent < request.size()) {
+      ssize_t n = send(fd, request.data() + sent, request.size() - sent, MSG_NOSIGNAL);
+      if (n > 0) { sent += size_t(n); continue; }
+      if (n < 0 && (errno == EAGAIN || errno == EINTR) && determinismo_tcp_wait(fd, POLLOUT, deadline)) continue;
+      break;
+    }
+    if (sent < request.size()) break;
+    deadline = determinismo_tcp_now_ms() + timeout_ms;
+    char chunk[4096];
+    for (;;) {
+      ssize_t n = recv(fd, chunk, sizeof chunk, 0);
+      if (n > 0) {
+        reply.append(chunk, size_t(n));
+        size_t end = reply.find('\\n');
+        if (end != std::string::npos) { reply.resize(end); ok = true; break; }
+        if (reply.size() > (1u << 20)) break;
+        continue;
+      }
+      if (n < 0 && (errno == EAGAIN || errno == EINTR) && determinismo_tcp_wait(fd, POLLIN, deadline)) continue;
+      break;
+    }
+  } while (false);
+  close(fd);
+  return ok ? reply : std::string();
+}
+")
+
+(defn address
+  "A node's IPv4 address now (/etc/hosts' last line naming it), nil when none."
+  [node]
+  (let [found (cpp/determinismo_tcp_address (name node))]
+    (when-not (= "" found) found)))
+
+(defn request-line
+  "request (ending in a newline, as line APIs read) written on a new connection to node:port: the
+  reply's first line, without its newline; nil when it failed (no address, refused, a timeout of
+  timeout-ms at a step, closed before a line). A node is a name or an address."
+  [node port request timeout-ms]
+  (let [reply (cpp/determinismo_tcp_request_line (name node) port request timeout-ms)]
+    (when-not (= "" reply) reply)))
