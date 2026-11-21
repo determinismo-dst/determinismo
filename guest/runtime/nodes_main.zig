@@ -35,7 +35,8 @@ const usage =
     \\       det-nodes list
     \\       det-nodes symbol <node> <name> [--field <path>] [--pid <pid>]
     \\       det-nodes hold <node> <function> [--caller <function>] [--arg <register>=<value>]
-    \\                      [--arg-field <register>:<type>:<path>=<value>] [--repeat] [--every] [--direct]
+    \\                      [--arg-field <register>:<type>:<path>=<value>]
+    \\                      [--arg-string <register>:<register>=<text>] [--repeat] [--every] [--direct]
     \\                      [--and <function> [--caller ...] [--arg ...]]... [--pid <pid>] [--timeout-ms <ms>]
     \\       det-nodes where <node> <address>... [--pid <pid>] [--return]
     \\       det-nodes cfi <node> <pc> <return address>... [--pid <pid>]

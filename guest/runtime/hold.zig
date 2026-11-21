@@ -19,6 +19,10 @@
 //! a number for an integer, a boolean or a pointer (of its size); the text for a Go string (its
 //! pointer and length) — a call told apart by what its argument holds, not the argument itself
 //! (a replication to one follower among the leader's goroutines, all in the same function).
+//! `--arg-string <register>:<register>=<text>`: only a thread whose string argument, its data's
+//! pointer and its length in those registers (Go passes a string in two: `target ServerAddress`
+//! of NetworkTransport.RequestVote in rdi and rsi), is that text: one peer's request among the
+//! goroutines sending a campaign's.
 //! `--repeat`: once its thread is let go, the point holds the next one that matches (a writer
 //! kept from landing again while the rest goes on). `--every`: every thread that matches is held
 //! until the end (all of a node's sends of a message kept from leaving). `--direct`: the caller
@@ -80,6 +84,9 @@ const register_names = [_]struct { name: []const u8, index: u8 }{
 
 pub const Arg = struct { index: u8, value: u64 };
 
+/// `--arg-string`: a string argument by its pointer's and its length's registers.
+pub const ArgString = struct { pointer: u8, length: u8, value: []const u8 };
+
 /// `--arg-field`, as given.
 pub const ArgField = struct { index: u8, type_name: []const u8, path: []const u8, value: []const u8 };
 
@@ -97,6 +104,7 @@ pub const PointOptions = struct {
     caller: ?[]const u8 = null,
     arg: ?Arg = null,
     field: ?ArgField = null,
+    string: ?ArgString = null,
     /// Once its thread is let go, the point holds the next one that matches.
     repeat: bool = false,
     /// Every thread that matches is held (until the end), not only the first.
@@ -148,6 +156,8 @@ pub fn parse(node: []const u8, function: []const u8, rest: []const []const u8) !
             point.arg = try arg_parse(value);
         } else if (std.mem.eql(u8, name, "--arg-field")) {
             point.field = try arg_field_parse(value);
+        } else if (std.mem.eql(u8, name, "--arg-string")) {
+            point.string = try arg_string_parse(value);
         } else if (std.mem.eql(u8, name, "--pid")) {
             options.pid = try std.fmt.parseInt(linux.pid_t, value, 10);
         } else if (std.mem.eql(u8, name, "--timeout-ms")) {
@@ -178,6 +188,18 @@ fn arg_field_parse(text: []const u8) !ArgField {
     const value = field[equals + 1 ..];
     if (value.len > field_text_max) return error.Usage;
     return .{ .index = index, .type_name = rest[0..second], .path = field[0..equals], .value = value };
+}
+
+/// `<register>:<register>=<text>`: the pointer's register, the length's, then the text.
+fn arg_string_parse(text: []const u8) !ArgString {
+    const equals = std.mem.indexOfScalar(u8, text, '=') orelse return error.Usage;
+    const registers = text[0..equals];
+    const colon = std.mem.indexOfScalar(u8, registers, ':') orelse return error.Usage;
+    const pointer = register_index(registers[0..colon]) orelse return error.UnknownRegister;
+    const length = register_index(registers[colon + 1 ..]) orelse return error.UnknownRegister;
+    const value = text[equals + 1 ..];
+    if (value.len > field_text_max) return error.Usage;
+    return .{ .pointer = pointer, .length = length, .value = value };
 }
 
 /// The field's place in the module's DWARF and the value it must hold, as its kind reads it.
@@ -258,6 +280,7 @@ const Point = struct {
     caller: ?[2]u64,
     arg: ?Arg,
     field: ?FieldMatch = null,
+    string: ?ArgString = null,
     repeat: bool,
     every: bool,
     direct: bool,
@@ -316,6 +339,15 @@ const Hold = struct {
         return linux.errno(read) == .SUCCESS and read == bytes.len;
     }
 
+    /// Whether `length` bytes at `data` are `text`.
+    fn text_at(hold: *const Hold, data: u64, length: u64, text: []const u8) bool {
+        if (length != text.len) return false;
+        if (text.len == 0) return true;
+        var buffer: [field_text_max]u8 = undefined;
+        if (!hold.bytes_read(data, buffer[0..text.len])) return false;
+        return std.mem.eql(u8, buffer[0..text.len], text);
+    }
+
     /// Whether the field behind a register holds the value asked for.
     fn field_holds(hold: *const Hold, field: *const FieldMatch, regs: *const Regs) bool {
         const base = regs[field.index];
@@ -331,11 +363,7 @@ const Hold = struct {
             .text => |text| {
                 const data = hold.word_read(at) orelse return false;
                 const length = hold.word_read(at + 8) orelse return false;
-                if (length != text.len) return false;
-                if (text.len == 0) return true;
-                var buffer: [field_text_max]u8 = undefined;
-                if (!hold.bytes_read(data, buffer[0..text.len])) return false;
-                return std.mem.eql(u8, buffer[0..text.len], text);
+                return hold.text_at(data, length, text);
             },
         }
     }
@@ -356,6 +384,9 @@ const Hold = struct {
         }
         if (point.field) |*field| {
             if (!hold.field_holds(field, regs)) return false;
+        }
+        if (point.string) |string| {
+            if (!hold.text_at(regs[string.pointer], regs[string.length], string.value)) return false;
         }
         const range = point.caller orelse return true;
         const first = hold.word_read(regs[rsp_index]) orelse return false;
@@ -537,7 +568,7 @@ pub fn run(arena: std.mem.Allocator, options: Options) !u8 {
         var original: [1]u8 = undefined;
         if (linux.pread(hold.memory, &original, 1, @bitCast(found.address)) != 1) return error.Memory;
         assert(original[0] != int3);
-        hold.points[hold.count] = .{ .entry = found.address, .original = original[0], .caller = caller, .arg = asked.arg, .field = field, .repeat = asked.repeat, .every = asked.every, .direct = asked.direct };
+        hold.points[hold.count] = .{ .entry = found.address, .original = original[0], .caller = caller, .arg = asked.arg, .field = field, .string = asked.string, .repeat = asked.repeat, .every = asked.every, .direct = asked.direct };
         hold.count += 1;
     }
 
@@ -654,6 +685,25 @@ test arg_field_parse {
     try std.testing.expectError(error.Usage, parse("n", "f", &.{ "--arg-field", "rbx:T=1" }));
     try std.testing.expectError(error.Usage, parse("n", "f", &.{ "--arg-field", "rbx:T:=1" }));
     try std.testing.expectError(error.UnknownRegister, parse("n", "f", &.{ "--arg-field", "xmm0:T:a=1" }));
+}
+
+test "a string argument by its registers" {
+    const options = try parse("n", "github.com/hashicorp/raft.(*NetworkTransport).RequestVote", &.{ "--arg-string", "rdi:rsi=raft-node-1:8300" });
+    const string = options.points[0].string.?;
+    try std.testing.expectEqual(@as(u8, 14), string.pointer);
+    try std.testing.expectEqual(@as(u8, 13), string.length);
+    try std.testing.expectEqualStrings("raft-node-1:8300", string.value);
+    try std.testing.expectError(error.Usage, parse("n", "f", &.{ "--arg-string", "rdi=x" }));
+    try std.testing.expectError(error.UnknownRegister, parse("n", "f", &.{ "--arg-string", "rdi:xmm1=x" }));
+    // Matched against this process's memory: the text's own bytes, then another length.
+    const memory = linux.open("/proc/self/mem", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(memory));
+    defer _ = linux.close(@intCast(memory));
+    const hold: Hold = .{ .pid = linux.getpid(), .memory = @intCast(memory) };
+    const text: []const u8 = "raft-node-1:8300";
+    try std.testing.expect(hold.text_at(@intFromPtr(text.ptr), text.len, "raft-node-1:8300"));
+    try std.testing.expect(!hold.text_at(@intFromPtr(text.ptr), text.len, "raft-node-2:8300"));
+    try std.testing.expect(!hold.text_at(@intFromPtr(text.ptr), text.len - 1, "raft-node-1:8300"));
 }
 
 test field_number {
