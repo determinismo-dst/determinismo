@@ -37,6 +37,7 @@ pub const schema = @import("schema.zig");
 const system = @import("system.zig");
 pub const System = system.System;
 pub const Node = system.Node;
+pub const Hold = system.Hold;
 pub const Output = system.Output;
 pub const Check = system.Check;
 /// TCP connections with timeouts, for protocol clients (see tcp.zig).

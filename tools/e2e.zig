@@ -214,7 +214,7 @@ fn scratches_sweep(io: std.Io, arena: std.mem.Allocator, scratches: []const u8) 
 /// and counts them.
 fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
     const checks = .{
-        .{ "bank", check_bank },                             .{ "shop", check_shop },
+        .{ "bank", check_bank },                             .{ "hold", check_hold },                             .{ "shop", check_shop },
         .{ "tapes", check_tapes },                           .{ "debugging", check_debugging },
         .{ "python", check_python_strategy },                .{ "setup-decisions", check_setup_decisions },
         .{ "machine-decisions", check_machine_decisions },   .{ "branch-seeds", check_branch_seeds },
@@ -7271,6 +7271,26 @@ fn check_interleave(context: *Context) !void {
     if (!passes) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
         "FAIL", "fault_failed", "fault_inject_refused", "races", "always",
     }) catch ""});
+}
+
+/// det-nodes hold through the SDK's Node.hold: the two-thread race of examples/race/race_held.zig,
+/// each thread held at `act` until both checked a zero, then let go: the race in every timeline
+/// (blind, nearly never). Red without the hold (no `det-nodes hold`: the driver's hold is never
+/// armed and the program never fails).
+fn check_hold(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "race-test" });
+    const timelines = 4;
+    const report = try explore(context, &.{
+        "--program", program, "--profile",  "held", "--scenario", "held",
+        "--seed",    "1",     "--branches", "4",
+    });
+    var branches: [timelines]Branch = undefined;
+    const count = parse_branches(report, &branches);
+    const crashed = failing_in(report, "no process crashes: race-held") orelse 0;
+    expect_all(context, &.{
+        .{ "every timeline explored", count == timelines },
+        .{ "every timeline has the race", count > 0 and crashed == count },
+    }, "hold: {d} of {d} timelines failing \"no process crashes: race-held\"", .{ crashed, count });
 }
 
 /// Thread pausing at the instrumentation's callbacks, in every language instrumented by

@@ -485,6 +485,17 @@ pub fn build(b: *std.Build) void {
     race_zig.sanitize_coverage_trace_pc_guard = true;
     race_zig.use_llvm = true;
     phases.node_binary(b, "race-test", race_zig);
+    // The race reduced to two threads and split at its decision (check, act), for the profile
+    // `held`: Node.hold makes it every time. Debug: its functions stay functions.
+    const race_held = b.addExecutable(.{
+        .name = "race-held",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/race/race_held.zig"),
+            .target = target,
+            .optimize = .Debug,
+        }),
+    });
+    phases.node_binary(b, "race-test", race_held);
 
     // The guest's base initramfs, built on the host from the guest runtime above.
     const initramfs = b.addExecutable(.{

@@ -28,7 +28,7 @@ const Nodes = struct { race: sdk.Node };
 const System = sdk.System(Nodes);
 
 pub fn main(init: std.process.Init) !void {
-    return System.main(init, .{ .describe = describe, .scenarios = .{ .race = race } });
+    return System.main(init, .{ .describe = describe, .scenarios = .{ .race = race, .held = held } });
 }
 
 fn describe(d: *System.Describe) !void {
@@ -83,6 +83,35 @@ fn describe(d: *System.Describe) !void {
     });
     const zig = try d.profile("zig");
     zig.node(.race, .{ .binary = "zig-out/bin/race-zig", .faults = faults });
+    // The two-thread race (examples/race/race_held.zig) for scenario `held`: no fault drawn,
+    // its threads ordered by Node.hold alone.
+    const held_profile = try d.profile("held");
+    held_profile.node(.race, .{ .binary = "zig-out/bin/race-held", .faults = faults });
+}
+
+/// Scenario `held` (profile `held`): Node.hold on `race_held.act`, every thread that enters it
+/// held until both of a run's threads did, then all let go: both checked a zero, both
+/// increment, and the program panics, in every timeline. The platform's control for a race
+/// inside a process (det-nodes hold), where blind exploration nearly never finds it.
+fn held(s: *System.Scenario) void {
+    s.faults = false;
+    s.singleton_driver("hold", hold_both);
+}
+
+fn hold_both(context: *System.Context) !void {
+    sdk.sleep_ms(200 + sdk.random_below(800));
+    const hold = try context.nodes.race.hold(&.{ "race_held.act", "--every" }, 10_000);
+    if (!hold.armed()) {
+        hold.release();
+        return error.NotArmed;
+    }
+    const first = hold.held(0);
+    const second = first and hold.held(0);
+    hold.release();
+    sdk.event("race_held", .{ .first = first, .second = second });
+    // The program's run goes on from the threads' release to its check (and panic) within the
+    // timeline: a driver that returned at once ended it first.
+    sdk.sleep_ms(1000);
 }
 
 fn race(s: *System.Scenario) void {

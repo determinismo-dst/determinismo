@@ -117,6 +117,17 @@ pub const Node = struct {
         return nodes_command(&.{ "upgrade", node.name, @tagName(to) });
     }
 
+    /// Holds threads of its process where `points` say (`det-nodes hold`: a function, then
+    /// `--caller <f>`, `--arg <register>=<value>`, `--repeat`, `--every`, `--direct`, and `--and
+    /// <function> ...` for another point; guest/runtime/hold.zig): each point's thread stays at
+    /// its function's entry, the rest of the process running on, until released. A race inside
+    /// a process caused rather than waited for. A held Go thread keeps its P: a Go node held this
+    /// way runs with GOMAXPROCS of 2 or more and GOGC=off. Call `armed` before what the hold must
+    /// see happen.
+    pub fn hold(node: *const Node, points: []const []const u8, timeout_ms: u64) !Hold {
+        return Hold.start(node.name, points, timeout_ms);
+    }
+
     /// Whether its process runs now (its pidfile names a live process): a spare not started
     /// yet, a node a fault or a driver stopped, one whose process exited, are not.
     pub fn running(node: *const Node) bool {
@@ -758,6 +769,95 @@ test hosts_address {
 }
 
 const argument_size_max = 1024;
+
+/// A `det-nodes hold` running (Node.hold): its JSON lines read as they come, its points released
+/// by `release <n>` on its input and SIGUSR1, all of them on SIGTERM.
+pub const Hold = struct {
+    pid: linux.pid_t,
+    output: linux.fd_t,
+    input: linux.fd_t,
+
+    fn start(node: []const u8, points: []const []const u8, timeout_ms: u64) !Hold {
+        assert(points.len > 0 and points.len + 5 <= exec_arguments_max);
+        var timeout: [24]u8 = undefined;
+        var arguments: [exec_arguments_max][]const u8 = undefined;
+        arguments[0] = "hold";
+        arguments[1] = node;
+        for (points, arguments[2..][0..points.len]) |point, *target| target.* = point;
+        arguments[2 + points.len] = "--timeout-ms";
+        arguments[3 + points.len] = try std.fmt.bufPrint(&timeout, "{d}", .{timeout_ms});
+        const count = points.len + 4;
+        var storage: [exec_arguments_max][argument_size_max]u8 = undefined;
+        var argv: [exec_arguments_max:null]?[*:0]const u8 = @splat(null);
+        argv[0] = nodes_binary;
+        for (arguments[0..count], 1..) |argument, index| {
+            argv[index] = try std.fmt.bufPrintSentinel(&storage[index], "{s}", .{argument}, 0);
+        }
+        const environment = [_:null]?[*:0]const u8{"PATH=/opt/determinismo/bin:/usr/bin:/bin"};
+        var output: [2]linux.fd_t = .{ -1, -1 };
+        var input: [2]linux.fd_t = .{ -1, -1 };
+        if (linux.errno(linux.pipe2(&output, .{ .CLOEXEC = true })) != .SUCCESS) return error.Pipe;
+        if (linux.errno(linux.pipe2(&input, .{ .CLOEXEC = true })) != .SUCCESS) return error.Pipe;
+        const pid = linux.fork();
+        if (linux.errno(pid) != .SUCCESS) return error.Fork;
+        if (pid == 0) {
+            _ = linux.dup2(output[1], 1);
+            _ = linux.dup2(input[0], 0);
+            _ = linux.execve(nodes_binary, &argv, &environment);
+            linux.exit_group(127);
+        }
+        _ = linux.close(output[1]);
+        _ = linux.close(input[0]);
+        return .{ .pid = @intCast(pid), .output = output[0], .input = input[1] };
+    }
+
+    fn line(hold: *const Hold, buffer: []u8) []const u8 {
+        var size: usize = 0;
+        while (size < buffer.len) {
+            const result = linux.read(hold.output, buffer[size..].ptr, 1);
+            if (linux.errno(result) != .SUCCESS or result == 0) break;
+            if (buffer[size] == '\n') break;
+            size += 1;
+        }
+        return buffer[0..size];
+    }
+
+    /// Its first line: whether its breakpoints are in (false: a function not found, no thread).
+    pub fn armed(hold: *const Hold) bool {
+        var buffer: [256]u8 = undefined;
+        return std.mem.startsWith(u8, hold.line(&buffer), "{\"armed\":");
+    }
+
+    /// Its lines until a thread is held at point `point` (true), or none will be (its timeout,
+    /// its end).
+    pub fn held(hold: *const Hold, point: u32) bool {
+        var expected: [24]u8 = undefined;
+        const suffix = std.fmt.bufPrint(&expected, "\"point\":{d}}}", .{point}) catch unreachable;
+        while (true) {
+            var buffer: [256]u8 = undefined;
+            const said = hold.line(&buffer);
+            if (said.len == 0 or std.mem.startsWith(u8, said, "{\"held\":null")) return false;
+            if (std.mem.startsWith(u8, said, "{\"held\":") and std.mem.endsWith(u8, said, suffix)) return true;
+        }
+    }
+
+    /// Lets point `point`'s thread go on, the others held still.
+    pub fn release_point(hold: *const Hold, point: u32) void {
+        var command: [24]u8 = undefined;
+        const text = std.fmt.bufPrint(&command, "release {d}\n", .{point}) catch unreachable;
+        _ = linux.write(hold.input, text.ptr, text.len);
+        _ = linux.kill(hold.pid, .USR1);
+    }
+
+    /// Lets every held thread go, and waits for the command's end.
+    pub fn release(hold: *const Hold) void {
+        _ = linux.kill(hold.pid, .TERM);
+        var status: i32 = 0;
+        _ = linux.waitpid(hold.pid, &status, 0);
+        _ = linux.close(hold.output);
+        _ = linux.close(hold.input);
+    }
+};
 
 fn nodes_command(arguments: []const []const u8) !void {
     if ((try nodes_run(arguments, null, .stdout)).status != 0) return error.NodeCommandFailed;
