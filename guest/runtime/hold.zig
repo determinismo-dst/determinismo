@@ -57,6 +57,7 @@ const ptrace_o_traceclone = 0x8;
 const ptrace_event_clone = 3;
 const ptrace_event_stop = 128;
 const wait_all = 0x40000000; // __WALL: threads too.
+const wait_no_hang = 1; // WNOHANG
 const signal_trap = 5;
 const int3: u8 = 0xcc;
 const processes_max = 1024;
@@ -273,6 +274,9 @@ fn on_release_some(_: linux.SIG) callconv(.c) void {
 fn on_alarm(_: linux.SIG) callconv(.c) void {
     timed_out.store(true, .release);
 }
+
+/// SIGCHLD (a tracee stopped or exited): only to wake the wait below.
+fn on_child(_: linux.SIG) callconv(.c) void {}
 
 const Point = struct {
     entry: u64,
@@ -591,6 +595,16 @@ pub fn run(arena: std.mem.Allocator, options: Options) !u8 {
     _ = linux.sigaction(.USR1, &some_action, null);
     const alarm_action = linux.Sigaction{ .handler = .{ .handler = on_alarm }, .mask = linux.sigemptyset(), .flags = 0 };
     _ = linux.sigaction(.ALRM, &alarm_action, null);
+    const child_action = linux.Sigaction{ .handler = .{ .handler = on_child }, .mask = linux.sigemptyset(), .flags = 0 };
+    _ = linux.sigaction(.CHLD, &child_action, null);
+    // Blocked but while waiting (ppoll below unblocks them atomically): a release asked between
+    // the loop's checks and its wait is pending, not lost. Before, the wait was a blocking
+    // wait4, and a SIGUSR1 landing just before it was seen only at the tracees' next stop (a
+    // walk's late write let go only when the walk ended: two_leaders_trace, tl-data run 1).
+    var waking = linux.sigemptyset();
+    inline for (.{ linux.SIG.TERM, linux.SIG.INT, linux.SIG.USR1, linux.SIG.ALRM, linux.SIG.CHLD }) |signal| linux.sigaddset(&waking, signal);
+    _ = linux.sigprocmask(linux.SIG.BLOCK, &waking, null);
+    const open = linux.sigemptyset();
     _ = linux.syscall1(.alarm, @max(1, (options.timeout_ms + 999) / 1000));
     // The release commands' input, read without waiting.
     const input_flags = linux.fcntl(0, linux.F.GETFL, 0);
@@ -617,9 +631,15 @@ pub fn run(arena: std.mem.Allocator, options: Options) !u8 {
             }
         }
         var status: i32 = 0;
-        const result = linux.wait4(-1, &status, wait_all, null);
+        const result = linux.wait4(-1, &status, wait_all | wait_no_hang, null);
         if (linux.errno(result) == .INTR) continue;
         if (linux.errno(result) != .SUCCESS) break; // No tracee left.
+        if (result == 0) {
+            // Nothing stopped: wait for a signal (a tracee's stop is SIGCHLD), the blocked ones
+            // let through for the wait only.
+            _ = linux.ppoll(&.{}, 0, null, &open);
+            continue;
+        }
         const tid: linux.pid_t = @intCast(result);
         const word: u32 = @bitCast(status);
         if (!linux.W.IFSTOPPED(word)) {
