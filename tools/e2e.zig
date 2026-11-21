@@ -263,7 +263,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "ingress-checkpoint", check_ingress_checkpoint }, .{ "ingress-crash", check_ingress_crash },         .{ "draws", check_draws },
         .{ "exit-stack", check_exit_stack },                 .{ "plan-calls", check_plan_calls },               .{ "services", check_services },
         .{ "sites", check_sites },                           .{ "client", check_client },                       .{ "session-exact", check_session_exact },
-        .{ "java-watch", check_java_watch },
+        .{ "java-watch", check_java_watch },                 .{ "raft-558", check_raft_558 },
     };
     // A check's whole name runs it alone (check.sh's `ui` ran guidance and quiet too).
     var exact = std.mem.eql(u8, only, "tla");
@@ -7298,6 +7298,29 @@ fn check_interleave(context: *Context) !void {
 /// each thread held at `act` until both checked a zero, then let go: the race in every timeline
 /// (blind, nearly never). Red without the hold (no `det-nodes hold`: the driver's hold is never
 /// armed and the program never fails).
+/// etcd-io/raft#558 made to happen with thread holds (examples/etcd-raft-joint, scenario
+/// joint_crash, profile holds): a follower frozen across a joint configuration change's two
+/// entries, held at its HardState write and crashed there, then elected in the old
+/// configuration: two replicas apply different entries at one index. In most fresh timelines
+/// (the walk's timings are drawn: 3 of 4 at seed 1); every one of a tree's that branched past
+/// the crash (the walk's first run: 1,433 of 1,433).
+fn check_raft_558(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "etcd-raft-joint-test" });
+    const timelines = 4;
+    const report = try explore(context, &.{
+        "--program", program, "--profile",  "holds", "--scenario",   "joint_crash",
+        "--seed",    "1",     "--branches", "4",     "--memory-mib", "3072",
+    });
+    var branches: [timelines]Branch = undefined;
+    const count = parse_branches(report, &branches);
+    const property = "replicas agree on the entries they applied";
+    const failing = failing_in(report, property) orelse 0;
+    expect_all(context, &.{
+        .{ "every timeline explored", count == timelines },
+        .{ "the issue's divergence in at least half the timelines", count > 0 and failing * 2 >= count },
+    }, "raft-558: {d} of {d} timelines failing \"{s}\"", .{ failing, count, property });
+}
+
 fn check_hold(context: *Context) !void {
     const program = try std.fs.path.join(context.arena, &.{ context.bin, "race-test" });
     const timelines = 4;

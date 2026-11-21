@@ -44,7 +44,7 @@ repo=$(cd "$(dirname "$0")/../.." && pwd)
 ssh_opts=(-o BatchMode=yes -o ConnectTimeout=15)
 # What the e2e checks run: determinismo's phases (the runner among the self-tests) and the
 # workloads its checks name (build.zig's e2e_workloads).
-steps=(determinismo guest selftest bank-test shop-test clojure-bank-test k3s-test race-test nrepl-test)
+steps=(determinismo guest selftest bank-test shop-test clojure-bank-test k3s-test race-test nrepl-test etcd-raft-joint-test)
 
 if [ "$build_on" = here ]; then
   echo "== the build, here"

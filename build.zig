@@ -190,6 +190,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "clojure-bank-test", .path = "examples/clojure-bank/clojure_bank_test.zig" },
         .{ .name = "k3s-test", .path = "examples/k3s/k3s_test.zig" },
         .{ .name = "raft-test", .path = "examples/raft/raft_test.zig" },
+        .{ .name = "etcd-raft-joint-test", .path = "examples/etcd-raft-joint/etcd_raft_joint_test.zig" },
         .{ .name = "race-test", .path = "examples/race/race_test.zig" },
         .{ .name = "nrepl-test", .path = "examples/nrepl/nrepl_test.zig" },
         .{ .name = "det-selftest", .path = "tests/selftest/selftest.zig" },
@@ -954,7 +955,7 @@ fn wamr_link(b: *std.Build, module: *std.Build.Module) void {
 const wasm_memory_max = 256 << 20;
 
 /// The example workloads the e2e checks run (tools/e2e.zig's programs from zig-out/bin).
-const e2e_workloads = [_][]const u8{ "bank-test", "shop-test", "clojure-bank-test", "k3s-test", "race-test", "nrepl-test" };
+const e2e_workloads = [_][]const u8{ "bank-test", "shop-test", "clojure-bank-test", "k3s-test", "race-test", "nrepl-test", "etcd-raft-joint-test" };
 
 const Phases = struct {
     determinismo: *std.Build.Step,
