@@ -9390,6 +9390,59 @@ test "while a judgment's nodes are made and nothing is planned, a CPU takes a fr
     try std.testing.expectEqual(@as(u32, 302), (try queue_take(arena, &state, true, setup)).?.index);
 }
 
+test "a judgment's made nodes start their branches whatever their order: a slow first one holds none back" {
+    // Run 2114 (the #558 harness, 2026-11-21): a generation's first node took 806 s to replay
+    // (a return to 995 s of a generation-0 timeline, no holder left) while its other five were
+    // made in seconds; planned as a prefix, none of their branches could start, and the judgment
+    // waited 807 s with the CPUs on fillers.
+    const arena = std.testing.allocator;
+    var state: TreeState = undefined;
+    state.queue = .empty;
+    state.queue_head = 0;
+    state.filler_start = 0;
+    state.users = .empty;
+    state.base = 7;
+    state.children = 2;
+    state.next_index = 100;
+    state.total = 200;
+    state.tape_directory = null;
+    defer state.queue.deinit(arena);
+    defer state.users.deinit(arena);
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    var arguments: Arguments = .{ .command = .explore };
+    var branches: Branches = undefined;
+    branches.arguments = &arguments;
+    const node: *const Snapshot = @ptrFromInt(2 * @alignOf(Snapshot));
+    const parent: Planned = .{ .index = 40, .seed = 1, .snapshot = @ptrFromInt(@alignOf(Snapshot)) };
+    var makings = [_]NodeMaking{
+        .{ .back = .{ .branch = 40, .vtime_ns = 995 * std.time.ns_per_s, .why = "far" }, .parent = parent },
+        .{ .back = .{ .branch = 40, .vtime_ns = 10 * std.time.ns_per_s, .why = "near" }, .parent = parent, .ready = true, .snapshot = node },
+    };
+    var judging: Judging = undefined;
+    judging.generation = 9;
+    judging.makings = &makings;
+    judging.making_count = makings.len;
+    judging.planned = 0;
+    judging.branches_planned = 0;
+    judging.made = .{};
+    try judge_plan_ready(arena_state.allocator(), branches, &state, &judging);
+    // The second node's two branches queued, though the first is still being made.
+    try std.testing.expectEqual(@as(u32, 1), judging.planned);
+    try std.testing.expectEqual(@as(u32, 2), judging.branches_planned);
+    const first = queue_next(&state).?;
+    try std.testing.expectEqual(node, first.snapshot);
+    try std.testing.expectEqual(@as(u32, 100), first.index);
+    try std.testing.expectEqual(@as(u32, 101), queue_next(&state).?.index);
+    // Planned once: the first node, made later, plans its own two after them.
+    makings[0].ready = true;
+    makings[0].snapshot = node;
+    try judge_plan_ready(arena_state.allocator(), branches, &state, &judging);
+    try std.testing.expectEqual(@as(u32, 2), judging.planned);
+    try std.testing.expectEqual(@as(u32, 4), judging.branches_planned);
+    try std.testing.expectEqual(@as(u32, 102), queue_next(&state).?.index);
+}
+
 test "no fresh timeline starts while a judgment's makers wait for memory; a planned one still does" {
     // Run 2106 (etcd, 2026-11-21): its claims back at the guests' 4 GiB, the makers waited for
     // room the filler's VMs took as it freed; judgments went from 35 s to over 538 s and the
