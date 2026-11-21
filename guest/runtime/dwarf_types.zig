@@ -744,6 +744,36 @@ test "a type's field by its path, from this test binary's DWARF" {
     try std.testing.expectError(error.NoSuchField, member_of(arena, sections, "dwarf_types.TestStats", "missing"));
 }
 
+test "a compressed section's bytes (zlib, zstd), as Go's linker writes debug sections" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const plain = "a section of DWARF, compressed: a section of DWARF, compressed: " ++
+        "a section of DWARF, compressed: a section of DWARF, compressed: ";
+    // python3 -c "import zlib; print(zlib.compress(b'a section of DWARF, compressed: ' * 4).hex())"
+    const zlib_stream = "789c4b54284e4d2ec9cccf53c84f537009770c72d35148cecf2d284a2d2e4e4db15248a4b13c00f4a62b69";
+    // printf 'a section of DWARF, compressed: %.0s' 1 2 3 4 | zstd -19 | xxd -p
+    const zstd_stream = "28b52ffd04684d01001402612073656374696f6e206f662044574152462c20636f6d707265737365643a20610100e131a9277aadb856";
+    inline for (.{ .{ 1, zlib_stream }, .{ 2, zstd_stream } }) |case| {
+        var stream: [128]u8 = undefined;
+        const raw = try std.fmt.hexToBytes(&stream, case[1]);
+        var section: std.ArrayList(u8) = .empty;
+        var header: [24]u8 = @splat(0);
+        std.mem.writeInt(u32, header[0..4], case[0], .little);
+        std.mem.writeInt(u64, header[8..16], plain.len, .little);
+        std.mem.writeInt(u64, header[16..24], 1, .little);
+        try section.appendSlice(arena, &header);
+        try section.appendSlice(arena, raw);
+        const back = (try decompressed(arena, section.items)).?;
+        try std.testing.expectEqualStrings(plain, back);
+        // Cut in its data: not whole, null.
+        try std.testing.expectEqual(@as(?[]const u8, null), try decompressed(arena, section.items[0 .. 24 + raw.len / 2]));
+    }
+    var unknown: [24]u8 = @splat(0);
+    std.mem.writeInt(u32, unknown[0..4], 9, .little);
+    try std.testing.expectEqual(@as(?[]const u8, null), try decompressed(arena, &unknown));
+}
+
 // A test function whose parameters this file reads back from the test binary's own DWARF.
 export fn det_types_test_function(client: i32, ratio: f64, stats: *const TestStats, flag: bool) callconv(.c) u64 {
     return @as(u64, @intCast(@max(client, 0))) + @as(u64, @intFromFloat(@max(ratio, 0))) + stats.accepted + @intFromBool(flag);
@@ -780,8 +810,9 @@ fn sections_of_self(arena: std.mem.Allocator) !?Sections {
     return sections_of(arena, fd);
 }
 
-/// The DWARF sections of the ELF file `fd` this file reads, or null: no .debug_info (stripped)
-/// or a compressed one (SHF_COMPRESSED: not read).
+/// The DWARF sections of the ELF file `fd` this file reads, or null: no .debug_info (stripped).
+/// A compressed section (SHF_COMPRESSED: Go's linker compresses every debug section by default,
+/// zlib) is decompressed (zlib or zstd), as large as an uncompressed one may be.
 pub fn sections_of(arena: std.mem.Allocator, fd: std.os.linux.fd_t) !?Sections {
     var header: [64]u8 = undefined;
     if (!pread_all(fd, &header, 0)) return null;
@@ -827,11 +858,10 @@ pub fn sections_of(arena: std.mem.Allocator, fd: std.os.linux.fd_t) !?Sections {
             &sections.str_offsets
         else
             continue;
-        if (section.flags & shf_compressed != 0) return null;
         if (section.size > section_size_max) return null;
         const bytes = try arena.alloc(u8, @intCast(section.size));
         if (!pread_all(fd, bytes, section.offset)) return null;
-        slot.* = bytes;
+        slot.* = if (section.flags & shf_compressed != 0) (try decompressed(arena, bytes)) orelse return null else bytes;
     }
     if (sections.info.len == 0 or sections.abbrev.len == 0) return null;
     return sections;
@@ -840,6 +870,33 @@ pub fn sections_of(arena: std.mem.Allocator, fd: std.os.linux.fd_t) !?Sections {
 /// The largest debug section read (a large C++ server's .debug_info is hundreds of MB: its
 /// variables' types are not looked up).
 const section_size_max = 256 << 20;
+
+/// A compressed section's bytes (ELF64's Elf64_Chdr: its type, reserved, its uncompressed size,
+/// its alignment; then the stream), or null: another type, too large, or not whole.
+fn decompressed(arena: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}!?[]const u8 {
+    const header_size = 24;
+    if (bytes.len < header_size) return null;
+    const kind = std.mem.readInt(u32, bytes[0..4], .little);
+    const size = std.mem.readInt(u64, bytes[8..16], .little);
+    if (size > section_size_max) return null;
+    const out = try arena.alloc(u8, @intCast(size));
+    var input: std.Io.Reader = .fixed(bytes[header_size..]);
+    switch (kind) {
+        1 => { // ELFCOMPRESS_ZLIB
+            const window = try arena.alloc(u8, std.compress.flate.max_window_len);
+            var stream: std.compress.flate.Decompress = .init(&input, .zlib, window);
+            stream.reader.readSliceAll(out) catch return null;
+        },
+        2 => { // ELFCOMPRESS_ZSTD
+            const zstd = std.compress.zstd;
+            const window = try arena.alloc(u8, zstd.default_window_len + zstd.block_size_max);
+            var stream: zstd.Decompress = .init(&input, window, .{});
+            stream.reader.readSliceAll(out) catch return null;
+        },
+        else => return null,
+    }
+    return out;
+}
 
 fn pread_all(fd: std.os.linux.fd_t, buffer: []u8, offset: u64) bool {
     const linux = std.os.linux;
