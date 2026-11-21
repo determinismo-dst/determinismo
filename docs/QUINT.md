@@ -171,6 +171,20 @@ adapter a map of functions (`:kind`, `:act`, `:reached`, optionally `:prepare`, 
 Its test runs anywhere jank does, the platform faked:
 `jank --module-path sdk/jank/determinismo/src:sdk/jank/determinismo/test run sdk/jank/determinismo/test/determinismo/trace_test.jank`.
 
+Writing an adapter for a real system (examples/raft-poc's `two_leaders_trace`, in Zig and jank):
+
+- A step the system does not show (a vote, which no client API says) can only be taken as its
+  control's doing: the walk goes on without knowing it happened. Prefer traces whose steps
+  show; read what happened from the run's own assertions afterwards.
+- A spec looser than the system gives traces the system cannot take. The double-vote spec had no
+  log check, so its trace had a voter grant a stale request that the real node refused ("our
+  last term is greater"); with the check in the spec its trace became one the system takes.
+- One `det-nodes hold` a process (a single tracer): put a node's points in one hold and arm
+  the later ones when the walk needs them (`--later`, then `arm <n>`; `arm-point` in jank and
+  Clojure), and wait on a point with a bound (`held-within?`, a thread that may never come).
+- A Go node held needs its collector off (`GOGC=off`, GOMAXPROCS above 1) in the profile its
+  walks run under, and only there.
+
 ## Limits
 
 - 65,536 events a trace. Quint takes about 5 ms an event (a 3,000-event timeline: 18 s on a
