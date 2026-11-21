@@ -4354,7 +4354,10 @@ fn queue_next(state: *TreeState) ?Planned {
 /// its timeline.
 fn queue_take(arena: std.mem.Allocator, state: *TreeState, judging: bool, setup: *const Snapshot) !?Planned {
     if (queue_next(state)) |place| return place;
-    if (!judging) return null;
+    // Nor while the judgment's makers wait for memory: a filler's VM would take the room they
+    // wait for as it frees, and the judgment waits on them (run 2106: its judgments went from
+    // 35 s to over 538 s, the filler most of its timelines).
+    if (!judging or state.makers_short) return null;
     index_settle(state);
     if (state.next_index >= state.total) return null;
     report.record(.{ .fresh = .{ .generation = state.generation, .index = state.next_index } });
@@ -5380,6 +5383,10 @@ const TreeState = struct {
     /// Galera's hunt (run 410, 132 timelines) and RabbitMQ's smoke (run 422, 89) were all of the
     /// first, flat searches, the tree's first returns planned after 144 fresh ones.
     filler_start: u32 = 0,
+    /// A judgment's node makers wait for memory (makings_start: fewer in flight than the run's
+    /// jobs, short of room for the next): no filler starts meanwhile (queue_take), as it would
+    /// take the room they wait for.
+    makers_short: bool = false,
     /// Each start snapshot's timelines not judged yet: freed after its last (node_served).
     users: std.AutoHashMapUnmanaged(*const Snapshot, u32) = .empty,
     /// The generation filling: judged next.
@@ -5933,7 +5940,7 @@ fn tree_judge_poll(arena: std.mem.Allocator, start: MakerStart, branches: Branch
     // The made prefix's branches planned now (not while holders are verified: that compares
     // the nodes first, tree_judge_end): timelines start from the first nodes as later ones come.
     if (!branches.arguments.verify_holders) try judge_plan_ready(arena, branches, state, judging);
-    try makings_start(arena, start, makings, state.jobs, runners_keep(state), vm_claim(state), &state.nodes_skipped);
+    state.makers_short = try makings_start(arena, start, makings, state.jobs, runners_keep(state), vm_claim(state), &state.nodes_skipped);
     for (makings) |making| if (!making.ready) return false;
     return true;
 }
@@ -6245,7 +6252,7 @@ fn tree_judge_begin(
         }
         making_count += 1;
     }
-    if (waiting) try makings_start(arena, maker_start(vm, options, branches, state), makings[0..making_count], state.jobs, runners_keep(state), vm_claim(state), &state.nodes_skipped);
+    state.makers_short = if (waiting) try makings_start(arena, maker_start(vm, options, branches, state), makings[0..making_count], state.jobs, runners_keep(state), vm_claim(state), &state.nodes_skipped) else false;
     // The next generation fills the spare summaries meanwhile, from those carried; this one's
     // stay the Judging's.
     const carried = summaries.count - judged;
@@ -7405,7 +7412,8 @@ fn maker_begin(arena: std.mem.Allocator, start: MakerStart, making: *NodeMaking)
 /// to 16 GB available, made its nodes 1.5 at a time and its explorer was in that wait for 43%
 /// of its time (68 gaps over 30 s in its samples, 13,901 s of 32,227 s; a drain taken up
 /// after 3 min 37 s, 405 children ended and not collected).
-fn makings_start(arena: std.mem.Allocator, start: MakerStart, makings: []NodeMaking, jobs: u32, keep: u64, claim: u64, skipped: *u32) !void {
+/// Whether makers still wait for memory then (fewer in flight than `jobs`): TreeState.makers_short.
+fn makings_start(arena: std.mem.Allocator, start: MakerStart, makings: []NodeMaking, jobs: u32, keep: u64, claim: u64, skipped: *u32) !bool {
     var waiting = false;
     for (makings) |*making| {
         if (!making.waiting) continue;
@@ -7424,11 +7432,13 @@ fn makings_start(arena: std.mem.Allocator, start: MakerStart, makings: []NodeMak
     const in_flight = makings_in_flight(makings);
     const room = (@as(u64, in_flight) + 1) * cpus.claim_bytes;
     // Short of a job alone (as many in flight as the run has): no room to ask for.
-    if (waiting and in_flight < jobs and room > 0) {
+    const short = waiting and in_flight < jobs;
+    if (short and room > 0) {
         cpus.makers_want(room);
     } else {
         cpus.makers_want_end();
     }
+    return short;
 }
 
 /// The makers that still wait are not started: no node of theirs (a run that starts no timeline
@@ -7484,7 +7494,7 @@ test makings_stop {
 /// or a judgment made in one go).
 fn makings_finish_all(arena: std.mem.Allocator, start: MakerStart, makings: []NodeMaking, jobs: u32, skipped: *u32) !void {
     while (true) {
-        try makings_start(arena, start, makings, jobs, 0, cpus.claim_bytes, skipped);
+        _ = try makings_start(arena, start, makings, jobs, 0, cpus.claim_bytes, skipped);
         if (makings_in_flight(makings) == 0) break; // None waits then: the first always starts.
         makings_finish_any(makings);
     }
@@ -9327,6 +9337,7 @@ test "while a judgment's nodes are made and nothing is planned, a CPU takes a fr
     state.queue = .empty;
     state.queue_head = 0;
     state.filler_start = 0;
+    state.makers_short = false;
     state.users = .empty;
     state.base = 7;
     state.generation = 5;
@@ -9357,6 +9368,37 @@ test "while a judgment's nodes are made and nothing is planned, a CPU takes a fr
     try queue_push(arena, &state, branch);
     try std.testing.expectEqual(@as(u32, 303), (try queue_take(arena, &state, true, setup)).?.index);
     try std.testing.expectEqual(@as(u32, 302), (try queue_take(arena, &state, true, setup)).?.index);
+}
+
+test "no fresh timeline starts while a judgment's makers wait for memory; a planned one still does" {
+    // Run 2106 (etcd, 2026-11-21): its claims back at the guests' 4 GiB, the makers waited for
+    // room the filler's VMs took as it freed; judgments went from 35 s to over 538 s and the
+    // filler ran most timelines.
+    const arena = std.testing.allocator;
+    var state: TreeState = undefined;
+    state.queue = .empty;
+    state.queue_head = 0;
+    state.filler_start = 0;
+    state.makers_short = true;
+    state.users = .empty;
+    state.base = 7;
+    state.generation = 5;
+    state.next_index = 300;
+    state.total = 304;
+    state.tape_directory = null;
+    defer state.queue.deinit(arena);
+    defer state.users.deinit(arena);
+    // Indices compared: a Planned printed (a failure's) reads its snapshot, a fake one here.
+    const setup: *const Snapshot = @ptrFromInt(@alignOf(Snapshot));
+    try std.testing.expectEqual(@as(?u32, null), if (try queue_take(arena, &state, true, setup)) |taken| taken.index else null);
+    try std.testing.expectEqual(@as(u32, 300), state.next_index);
+    // A judged generation's branch is no filler: it starts.
+    try queue_push(arena, &state, .{ .index = 303, .seed = 1, .snapshot = setup, .generation = 6, .why = "planned" });
+    try std.testing.expectEqual(@as(u32, 303), (try queue_take(arena, &state, true, setup)).?.index);
+    try std.testing.expectEqual(@as(?u32, null), if (try queue_take(arena, &state, true, setup)) |taken| taken.index else null);
+    // Room for them again: the filler starts.
+    state.makers_short = false;
+    try std.testing.expectEqual(@as(u32, 300), (try queue_take(arena, &state, true, setup)).?.index);
 }
 
 test "the tree passes over a number a timeline extending another took, and plans the same again resumed" {
