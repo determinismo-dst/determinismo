@@ -1,24 +1,24 @@
 SPDX-License-Identifier: GPL-2.0-only
 determinismo: deterministic execution for single-vCPU KVM guests (see ARCHITECTURE.md §4).
 Branch-count clock, in-kernel RDTSC (fastpath), exact-count stops (PMU overflow + MTF), HLT to userspace.
-Ported to Linux 7.0 (GitHub's hosted runners: Ubuntu's AWS kernel) from the 6.12 patch (kernel/patches/).
+Ported to Linux 7.0 from the 6.12 patch (kernel/patches/), against Ubuntu's 7.0.0-1014-aws (GitHub's hosted runners).
 diff --git a/arch/x86/include/asm/kvm-x86-ops.h b/arch/x86/include/asm/kvm-x86-ops.h
-index de709fb..ffebab5 100644
+index 7002416..31fa5da 100644
 --- a/arch/x86/include/asm/kvm-x86-ops.h
 +++ b/arch/x86/include/asm/kvm-x86-ops.h
-@@ -148,6 +148,7 @@ KVM_X86_OP_OPTIONAL(alloc_apic_backing_page)
- KVM_X86_OP_OPTIONAL_RET0(gmem_prepare)
- KVM_X86_OP_OPTIONAL_RET0(gmem_max_mapping_level)
- KVM_X86_OP_OPTIONAL(gmem_invalidate)
+@@ -152,6 +152,7 @@ KVM_X86_OP_OPTIONAL(gmem_invalidate)
+ #ifdef CONFIG_HAVE_KVM_ARCH_GMEM_INVALIDATE
+ KVM_X86_OP_OPTIONAL(gmem_invalidate_range)
+ #endif
 +KVM_X86_OP_OPTIONAL(det_ioctl)
  
  #undef KVM_X86_OP
  #undef KVM_X86_OP_OPTIONAL
 diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
-index 6e4e3ef..37c8422 100644
+index f8fba0a..e52f802 100644
 --- a/arch/x86/include/asm/kvm_host.h
 +++ b/arch/x86/include/asm/kvm_host.h
-@@ -1092,6 +1092,9 @@ struct kvm_vcpu_arch {
+@@ -1094,6 +1094,9 @@ struct kvm_vcpu_arch {
  	bool guest_state_protected;
  	bool guest_tsc_protected;
  
@@ -28,9 +28,9 @@ index 6e4e3ef..37c8422 100644
  	/*
  	 * Set when PDPTS were loaded directly by the userspace without
  	 * reading the guest memory
-@@ -1962,6 +1965,7 @@ struct kvm_x86_ops {
- 	int (*gmem_prepare)(struct kvm *kvm, kvm_pfn_t pfn, gfn_t gfn, int max_order);
- 	void (*gmem_invalidate)(kvm_pfn_t start, kvm_pfn_t end);
+@@ -1977,6 +1980,7 @@ struct kvm_x86_ops {
+ 	void (*gmem_invalidate_range)(struct kvm *kvm, struct kvm_gfn_range *range);
+ #endif
  	int (*gmem_max_mapping_level)(struct kvm *kvm, kvm_pfn_t pfn, bool is_private);
 +	long (*det_ioctl)(struct kvm_vcpu *vcpu, unsigned int ioctl, void __user *argp);
  };
@@ -51,11 +51,11 @@ index a46ccd6..941a012 100644
  
  struct kvm_x86_init_ops vt_init_ops __initdata = {
 diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
-index 8b24e68..f8ff7bb 100644
+index 95ce5df..ca7b274 100644
 --- a/arch/x86/kvm/vmx/vmx.c
 +++ b/arch/x86/kvm/vmx/vmx.c
-@@ -73,6 +73,8 @@
- #include "smm.h"
+@@ -74,6 +74,8 @@
+ #include "tss.h"
  #include "vmx_onhyperv.h"
  #include "posted_intr.h"
 +#include <linux/perf_event.h>
@@ -63,7 +63,7 @@ index 8b24e68..f8ff7bb 100644
  
  #include "mmu/spte.h"
  
-@@ -1583,6 +1585,75 @@ void vmx_vcpu_load_vmcs(struct kvm_vcpu *vcpu, int cpu)
+@@ -1584,6 +1586,75 @@ void vmx_vcpu_load_vmcs(struct kvm_vcpu *vcpu, int cpu)
   * Switches to specified vcpu, until a matching vcpu_put(), but assumes
   * vcpu mutex is already taken.
   */
@@ -139,7 +139,7 @@ index 8b24e68..f8ff7bb 100644
  void vmx_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
  {
  	if (vcpu->scheduled_out && !kvm_pause_in_guest(vcpu->kvm))
-@@ -1591,10 +1662,12 @@ void vmx_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+@@ -1592,10 +1663,12 @@ void vmx_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
  	vmx_vcpu_load_vmcs(vcpu, cpu);
  
  	vmx_vcpu_pi_load(vcpu, cpu);
@@ -152,7 +152,7 @@ index 8b24e68..f8ff7bb 100644
  	vmx_vcpu_pi_put(vcpu);
  
  	vmx_prepare_switch_to_host(to_vmx(vcpu));
-@@ -6207,9 +6280,481 @@ static int handle_pause(struct kvm_vcpu *vcpu)
+@@ -6208,9 +6281,481 @@ static int handle_pause(struct kvm_vcpu *vcpu)
  	return kvm_skip_emulated_instruction(vcpu);
  }
  
@@ -635,7 +635,7 @@ index 8b24e68..f8ff7bb 100644
  }
  
  static int handle_invpcid(struct kvm_vcpu *vcpu)
-@@ -6415,6 +6960,7 @@ static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
+@@ -6416,6 +6961,7 @@ static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
  	[EXIT_REASON_INVD]		      = kvm_emulate_invd,
  	[EXIT_REASON_INVLPG]		      = handle_invlpg,
  	[EXIT_REASON_RDPMC]                   = kvm_emulate_rdpmc,
@@ -643,7 +643,7 @@ index 8b24e68..f8ff7bb 100644
  	[EXIT_REASON_VMCALL]                  = kvm_emulate_hypercall,
  	[EXIT_REASON_VMCLEAR]		      = handle_vmx_instruction,
  	[EXIT_REASON_VMLAUNCH]		      = handle_vmx_instruction,
-@@ -6938,6 +7484,9 @@ int vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
+@@ -6942,6 +7488,9 @@ int vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
  {
  	int ret = __vmx_handle_exit(vcpu, exit_fastpath);
  
@@ -653,7 +653,7 @@ index 8b24e68..f8ff7bb 100644
  	/*
  	 * Exit to user space when bus lock detected to inform that there is
  	 * a bus lock in guest.
-@@ -7544,6 +8093,10 @@ static fastpath_t vmx_exit_handlers_fastpath(struct kvm_vcpu *vcpu,
+@@ -7547,6 +8096,10 @@ static fastpath_t vmx_exit_handlers_fastpath(struct kvm_vcpu *vcpu,
  		return handle_fastpath_hlt(vcpu);
  	case EXIT_REASON_INVD:
  		return handle_fastpath_invd(vcpu);
@@ -664,7 +664,7 @@ index 8b24e68..f8ff7bb 100644
  	default:
  		return EXIT_FASTPATH_NONE;
  	}
-@@ -7682,6 +8235,10 @@ fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
+@@ -7685,6 +8238,10 @@ fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
  	if (vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP)
  		vmx_set_interrupt_shadow(vcpu, 0);
  
@@ -675,7 +675,7 @@ index 8b24e68..f8ff7bb 100644
  	pt_guest_enter(vmx);
  
  	atomic_switch_perf_msrs(vmx);
-@@ -7697,6 +8254,8 @@ fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
+@@ -7700,6 +8257,8 @@ fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
  
  	/* The actual VMENTER/EXIT is in the .noinstr.text section. */
  	vmx_vcpu_enter_exit(vcpu, __vmx_vcpu_run_flags(vmx));
@@ -684,7 +684,7 @@ index 8b24e68..f8ff7bb 100644
  
  	/* All fields are clean at this point */
  	if (kvm_is_using_evmcs()) {
-@@ -7765,6 +8324,11 @@ void vmx_vcpu_free(struct kvm_vcpu *vcpu)
+@@ -7768,6 +8327,11 @@ void vmx_vcpu_free(struct kvm_vcpu *vcpu)
  	nested_vmx_free_vcpu(vcpu);
  	free_loaded_vmcs(vmx->loaded_vmcs);
  	free_page((unsigned long)vmx->ve_info);
@@ -697,10 +697,10 @@ index 8b24e68..f8ff7bb 100644
  
  int vmx_vcpu_create(struct kvm_vcpu *vcpu)
 diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
-index 70bfe81..4b67181 100644
+index db84e80..4ae8ac5 100644
 --- a/arch/x86/kvm/vmx/vmx.h
 +++ b/arch/x86/kvm/vmx/vmx.h
-@@ -289,6 +289,51 @@ struct vcpu_vmx {
+@@ -286,6 +286,51 @@ struct vcpu_vmx {
  
  	/* ve_info must be page aligned. */
  	struct vmx_ve_information *ve_info;
@@ -765,10 +765,10 @@ index d09abea..da38599 100644
  int vmx_skip_emulated_instruction(struct kvm_vcpu *vcpu);
  void vmx_update_emulated_instruction(struct kvm_vcpu *vcpu);
 diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
-index fd1c4a3..3e93766 100644
+index 4810bee..b8d7bb7 100644
 --- a/arch/x86/kvm/x86.c
 +++ b/arch/x86/kvm/x86.c
-@@ -6484,6 +6484,20 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
+@@ -6091,6 +6091,20 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
  		r = kvm_vcpu_ioctl_x86_set_xcrs(vcpu, u.xcrs);
  		break;
  	}
@@ -789,7 +789,7 @@ index fd1c4a3..3e93766 100644
  	case KVM_SET_TSC_KHZ: {
  		u32 user_tsc_khz;
  
-@@ -11720,8 +11734,13 @@ static int __kvm_emulate_halt(struct kvm_vcpu *vcpu, int state, int reason)
+@@ -11346,8 +11360,13 @@ static int __kvm_emulate_halt(struct kvm_vcpu *vcpu, int state, int reason)
  	 */
  	++vcpu->stat.halt_exits;
  	if (lapic_in_kernel(vcpu)) {
@@ -805,7 +805,7 @@ index fd1c4a3..3e93766 100644
  		return 1;
  	} else {
 diff --git a/include/uapi/linux/kvm.h b/include/uapi/linux/kvm.h
-index 3f0d8d3..ab3ba42 100644
+index 3dc7d9b..7123441 100644
 --- a/include/uapi/linux/kvm.h
 +++ b/include/uapi/linux/kvm.h
 @@ -193,6 +193,8 @@ struct kvm_exit_snp_req_certs {
@@ -817,7 +817,7 @@ index 3f0d8d3..ab3ba42 100644
  
  /* For KVM_EXIT_INTERNAL_ERROR */
  /* Emulate instruction failed. */
-@@ -1652,6 +1654,77 @@ struct kvm_create_guest_memfd {
+@@ -1653,6 +1655,77 @@ struct kvm_create_guest_memfd {
  
  #define KVM_PRE_FAULT_MEMORY	_IOWR(KVMIO, 0xd5, struct kvm_pre_fault_memory)
  
