@@ -533,8 +533,8 @@ public final class DeterminismoCoverage {
     send(new Watched(text));
   }
 
-  /** A value as JSON with no program code run: the JDK's boxes, strings and enums' names, any
-   * other object its class and identity. */
+  /** A value as JSON with no program code run: the JDK's boxes, strings and enums' names, a
+   * Clojure keyword's name, any other object its class and identity. */
   private static void watchValue(StringBuilder out, Object value) {
     if (value == null) {
       out.append("null");
@@ -551,6 +551,10 @@ public final class DeterminismoCoverage {
       watchText(out, value.toString());
     } else if (value instanceof Enum<?> constant) {
       watchText(out, constant.name());
+    } else if (value.getClass().getName().equals("clojure.lang.Keyword")) {
+      // A Clojure keyword by its name (":leader"): its toString is the Clojure runtime's, no
+      // program code (known by its class's name: the SDK depends on no Clojure).
+      watchText(out, value.toString());
     } else {
       watchIdentity(out, value);
     }

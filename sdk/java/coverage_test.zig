@@ -266,6 +266,7 @@ const watched_java =
     \\  double ratio;
     \\  Role role = Role.FOLLOWER;
     \\  static int count;
+    \\  Object state;
     \\  Watched(long start) { term = start; }
     \\  void vote(int candidate, String name, double weight) { term++; leader = name; ratio = weight; }
     \\  static void bump(long by) { count += (int) by; }
@@ -275,8 +276,21 @@ const watched_java =
     \\    w.vote(4, "n2", 1.5);
     \\    bump(2);
     \\    w.role = Role.LEADER;
+    \\    w.state = clojure.lang.Keyword.intern("leader");
     \\    System.out.println("term " + w.term + " count " + count);
     \\  }
+    \\}
+    \\
+;
+
+/// A stand-in for Clojure's keyword (the SDK knows it by its class's name): said by its name.
+const keyword_java =
+    \\package clojure.lang;
+    \\public final class Keyword {
+    \\  final String name;
+    \\  private Keyword(String name) { this.name = name; }
+    \\  public static Keyword intern(String name) { return new Keyword(name); }
+    \\  public String toString() { return ":" + name; }
     \\}
     \\
 ;
@@ -303,7 +317,9 @@ test "watched fields' stores and methods' calls said with their values, past a c
     try run_ok(arena, io, argv.items);
     const probe_path = try std.fmt.allocPrint(arena, "{s}/Watched.java", .{directory});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = probe_path, .data = watched_java });
-    try run_ok(arena, io, &.{ "javac", "-g", "-d", probe_classes, probe_path });
+    const keyword_path = try std.fmt.allocPrint(arena, "{s}/Keyword.java", .{directory});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = keyword_path, .data = keyword_java });
+    try run_ok(arena, io, &.{ "javac", "-g", "-d", probe_classes, probe_path, keyword_path });
     const plain = try std.fmt.allocPrint(arena, "{s}/watched.jar", .{directory});
     const instrumented = try std.fmt.allocPrint(arena, "{s}/watched-instrumented.jar", .{directory});
     try run_ok(arena, io, &.{ "jar", "cf", plain, "-C", probe_classes, "." });
@@ -311,7 +327,7 @@ test "watched fields' stores and methods' calls said with their values, past a c
     // class in.
     var building = std.process.Environ.Map.init(arena);
     try building.put("PATH", "/usr/bin:/bin");
-    try building.put("DETERMINISMO_WATCH", "Watched.term,Watched.leader,Watched.ratio,Watched.role,Watched.count,Watched.vote(),Watched.bump(),Watched.<init>()");
+    try building.put("DETERMINISMO_WATCH", "Watched.term,Watched.leader,Watched.ratio,Watched.role,Watched.count,Watched.state,Watched.vote(),Watched.bump(),Watched.<init>()");
     const built = try std.process.run(arena, io, .{ .argv = &.{ "java", "-cp", sdk_classes, "DeterminismoCoverage", "instrument", "Nothing", plain, instrumented }, .environ_map = &building });
     try std.testing.expect(built.term == .exited and built.term.exited == 0);
     const events = try std.fmt.allocPrint(arena, "{s}/events.jsonl", .{directory});
@@ -341,6 +357,8 @@ test "watched fields' stores and methods' calls said with their values, past a c
         "{\"name\":\"field Watched.count\",\"value\":2}",
         // An enum by its name.
         "{\"name\":\"field Watched.role\",\"value\":\"LEADER\",\"object\":\"Watched@",
+        // A Clojure keyword by its name, not its class and identity.
+        "{\"name\":\"field Watched.state\",\"value\":\":leader\",\"object\":\"Watched@",
     };
     for (said) |line| {
         if (std.mem.indexOf(u8, reported, line) == null) {
