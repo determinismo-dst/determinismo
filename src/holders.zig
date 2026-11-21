@@ -505,6 +505,7 @@ pub const Registry = struct {
     /// through its closing replays, the next hunt waiting for their room).
     pub fn add(registry: *Registry, branch: u32, kept: []const Held) void {
         var on_disk: u64 = 0;
+        const first = registry.count;
         for (kept) |held| {
             if (registry.count == entries_max) {
                 if (!held.disk) kill(held.pid); // Never with generations of at most 256 timelines.
@@ -516,6 +517,16 @@ pub const Registry = struct {
             registry.count += 1;
             on_disk += bytes;
         }
+        // Its files past its listed holders too (dropped ones, left as bases), on its first
+        // entry: run 2114's long timelines kept 40 holders on disk each, 370 GB, while the
+        // budget saw their last 8 and never filled.
+        if (registry.disk) |disk| if (registry.count > first) {
+            var total: [1]u64 = undefined;
+            disk.branches_bytes(&.{branch}, &total);
+            const extra = total[0] -| on_disk;
+            registry.entries[first].extra = extra;
+            on_disk += extra;
+        };
         if (on_disk == 0) return;
         registry.pending_bytes += on_disk;
         registry.kept_trim(); // The kept ones make room, the oldest first.
@@ -606,7 +617,7 @@ pub const Registry = struct {
         for (registry.entries[0..registry.count]) |entry| {
             const theirs = std.mem.indexOfScalar(u32, branches, entry.branch) != null;
             // Judged: out of the pending bytes (kept ones counted again as kept, below).
-            if (theirs) registry.pending_bytes -|= entry.bytes;
+            if (theirs) registry.pending_bytes -|= entry.bytes + entry.extra;
             if (!theirs) {
                 registry.entries[staying] = entry;
                 staying += 1;
@@ -624,6 +635,7 @@ pub const Registry = struct {
                     dying_count += 1;
                 }
                 var kept = entry;
+                kept.extra = 0; // Its timeline's files past it counted again (branches_settle).
                 kept.held.pid = 0; // Gone, if it was ever a process: a file now (take's on_disk).
                 kept.held.disk = true;
                 if (registry.disk) |disk| {
@@ -1660,6 +1672,41 @@ test "holders on disk not judged yet count in the budget: the kept ones make roo
     try std.testing.expectEqual(@as(u64, 0), registry.pending_bytes);
     try std.testing.expectEqual(@as(u32, 2), registry.kept_count);
     try std.testing.expect(!registry.disk_full());
+}
+
+test "a timeline's dropped holders on disk count in the budget as it is reaped, not only at its judgment" {
+    var path_buffer: [64]u8 = undefined;
+    const directory_z = try std.fmt.bufPrintSentinel(&path_buffer, "/tmp/determinismo-dropped-test-{d}", .{linux.getpid()}, 0);
+    const directory: []const u8 = directory_z;
+    _ = linux.mkdir(directory_z, 0o755);
+    const disk: Disk = .{ .directory = directory };
+    defer {
+        disk.delete(null);
+        _ = linux.rmdir(directory_z);
+    }
+    var content: [64 * 1024]u8 = @splat(7);
+    // Timeline 7's holders at 10, 20 and 30 on disk; it lists only 30's (10 and 20 dropped from
+    // its list, their files left as bases).
+    for ([_]u64{ 10, 20, 30 }) |moment| for (Disk.suffixes) |suffix| {
+        var file_buffer: [128]u8 = undefined;
+        const file = try std.fmt.bufPrintSentinel(&file_buffer, "{s}/h7-{d}{s}", .{ directory, moment, suffix }, 0);
+        const fd = linux.open(file, .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true }, 0o644);
+        try std.testing.expect(linux.errno(fd) == .SUCCESS);
+        _ = linux.write(@intCast(fd), &content, content.len);
+        _ = linux.close(@intCast(fd));
+    };
+    const one = disk.bytes_of(7, 10);
+    var kept: [8]Registry.Entry = undefined;
+    var registry: Registry = .{ .explorer = 0, .kept = &kept, .disk = &disk, .kept_budget = 2 * one + one / 2 };
+    // Reaped, its generation not judged: all three holders' files count (run 2114: 370 GB of
+    // holders on disk, its timelines 40 holders each, while pending_bytes saw their last 8).
+    registry.add(7, &.{.{ .pid = 0, .worker = 0, .id = 0, .vtime_ns = 30, .disk = true }});
+    try std.testing.expectEqual(3 * one, registry.pending_bytes);
+    try std.testing.expect(registry.disk_full());
+    // Judged: out of the pending bytes, its files counted on its kept holder.
+    registry.release_listed(&.{7});
+    registry.trims_wait();
+    try std.testing.expectEqual(@as(u64, 0), registry.pending_bytes);
 }
 
 test "a kept holder stays while a kept one is a change from it; the oldest that none is go first" {
