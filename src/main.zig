@@ -34,6 +34,7 @@ const merge = @import("merge.zig");
 const script = @import("script.zig");
 const tla = @import("tla.zig");
 const quint = @import("quint.zig");
+const veil = @import("veil.zig");
 const advisor_zig = @import("advisor.zig");
 const draws_zig = @import("draws.zig");
 const serve_call = @import("serve_call.zig");
@@ -270,6 +271,10 @@ const usage =
     \\                            [--quint <command>] [--piece <steps>]   (a timeline's own
     \\                            events, those named like an action of the spec, as a run of
     \\                            it, a long one in pieces: docs/QUINT.md)
+    \\       determinismo veil    --module <M.lean> --map <map.json> --instance '<{ node := Fin 3 }>'
+    \\                            --events <directory> --branch <n> --veil <checkout> [--theory <t>]
+    \\                            [--lake <command>]   (a timeline's lines as a Veil model's action
+    \\                            labels, replayed by its #replay: docs/VEIL.md)
     \\       determinismo runs    list | show <id> | properties <id> [--details] |
     \\                            logs <id> <timeline> <seconds> | search <id> '<condition>' |
     \\                            export <id> <timeline> <seconds | failure> [--property <message>] [--html] |
@@ -881,6 +886,8 @@ fn command_tool(
         tla.check(arena, io, rest)
     else if (eql(u8, name, "quint"))
         quint.check(arena, io, rest)
+    else if (eql(u8, name, "veil"))
+        veil.check(arena, io, rest)
     else if (eql(u8, name, "runs"))
         runs_cli.run(arena, io, rest)
     else if (eql(u8, name, "bundle"))
@@ -9276,6 +9283,7 @@ test {
     _ = @import("script.zig");
     _ = @import("tla.zig");
     _ = @import("quint.zig");
+    _ = @import("veil.zig");
     _ = @import("core").guest_memory;
     _ = @import("query.zig");
     _ = @import("runs_cli.zig");

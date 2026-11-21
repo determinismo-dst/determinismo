@@ -1,0 +1,176 @@
+diff --git a/Veil/Core/Tools/ModelChecker/Simulation.lean b/Veil/Core/Tools/ModelChecker/Simulation.lean
+index 8153bd7..4ce9c4f 100644
+--- a/Veil/Core/Tools/ModelChecker/Simulation.lean
++++ b/Veil/Core/Tools/ModelChecker/Simulation.lean
+@@ -1,3 +1,5 @@
+ module
+ 
+ public import Veil.Core.Tools.ModelChecker.Simulation.Checker
++
++public import Veil.Core.Tools.ModelChecker.Simulation.Replay
+diff --git a/Veil/Core/Tools/ModelChecker/Simulation/Replay.lean b/Veil/Core/Tools/ModelChecker/Simulation/Replay.lean
+new file mode 100644
+index 0000000..b34eeb9
+--- /dev/null
++++ b/Veil/Core/Tools/ModelChecker/Simulation/Replay.lean
+@@ -0,0 +1,104 @@
++module
++
++public import Veil.Core.Tools.ModelChecker.Simulation.Basic
++public import Veil.Core.Tools.ModelChecker.Concrete.Core
++
++@[expose] public section
++
++namespace Veil.ModelChecker.Simulation
++open Lean
++
++/-- `#replay`'s configuration: a JSON file of the labels to take, in order, each an action's
++name and arguments as traces display them (`{"name": "Grant", "args": [{"name": "v", "value":
++2}, ...]}`; other fields ignored), as `{"labels": [...]}` or a bare array. -/
++structure ReplayConfig where
++  file : String := ""
++deriving Inhabited, Repr
++
++/-- A label as compared: its name and its arguments, nothing else of what it displays. -/
++def labelKey (j : Json) : Json :=
++  let name := (j.getObjVal? "name").toOption.getD Json.null
++  let args := (j.getObjVal? "args").toOption.getD (Json.arr #[])
++  Json.mkObj [("name", name), ("args", args)]
++
++/-- The labels of a replay file. -/
++def readLabels (text : String) : Except String (Array Json) := do
++  let j ← Json.parse text
++  match j with
++  | .arr labels => return labels
++  | _ => match j.getObjVal? "labels" with
++    | .ok (.arr labels) => return labels
++    | _ => throw "a replay file is an array of labels or {\"labels\": [...]}"
++
++/-- The longest a replay keeps: the states its labels leave possible (a label's arguments name
++everything an action picks, so usually one). -/
++def replayStatesMax : Nat := 4096
++
++/-- Takes `labels` in order from the system's initial states, keeping at each step the successors
++whose label matches (`labelKey`): a violation `replay_refused_at_<k>` at the first step none
++matches (the trace up to it, as one of the states that reached it), a safety failure at the first
++state that breaks a property (as `#simulate` checks them), none when every label was taken. -/
++def replay {ρ σ κ : Type} {th₀ : ρ} [Display κ]
++  (sys : EnumerableTransitionSystem ρ (List ρ) σ (List σ) Int κ (Transitions κ Int σ) th₀)
++  (params : SearchParameters ρ σ)
++  (th : ρ)
++  (labels : Array Json)
++  : Option (SimulationResult ρ σ κ) × Nat := Id.run do
++  let inits := sys.initStates
++  match inits with
++  | [] => return (none, 0)
++  | first :: _ =>
++    let mut current : List (σ × Trace ρ σ κ) :=
++      inits.map fun st => (st, { theory := th, initialState := st, steps := #[] })
++    for (st, tr) in current do
++      let bad := violatedInvariantNames params th st
++      if !bad.isEmpty then return (some (.foundViolation (.safetyFailure bad) tr), 0)
++    let mut taken := 0
++    for want in labels do
++      let key := labelKey want
++      let mut next : List (σ × Trace ρ σ κ) := []
++      for (st, tr) in current do
++        for (label, st') in (sys.tr th st).successes do
++          if next.length < replayStatesMax && labelKey (Display.display label) == key then
++            next := next ++ [(st', tr.push { transitionLabel := label, nextState := st' })]
++      match next with
++      | [] =>
++        let tr := (current.head?.map (·.2)).getD { theory := th, initialState := first, steps := #[] }
++        let refused := Name.mkSimple s!"replay_refused_at_{taken + 1}"
++        return (some (.foundViolation (.safetyFailure [refused]) tr), taken)
++      | _ =>
++        for (st', tr') in next do
++          let bad := violatedInvariantNames params th st'
++          if !bad.isEmpty then return (some (.foundViolation (.safetyFailure bad) tr'), taken + 1)
++        current := next
++        taken := taken + 1
++    return (none, taken)
++
++/-- `replay` as `#replay` runs it: the labels read from `cfg.file`, the result as `#simulate`'s
++(one trace; its depth the labels taken). -/
++def replayWithProgress {ρ σ κ : Type} {th₀ : ρ} [Display κ]
++  (sys : EnumerableTransitionSystem ρ (List ρ) σ (List σ) Int κ (Transitions κ Int σ) th₀)
++  (params : SearchParameters ρ σ)
++  (th : ρ)
++  (cfg : ReplayConfig)
++  (_progressInstanceId : Nat)
++  (_cancelToken : IO.CancelToken)
++  : IO (SimulateResult ρ σ κ) := do
++  let startMs ← IO.monoMsNow
++  let text ← IO.FS.readFile cfg.file
++  let labels ← IO.ofExcept (readLabels text)
++  let (result, taken) := replay sys params th labels
++  -- A refusal: `taken` labels taken, the next refused. A property broken: `taken` counts the step
++  -- whose state broke it.
++  let (refusedAt, violates) : Option Nat × List Name := match result with
++    | some (.foundViolation (.safetyFailure names) _) =>
++      if names.any (fun n => n.toString.startsWith "replay_refused_at_") then (some (taken + 1), [])
++      else (none, names)
++    | _ => (none, [])
++  IO.println (Json.mkObj [("replay", Json.mkObj [("file", toJson cfg.file), ("labels", toJson labels.size),
++    ("taken", toJson taken), ("refused_at", toJson refusedAt),
++    ("violates", toJson (violates.map toString)), ("violated_at", toJson (if violates.isEmpty then none else some taken))])]).compress
++  return { result, tracesRun := 1, numTraces := 1, elapsedMs := (← IO.monoMsNow) - startMs, seed := 0,
++           depthHistogram := {} }
++
++end Veil.ModelChecker.Simulation
+diff --git a/Veil/Frontend/DSL/Module/Elaborators/Core.lean b/Veil/Frontend/DSL/Module/Elaborators/Core.lean
+index cd98af5..1e3a595 100644
+--- a/Veil/Frontend/DSL/Module/Elaborators/Core.lean
++++ b/Veil/Frontend/DSL/Module/Elaborators/Core.lean
+@@ -552,6 +552,7 @@ structure LivenessCheckConfig where
+ declare_command_config_elab elabLivenessCheckConfig LivenessCheckConfig
+ 
+ declare_command_config_elab elabSimulateConfig ModelChecker.Simulation.SimulateConfig
++declare_command_config_elab elabReplayConfig ModelChecker.Simulation.ReplayConfig
+ 
+ /--
+ Check whether a particular config field was written explicitly in the command syntax.
+@@ -906,6 +907,24 @@ private def elabSimulateCommandConfig (cfgStx : Syntax)
+   let seed ← liftIO <| if cfg0.seed == 0 then IO.rand 0 0xFFFFFFFFFFFFFFFF else pure cfg0.seed
+   return { cfg0 with numTraces, maxSteps, seed }
+ 
++private def mkReplayCall (em : ExecutableModule) (instantiation theoryTerm : Term)
++    (cfg : ModelChecker.Simulation.ReplayConfig) : CommandElabM Term := do
++  let cfgTerm ← `($(mkIdent ``Veil.ModelChecker.Simulation.ReplayConfig.mk) $(quote cfg.file))
++  let runtimeCallExpr ← mkExecutionCall em {} instantiation theoryTerm fun ectx =>
++    `(($(mkIdent ``Veil.ModelChecker.Simulation.replayWithProgress)
++        $(ectx.sysWithoutLog) $(ectx.searchParams) $(ectx.theoryArg) $cfgTerm : _ → _ → IO _))
++  let resultIdent := mkVeilImplementationDetailIdent `replayRuntimeResult
++  `(fun (_ : Option Veil.ModelChecker.ParallelConfig)
++      (progressInstanceId : Nat) (cancelToken : IO.CancelToken) (finish : Lean.Json → IO _) => do
++    let $resultIdent ← ($runtimeCallExpr progressInstanceId cancelToken)
++    finish ($(mkIdent ``Veil.ModelChecker.Simulation.SimulateResult.toDisplayJson) $resultIdent))
++
++@[command_elab Veil.replay, incremental]
++def elabReplay : CommandElab :=
++  elabExecutionCommand "replay" `veil.perf.elaborator.simulate .simulate
++    (fun stx => elabReplayConfig stx[4]) 5 fun ecctx => do
++    return (← mkReplayCall ecctx.executable ecctx.instantiation ecctx.theory ecctx.config, none)
++
+ @[command_elab Veil.simulate, incremental]
+ def elabSimulate : CommandElab :=
+   elabExecutionCommand "simulate" `veil.perf.elaborator.simulate .simulate
+diff --git a/Veil/Frontend/DSL/Module/Syntax.lean b/Veil/Frontend/DSL/Module/Syntax.lean
+index ca37119..3ca2cc9 100644
+--- a/Veil/Frontend/DSL/Module/Syntax.lean
++++ b/Veil/Frontend/DSL/Module/Syntax.lean
+@@ -636,4 +636,14 @@ For a module without abstract types or immutable fields:
+ -/
+ scoped syntax (name := simulate) "#simulate " (modelCheckMode)? term:max (term:max)? Parser.Tactic.optConfig (assumptionsHoldBy)? : command
+ 
++/-- Replays a run given as its actions' labels (`(file := "<path>")`: a JSON array of labels, each an
++action's name and arguments as traces display them) through the module's instance, from its initial
++states, keeping at each step the successors whose label matches: a violation
++`replay_refused_at_<k>` at the first label no successor matches, a safety failure at the first state
++that breaks a property, none when every label was taken. Its result is `#simulate`'s (one trace), and
++a JSON line `{"replay": {"labels", "taken", "refused"}}` on standard output. For checking a real
++system's run against the module (determinismo's `determinismo veil`), as a model checker's
++counterexample is checked against the system the other way. -/
++scoped syntax (name := replay) "#replay " (modelCheckMode)? term:max (term:max)? Parser.Tactic.optConfig (assumptionsHoldBy)? : command
++
+ end Veil
