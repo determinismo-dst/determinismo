@@ -6,10 +6,15 @@
 # host) and a JDK 25 (the guest's JVM coverage agent).
 # Idempotent.
 # Runs on the host as the user.
-# Usage: infra/host/tools.sh
+# Usage: infra/host/tools.sh [--build]
+# --build: only what `zig build` needs (Zig, DuckDB, the JDK), as GitHub's CI runners install it
+# (.github/workflows/ci.yml); jank's rolling package, pinned by the copy shipped from your
+# machine, is not fetched there.
 set -euo pipefail
 opt=$HOME/opt
 mkdir -p "$opt"
+build_only=0
+[ "${1:-}" = --build ] && build_only=1
 
 # fetch <url> <sha256> <file>: downloads unless the file is there with that checksum.
 fetch() {
@@ -29,7 +34,7 @@ fi
 ln -sfn "$opt/$zig" "$opt/zig"
 
 bb=babashka-1.13.225-linux-amd64-static.tar.gz
-if ! "$opt/bb/bb" --version 2>/dev/null | grep -q 'v1.13.225'; then
+if [ $build_only = 0 ] && ! "$opt/bb/bb" --version 2>/dev/null | grep -q 'v1.13.225'; then
   mkdir -p "$opt/bb"
   fetch "https://github.com/babashka/babashka/releases/download/v1.13.225/$bb" \
     ab0e98307405ba19e7c5ba0c3c7cd17a6f90aa90577a72709055f120796d6bfe "$opt/$bb"
@@ -57,6 +62,7 @@ if [ ! -f "$duckdb/libstdc++.a" ]; then
 fi
 ln -sfn "$duckdb" "$opt/duckdb"
 
+if [ $build_only = 0 ]; then
 mkdir -p "$opt/tla"
 # The latest stable release: v1.8.0 is a pre-release its project republishes under the same tag
 # (2026-10-26, 2026-10-30), each time failing the checksum.
@@ -75,6 +81,7 @@ if ! "$wamrc/wamrc" --version 2>/dev/null | grep -q 'wamrc 2.4.4'; then
   rm "$opt/wamrc-2.4.4.tar.gz"
 fi
 ln -sfn "$wamrc" "$opt/wamrc"
+fi
 
 # A JDK 25 (Temurin), for the guest's JVM coverage agent (build.zig: java.lang.classfile needs
 # JDK 24+ to compile, its entry point built for Java 8): ~/opt/jdk-25.
@@ -94,6 +101,10 @@ ln -sfn "$jdk" "$opt/jdk-25"
 # finds here; a new pin downloads once more.
 jank_deb=jank_0.1-noble_amd64.deb
 jank_sha256=68f6d0d8f0f85bbed76ba7c04d38de0abbb50db4ae9adba214117e4e2eafd983
+if [ $build_only = 1 ]; then
+  echo "zig $("$opt/zig/zig" version), duckdb v2.0.0, jdk 25.0.5"
+  exit 0
+fi
 if [ "$(cat "$opt/jank/.sha256" 2>/dev/null)" != "$jank_sha256" ]; then
   fetch "https://ppa.jank-lang.org/pool/main/j/jank/$jank_deb" "$jank_sha256" "$opt/$jank_deb"
   rm -rf "$opt/jank" && mkdir -p "$opt/jank"

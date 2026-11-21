@@ -1,0 +1,78 @@
+# SPDX-License-Identifier: MIT
+# The platform's CI on GitHub's hosted runners: the release build (determinismo, the guest's
+# programs, the self test) kept as an artifact, and the unit tests. No secrets: a fork's pull
+# request runs it as is. The e2e checks boot deterministic VMs, which need a bare-metal KVM host
+# (infra/host/check.sh), not a runner (a VM itself: nested, without the deterministic VM's CPU
+# features).
+name: ci
+
+on:
+  push:
+    branches: [main, next]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/opt
+          key: tools-${{ hashFiles('infra/host/tools.sh') }}
+      - name: Toolchain (Zig, DuckDB, the JDK, pinned by infra/host/tools.sh)
+        run: infra/host/tools.sh --build
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: zig-build-${{ hashFiles('build.zig.zon') }}-${{ github.sha }}
+          restore-keys: zig-build-${{ hashFiles('build.zig.zon') }}-
+      - name: Build
+        run: ~/opt/zig/zig build determinismo guest selftest -Drelease -Dduckdb="$HOME/opt/duckdb" -Djdk="$HOME/opt/jdk-25"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: determinismo-linux-x86_64-${{ github.sha }}
+          path: zig-out/bin/
+          retention-days: 30
+
+  unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/opt
+          key: tools-${{ hashFiles('infra/host/tools.sh') }}
+      - name: Toolchain
+        run: infra/host/tools.sh --build
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: zig-unit-${{ hashFiles('build.zig.zon') }}-${{ github.sha }}
+          restore-keys: zig-unit-${{ hashFiles('build.zig.zon') }}-
+      - name: Unit tests (each binary as infra/host/unit.sh runs it)
+        run: |
+          ~/opt/zig/zig build tests -Dduckdb="$HOME/opt/duckdb" -Djdk="$HOME/opt/jdk-25" -p zig-out-unit
+          failed=0
+          for binary in zig-out-unit/tests/*; do
+            name=$(basename "$binary")
+            if timeout 600 "$binary" > output.txt 2>&1; then
+              echo "PASS $name: $(grep -E 'passed|All [0-9]+ tests' output.txt | tail -1)"
+            else
+              echo "::error::FAIL $name"
+              tail -60 output.txt
+              failed=$((failed + 1))
+            fi
+          done
+          echo "$failed failing"
+          [ "$failed" = 0 ]
