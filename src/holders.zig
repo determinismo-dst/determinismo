@@ -453,6 +453,10 @@ pub const Registry = struct {
     /// node spills and every return replays.
     kept_bytes: u64 = 0,
     kept_budget: ?u64 = null,
+    /// The disk holders of generations not judged yet (`entries`), counted as their timelines
+    /// are reaped (add): in the budget beside the kept ones. Outside it, run 2106's grew to 413
+    /// GiB past a ~285 GB budget while its judgments stalled, the reserve their only bound.
+    pending_bytes: u64 = 0,
     /// Trims whose files are still being deleted, each by a thread of its own (Trim): a trim of
     /// a long run's oldest kept holders unlinks hundreds of GB, and on the explorer's loop it
     /// stalled it (run 2019: 133 GB 58 s, 177 GB 111 s, ext4 freeing each file's extents).
@@ -488,19 +492,33 @@ pub const Registry = struct {
         registry.* = .{ .explorer = linux.getpid(), .kept = try arena.alloc(Entry, kept_max) };
     }
 
+    /// Whether the disk holders not judged yet fill the budget: new timelines are given no disk
+    /// (their holders stay in memory or go; returns to them replay) until a judgment frees room.
+    pub fn disk_full(registry: *const Registry) bool {
+        const budget = registry.kept_budget orelse return false;
+        return registry.pending_bytes >= budget;
+    }
+
     /// A timeline's holders (its summary's), as it is reaped: not at its generation's judgment,
     /// which a late run (drained, past its budget) never holds, so its last timelines' holders
     /// were never released (Kafka 1919's drain: 46 holders of ~4 GB polling for up to 54 minutes,
     /// through its closing replays, the next hunt waiting for their room).
     pub fn add(registry: *Registry, branch: u32, kept: []const Held) void {
+        var on_disk: u64 = 0;
         for (kept) |held| {
             if (registry.count == entries_max) {
                 if (!held.disk) kill(held.pid); // Never with generations of at most 256 timelines.
                 continue;
             }
-            registry.entries[registry.count] = .{ .held = held, .branch = branch, .taken = false };
+            // On disk: counted in the budget now, not at its generation's judgment.
+            const bytes = if (held.disk) (if (registry.disk) |disk| disk.bytes_of(branch, held.vtime_ns) else 0) else 0;
+            registry.entries[registry.count] = .{ .held = held, .branch = branch, .taken = false, .bytes = bytes };
             registry.count += 1;
+            on_disk += bytes;
         }
+        if (on_disk == 0) return;
+        registry.pending_bytes += on_disk;
+        registry.kept_trim(); // The kept ones make room, the oldest first.
     }
 
     /// A holder's socket, where the snapshot comes back as from a node-making child, and its
@@ -587,6 +605,8 @@ pub const Registry = struct {
         var staying: u32 = 0;
         for (registry.entries[0..registry.count]) |entry| {
             const theirs = std.mem.indexOfScalar(u32, branches, entry.branch) != null;
+            // Judged: out of the pending bytes (kept ones counted again as kept, below).
+            if (theirs) registry.pending_bytes -|= entry.bytes;
             if (!theirs) {
                 registry.entries[staying] = entry;
                 staying += 1;
@@ -722,7 +742,7 @@ pub const Registry = struct {
             registry.kept_budget = measured;
             break :budget measured;
         };
-        if (registry.kept_bytes <= budget) return;
+        if (registry.kept_bytes + registry.pending_bytes <= budget) return;
         const kept = registry.kept[0..registry.kept_count];
         for (kept) |*entry| {
             entry.going = false;
@@ -743,7 +763,7 @@ pub const Registry = struct {
         var dropped: u32 = 0;
         var dropped_bytes: u64 = 0;
         var at: usize = 0;
-        while (registry.kept_bytes - dropped_bytes > budget and at < kept.len) {
+        while (registry.kept_bytes - dropped_bytes + registry.pending_bytes > budget and at < kept.len) {
             const entry = &kept[at];
             if (entry.going or entry.dependents > 0) {
                 at += 1;
@@ -803,9 +823,11 @@ pub const Registry = struct {
         registry.kept_count = staying;
         registry.kept_bytes -= dropped_bytes;
         std.debug.print("[determinismo] holders: {d} kept on disk removed for the run's budget " ++
-            "({d} MB of them; {d} older ones left, kept ones are changes from them; {d} kept, {d} MB of {d} MB)\n", .{
+            "({d} MB of them; {d} older ones left, kept ones are changes from them; {d} kept, {d} MB, " ++
+            "and {d} MB not judged yet, of {d} MB)\n", .{
             dropped,             dropped_bytes >> 20,       needed,
-            registry.kept_count, registry.kept_bytes >> 20, budget >> 20,
+            registry.kept_count, registry.kept_bytes >> 20, registry.pending_bytes >> 20,
+            budget >> 20,
         });
     }
 
@@ -856,6 +878,7 @@ pub const Registry = struct {
         registry.count = 0;
         registry.kept_count = 0;
         registry.kept_bytes = 0;
+        registry.pending_bytes = 0;
         if (disk) |known| known.delete(null);
         // A trim still deleting finds its files gone already: ended before the explorer does.
         registry.trims_wait();
@@ -1588,6 +1611,55 @@ test "kept holders on disk past the run's budget go, the oldest first, and none 
     registry.release_listed(&.{4});
     registry.trims_wait();
     try std.testing.expectEqual(@as(u64, 0), disk.bytes_of(4, 10));
+}
+
+test "holders on disk not judged yet count in the budget: the kept ones make room, and past it no more are written" {
+    var path_buffer: [64]u8 = undefined;
+    const directory_z = try std.fmt.bufPrintSentinel(&path_buffer, "/tmp/determinismo-pending-test-{d}", .{linux.getpid()}, 0);
+    const directory: []const u8 = directory_z;
+    _ = linux.mkdir(directory_z, 0o755);
+    const disk: Disk = .{ .directory = directory };
+    defer {
+        disk.delete(null);
+        _ = linux.rmdir(directory_z);
+    }
+    var content: [64 * 1024]u8 = @splat(7);
+    for ([_]u32{ 1, 2, 3, 4, 5 }) |branch| for (Disk.suffixes) |suffix| {
+        var file_buffer: [128]u8 = undefined;
+        const file = try std.fmt.bufPrintSentinel(&file_buffer, "{s}/h{d}-10{s}", .{ directory, branch, suffix }, 0);
+        const fd = linux.open(file, .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true }, 0o644);
+        try std.testing.expect(linux.errno(fd) == .SUCCESS);
+        _ = linux.write(@intCast(fd), &content, content.len);
+        _ = linux.close(@intCast(fd));
+    };
+    const one = disk.bytes_of(1, 10);
+    const on_disk: Held = .{ .pid = 0, .worker = 0, .id = 0, .vtime_ns = 10, .disk = true };
+    var kept: [8]Registry.Entry = undefined;
+    var registry: Registry = .{ .explorer = 0, .kept = &kept, .disk = &disk, .kept_budget = 2 * one + one / 2 };
+    // 1 and 2 judged: kept, within the budget.
+    registry.add(1, &.{on_disk});
+    registry.add(2, &.{on_disk});
+    registry.release_listed(&.{ 1, 2 });
+    registry.trims_wait();
+    try std.testing.expectEqual(@as(u32, 2), registry.kept_count);
+    try std.testing.expectEqual(@as(u64, 0), registry.pending_bytes);
+    // 3 and 4 reaped, their generation not judged: counted, and the oldest kept make room.
+    registry.add(3, &.{on_disk});
+    registry.add(4, &.{on_disk});
+    registry.trims_wait();
+    try std.testing.expectEqual(2 * one, registry.pending_bytes);
+    try std.testing.expectEqual(@as(u32, 0), registry.kept_count);
+    for ([_]u32{ 1, 2, 3, 4 }) |branch| try std.testing.expectEqual(branch >= 3, disk.bytes_of(branch, 10) > 0);
+    try std.testing.expect(!registry.disk_full());
+    // 5 too: pending alone past the budget, no new timeline gets the disk.
+    registry.add(5, &.{on_disk});
+    try std.testing.expect(registry.disk_full());
+    // Judged: kept, trimmed to the budget, the disk given again.
+    registry.release_listed(&.{ 3, 4, 5 });
+    registry.trims_wait();
+    try std.testing.expectEqual(@as(u64, 0), registry.pending_bytes);
+    try std.testing.expectEqual(@as(u32, 2), registry.kept_count);
+    try std.testing.expect(!registry.disk_full());
 }
 
 test "a kept holder stays while a kept one is a change from it; the oldest that none is go first" {

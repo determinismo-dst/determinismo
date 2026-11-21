@@ -4180,7 +4180,15 @@ fn explore_tree(
             mine.history = state.history;
             if (holding) {
                 mine.holders = registry.explorer;
-                mine.holders_disk = disk;
+                // None while holders not judged yet fill the disk budget: a judgment frees room
+                // (their returns then load them or replay). Said as it changes.
+                const full = registry.disk_full();
+                if (full != state.holders_disk_full) std.debug.print("[determinismo] holders: {s}\n", .{if (full)
+                    "the disk budget is full of holders not judged yet: timelines start with none on disk"
+                else
+                    "room in the disk budget again: timelines keep holders on disk"});
+                state.holders_disk_full = full;
+                mine.holders_disk = if (full) null else disk;
                 if (ladders) |known| mine.ladder = &known.ladder;
                 if (state.ends_count > 0) mine.end_ns_expected = state.ends_ns_sum / state.ends_count;
             }
@@ -5387,6 +5395,9 @@ const TreeState = struct {
     /// jobs, short of room for the next): no filler starts meanwhile (queue_take), as it would
     /// take the room they wait for.
     makers_short: bool = false,
+    /// The disk holders of generations not judged yet fill the run's disk budget
+    /// (holders.Registry.disk_full): timelines start with no disk for their holders meanwhile.
+    holders_disk_full: bool = false,
     /// Each start snapshot's timelines not judged yet: freed after its last (node_served).
     users: std.AutoHashMapUnmanaged(*const Snapshot, u32) = .empty,
     /// The generation filling: judged next.
