@@ -39,7 +39,11 @@ fi
 
 # Re-apply our patches on a clean base every time.
 (cd "$tree" && git checkout -q -- $patched_paths && git clean -qfd -- arch/x86/kvm virt/kvm)
-for p in "$repo"/kernel/patches/*.patch; do
+# The patches for this kernel's series when it has its own (kernel/patches-7.0: GitHub's hosted
+# runners), else kernel/patches (the hosts' 6.12).
+patches=$repo/kernel/patches
+[ -d "$repo/kernel/patches-$series" ] && patches=$repo/kernel/patches-$series
+for p in "$patches"/*.patch; do
   [ -e "$p" ] || continue
   echo "applying $(basename "$p")"
   (cd "$tree" && git apply --whitespace=nowarn "$p")
