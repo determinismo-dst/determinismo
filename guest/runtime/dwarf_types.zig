@@ -395,8 +395,20 @@ const Types = struct {
         return resolve_walk(types, found, path);
     }
 
-    /// A type by its name: a structure's, class's or union's definition, or a typedef's.
+    /// A type by its name: a structure's, class's or union's definition, or a typedef's; the
+    /// one so named (Go's carry their package path: `github.com/hashicorp/raft.followerReplication`),
+    /// else the first named by the name's last segment (Zig's own DWARF names `hold.TestPeer`
+    /// `TestPeer` under its file's entry, C++ `ns::conn` `conn` under its namespace's).
     fn type_find(types: *Types, name: []const u8) Error!?u64 {
+        if (try types.type_named(name)) |found| return found;
+        const dot = if (std.mem.lastIndexOfScalar(u8, name, '.')) |at| at + 1 else 0;
+        const colons = if (std.mem.lastIndexOf(u8, name, "::")) |at| at + 2 else 0;
+        const last = name[@max(dot, colons)..];
+        if (last.len == 0 or last.len == name.len) return null;
+        return try types.type_named(last);
+    }
+
+    fn type_named(types: *Types, name: []const u8) Error!?u64 {
         for (types.units.items) |*unit| {
             var at = unit.dies;
             while (at < unit.end) {
