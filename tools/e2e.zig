@@ -3644,8 +3644,9 @@ fn check_repl(context: *Context) !void {
         .{ "and the REPL is back there, its bank with it", std.mem.eql(u8, resumed_total, values[1]) },
         .{ "through nrepl-proxy.py: det-checkpoint saved", std.mem.indexOf(u8, proxied, "checkpoint {\"name\":\"proxy\"") != null and std.mem.indexOf(u8, proxied, "\"saved\":true") != null },
         .{ "and det-resume back there: defined before it, not after", std.mem.indexOf(u8, proxied, "back [1 nil]") != null },
-    }, "repl: a session {d}, (+ 1 2) = {s}, the bank's total {s}, the peer {s} {s} {s} {s}, serve {s} {s}, the fork {s}, its server's death answered in {d:.1} s, the total at the checkpoint {s}", .{
-        session, values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8], halt_s, resumed_total,
+    }, "repl: a session {d}, (+ 1 2) = {s}, the bank's total {s}, the peer {s} {s} {s} {s}, serve {s} {s}, the fork {s}, its server's death answered in {d:.1} s, the total at the checkpoint {s}, the runner session {s} {s}", .{
+        session,       values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8], halt_s, resumed_total,
+        values[10],    nrepl_field(outputs[10], "err") orelse nrepl_field(outputs[10], "ex") orelse "",
     });
 }
 
