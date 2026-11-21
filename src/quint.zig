@@ -172,6 +172,8 @@ pub fn check(arena: std.mem.Allocator, io: std.Io, arguments: []const [:0]const 
             std.debug.print("{s}", .{text.items});
             return status;
         }
+        // Said as each piece passes: a long check takes minutes a thousand events.
+        std.debug.print("[determinismo] events {d} to {d} of {d}: a behavior of the spec\n", .{ offset + 1, end, trace.steps.len });
         // The next piece starts where this one's last state is: its variables assigned.
         const last = (states orelse {
             std.debug.print("[determinismo] Quint wrote no states for the events {d} to {d}\n", .{ offset + 1, end });
