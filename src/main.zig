@@ -2769,6 +2769,15 @@ fn command_explore(
         }
     }
     try multiverse.learned_limit_judge(learned_stopped, learned_cuts, learned_cut_first);
+    // What set it, beside its cuts: a slow but sound system told from a hang.
+    if (timeline_learner.limit_ns()) |limit| say("[determinismo] learned timeline limit: {d:.1} s past a " ++
+        "branch point (twice timeline {?d}'s normal end, {d:.1} s past its own; {d} normal ends, {d} needed); " ++
+        "{d} of {d} timelines with it cut there\n", .{
+        @as(f64, @floatFromInt(limit)) / 1e9,                       timeline_learner.longest_index,
+        @as(f64, @floatFromInt(timeline_learner.longest_ns)) / 1e9, timeline_learner.ends,
+        timeline_learner.min_ends,                                  learned_cuts,
+        learned_stopped,
+    });
     multiverse.summarize(monotonic_ns() - time_start_ns);
     // Not a pass: nothing was judged.
     if (multiverse.branches == 0) return error.NoTimelineFinished;
@@ -4711,7 +4720,7 @@ fn learner_note(summary: *const Summary) void {
         .hung
     else
         .normal;
-    timeline_learner.note(end, summary.end_ns -| summary.start_ns);
+    timeline_learner.note(end, summary.index, summary.end_ns -| summary.start_ns);
     if (!summary.learned_stop) return;
     learned_stopped += 1;
     if (!summary.learned_cut) return;

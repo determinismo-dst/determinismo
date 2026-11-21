@@ -27,14 +27,19 @@ pub const Learner = struct {
     floor_ns: u64 = 5 * std.time.ns_per_min,
     ends: u32 = 0,
     longest_ns: u64 = 0,
+    /// The timeline whose normal end is the longest: what set the limit, to tell a slow but sound
+    /// system from a hang.
+    longest_index: ?u32 = null,
 
     pub const End = enum { normal, hung, cut_short };
 
-    /// A timeline that ended `length_ns` after its branch point.
-    pub fn note(learner: *Learner, end: End, length_ns: u64) void {
+    /// Timeline `index`, which ended `length_ns` after its branch point.
+    pub fn note(learner: *Learner, end: End, index: u32, length_ns: u64) void {
         if (end != .normal) return;
         learner.ends +|= 1;
-        learner.longest_ns = @max(learner.longest_ns, length_ns);
+        if (learner.longest_index != null and length_ns <= learner.longest_ns) return;
+        learner.longest_ns = length_ns;
+        learner.longest_index = index;
     }
 
     /// How long a timeline may run past its branch point; null while there is nothing to go by.
@@ -48,22 +53,24 @@ test "a learned limit: from normal ends only, from the branch point, never lower
     var learner: Learner = .{ .min_ends = 3 };
     const s = std.time.ns_per_s;
     // Run 2100's shape: normal ends of a few hundred seconds, hangs held the hour.
-    learner.note(.normal, 16 * s);
-    learner.note(.hung, 3600 * s);
-    learner.note(.normal, 288 * s);
+    learner.note(.normal, 1, 16 * s);
+    learner.note(.hung, 2, 3600 * s);
+    learner.note(.normal, 3, 288 * s);
     try std.testing.expectEqual(null, learner.limit_ns()); // Two normal ends: not yet.
-    learner.note(.cut_short, 9000 * s);
-    learner.note(.normal, 836 * s);
+    learner.note(.cut_short, 4, 9000 * s);
+    learner.note(.normal, 386, 836 * s);
     try std.testing.expectEqual(@as(?u64, 1672 * s), learner.limit_ns());
+    try std.testing.expectEqual(@as(?u32, 386), learner.longest_index); // What set it.
     // A shorter end never lowers it.
-    learner.note(.normal, 5 * s);
+    learner.note(.normal, 6, 5 * s);
     try std.testing.expectEqual(@as(?u64, 1672 * s), learner.limit_ns());
+    try std.testing.expectEqual(@as(?u32, 386), learner.longest_index);
     // Quick ends alone keep the floor's room.
     var quick: Learner = .{ .min_ends = 1 };
-    quick.note(.normal, 2 * s);
+    quick.note(.normal, 0, 2 * s);
     try std.testing.expectEqual(@as(?u64, 5 * std.time.ns_per_min), quick.limit_ns());
     // Off.
     var off: Learner = .{ .multiple = 0, .min_ends = 1 };
-    off.note(.normal, 2 * s);
+    off.note(.normal, 0, 2 * s);
     try std.testing.expectEqual(null, off.limit_ns());
 }
