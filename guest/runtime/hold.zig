@@ -47,6 +47,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const nodes = @import("nodes.zig");
+const sdk = @import("determinismo");
 const symbol = @import("symbol.zig");
 const dwarf_types = @import("dwarf_types.zig");
 
@@ -325,6 +326,8 @@ const Point = struct {
 const Hold = struct {
     pid: linux.pid_t,
     memory: linux.fd_t,
+    /// For its events (`hold`): what it did, in the timeline beside the nodes' own.
+    node: []const u8 = "",
     points: [points_max]Point = undefined,
     count: u32 = 0,
     tids: [threads_max]linux.pid_t = undefined,
@@ -442,6 +445,7 @@ const Hold = struct {
         _ = linux.ptrace(ptrace_setregs, tid, 0, @intFromPtr(regs), 0);
         if (point.passing != null and point.passing.? == tid) {
             point.passing = null;
+            hold.note("passing_back", index, tid, 0);
             if (point.inserted) {
                 if (!hold.byte_write(point.entry, point.original)) return;
                 point.inserted = false;
@@ -466,12 +470,14 @@ const Hold = struct {
                 return;
             }
             out("{{\"held\":{d},\"point\":{d}}}\n", .{ tid, index });
+            hold.note("held", index, tid, 0);
             return; // Left stopped.
         }
         if (point.held == null and !point.done and hold.matches(point, regs)) {
             point.held = tid;
             if (hold.byte_write(point.entry, point.original)) point.inserted = false;
             out("{{\"held\":{d},\"point\":{d}}}\n", .{ tid, index });
+            hold.note("held", index, tid, 0);
             return; // Left stopped.
         }
         if (!hold.byte_write(point.entry, point.original)) return;
@@ -505,6 +511,7 @@ const Hold = struct {
             const read = linux.errno(linux.ptrace(ptrace_getregs, tid, 0, @intFromPtr(&regs), 0)) == .SUCCESS;
             const past = read and regs[rip_index] > point.entry and regs[rip_index] <= point.entry + instruction_size_max;
             if (!past) point.passing = tid;
+            hold.note(if (past) "stepped_signal" else "into_handler", hold.index_of(point), tid, @intCast(signal));
         }
         if (hold.byte_write(point.entry, int3)) point.inserted = true;
         _ = linux.ptrace(ptrace_cont, tid, 0, 0, 0);
@@ -517,6 +524,7 @@ const Hold = struct {
         point.later = false;
         if (hold.byte_write(point.entry, int3)) point.inserted = true;
         out("{{\"armed_point\":{d}}}\n", .{index});
+        hold.note("armed", index, 0, 0);
     }
 
     fn release(hold: *Hold, index: u32) void {
@@ -524,12 +532,23 @@ const Hold = struct {
         const tid = point.held orelse return;
         point.held = null;
         out("{{\"released\":{d},\"point\":{d}}}\n", .{ tid, index });
+        hold.note("released", index, tid, 0);
         if (point.repeat) {
             hold.step_over(tid, point); // Armed again for the next thread.
             return;
         }
         point.done = true;
         _ = linux.ptrace(ptrace_cont, tid, 0, 0, 0);
+    }
+
+    /// What it did, as an event of the timeline's (`hold`): a release that did not land is
+    /// read from these (held, released, armed, a step into a signal handler, its way back).
+    fn note(hold: *const Hold, what: []const u8, index: u32, tid: linux.pid_t, signal: u32) void {
+        sdk.event("hold", .{ .node = hold.node, .what = what, .point = index, .tid = tid, .signal = signal });
+    }
+
+    fn index_of(hold: *const Hold, point: *const Point) u32 {
+        return @intCast((@intFromPtr(point) - @intFromPtr(&hold.points[0])) / @sizeOf(Point));
     }
 
     fn held_any(hold: *const Hold) bool {
@@ -599,7 +618,7 @@ pub fn run(arena: std.mem.Allocator, options: Options) !u8 {
     const path = std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}/mem", .{first.pid}, 0) catch unreachable;
     const fd = linux.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
     if (linux.errno(fd) != .SUCCESS) return error.Memory;
-    var hold: Hold = .{ .pid = first.pid, .memory = @intCast(fd) };
+    var hold: Hold = .{ .pid = first.pid, .memory = @intCast(fd), .node = options.node };
     defer _ = linux.close(hold.memory);
     for (options.points[0..options.count]) |asked| {
         const found = (symbol.find(arena, hold.pid, asked.function, null) catch null) orelse return error.UnknownFunction;
