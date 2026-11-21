@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: MIT
+# A service's namespaced kernel settings (Compose's `sysctls`, as Antithesis's formalized Raft
+# drivers ask for net.unix.max_dgram_qlen): its test command reads them in the node and says, in
+# the Antithesis SDK's format, whether they are this file's. Run with:
+#   determinismo explore ... --compose tests/antithesis-compat/sysctls/compose.yaml --scenario settings
+services:
+  client:
+    build: ./client
+    command: [/usr/local/bin/ready]
+    sysctls:
+      net.unix.max_dgram_qlen: "4096"
+      net.core.somaxconn: 1024
