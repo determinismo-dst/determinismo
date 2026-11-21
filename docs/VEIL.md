@@ -35,9 +35,13 @@ separate module.
 
 ## From another machine, an agent, the run's page
 
+- `clients/veil/replay.sh <serve's URL> <run> <timeline> <Module.lean> <map.json> <instance>
+  <veil checkout>` does the same with a model and a Veil on another machine (someone's laptop,
+  an agent's): serve gives the labels, Veil replays them there, serve names the line where the
+  replay stopped. Same verdicts, same exit statuses.
 - serve: `POST /runs/<run>/veil` with `{"branch": <n>, "map": {...}}` answers the timeline's labels
   (`labels`, the file `#replay` reads, as `file`), how many lines became labels by action, and
-  the line to put in the module, for a model and a Veil that are not where the run is.
+  the line to put in the module; with `"label": <k>` (from 1), that label's moment, node and line.
 - For an agent where determinismo runs: the MCP server's `veil` tool (`determinismo mcp`).
 - From the run's page: a timeline's logs have "Labels for Veil": the map pasted (kept for the
   next timeline), the labels file downloaded, the `#replay` line said.

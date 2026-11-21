@@ -107,8 +107,9 @@ pub fn check(arena: std.mem.Allocator, io: std.Io, arguments: []const [:0]const 
     return report(verdict, labels);
 }
 
-/// What serve's POST /runs/<id>/veil asks: a timeline and a map.
-pub const Asked = struct { branch: u32, map: Map };
+/// What serve's POST /runs/<id>/veil asks: a timeline and a map; with `label` (from 1), only
+/// that label's line (where a replay stopped).
+pub const Asked = struct { branch: u32, map: Map, label: ?u64 = null };
 
 /// serve's answer for a timeline and a map, a JSON object: the labels file's name and content
 /// (`labels`, for `#replay`'s `file`), how many lines became labels, by action, and the line to
@@ -118,6 +119,21 @@ pub fn answer(arena: std.mem.Allocator, io: std.Io, events_directory: []const u8
     for (asked.map.actions) |action| if (action.name.len == 0 or action.match.len == 0) return error.BadRequest;
     const source = try event_files.read(arena, io, events_directory, asked.branch, .limited(events_size_max));
     const labels = try labels_of(arena, source, asked.map);
+    if (asked.label) |index| {
+        if (index == 0 or index > labels.len) return error.BadRequest;
+        const label = labels[@intCast(index - 1)];
+        try std.json.Stringify.value(.{ .at = .{
+            .index = index,
+            .of = labels.len,
+            .name = label.name,
+            .node = label.node,
+            .vtime_ns = label.vtime_ns,
+            .source = label.source,
+            .text = label.text,
+        } }, .{}, out);
+        try out.writeAll("\n");
+        return;
+    }
     const Count = struct { name: []const u8, count: u64 };
     var counts: std.ArrayList(Count) = .empty;
     for (asked.map.actions) |action| {
@@ -312,6 +328,16 @@ test "serve's answer: a timeline's labels for a map" {
     try std.testing.expectEqual(@as(u64, 1), parsed.actions[1].count);
     try std.testing.expectEqual(@as(usize, 3), parsed.labels.object.get("labels").?.array.items.len);
     try std.testing.expectError(error.BadRequest, answer(arena, io, directory, .{ .branch = 2, .map = .{ .actions = &.{} } }, &out.writer));
+    // One label's line: the third, raft-node-1's at 3 ns.
+    var one: std.Io.Writer.Allocating = .init(arena);
+    try answer(arena, io, directory, .{ .branch = 2, .map = map, .label = 3 }, &one.writer);
+    const At = struct { at: struct { index: u64, of: u64, name: []const u8, node: u64, vtime_ns: u64, source: []const u8 } };
+    const at = (try std.json.parseFromSliceLeaky(At, arena, one.written(), .{ .ignore_unknown_fields = true })).at;
+    try std.testing.expectEqual(@as(u64, 3), at.of);
+    try std.testing.expectEqualStrings("EnterLeader", at.name);
+    try std.testing.expectEqual(@as(u64, 1), at.node);
+    try std.testing.expectEqual(@as(u64, 3), at.vtime_ns);
+    try std.testing.expectError(error.BadRequest, answer(arena, io, directory, .{ .branch = 2, .map = map, .label = 4 }, &one.writer));
 }
 
 test "Veil's verdict line" {
