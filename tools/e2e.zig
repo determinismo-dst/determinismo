@@ -7320,9 +7320,22 @@ fn check_hold(context: *Context) !void {
     const released_line = for_line(released_report, property);
     const released_hit = if (released_line) |text| hit_count(text) else 0;
     const released_failing = failing_in(released_report, property);
+    // A point armed later (--later, then `arm 0`): none held before, the next after.
+    const later_report = try explore(context, &.{
+        "--program", program, "--profile",  "held", "--scenario", "held_later",
+        "--seed",    "1",     "--branches", "4",
+    });
+    var later_branches: [timelines]Branch = undefined;
+    const later_count = parse_branches(later_report, &later_branches);
+    const later_property = "a later hold point holds only once armed";
+    const later_line = for_line(later_report, later_property);
+    const later_hit = if (later_line) |text| hit_count(text) else 0;
+    const later_failing = failing_in(later_report, later_property);
     expect_all(context, &.{
         .{ "every timeline explored", count == timelines },
         .{ "every timeline has the race", count > 0 and crashed == count },
+        .{ "a point armed later: every timeline explored", later_count == timelines },
+        .{ "none held before it was armed, the next after, in every timeline", later_hit == timelines and later_failing != null and later_failing.? == 0 },
         .{ "a point let go alone: every timeline explored", released_count == timelines },
         .{ "its thread went on and the next was held, in every timeline", released_hit == timelines and released_failing != null and released_failing.? == 0 },
     }, "hold: {d} of {d} timelines failing \"no process crashes: race-held\"; a point let go alone: {d} timelines, the next held in {d}", .{ crashed, count, released_count, released_hit - (released_failing orelse released_hit) });

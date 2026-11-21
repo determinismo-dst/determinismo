@@ -23,6 +23,10 @@
 //! pointer and its length in those registers (Go passes a string in two: `target ServerAddress`
 //! of NetworkTransport.RequestVote in rdi and rsi), is that text: one peer's request among the
 //! goroutines sending a campaign's.
+//! `--later`: the point's breakpoint is left out until `arm <point>` (on its standard input, then
+//! SIGUSR1, as a release), then `{"armed_point":<n>}`: one hold a process (a single tracer), its
+//! points armed as a walk needs them (a leader's replication to one follower held only once that
+//! follower caught up).
 //! `--repeat`: once its thread is let go, the point holds the next one that matches (a writer
 //! kept from landing again while the rest goes on). `--every`: every thread that matches is held
 //! until the end (all of a node's sends of a message kept from leaving). `--direct`: the caller
@@ -112,6 +116,8 @@ pub const PointOptions = struct {
     every: bool = false,
     /// `caller` must be the immediate caller (the entry's return address), not one further up.
     direct: bool = false,
+    /// Its breakpoint left out until `arm <point>`.
+    later: bool = false,
 };
 
 pub const Options = struct {
@@ -141,6 +147,11 @@ pub fn parse(node: []const u8, function: []const u8, rest: []const []const u8) !
         }
         if (std.mem.eql(u8, option[0], "--direct")) {
             point.direct = true;
+            option = option[1..];
+            continue;
+        }
+        if (std.mem.eql(u8, option[0], "--later")) {
+            point.later = true;
             option = option[1..];
             continue;
         }
@@ -249,12 +260,17 @@ fn returns_into(address: u64, start: u64, end: u64) bool {
     return address > start and address <= end;
 }
 
-/// The point numbers of `release <n>` lines in `text` (a command each line).
-fn releases_parse(text: []const u8, asked: *[points_max]bool) void {
+/// The point numbers of `release <n>` and `arm <n>` lines in `text` (a command each line).
+fn commands_parse(text: []const u8, released: *[points_max]bool, armed: *[points_max]bool) void {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
-        if (!std.mem.startsWith(u8, line, "release ")) continue;
-        const point = std.fmt.parseInt(u32, std.mem.trim(u8, line["release ".len..], " \r"), 10) catch continue;
+        const word, const asked = if (std.mem.startsWith(u8, line, "release "))
+            .{ "release ", released }
+        else if (std.mem.startsWith(u8, line, "arm "))
+            .{ "arm ", armed }
+        else
+            continue;
+        const point = std.fmt.parseInt(u32, std.mem.trim(u8, line[word.len..], " \r"), 10) catch continue;
         if (point < points_max) asked[point] = true;
     }
 }
@@ -291,6 +307,8 @@ const Point = struct {
     repeat: bool,
     every: bool,
     direct: bool,
+    /// Its breakpoint left out until `arm <point>` (then false).
+    later: bool = false,
     inserted: bool = false,
     held: ?linux.pid_t = null,
     /// With `every`, the threads held besides `held` (the first), until the end.
@@ -492,6 +510,15 @@ const Hold = struct {
         _ = linux.ptrace(ptrace_cont, tid, 0, 0, 0);
     }
 
+    /// A `--later` point's breakpoint put in: it holds from now on.
+    fn arm_later(hold: *Hold, index: u32) void {
+        const point = &hold.points[index];
+        if (!point.later) return;
+        point.later = false;
+        if (hold.byte_write(point.entry, int3)) point.inserted = true;
+        out("{{\"armed_point\":{d}}}\n", .{index});
+    }
+
     fn release(hold: *Hold, index: u32) void {
         const point = &hold.points[index];
         const tid = point.held orelse return;
@@ -599,7 +626,7 @@ pub fn run(arena: std.mem.Allocator, options: Options) !u8 {
         var original: [1]u8 = undefined;
         if (linux.pread(hold.memory, &original, 1, @bitCast(found.address)) != 1) return error.Memory;
         assert(original[0] != int3);
-        hold.points[hold.count] = .{ .entry = found.address, .original = original[0], .caller = caller, .arg = asked.arg, .field = field, .string = asked.string, .repeat = asked.repeat, .every = asked.every, .direct = asked.direct };
+        hold.points[hold.count] = .{ .entry = found.address, .original = original[0], .caller = caller, .arg = asked.arg, .field = field, .string = asked.string, .repeat = asked.repeat, .every = asked.every, .direct = asked.direct, .later = asked.later };
         hold.count += 1;
     }
 
@@ -638,6 +665,7 @@ pub fn run(arena: std.mem.Allocator, options: Options) !u8 {
     if (linux.errno(input_flags) == .SUCCESS) _ = linux.fcntl(0, linux.F.SETFL, input_flags | 0o4000); // O_NONBLOCK
     var inserted: u32 = 0;
     for (hold.points[0..hold.count]) |*point| {
+        if (point.later) continue; // Armed by `arm <point>`.
         if (hold.byte_write(point.entry, int3)) {
             point.inserted = true;
             inserted += 1;
@@ -652,9 +680,11 @@ pub fn run(arena: std.mem.Allocator, options: Options) !u8 {
             var commands: [256]u8 = undefined;
             const size = linux.read(0, &commands, commands.len);
             if (linux.errno(size) == .SUCCESS and size > 0) {
-                var asked: [points_max]bool = @splat(false);
-                releases_parse(commands[0..size], &asked);
-                for (asked[0..hold.count], 0..) |release, index| if (release) hold.release(@intCast(index));
+                var released: [points_max]bool = @splat(false);
+                var armed: [points_max]bool = @splat(false);
+                commands_parse(commands[0..size], &released, &armed);
+                for (armed[0..hold.count], 0..) |arm, index| if (arm) hold.arm_later(@intCast(index));
+                for (released[0..hold.count], 0..) |release, index| if (release) hold.release(@intCast(index));
             }
         }
         var status: i32 = 0;
@@ -708,6 +738,8 @@ test returns_into {
 test parse {
     const options = try parse("raft-node-1", "f", &.{ "--caller", "g", "--every", "--and", "h", "--repeat", "--arg", "rbx=0x18", "--timeout-ms", "2500" });
     try std.testing.expect(!options.points[0].repeat and options.points[1].repeat);
+    const later = try parse("raft-node-1", "f", &.{ "--and", "g", "--later", "--repeat" });
+    try std.testing.expect(!later.points[0].later and later.points[1].later and later.points[1].repeat);
     try std.testing.expect(options.points[0].every and !options.points[1].every);
     const direct = try parse("n", "f", &.{ "--caller", "g", "--direct" });
     try std.testing.expect(direct.points[0].direct);
@@ -796,8 +828,10 @@ test "a field behind a register, matched as its DWARF type reads it" {
     try std.testing.expectError(error.NoSuchField, field_match(arena, sections, .{ .index = 5, .type_name = type_name, .path = "missing", .value = "1" }));
 }
 
-test releases_parse {
-    var asked: [points_max]bool = @splat(false);
-    releases_parse("release 1\nnoise\nrelease 3\nrelease 9\n", &asked);
-    try std.testing.expect(!asked[0] and asked[1] and !asked[2] and asked[3]);
+test commands_parse {
+    var released: [points_max]bool = @splat(false);
+    var armed: [points_max]bool = @splat(false);
+    commands_parse("release 1\nnoise\narm 2\nrelease 3\nrelease 9\narm x\n", &released, &armed);
+    try std.testing.expect(!released[0] and released[1] and !released[2] and released[3]);
+    try std.testing.expect(!armed[0] and !armed[1] and armed[2] and !armed[3]);
 }

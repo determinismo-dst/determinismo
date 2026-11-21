@@ -276,8 +276,9 @@
 
 (defn hold
   "Holds threads of a node's process where points say (det-nodes hold: a function, then --caller,
-  --arg, --repeat, --every, --direct, --and <function> ...), as the Zig SDK's Node.hold: armed
-  before it returns. {:session :armed}; then held?, held-within?, release-point, release."
+  --arg, --repeat, --every, --direct, --later, --and <function> ...), as the Zig SDK's Node.hold:
+  armed before it returns. {:session :armed}; then held?, held-within?, arm-point (a --later
+  point), release-point, release."
   [node points timeout-ms]
   (let [id (session (concat ["det-nodes" "hold" (name node)] points ["--timeout-ms" (str timeout-ms)]))
         line (session-read id)]
@@ -306,6 +307,12 @@
           (or (nil? line) (.startsWith ^String line "{\"held\":null")) false
           (and (.startsWith ^String line "{\"held\":") (.endsWith ^String line (str "\"point\":" point "}"))) true
           :else (recur waited))))))
+
+(defn arm-point
+  "Puts a --later point's breakpoint in: it holds from now on (one hold a process, its points
+  armed as they are needed)."
+  [{:keys [session]} point]
+  (session-write session {:input (str "arm " point "\n") :signal "USR1"}))
 
 (defn release-point
   "Lets point's held thread go on, the others held still."

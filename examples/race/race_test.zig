@@ -29,7 +29,7 @@ const Nodes = struct { race: sdk.Node };
 const System = sdk.System(Nodes);
 
 pub fn main(init: std.process.Init) !void {
-    return System.main(init, .{ .describe = describe, .scenarios = .{ .race = race, .held = held, .held_release = held_release } });
+    return System.main(init, .{ .describe = describe, .scenarios = .{ .race = race, .held = held, .held_release = held_release, .held_later = held_later } });
 }
 
 fn describe(d: *System.Describe) !void {
@@ -175,6 +175,55 @@ fn hold_release_one(context: *System.Context) !void {
     hold.release();
     sdk.event("race_held_release", .{ .first = first, .again = again, .first_again = first_again });
     sdk.always(first != null and again != null, "a hold point let go alone holds the next thread", .{ .first = first, .first_again = first_again });
+}
+
+/// Scenario `held_later` (profile `held`): Node.hold on `race_held.check` with `--later`: no
+/// thread held while its point waits (the program's runs go on), then `arm 0`, and the next
+/// thread that checks is held. One hold a process, its points armed as a walk needs them.
+fn held_later(s: *System.Scenario) void {
+    s.faults = false;
+    s.singleton_driver("hold", hold_later_armed);
+}
+
+/// The hold's next line; empty at its end.
+fn hold_line(hold: anytype, buffer: []u8) []const u8 {
+    var size: usize = 0;
+    while (size < buffer.len) {
+        const result = linux.read(hold.output, buffer[size..].ptr, 1);
+        if (linux.errno(result) != .SUCCESS or result == 0) break;
+        if (buffer[size] == '\n') break;
+        size += 1;
+    }
+    return buffer[0..size];
+}
+
+fn hold_later_armed(context: *System.Context) !void {
+    sdk.sleep_ms(200 + sdk.random_below(800));
+    const hold = try context.nodes.race.hold(&.{ "race_held.check", "--later" }, 10_000);
+    if (!hold.armed()) {
+        hold.release();
+        return error.NotArmed;
+    }
+    // Runs of the program go on meanwhile: none may be held before the point is armed.
+    sdk.sleep_ms(500);
+    const command = "arm 0\n";
+    _ = linux.write(hold.input, command.ptr, command.len);
+    _ = linux.kill(hold.pid, .USR1);
+    var armed_seen = false;
+    var held_before = false;
+    var held_after = false;
+    while (!held_after) {
+        var buffer: [256]u8 = undefined;
+        const said = hold_line(hold, &buffer);
+        if (said.len == 0 or std.mem.startsWith(u8, said, "{\"held\":null")) break;
+        if (std.mem.eql(u8, said, "{\"armed_point\":0}")) armed_seen = true;
+        if (std.mem.startsWith(u8, said, "{\"held\":")) {
+            if (armed_seen) held_after = true else held_before = true;
+        }
+    }
+    hold.release();
+    sdk.event("race_held_later", .{ .armed = armed_seen, .held_before = held_before, .held_after = held_after });
+    sdk.always(armed_seen and held_after and !held_before, "a later hold point holds only once armed", .{ .armed = armed_seen, .held_before = held_before });
 }
 
 fn race(s: *System.Scenario) void {
