@@ -14,7 +14,9 @@
 //! ABIInternal: rax, rbx, rcx, rdi, rsi, r8 to r11 in order, a method's receiver first; the
 //! System V ABI: rdi, rsi, rdx, rcx, r8, r9). Other entries step over the breakpoint and go on.
 //! `--repeat`: once its thread is let go, the point holds the next one that matches (a writer
-//! kept from landing again while the rest goes on).
+//! kept from landing again while the rest goes on). `--every`: every thread that matches is held
+//! until the end (all of a node's sends of a message kept from leaving). `--direct`: the caller
+//! must be the immediate one (a store's Set called by persistVote itself, not through SetUint64).
 //!
 //! A held thread keeps what it holds: a lock, and in Go its P (a held thread with the only P
 //! stops every goroutine, and a collection's stop-the-world waits for it). A Go program held
@@ -50,6 +52,7 @@ const processes_max = 1024;
 const threads_max = 1024;
 const frames_max = 32;
 pub const points_max = 4;
+const threads_held_max = 64;
 
 /// struct user_regs_struct: 27 registers.
 const Regs = [27]u64;
@@ -74,6 +77,10 @@ pub const PointOptions = struct {
     arg: ?Arg = null,
     /// Once its thread is let go, the point holds the next one that matches.
     repeat: bool = false,
+    /// Every thread that matches is held (until the end), not only the first.
+    every: bool = false,
+    /// `caller` must be the immediate caller (the entry's return address), not one further up.
+    direct: bool = false,
 };
 
 pub const Options = struct {
@@ -93,6 +100,16 @@ pub fn parse(node: []const u8, function: []const u8, rest: []const []const u8) !
         const point = &options.points[options.count - 1];
         if (std.mem.eql(u8, option[0], "--repeat")) {
             point.repeat = true;
+            option = option[1..];
+            continue;
+        }
+        if (std.mem.eql(u8, option[0], "--every")) {
+            point.every = true;
+            option = option[1..];
+            continue;
+        }
+        if (std.mem.eql(u8, option[0], "--direct")) {
+            point.direct = true;
             option = option[1..];
             continue;
         }
@@ -169,8 +186,13 @@ const Point = struct {
     caller: ?[2]u64,
     arg: ?Arg,
     repeat: bool,
+    every: bool,
+    direct: bool,
     inserted: bool = false,
     held: ?linux.pid_t = null,
+    /// With `every`, the threads held besides `held` (the first), until the end.
+    others: [threads_held_max]linux.pid_t = undefined,
+    others_count: u32 = 0,
     /// Held once and let go: the point is done (its byte stays restored).
     done: bool = false,
 };
@@ -233,6 +255,7 @@ const Hold = struct {
         const range = point.caller orelse return true;
         const first = hold.word_read(regs[rsp_index]) orelse return false;
         if (returns_into(first, range[0], range[1])) return true;
+        if (point.direct) return false;
         var frame = regs[rbp_index];
         for (0..frames_max) |_| {
             if (frame == 0) return false;
@@ -255,6 +278,21 @@ const Hold = struct {
         if (!point.inserted) {
             _ = linux.ptrace(ptrace_cont, tid, 0, 0, 0);
             return;
+        }
+        if (point.every and !point.done and hold.matches(point, regs)) {
+            // Held where it stands, the breakpoint kept for the next one (each goes on from the
+            // entry at the end, the byte restored then).
+            if (point.held == null) {
+                point.held = tid;
+            } else if (point.others_count < threads_held_max) {
+                point.others[point.others_count] = tid;
+                point.others_count += 1;
+            } else {
+                _ = linux.ptrace(ptrace_cont, tid, 0, 0, 0);
+                return;
+            }
+            out("{{\"held\":{d},\"point\":{d}}}\n", .{ tid, index });
+            return; // Left stopped.
         }
         if (point.held == null and !point.done and hold.matches(point, regs)) {
             point.held = tid;
@@ -331,6 +369,7 @@ const Hold = struct {
     fn held_by(hold: *const Hold, tid: linux.pid_t) ?u32 {
         for (hold.points[0..hold.count], 0..) |point, index| {
             if (point.held != null and point.held.? == tid) return @intCast(index);
+            for (point.others[0..point.others_count]) |other| if (other == tid) return @intCast(index);
         }
         return null;
     }
@@ -378,7 +417,7 @@ pub fn run(arena: std.mem.Allocator, options: Options) !u8 {
         var original: [1]u8 = undefined;
         if (linux.pread(hold.memory, &original, 1, @bitCast(found.address)) != 1) return error.Memory;
         assert(original[0] != int3);
-        hold.points[hold.count] = .{ .entry = found.address, .original = original[0], .caller = caller, .arg = asked.arg, .repeat = asked.repeat };
+        hold.points[hold.count] = .{ .entry = found.address, .original = original[0], .caller = caller, .arg = asked.arg, .repeat = asked.repeat, .every = asked.every, .direct = asked.direct };
         hold.count += 1;
     }
 
@@ -469,8 +508,11 @@ test returns_into {
 }
 
 test parse {
-    const options = try parse("raft-node-1", "f", &.{ "--caller", "g", "--and", "h", "--repeat", "--arg", "rbx=0x18", "--timeout-ms", "2500" });
+    const options = try parse("raft-node-1", "f", &.{ "--caller", "g", "--every", "--and", "h", "--repeat", "--arg", "rbx=0x18", "--timeout-ms", "2500" });
     try std.testing.expect(!options.points[0].repeat and options.points[1].repeat);
+    try std.testing.expect(options.points[0].every and !options.points[1].every);
+    const direct = try parse("n", "f", &.{ "--caller", "g", "--direct" });
+    try std.testing.expect(direct.points[0].direct);
     try std.testing.expectEqual(@as(u32, 2), options.count);
     try std.testing.expectEqualStrings("g", options.points[0].caller.?);
     try std.testing.expect(options.points[0].arg == null);
