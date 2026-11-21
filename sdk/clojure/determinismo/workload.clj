@@ -251,12 +251,12 @@
   "A runner command that outlives one request (det-runner's sessions: det-nodes hold, a tail of a
   log), opened: its id, for session-read, session-write and session-close."
   [argv]
-  (get (runner-raw {:argv (mapv #(if (keyword? %) (name %) (str %)) argv) :session "open"}) "session"))
+  (:session (runner-raw {:argv (mapv #(if (keyword? %) (name %) (str %)) argv) :session "open"})))
 
 (defn session-read
   "A session's next line of output; nil at its end."
   [id]
-  (get (runner-raw {:session "read" :id id}) "line"))
+  (:line (runner-raw {:session "read" :id id})))
 
 (defn session-write
   "Writes :input to a session's command and sends it :signal (\"USR1\", \"TERM\", ...)."
