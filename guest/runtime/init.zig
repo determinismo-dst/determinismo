@@ -437,6 +437,39 @@ fn exit_known_now(index: usize, name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Whether a node's exit (a wait status) is an expected one (orphan_reaped says why).
+fn exit_expected(status: u32, stopping: bool, disk_failing: bool) bool {
+    const code = if (status & 0x7f == 0) (status >> 8) & 0xff else 128 + (status & 0x7f);
+    if (code == 0 or code == 128 + 9 or code == 128 + 15 or disk_failing) return true;
+    if (!stopping) return false;
+    // 147 from a process that exited by itself: a shell with job control (`set -m`) in front of
+    // the node's process, whose wait returned "stopped" (SIGSTOP: a process_pause of ours) as the
+    // graceful stop came, passes that on as its own code (Antithesis's formalized Raft images'
+    // forward-logs: run 2122, 6 such exits of its own, each a pause's end beside a stop; bash
+    // alone does it on Linux). No process dies of SIGSTOP: no crash hides behind it.
+    return code < 128 or code == 128 + @backingInt(linux.SIG.STOP);
+}
+
+test exit_expected {
+    const exited = struct {
+        fn status(code: u32) u32 {
+            return code << 8;
+        }
+    }.status;
+    try std.testing.expect(exit_expected(exited(0), false, false));
+    try std.testing.expect(exit_expected(exited(143), false, false));
+    try std.testing.expect(exit_expected(9, false, false)); // Killed.
+    try std.testing.expect(exit_expected(exited(2), true, false));
+    try std.testing.expect(!exit_expected(exited(2), false, false));
+    // A shell that passes its child's status on, stopped while the child was paused (SIGSTOP).
+    try std.testing.expect(exit_expected(exited(128 + 19), true, false));
+    // Not outside a stop, and a crash passed on during one is still judged.
+    try std.testing.expect(!exit_expected(exited(128 + 19), false, false));
+    try std.testing.expect(!exit_expected(exited(128 + 6), true, false));
+    try std.testing.expect(!exit_expected(exited(128 + 11), true, false));
+    try std.testing.expect(!exit_expected(11, true, false)); // Killed by SIGSEGV.
+}
+
 fn orphan_reaped(pid: linux.pid_t, status: u32) void {
     for (node_names, 0..) |name, index| {
         // The node's main process, or the one a graceful stop signalled (gone from the pidfile,
@@ -454,7 +487,7 @@ fn orphan_reaped(pid: linux.pid_t, status: u32) void {
         // expected (a Go program that was PID 1, gosu in PostgreSQL's entrypoint, cannot die of
         // the SIGTERM it re-raises and exits 2: hunt run 1971, 6 timelines, since c89a7a28
         // judged stopping exits); a crash signal is still judged, with its crash lines.
-        const expected = code == 0 or signaled or nodes.disk_failing(name) or (stopping and code < 128);
+        const expected = exit_expected(status, stopping, nodes.disk_failing(name));
         // What it said names a known exit for any exit but a plain one, under a failing disk
         // too: its crash lines are judged by it (MongoDB's abort on WiredTiger's EIO, hunt run
         // 1707: expected under a disk fault, its crash then failed as if nothing was said).
