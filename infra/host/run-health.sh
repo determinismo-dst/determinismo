@@ -121,6 +121,9 @@ if run.get("state") == "error": problems.append("it ended in error (its output.l
 elif run.get("state") not in (None, "running") and sum(outcomes.values()) == 0:  # total is at least 1.
     problems.append("it ended without a timeline")
 if lost: problems.append(f"sometimes no longer reached (the previous run in half its timelines): {lost}")
+# Our coverage agent's doing, not the system's (serve's note): its JVMs refused their AOT caches,
+# so a trial says it before a hunt starts every server three times slower.
+if run.get("jvm_cache"): problems.append(run["jvm_cache"].strip())
 # The setup's baseline: the previous run of the same scenario and profile, else of the system in
 # any (a program's setup is the same: Cassandra's first power-loss run, 163 s, was flagged
 # against none though its default runs take 160 s).

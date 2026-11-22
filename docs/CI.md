@@ -71,7 +71,13 @@ the timelines that reach new code and serve can tell a job that ran from one tha
 (it stops a run whose first timelines report no coverage):
 
 - **JVM** (24 or later): determinismo's agent, on `JAVA_TOOL_OPTIONS`; 17 to 23, only jars
-  instrumented ahead of time (docs/PLUGINS.md).
+  instrumented ahead of time (docs/PLUGINS.md). An image that trains an AOT cache or a CDS
+  archive (`-XX:AOTCache`, `-XX:SharedArchiveFile`) trains it with `--add-modules
+  java.instrument` and starts with that too: the agent puts the module at every start, and the
+  JVM refuses a cache trained without it (`java.instrument specified during runtime but not
+  during dump time`), starting about 3 times slower; the run says so in a note. A cache's
+  classes pass the agent by, so its system's own jars are instrumented ahead of time as well
+  (docs/PLUGINS.md), or their lines go unreported.
 - **Python** (3.12 or later): each Python process the run command starts reports the lines of
   its own code: every file but the interpreter's library and the installed packages (the
   node's `DETERMINISMO_COVERAGE` narrows it). A `sitecustomize` of your own still runs.

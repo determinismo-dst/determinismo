@@ -1270,6 +1270,17 @@ pub const logged_sql =
     \\
 ;
 
+/// JVM starts that refused their AOT cache because of our coverage agent: its -javaagent puts
+/// java.instrument among the modules at runtime, and a cache trained without it is refused (the
+/// JDK's own line, read from `logged`: aws-hunt run 18's Datalevin, 1,255 of 1,441 starts, a
+/// restarted server serving a median 75 virtual s later). Our doing, not the system's: a note of
+/// the run's (serve's jvm-cache file), never a property. docs/CI.md has the image's recipe.
+pub const jvm_cache_refused_sql =
+    \\SELECT coalesce(sum(lines), 0)::UBIGINT AS starts, count(DISTINCT branch)::UBIGINT AS timelines
+    \\FROM logged
+    \\WHERE template LIKE '%java.instrument specified during runtime but not during dump time%'
+;
+
 /// how many distinct behaviors the exploration has seen. A timeline's ancestors finished before
 /// it began, so a behavior is first seen at the lowest index whose own events (or the setup's,
 /// for every timeline) have it.
@@ -2125,6 +2136,34 @@ test "logged errors are templates by node, panics first, the kernel's and plain 
     try testing.expectEqualStrings("[ERROR] [store.go:#] [\"loadStore failed\"] [id=#]", rows[2].template);
     try testing.expectEqual(3, rows[2].timelines);
     try testing.expectEqual(5, rows[2].first_timeline);
+}
+
+test "a JVM's refused AOT cache is counted from its own line: starts and timelines" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var failure: duckdb.Failure = .{};
+    var database = try duckdb.Database.open(":memory:", .{ .threads = 1 }, &failure);
+    defer database.close();
+    var connection = try database.connect(&failure);
+    defer connection.close();
+    try connection.exec("CREATE TABLE events (branch UINTEGER, vtime_ns UBIGINT, kind VARCHAR, node VARCHAR, text VARCHAR)");
+    try connection.exec("CREATE TABLE timelines (branch UINTEGER, extends UINTEGER)");
+    try connection.exec(summaries_tables_sql);
+    // aws-hunt run 18's timeline 71, as recorded (two starts of dl1, one of dl2 in another).
+    try connection.exec(
+        \\INSERT INTO events VALUES
+        \\ (71, 226922049994, 'output', 'dl1', '[0.129s][error][aot] Mismatched values for property jdk.module.addmods: java.instrument specified during runtime but not during dump time'),
+        \\ (71, 226922049995, 'output', 'dl1', '[0.129s][error][aot] Unable to map shared spaces'),
+        \\ (71, 232622649952, 'output', 'dl1', '[0.134s][error][aot] Mismatched values for property jdk.module.addmods: java.instrument specified during runtime but not during dump time'),
+        \\ (72, 100, 'output', 'dl2', '[0.131s][error][aot] Mismatched values for property jdk.module.addmods: java.instrument specified during runtime but not during dump time'),
+        \\ (73, 100, 'output', 'dl3', '[0.140s][error][aot] Unable to map shared spaces')
+    );
+    try connection.exec(try scoped(arena, logged_summary_sql, "TRUE"));
+    const Refused = struct { starts: u64, timelines: u64 };
+    const refused = (try connection.row(Refused, arena, jvm_cache_refused_sql, .{})).?;
+    try testing.expectEqual(3, refused.starts);
+    try testing.expectEqual(2, refused.timelines);
 }
 
 test "logged failed assertions are panics, Valkey's expression line among them" {

@@ -2301,8 +2301,9 @@ fn run_show(server: *Server, run: *const Run, out: *std.Io.Writer) !u16 {
     if (run.status) |status| try out.print(",\"status\":{d}", .{status});
     // Why serve stopped it (the coverage gate's reason in its `stopped` file; someone's stop
     // leaves the file empty), and that it ended without coverage (its `uncovered` file) or
-    // without exploring (its `unexplored` file).
-    inline for (.{ .{ "stopped", "stopped_why" }, .{ "uncovered", "uncovered" }, .{ "unexplored", "unexplored" } }) |pair| {
+    // without exploring (its `unexplored` file), and that its JVMs refused their caches for our
+    // agent (its `jvm-cache` file).
+    inline for (.{ .{ "stopped", "stopped_why" }, .{ "uncovered", "uncovered" }, .{ "unexplored", "unexplored" }, .{ "jvm-cache", "jvm_cache" } }) |pair| {
         if (run_file(server, run.id, pair[0])) |text| {
             const said = std.mem.trim(u8, text, " \n");
             if (said.len > 0) try out.print(",\"{s}\":{f}", .{ pair[1], std.json.fmt(said, .{}) });
@@ -5672,8 +5673,10 @@ fn run_resume(server: *Server, id: u32, out: *std.Io.Writer) !u16 {
     const stopped_path = try std.fs.path.join(server.arena, &.{ directory, "stopped" });
     std.Io.Dir.cwd().deleteFile(server.io, stopped_path) catch {};
     // It explores again: judged again as it ends.
-    const unexplored_path = try std.fs.path.join(server.arena, &.{ directory, "unexplored" });
-    std.Io.Dir.cwd().deleteFile(server.io, unexplored_path) catch {};
+    inline for (.{ "unexplored", "jvm-cache" }) |name| {
+        const said_path = try std.fs.path.join(server.arena, &.{ directory, name });
+        std.Io.Dir.cwd().deleteFile(server.io, said_path) catch {};
+    }
     shared.exploration_known[id] = false;
     run.* = .{ .id = id, .pid = pid };
     try out.print("{{\"id\":{d},\"state\":\"running\",\"build\":{f},\"serve_build\":{f},\"same_core\":{}}}\n", .{
@@ -6201,6 +6204,33 @@ fn exploration_missing(asked: *const RunRequest, ended: u64, returned: u64, work
     return ended >= 2 * @as(u64, asked.generation orelse exploration_generation(workers));
 }
 
+/// A run whose JVMs refused their AOT cache for our coverage agent (store.jvm_cache_refused_sql)
+/// gets its `jvm-cache` file: a note on its page and in its JSON, never a property (our doing).
+fn jvm_cache_note(server: *Server, id: u32, connection: *duckdb.Connection) void {
+    const Refused = struct { starts: u64, timelines: u64 };
+    const refused = (connection.row(Refused, server.arena, store.jvm_cache_refused_sql, .{}) catch return) orelse return;
+    if (refused.starts == 0) return;
+    const why = jvm_cache_said(server.arena, refused.starts, refused.timelines) catch return;
+    const directory = run_directory(server, id) catch return;
+    const path = std.fs.path.join(server.arena, &.{ directory, "jvm-cache" }) catch return;
+    std.Io.Dir.cwd().writeFile(server.io, .{ .sub_path = path, .data = why }) catch return;
+    generation_next(server, id);
+    std.debug.print("[serve] run {d}: {s}", .{ id, why });
+}
+
+fn jvm_cache_said(arena: std.mem.Allocator, starts: u64, timelines: u64) ![]const u8 {
+    return std.fmt.allocPrint(arena, "the coverage agent made the JVM refuse its AOT cache: {d} starts in {d} " ++
+        "timelines, each about 3 times slower to serve (docs/CI.md, Coverage: train the cache with " ++
+        "--add-modules java.instrument)\n", .{ starts, timelines });
+}
+
+test "a refused JVM cache is said with its count and its remedy" {
+    const said = try jvm_cache_said(std.testing.allocator, 1255, 63);
+    defer std.testing.allocator.free(said);
+    try std.testing.expect(std.mem.indexOf(u8, said, "1255 starts in 63 timelines") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "--add-modules java.instrument") != null);
+}
+
 /// A generation's size where the request gives none: main.zig's tree.generation_for, from the
 /// run's workers (its record's summary; 0 unknown: 32, as on 32 to 47).
 fn exploration_generation(workers: u32) u32 {
@@ -6225,6 +6255,8 @@ fn exploration_judge(server: *Server, id: u32, connection: *duckdb.Connection) v
     const shared = server.shared;
     const run = run_get(server, id) orelse return;
     const status = run.status orelse return;
+    // Ended however (a stop too): whether our agent cost its JVMs their caches.
+    jvm_cache_note(server, id, connection);
     // Stopped, drained or broken: said already, and no verdict on its exploration.
     if (run.stopped or run.draining or (status != 0 and status != 3)) {
         shared.exploration_known[id] = true;
