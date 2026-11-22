@@ -150,8 +150,15 @@ for check in $CHECKS; do
   # Its runs in a store of its own.
   run env DETERMINISMO_DATA=.zig-cache/e2e-runs \
     zig-out/bin/e2e --guest "$guest" --only "$check" ${bb:+--bb "$bb"} ${jank:+--jank "$jank"} > "check-$check.log" 2>&1 || status=$?
+  # Passed only with e2e's own verdict: a check whose unit was stopped from outside ends on
+  # SIGTERM, which systemd counts as a clean exit (status 0). On 2026-11-22 a hold check
+  # stopped by hand after 21 minutes, one timeline still running, said "exit 0".
+  if [ $status -eq 0 ] && ! grep -aq "^e2e: all checks passed" "check-$check.log"; then
+    echo "  no verdict: the check ended without e2e's (stopped from outside?)" >> "check-$check.log"
+    status=1
+  fi
   echo "== $check: exit $status in $(( $(date +%s) - start )) s"
-  grep -aE "^(FAIL|SKIP)|^  failed:|all checks passed" "check-$check.log" | head -20 || true
+  grep -aE "^(FAIL|SKIP)|^  failed:|^  no verdict:|all checks passed" "check-$check.log" | head -20 || true
   [ $status -eq 0 ] || failed=1
 done
 exit $failed
