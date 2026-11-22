@@ -540,6 +540,9 @@ fn io_threaded(arena: std.mem.Allocator) !std.Io.Threaded {
     while (parts.next()) |entry| try entries.append(arena, try arena.dupeSentinel(u8, entry, 0));
     const block = try entries.toOwnedSliceSentinel(arena, null);
     var threaded: std.Io.Threaded = .init_single_threaded;
+    // Its own allocator in place of init_single_threaded's failing one: a process started
+    // through it allocates its argv and environment first (podman, for Elle's service).
+    threaded.allocator = arena;
     threaded.environ = .{ .process_environ = .{ .block = .{ .slice = block } } };
     threaded.environ_initialized = block.len == 0;
     return threaded;
@@ -714,4 +717,16 @@ test "a definition that is not one is refused" {
         const definition = try std.json.parseFromSliceLeaky(Definition, arena, source, .{ .allocate = .alloc_always });
         try std.testing.expectEqual(null, try description_make(arena, definition));
     }
+}
+
+test "the host checks' Io starts processes (Elle's service: podman)" {
+    // init_single_threaded's allocator is the failing one: a spawn through it was OutOfMemory
+    // before its fork, so a Clojure workload's Elle check never started the service (an EC2
+    // machine with an older one, 2026-11-21: "libdeterminismo: elle: OutOfMemory").
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded = try io_threaded(arena);
+    const result = try std.process.run(arena, threaded.io(), .{ .argv = &.{"true"} });
+    try std.testing.expect(result.term.success());
 }
