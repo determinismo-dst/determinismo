@@ -3644,7 +3644,7 @@ fn check_jank_aot(context: *Context) !void {
         return;
     };
     const program = try std.fs.path.join(arena, &.{ context.scratch, "aot-hello" });
-    const packed_run = try run_kept(context, &.{ "bash", "tools/jank_aot_pack.sh", jank, context.bin, program, "aot-hello.main", "tests/jank-aot/src:sdk/jank/determinismo/src" });
+    const packed_run = try run_kept(context, &.{ "bash", "tools/jank_aot_pack.sh", jank, context.bin, program, "aot-hello.main", "tests/jank-aot/src", "sdk/jank/determinismo/src" });
     const packed_ok = switch (packed_run.term) {
         .exited => |code| code == 0,
         else => false,

@@ -365,6 +365,12 @@ pub fn build(b: *std.Build) void {
     const header_installed = b.addInstallFileWithDir(header, .bin, "libdeterminismo.h");
     phases.guest.dependOn(&header_installed.step);
     b.getInstallStep().dependOn(&header_installed.step);
+    // The library and its header in one directory, for the builds that compile against them: the
+    // examples' jank programs ahead of time (tools/jank_aot_pack.sh's <libdeterminismo dir>).
+    const library_dir = b.addWriteFiles();
+    _ = library_dir.addCopyFile(library.getEmittedBin(), "libdeterminismo.so");
+    _ = library_dir.addCopyFile(header, "libdeterminismo.h");
+    b.addNamedLazyPath("libdeterminismo", library_dir.getDirectory());
 
     // Reference strategy plugins (docs/PLUGINS.md). They run on the host, next to determinismo.
     for ([_][]const u8{ "random", "mutate" }) |plugin| {

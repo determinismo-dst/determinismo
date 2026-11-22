@@ -1,13 +1,15 @@
 #!/bin/bash
 # SPDX-License-Identifier: MIT
-# jank_aot_pack.sh <jank> <libdeterminismo dir> <out> <main namespace> <module path>: a jank workload
+# jank_aot_pack.sh <jank> <libdeterminismo dir> <out> <main namespace> <module directory>...: a jank workload
 # compiled ahead of time (jank's static runtime: no LLVM or Clang inside), packed with what it needs
 # that the guest's runner lacks (glibc's and libstdc++'s libraries, the loader) and libdeterminismo
 # (for the host's --describe; the runner's own /opt/determinismo/lib first) into one file, which
 # extracts itself once (/tmp/jank-program-<its size>) and runs through its bundled loader: a jank
 # workload then runs in the runner as a Zig one does (det-nodes, holds), one file for serve.
 set -euo pipefail
-jank=$1; lib=$2; out=$3; main=$4; modules=$5
+jank=$1; lib=$2; out=$3; main=$4; shift 4
+# The module directories (the program's sources, sdk/jank's), jank's module path.
+modules=$(IFS=:; echo "$*")
 work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
 "$jank" --module-path "$modules" -I "$lib" -L "$lib" -l determinismo --runtime static -O 2 \
   --target-dir "$work/target" --name program compile "$main" > "$work/compile.log" 2>&1 || { tail -30 "$work/compile.log"; exit 1; }
