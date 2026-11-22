@@ -6186,7 +6186,7 @@ fn state(run: *const Run) []const u8 {
 
 /// Whether a run that ended should have branched and never did (since 2026-11-22: a 2 hour
 /// hunt of 73 timelines, none from a return, read as a hunt).
-fn exploration_missing(asked: *const RunRequest, ended: u64, returned: u64) bool {
+fn exploration_missing(asked: *const RunRequest, ended: u64, returned: u64, workers: u32) bool {
     if (ended == 0 or returned > 0) return false;
     // No exploration of its own: a setup, a moment's futures, a CI job's shard.
     if (asked.setup_only or asked.ci != null) return false;
@@ -6194,13 +6194,30 @@ fn exploration_missing(asked: *const RunRequest, ended: u64, returned: u64) bool
     if (asked.branching) |branching| {
         if (!std.mem.eql(u8, branching, "tree")) return false;
     } else if (asked.plan or asked.strategy != null) return false; // Planned: flat (main.zig).
-    if (asked.time_budget != null) return true;
-    // By count: due once a generation after the first was to run whole.
-    return ended >= 2 * @as(u64, asked.generation orelse exploration_generation);
+    // Ended by its count (all it asked ran, budget or not): due once a generation after the
+    // first was to run whole. Ended by its budget: due whatever it ran.
+    const counted = if (asked.branches) |branches| ended >= branches else false;
+    if (asked.time_budget != null and !counted) return true;
+    return ended >= 2 * @as(u64, asked.generation orelse exploration_generation(workers));
 }
 
-/// A generation's size where the request gives none (main.zig's on 32 to 47 workers).
-const exploration_generation = 32;
+/// A generation's size where the request gives none: main.zig's tree.generation_for, from the
+/// run's workers (its record's summary; 0 unknown: 32, as on 32 to 47).
+fn exploration_generation(workers: u32) u32 {
+    if (workers == 0) return 32;
+    return std.math.clamp(std.mem.alignBackward(u32, workers, 16), 16, 256);
+}
+
+/// The workers its record's last summary says it had (0: none said).
+fn summary_workers(record: []const u8) u32 {
+    const start = std.mem.lastIndexOf(u8, record, "{\"summary\":") orelse return 0;
+    const end = std.mem.indexOfScalarPos(u8, record, start, '\n') orelse record.len;
+    const key = "\"workers\":";
+    const at = (std.mem.indexOf(u8, record[start..end], key) orelse return 0) + start + key.len;
+    var digits = at;
+    while (digits < end and std.ascii.isDigit(record[digits])) digits += 1;
+    return std.fmt.parseInt(u32, record[at..digits], 10) catch 0;
+}
 
 /// A run this serve saw end by itself, judged once: one exploration_missing finds gets its
 /// `unexplored` file and its state is failed. Reporting alone: nothing of the run changes.
@@ -6213,13 +6230,16 @@ fn exploration_judge(server: *Server, id: u32, connection: *duckdb.Connection) v
         shared.exploration_known[id] = true;
         return;
     }
+    // Looked at once, whatever comes: a request it cannot read would have every update attach
+    // the run's database to look again.
+    shared.exploration_known[id] = true;
     const text = run_file(server, id, "request.json") catch return;
     const asked = std.json.parseFromSliceLeaky(RunRequest, server.arena, text, .{ .ignore_unknown_fields = true }) catch return;
     const Counts = struct { ended: u64, returned: u64 };
     const counts_sql = "SELECT count(*) AS ended, count(parent) AS returned FROM timelines";
     const counts = (connection.row(Counts, server.arena, counts_sql, .{}) catch return) orelse return;
-    shared.exploration_known[id] = true;
-    if (!exploration_missing(&asked, counts.ended, counts.returned)) return;
+    const workers = summary_workers(run_file(server, id, "record.jsonl") catch "");
+    if (!exploration_missing(&asked, counts.ended, counts.returned, workers)) return;
     const why = print(server, "failed to explore: none of its {d} timelines came from a return, the tree never branched " ++
         "(a budget under a few generations, or memory fitting fewer VMs than workers)\n", .{counts.ended}) catch return;
     const directory = run_directory(server, id) catch return;
@@ -6238,16 +6258,26 @@ fn exploration_judge(server: *Server, id: u32, connection: *duckdb.Connection) v
 
 test "a tree that had a return due and never branched is a failed run" {
     const hunt: RunRequest = .{ .time_budget = "2h" };
-    try std.testing.expect(exploration_missing(&hunt, 73, 0)); // aws-hunt run 18.
-    try std.testing.expect(!exploration_missing(&hunt, 1773, 1203)); // Run 17.
-    try std.testing.expect(!exploration_missing(&hunt, 0, 0)); // Its setup failed: said already.
+    try std.testing.expect(exploration_missing(&hunt, 73, 0, 40)); // aws-hunt run 18.
+    try std.testing.expect(!exploration_missing(&hunt, 1773, 1203, 40)); // Run 17.
+    try std.testing.expect(!exploration_missing(&hunt, 0, 0, 40)); // Its setup failed: said already.
     const flat: RunRequest = .{ .time_budget = "2h", .branching = "flat" };
-    try std.testing.expect(!exploration_missing(&flat, 73, 0)); // Asked none.
+    try std.testing.expect(!exploration_missing(&flat, 73, 0, 40)); // Asked none.
     // A few timelines by count: no return was due before two generations.
     const few: RunRequest = .{ .branches = 8 };
-    try std.testing.expect(!exploration_missing(&few, 8, 0));
+    try std.testing.expect(!exploration_missing(&few, 8, 0, 40));
     const many: RunRequest = .{ .branches = 64, .generation = 16 };
-    try std.testing.expect(exploration_missing(&many, 64, 0));
+    try std.testing.expect(exploration_missing(&many, 64, 0, 40));
+    // Ended by its count before its budget (e2e's coverage check: 2 timelines, 10 minutes).
+    const counted: RunRequest = .{ .time_budget = "10m", .branches = 2 };
+    try std.testing.expect(!exploration_missing(&counted, 2, 0, 1));
+    // 48 workers: generations of 48, so 64 timelines are not two of them.
+    const by_count: RunRequest = .{ .branches = 64 };
+    try std.testing.expect(!exploration_missing(&by_count, 64, 0, 48));
+    try std.testing.expect(exploration_missing(&by_count, 64, 0, 32));
+    try std.testing.expectEqual(@as(u32, 35), summary_workers("{\"run\":{}}\n{\"summary\":{\"branches\":73,\"workers\":35,\"x\":1}}\n"));
+    try std.testing.expectEqual(@as(u32, 0), summary_workers("{\"run\":{}}\n"));
+    try std.testing.expectEqual(@as(u32, 48), exploration_generation(50));
     const run: Run = .{ .id = 18, .pid = 0, .status = 0, .unexplored = true };
     try std.testing.expectEqualStrings("failed", state(&run));
 }
