@@ -4225,7 +4225,8 @@ fn explore_tree(
             const wait_ms: i32 = if (judging != null) judging_poll_ms else progress_interval_ms;
             const finished = try timeline_wait(running[0..running_count], branches.multiverse, &batch.summaries, wait_ms) orelse {
                 if (judging != null) continue;
-                progress_print(running[0..running_count], branches.multiverse, state.generation);
+                const held = if (claims_pool_open) claims_pool.run_held() else null;
+                progress_print(running[0..running_count], held, branches.multiverse, state.generation);
                 continue;
             };
             try timeline_reaped(arena, &state, &batch, &running, &running_count, finished);
@@ -5024,12 +5025,13 @@ fn status_file_write(known: []const u8, bytes: []const u8) void {
     _ = linux.renameat(linux.AT.FDCWD, staging, linux.AT.FDCWD, final);
 }
 
-/// One line: the timelines running (each with its wall time so far), those done and failing.
-fn progress_print(running: []const Running, multiverse: *const report.Multiverse, generation: u32) void {
+/// One line: the timelines running and those still waiting to (each with its wall time so far),
+/// those done and failing. `held`: the CPUs the run's VMs hold (Pool.run_held), null unknown.
+fn progress_print(running: []const Running, held: ?u32, multiverse: *const report.Multiverse, generation: u32) void {
     var line_buffer: [1024]u8 = undefined;
     var line: std.Io.Writer = .fixed(&line_buffer);
     const now = monotonic_ns();
-    line.print("[determinismo] {d} timelines running (", .{running.len}) catch {};
+    progress_head(&line, @intCast(running.len), held) catch {};
     for (running, 0..) |timeline, at| {
         if (at == 12) {
             line.print(" ...", .{}) catch {};
@@ -5041,6 +5043,34 @@ fn progress_print(running: []const Running, multiverse: *const report.Multiverse
         multiverse.branches, multiverse.failing_branches, generation,
     }) catch {};
     say("{s}", .{line.buffered()});
+}
+
+/// The line's start. A worker has its timeline from before its VM is admitted: those waiting
+/// for memory or a CPU are not running (48 workers of 10 GiB guests on 192 GiB said "48 timelines
+/// running" for an hour, 17 VMs admitted). A VM making a node holds a CPU too: the waiting are
+/// then counted fewer, never more.
+fn progress_head(line: *std.Io.Writer, started: u32, held: ?u32) !void {
+    const admitted = @min(held orelse started, started);
+    if (admitted == started) return line.print("[determinismo] {d} timelines running (", .{started});
+    try line.print("[determinismo] {d} timelines running, {d} waiting for memory or a CPU (", .{
+        admitted, started - admitted,
+    });
+}
+
+test "timelines waiting for memory are not said to run" {
+    var buffer: [160]u8 = undefined;
+    const cases = [_]struct { started: u32, held: ?u32, said: []const u8 }{
+        .{ .started = 48, .held = 17, .said = "17 timelines running, 31 waiting for memory or a CPU (" },
+        .{ .started = 4, .held = 0, .said = "0 timelines running, 4 waiting for memory or a CPU (" },
+        .{ .started = 48, .held = 48, .said = "48 timelines running (" },
+        .{ .started = 8, .held = 11, .said = "8 timelines running (" }, // Node makers hold CPUs too.
+        .{ .started = 8, .held = null, .said = "8 timelines running (" }, // No pool to ask.
+    };
+    for (cases) |case| {
+        var line: std.Io.Writer = .fixed(&buffer);
+        try progress_head(&line, case.started, case.held);
+        try std.testing.expectEqualStrings(case.said, line.buffered()["[determinismo] ".len..]);
+    }
 }
 
 const Finished = struct { at: usize, killed: bool = false };
