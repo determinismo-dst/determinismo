@@ -452,6 +452,9 @@ const reportEmbedded = (() => {
   try { return JSON.parse(node.textContent); } catch { return null; }
 })();
 const reportRecording = !reportEmbedded && new URLSearchParams(location.search).has("record") ? new Map() : null;
+// Served by serve --public-listen (`<body data-public>`): live, read only, for anyone; serve
+// refuses the actions too, the page hides them.
+const servePublic = document.body.hasAttribute("data-public");
 const reportKey = (path, body) => body === undefined ? path : path + "\n" + JSON.stringify(body);
 // Reads a recording keeps: the GETs and the database's answers (a section's SQL, a query).
 const reportReads = /^\/runs\/\d+\/(sql|query)\b/;
@@ -639,7 +642,7 @@ function stateBadge(name) {
 // 2,500 timelines) was busy 70% of the time with its refreshes.
 // A copy has no notebook (it evaluates in a live REPL).
 const views = [["report", "Report"], ["explorer", "Logs explorer"], ["output", "Output"], ["notebook", "Notebook"]]
-  .filter(([name]) => !(reportEmbedded && name === "notebook"));
+  .filter(([name]) => !((reportEmbedded || servePublic) && name === "notebook"));
 // A property has a page of its own (#<id>/property/<its message>): its examples, the
 // statistic of what its failures drew and the lead-up of one, which in the list made a long
 // page hard to follow; the list stays one line a property.
@@ -4515,6 +4518,17 @@ window.addEventListener("hashchange", () => {
 </script>
 <script>
 "use strict";
+// Live and read only (serve --public-listen): it says so, and shows nothing that acts.
+if (servePublic) {
+  const button = document.getElementById("new-run");
+  if (button) button.hidden = true;
+  document.head.insertAdjacentHTML("beforeend", "<style>#run-again, [data-output] { display: none; }</style>");
+  const note = document.createElement("div");
+  note.className = "muted";
+  note.style.cssText = "margin: 0 0 12px; font-size: 12px;";
+  note.textContent = "Live, read only: runs as they go, nothing here changes them.";
+  document.querySelector("aside .brand")?.after(note);
+}
 // A copy says so, and starts no run.
 if (reportEmbedded) {
   const button = document.getElementById("new-run");

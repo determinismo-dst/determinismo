@@ -122,6 +122,12 @@ const schema = @import("determinismo").schema;
 pub const Options = struct {
     /// "address:port", e.g. 127.0.0.1:7878. Bind to loopback unless the network is trusted.
     listen: []const u8,
+    /// serve --public-listen: an address answering the page read only, for anyone (a CI hunt's
+    /// live page through a tunnel): the page and what it reads, its SQL a SELECT checked before
+    /// it runs and stopped past `public_query_s`; nothing that starts, stops or changes. With it,
+    /// DuckDB reaches files in the data directory alone (Database.files_only_in), so a SELECT
+    /// reads the runs' data and nothing else of the machine's.
+    public_listen: ?[]const u8 = null,
     /// serve --ui: the UI page read from this file at each request, the built-in one without
     /// it (a UI change then ships as a copy of src/ui/index.html: no rebuild, no restart).
     ui_path: ?[]const u8 = null,
@@ -359,6 +365,8 @@ const Server = struct {
     options: Options,
     io: std.Io,
     arena: std.mem.Allocator,
+    /// A request on --public-listen's address: read only (public_allowed).
+    public: bool = false,
     /// What DuckDB said, when a request failed on the database.
     detail: ?[]const u8 = null,
     /// The request's query string (after `?`), "" for none.
@@ -410,6 +418,12 @@ pub fn serve(arena: std.mem.Allocator, io: std.Io, options: Options) !void {
             return err;
         },
     };
+    if (options.public_listen != null) {
+        shared.database.files_only_in(options.data_directory, &failure) catch |err| {
+            std.debug.print("[determinismo] the events database's files kept to {s}: {s}\n", .{ options.data_directory, failure.text() });
+            return err;
+        };
+    }
     const runs_directory = try std.fs.path.join(arena, &.{ options.data_directory, "runs" });
     try std.Io.Dir.cwd().createDirPath(io, runs_directory);
     var server: Server = .{ .shared = shared, .options = options, .io = io, .arena = arena };
@@ -423,12 +437,16 @@ pub fn serve(arena: std.mem.Allocator, io: std.Io, options: Options) !void {
         const later = try std.Thread.spawn(.{}, listen_later, .{ shared, address });
         later.detach();
     }
+    if (options.public_listen) |address| {
+        const public = try std.Thread.spawn(.{}, listen_public, .{ shared, address });
+        public.detach();
+    }
     const watcher = try std.Thread.spawn(.{}, watch, .{shared});
     watcher.detach();
     std.debug.print("[determinismo] serving on http://{s} (data in {s})\n", .{
         first, options.data_directory,
     });
-    accept_loop(shared, listener);
+    accept_loop(shared, listener, false);
 }
 
 /// Listens on `address` once it can (retrying while the address is not up yet), then answers.
@@ -446,10 +464,20 @@ fn listen_later(shared: *Shared, address: []const u8) void {
         };
     };
     std.debug.print("[determinismo] serving on http://{s} too\n", .{address});
-    accept_loop(shared, listener);
+    accept_loop(shared, listener, false);
 }
 
-fn accept_loop(shared: *Shared, listener: linux.fd_t) noreturn {
+/// --public-listen's address: the page read only, for anyone.
+fn listen_public(shared: *Shared, address: []const u8) void {
+    const listener = listen(address) catch |err| {
+        std.debug.print("[determinismo] no public page on http://{s}: {s}\n", .{ address, @errorName(err) });
+        return;
+    };
+    std.debug.print("[determinismo] the page read only on http://{s}\n", .{address});
+    accept_loop(shared, listener, true);
+}
+
+fn accept_loop(shared: *Shared, listener: linux.fd_t, public: bool) noreturn {
     while (true) {
         const client = linux.accept4(listener, null, null, linux.SOCK.CLOEXEC);
         if (linux.errno(client) != .SUCCESS) continue;
@@ -460,7 +488,7 @@ fn accept_loop(shared: *Shared, listener: linux.fd_t) noreturn {
             _ = linux.close(fd);
             continue;
         }
-        const thread = std.Thread.spawn(.{}, answer, .{ shared, fd }) catch {
+        const thread = std.Thread.spawn(.{}, answer, .{ shared, fd, public }) catch {
             _ = shared.requests.fetchSub(1, .monotonic);
             respond(fd, 503, "text/plain", "busy\n");
             _ = linux.close(fd);
@@ -471,7 +499,7 @@ fn accept_loop(shared: *Shared, listener: linux.fd_t) noreturn {
 }
 
 /// A request's thread: its allocations go with it.
-fn answer(shared: *Shared, client: linux.fd_t) void {
+fn answer(shared: *Shared, client: linux.fd_t, public: bool) void {
     defer _ = shared.requests.fetchSub(1, .monotonic);
     defer _ = linux.close(client);
     var request_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
@@ -481,6 +509,7 @@ fn answer(shared: *Shared, client: linux.fd_t) void {
         .options = shared.options,
         .io = shared.io,
         .arena = request_arena.allocator(),
+        .public = public,
     };
     handle(&server, client);
 }
@@ -1085,10 +1114,19 @@ fn handle(server: *Server, client: linux.fd_t) void {
     const request = request_read(server, client) catch {
         return respond(client, 400, "text/plain", "bad request\n");
     };
+    if (server.public and !public_allowed(request)) {
+        return respond(client, 403, "text/plain", "read only: this page shows runs, it changes nothing\n");
+    }
     if (stream_id(request)) |id| return run_stream(server, client, id, request.body);
     // The page with a query string too (a property's link: `/?property=<message>#<run>`).
     const page_path = request.path[0 .. std.mem.indexOfScalar(u8, request.path, '?') orelse request.path.len];
     const page = std.mem.eql(u8, page_path, "/") or std.mem.eql(u8, page_path, "/index.html");
+    if (page and std.mem.eql(u8, request.method, "GET") and server.public) {
+        // The page told it is public (`<body data-public>`): it hides what it may not do.
+        const marked = std.mem.replaceOwned(u8, server.arena, ui_html, "<body>", "<body data-public>") catch
+            return respond(client, 500, "text/plain", "no memory\n");
+        return respond_to(server, request, client, 200, "text/html; charset=utf-8", marked);
+    }
     if (page and std.mem.eql(u8, request.method, "GET")) {
         const path = server.options.ui_path orelse return respond_to(server, request, client, 200, "text/html; charset=utf-8", ui_html);
         // The file asked for, or an error that says so (never the built-in page instead).
@@ -1297,6 +1335,52 @@ fn respond_to(
     }
     respond(client, status, content_type, body);
 }
+
+/// What --public-listen answers: the page and its fonts, the runs and each run's own reads (what
+/// the page shows), and its two database reads by POST (its SQL, a SELECT checked before it
+/// runs; a search). Nothing else: no run started, stopped or changed, no upload, no session, no
+/// notebook, no REPL, no stream.
+fn public_allowed(request: Request) bool {
+    const eql = std.mem.eql;
+    const path = request.path[0 .. std.mem.indexOfScalar(u8, request.path, '?') orelse request.path.len];
+    const get = eql(u8, request.method, "GET");
+    if (get and (eql(u8, path, "/") or eql(u8, path, "/index.html") or eql(u8, path, "/learn") or
+        eql(u8, path, "/export.html") or std.mem.startsWith(u8, path, "/fonts/"))) return true;
+    var parts = std.mem.tokenizeScalar(u8, path, '/');
+    if (!eql(u8, parts.next() orelse return false, "runs")) return false;
+    const id = parts.next() orelse return get; // GET /runs
+    _ = std.fmt.parseInt(u32, id, 10) catch return false;
+    const action = parts.next() orelse return get; // GET /runs/<id>
+    if (eql(u8, request.method, "POST")) {
+        return parts.next() == null and (eql(u8, action, "sql") or eql(u8, action, "query"));
+    }
+    if (!get) return false;
+    const reads = [_][]const u8{
+        "properties", "timelines", "discovery", "failures", "logged", "findings", "label",
+        "activity",   "causality", "shrink",    "explain",  "output", "triage",   "ranges",
+    };
+    for (reads) |read| if (eql(u8, action, read)) return true;
+    return false;
+}
+
+/// A public request's database read stopped past this long (an expensive SELECT holds a
+/// connection, and a CPU, of the machine the hunt runs on).
+const public_query_s = 15;
+
+/// Interrupts `connection`'s query past `public_query_s` unless told it is done.
+const QueryWatch = struct {
+    connection: *duckdb.Connection,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(query_watch: *QueryWatch) void {
+        for (0..public_query_s * 10) |_| {
+            if (query_watch.done.load(.acquire)) return;
+            const pause: linux.timespec = .{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+            _ = linux.nanosleep(&pause, null);
+        }
+        if (!query_watch.done.load(.acquire)) query_watch.connection.interrupt();
+    }
+};
 
 fn route(server: *Server, request: Request, out: *std.Io.Writer) !u16 {
     const eql = std.mem.eql;
@@ -1537,6 +1621,12 @@ fn run_route(
         break :page try run_connect(server, run.id);
     } else try run_database(server, run.id);
     defer run_release(server, run.id, &connection);
+    var query_watch: QueryWatch = .{ .connection = &connection };
+    const watcher = if (server.public) try std.Thread.spawn(.{}, QueryWatch.run, .{&query_watch}) else null;
+    defer if (watcher) |thread| {
+        query_watch.done.store(true, .release);
+        thread.join();
+    };
     database_answer(server, &connection, action, request.body, out) catch |err| {
         if (err == error.DuckDB) database_failed(server, &connection.failure);
         return err;
@@ -6557,4 +6647,25 @@ test content_length {
     const post = "POST /runs HTTP/1.1\r\nContent-Length: 12";
     try std.testing.expectEqual(@as(u32, 12), content_length(post));
     try std.testing.expectEqual(@as(u32, 0), content_length("GET /runs HTTP/1.1\r\nHost: x"));
+}
+
+test "public_allowed: the page, its fonts and each run's reads; nothing that acts" {
+    const allowed = [_][2][]const u8{
+        .{ "GET", "/" },                                .{ "GET", "/?property=x" },
+        .{ "GET", "/fonts/texgyreschola-regular.otf" }, .{ "GET", "/runs" },
+        .{ "GET", "/runs/3" },                          .{ "GET", "/runs/3/properties" },
+        .{ "GET", "/runs/3/timelines?offset=4" },       .{ "GET", "/runs/3/output?lines=300&explorer=1" },
+        .{ "POST", "/runs/3/sql?page=1" },              .{ "POST", "/runs/3/query" },
+    };
+    for (allowed) |asked| try std.testing.expect(public_allowed(.{ .method = asked[0], .path = asked[1], .body = "" }));
+    const refused = [_][2][]const u8{
+        .{ "POST", "/runs" },                     .{ "POST", "/runs/3/stop" },
+        .{ "POST", "/runs/3/resume" },            .{ "POST", "/runs/3/replay" },
+        .{ "POST", "/runs/3/notebook/evaluate" }, .{ "GET", "/runs/3/nrepl" },
+        .{ "GET", "/runs/3/notebook" },           .{ "POST", "/sessions/1/end" },
+        .{ "GET", "/machines" },                  .{ "POST", "/strategies/x" },
+        .{ "GET", "/samples.json" },              .{ "POST", "/runs/3/sql/x" },
+        .{ "GET", "/runs/x" },                    .{ "DELETE", "/runs/3" },
+    };
+    for (refused) |asked| try std.testing.expect(!public_allowed(.{ .method = asked[0], .path = asked[1], .body = "" }));
 }

@@ -147,6 +147,28 @@ pub const Database = struct {
     }
 
     /// A connection, for one thread at a time; a database takes any number of them at once.
+    /// From now on DuckDB reaches files in `directory` alone, and nothing over the network; the
+    /// setting locked (serve --public-listen: a public page's SQL then reads the runs' data and
+    /// nothing of the machine's). DuckDB 2.0 refuses read_text, glob, ATTACH and COPY elsewhere,
+    /// and any change of these settings once locked.
+    pub fn files_only_in(database: *Database, directory: []const u8, failure: *Failure) !void {
+        var connection = try database.connect(failure);
+        defer connection.close();
+        var buffer: [std.fs.max_path_bytes + 64]u8 = undefined;
+        assert(std.mem.indexOfScalar(u8, directory, '\'') == null);
+        const allowed = try std.fmt.bufPrintSentinel(&buffer, "SET allowed_directories = ['{s}']", .{directory}, 0);
+        connection.exec(allowed) catch |err| {
+            failure.* = connection.failure;
+            return err;
+        };
+        inline for (.{ "SET enable_external_access = false", "SET lock_configuration = true" }) |sql| {
+            connection.exec(sql) catch |err| {
+                failure.* = connection.failure;
+                return err;
+            };
+        }
+    }
+
     pub fn connect(database: *Database, failure: *Failure) !Connection {
         var info: ?*c.ErrorInfo = null;
         var handle: ?*c.ConnectionHandle = null;
@@ -354,20 +376,43 @@ pub const Connection = struct {
         _ = try connection.json_write(out, &result, std.math.maxInt(usize));
     }
 
-    /// Someone's SQL (an agent's, a notebook's), read-only: one SELECT (or EXPLAIN), its first
-    /// `rows_max` rows as JSON; whether it had more.
+    /// Someone's SQL (an agent's, a notebook's, a public page's), read-only: one SELECT (or
+    /// EXPLAIN), its first `rows_max` rows as JSON; whether it had more. Its type is the parser's,
+    /// checked before it runs: checked on the result, a DELETE had run already when refused.
     pub fn select_json(
         connection: *Connection,
         out: *std.Io.Writer,
         sql: [:0]const u8,
         rows_max: usize,
     ) !bool {
-        var result = try connection.query(sql, .{});
-        defer result.deinit();
-        if (result.statement != .select and result.statement != .explain) {
+        var info: ?*c.ErrorInfo = null;
+        var statements: ?*c.StatementIterator = null;
+        const parsed = c.duckdb_v2_parse_sql(connection.handle, sql, &statements, &info);
+        try connection.failure.check(parsed, info);
+        defer _ = c.duckdb_v2_statement_iterator_destroy(&statements);
+        var statement: ?*c.Statement = null;
+        try connection.failure.check(c.duckdb_v2_statement_iterator_next(statements.?, &statement, &info), info);
+        defer _ = c.duckdb_v2_sql_statement_destroy(&statement);
+        const one = statement orelse return connection.failure.say("no statement", .{});
+        var kind: StatementType = .invalid;
+        try connection.failure.check(c.duckdb_v2_sql_statement_get_type(one, &kind, &info), info);
+        if (kind != .select and kind != .explain) {
             return connection.failure.say("only SELECT (or EXPLAIN) reads here", .{});
         }
+        var after: ?*c.Statement = null;
+        try connection.failure.check(c.duckdb_v2_statement_iterator_next(statements.?, &after, &info), info);
+        if (after != null) {
+            _ = c.duckdb_v2_sql_statement_destroy(&after);
+            return connection.failure.say("one statement here", .{});
+        }
+        var result = try connection.execute(one, .{});
+        defer result.deinit();
         return connection.json_write(out, &result, rows_max);
+    }
+
+    /// Stops the query running on this connection, from another thread (a time limit).
+    pub fn interrupt(connection: *Connection) void {
+        _ = c.duckdb_v2_connection_interrupt(connection.handle, null);
     }
 
     /// Writes up to `rows_max` rows as a JSON array; whether there were more.
@@ -741,6 +786,8 @@ const c = struct {
     ) Code;
     extern fn duckdb_v2_statement_iterator_destroy(iterator: *?*StatementIterator) Code;
     extern fn duckdb_v2_sql_statement_destroy(statement: *?*Statement) Code;
+    extern fn duckdb_v2_sql_statement_get_type(statement: *Statement, out: *StatementType, err: ?*?*ErrorInfo) Code;
+    extern fn duckdb_v2_connection_interrupt(connection: *ConnectionHandle, err: ?*?*ErrorInfo) Code;
     extern fn duckdb_v2_statement_execute(
         connection: *ConnectionHandle,
         statement: *Statement,
@@ -906,4 +953,60 @@ test "a failing statement says why" {
     const cast = connection.rows(Row, arena_state.allocator(), "SELECT CAST('x' AS INTEGER)", .{});
     try testing.expectError(error.DuckDB, cast);
     try testing.expect(std.mem.indexOf(u8, connection.failure.text(), "Conversion Error") != null);
+}
+
+test "someone's SQL: anything but one SELECT refused before it runs" {
+    var failure: Failure = .{};
+    var database = try test_database(&failure);
+    defer database.close();
+    var connection = try database.connect(&failure);
+    defer connection.close();
+    try connection.exec("CREATE TABLE t (id UBIGINT); INSERT INTO t VALUES (1)");
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    // Checked on the result, the DELETE had run when refused: the row gone.
+    try testing.expectError(error.DuckDB, connection.select_json(&out.writer, "DELETE FROM t", 10));
+    try testing.expectError(error.DuckDB, connection.select_json(&out.writer, "SELECT 1; DELETE FROM t", 10));
+    try testing.expectError(error.DuckDB, connection.select_json(&out.writer, "CREATE TABLE u (x INT)", 10));
+    out.clearRetainingCapacity();
+    _ = try connection.select_json(&out.writer, "SELECT count(*) AS n FROM t", 10);
+    try testing.expectEqualStrings("[{\"n\":1}]", out.written());
+}
+
+test "files_only_in: a SELECT reads files in the directory alone, and the setting stays" {
+    const io = testing.io;
+    var buffer: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&buffer, "/tmp/det-duckdb-files-{d}", .{std.os.linux.getpid()});
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, base) catch {};
+    defer cwd.deleteTree(io, base) catch {};
+    var allowed_buffer: [160]u8 = undefined;
+    const allowed = try std.fmt.bufPrint(&allowed_buffer, "{s}/data", .{base});
+    try cwd.createDirPath(io, allowed);
+    var inside_buffer: [192]u8 = undefined;
+    const inside = try std.fmt.bufPrint(&inside_buffer, "{s}/ok.txt", .{allowed});
+    try cwd.writeFile(io, .{ .sub_path = inside, .data = "run data" });
+    var outside_buffer: [192]u8 = undefined;
+    const outside = try std.fmt.bufPrint(&outside_buffer, "{s}/secret.txt", .{base});
+    try cwd.writeFile(io, .{ .sub_path = outside, .data = "the machine's" });
+
+    var failure: Failure = .{};
+    var database = try test_database(&failure);
+    defer database.close();
+    try database.files_only_in(allowed, &failure);
+    var connection = try database.connect(&failure);
+    defer connection.close();
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var sql_buffer: [256]u8 = undefined;
+    const read_inside = try std.fmt.bufPrintSentinel(&sql_buffer, "SELECT content FROM read_text('{s}')", .{inside}, 0);
+    _ = try connection.select_json(&out.writer, read_inside, 10);
+    try testing.expectEqualStrings("[{\"content\":\"run data\"}]", out.written());
+    var outside_sql_buffer: [256]u8 = undefined;
+    const read_outside = try std.fmt.bufPrintSentinel(&outside_sql_buffer, "SELECT content FROM read_text('{s}')", .{outside}, 0);
+    try testing.expectError(error.DuckDB, connection.select_json(&out.writer, read_outside, 10));
+    try testing.expectError(error.DuckDB, connection.select_json(&out.writer, "SELECT count(*) FROM glob('/etc/*')", 10));
+    // Locked: no statement turns it back on.
+    try testing.expectError(error.DuckDB, connection.exec("SET enable_external_access = true"));
+    try testing.expectError(error.DuckDB, connection.exec("SET lock_configuration = false"));
 }

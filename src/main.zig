@@ -58,7 +58,7 @@ const profiler = @import("profile.zig");
 
 const usage =
     \\usage: determinismo run     <machine options> [--trace <out.txt>] [--events <out.jsonl>]
-    \\       determinismo serve   [--listen <address:port>[,<address:port>...]] [--data <dir>]
+    \\       determinismo serve   [--listen <address:port>[,<address:port>...]] [--public-listen <address:port>] [--data <dir>]
     \\                            [--archive "<cmd>"] [--ui <index.html>]
     \\                            [--snapshots-keep-hours <h>]   (runs' snapshots on disk, from
     \\                            causality analyses: removed when none was saved for that long;
@@ -1424,6 +1424,7 @@ fn run_request_write(
 fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
     const arena = init.arena.allocator();
     var listen: []const u8 = "127.0.0.1:7878";
+    var public_listen: ?[]const u8 = null;
     var data: ?[]const u8 = null;
     var explorer: ?[]const u8 = null;
     var archive: ?[]const u8 = null;
@@ -1442,6 +1443,9 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
         const value = if (index + 1 < argv.len) argv[index + 1] else "";
         if (std.mem.eql(u8, flag, "--listen")) {
             listen = value;
+            index += 1;
+        } else if (std.mem.eql(u8, flag, "--public-listen")) {
+            public_listen = value;
             index += 1;
         } else if (std.mem.eql(u8, flag, "--data")) {
             data = value;
@@ -1488,6 +1492,7 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
     if (linux.errno(self_size) != .SUCCESS) return error.SelfPath;
     try serve.serve(arena, init.io, .{
         .listen = listen,
+        .public_listen = public_listen,
         .data_directory = try runs.data_directory(arena, data),
         .machine = machine.items,
         .self = explorer orelse self_buffer[0..self_size],
