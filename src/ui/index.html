@@ -812,6 +812,7 @@ function statsHtml() {
   // What serve said of it: why it stopped the run (the coverage gate), or that it ended uncovered.
   if (run.stopped_why) notes.push(`<b class="fail-text">stopped by serve: ${escape(run.stopped_why)}</b>`);
   if (run.uncovered) notes.push(`<b class="fail-text">${escape(run.uncovered)}</b>`);
+  if (run.unexplored) notes.push(`<b class="fail-text">${escape(run.unexplored)}</b>`);
   return `<div class="stats" id="stats-live">
     ${stat("Timelines", done.toLocaleString(), notes.join(" · "))}
     ${stat("Failing", failing.toLocaleString(), "timelines with a failing property", failing ? "var(--fail)" : "var(--pass)")}

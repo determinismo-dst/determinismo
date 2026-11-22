@@ -201,6 +201,9 @@ const Run = struct {
     nrepl_port: ?u16 = null,
     /// Stopped on request (POST /runs/<id>/stop).
     stopped: bool = false,
+    /// A tree that ended with no timeline from a return though one was due (its `unexplored`
+    /// file says why): a failed run, whatever its properties (exploration_missing).
+    unexplored: bool = false,
     /// Draining on request (POST /runs/<id>/stop?drain=1): no timeline starts, those running
     /// end; stopped once its explorer is gone (drained_mark), resumable then and not before.
     draining: bool = false,
@@ -271,6 +274,8 @@ const Shared = struct {
     setup_ingested: [runs_max]bool = @splat(false),
     /// By run id: whether coverage_gate has its answer (covered, asked without it, or stopped).
     coverage_known: [runs_max]bool = @splat(false),
+    /// By run id: whether exploration_judge looked at it, ended (or it ended before this serve).
+    exploration_known: [runs_max]bool = @splat(false),
     answers: [runs_max][@typeInfo(Kept).@"enum".field_names.len]Answer = @splat(@splat(.{})),
     requests: std.atomic.Value(u32) = .init(0),
     /// Interactive sessions (POST /runs/<id>/session): replays held at a moment, taking steps.
@@ -654,7 +659,8 @@ fn run_update(server: *Server, id: u32) !void {
     // A run that ended before the coverage gate looked (fewer timelines than it waits for, or
     // all of them between two looks): judged once, here, though nothing new arrived.
     const judge_ended = !shared.coverage_known[id] and !run_going(server, id);
-    if (size == shared.ingested[id] and replays_size == shared.replays_ingested[id] and !judge_ended) return;
+    const judge_exploration = !shared.exploration_known[id] and !run_going(server, id);
+    if (size == shared.ingested[id] and replays_size == shared.replays_ingested[id] and !judge_ended and !judge_exploration) return;
     // Counted as any connection: its database stays attached while it ingests.
     var connection = try run_connect(server, id);
     defer run_release(server, id, &connection);
@@ -669,6 +675,7 @@ fn run_update(server: *Server, id: u32) !void {
         if (arrived > 0 and !shared.coverage_known[id]) coverage_gate(server, id, &connection);
     }
     if (judge_ended and !shared.coverage_known[id]) coverage_gate(server, id, &connection);
+    if (judge_exploration) exploration_judge(server, id, &connection);
     if (replays_size != shared.replays_ingested[id]) {
         store.replays_ingest(&connection, server.arena, server.io, replays) catch |err| {
             server.detail = try server.arena.dupe(u8, connection.failure.text());
@@ -2293,8 +2300,9 @@ fn run_show(server: *Server, run: *const Run, out: *std.Io.Writer) !u16 {
     if (run.draining) try out.writeAll(",\"draining\":true");
     if (run.status) |status| try out.print(",\"status\":{d}", .{status});
     // Why serve stopped it (the coverage gate's reason in its `stopped` file; someone's stop
-    // leaves the file empty), and that it ended without coverage (its `uncovered` file).
-    inline for (.{ .{ "stopped", "stopped_why" }, .{ "uncovered", "uncovered" } }) |pair| {
+    // leaves the file empty), and that it ended without coverage (its `uncovered` file) or
+    // without exploring (its `unexplored` file).
+    inline for (.{ .{ "stopped", "stopped_why" }, .{ "uncovered", "uncovered" }, .{ "unexplored", "unexplored" } }) |pair| {
         if (run_file(server, run.id, pair[0])) |text| {
             const said = std.mem.trim(u8, text, " \n");
             if (said.len > 0) try out.print(",\"{s}\":{f}", .{ pair[1], std.json.fmt(said, .{}) });
@@ -5663,6 +5671,10 @@ fn run_resume(server: *Server, id: u32, out: *std.Io.Writer) !u16 {
     const pid = try spawn(server, argv.items, output, try run_environment(server.arena, &asked), .appended);
     const stopped_path = try std.fs.path.join(server.arena, &.{ directory, "stopped" });
     std.Io.Dir.cwd().deleteFile(server.io, stopped_path) catch {};
+    // It explores again: judged again as it ends.
+    const unexplored_path = try std.fs.path.join(server.arena, &.{ directory, "unexplored" });
+    std.Io.Dir.cwd().deleteFile(server.io, unexplored_path) catch {};
+    shared.exploration_known[id] = false;
     run.* = .{ .id = id, .pid = pid };
     try out.print("{{\"id\":{d},\"state\":\"running\",\"build\":{f},\"serve_build\":{f},\"same_core\":{}}}\n", .{
         id, std.json.fmt(if (same_core) build_options.commit else run_build, .{}), std.json.fmt(build_options.commit, .{}), same_core,
@@ -5731,6 +5743,7 @@ fn runs_discover(server: *Server) !void {
         else |_|
             null;
         var run = Run{ .id = id, .pid = 0, .status = noted orelse recorded_status(record), .stopped = stopped, .draining = draining };
+        run.unexplored = if (run_file(server, id, "unexplored")) |_| true else |_| false;
         // A drain whose explorer ended while no server watched: stopped now.
         if (draining and host_runs.running_pid(server.arena, directory) == null) drained_mark(server, &run);
         if (host_runs.running_pid(server.arena, directory)) |pid| {
@@ -5753,7 +5766,10 @@ fn runs_discover(server: *Server) !void {
         if (run.status != null) run.complete = true;
         // Nor for the coverage gate: it judges the runs this serve sees end, not the host's
         // history (each ended run's events read once more at its first request).
-        if (run.status != null or run.stopped) shared.coverage_known[id] = true;
+        if (run.status != null or run.stopped) {
+            shared.coverage_known[id] = true;
+            shared.exploration_known[id] = true;
+        }
         runs_insert(shared, run);
     }
 }
@@ -6161,11 +6177,79 @@ fn state(run: *const Run) []const u8 {
     if (run.stopped) return "stopped";
     const status = run.status orelse return "running";
     return switch (status) {
-        0 => "passed",
+        0 => if (run.unexplored) "failed" else "passed",
         3 => "failed",
         status_interrupted => "interrupted",
         else => "error",
     };
+}
+
+/// Whether a run that ended should have branched and never did (since 2026-11-22: a 2 hour
+/// hunt of 73 timelines, none from a return, read as a hunt).
+fn exploration_missing(asked: *const RunRequest, ended: u64, returned: u64) bool {
+    if (ended == 0 or returned > 0) return false;
+    // No exploration of its own: a setup, a moment's futures, a CI job's shard.
+    if (asked.setup_only or asked.ci != null) return false;
+    if (asked.from_branch != null or asked.from_snapshot != null or asked.from_run != null) return false;
+    if (asked.branching) |branching| {
+        if (!std.mem.eql(u8, branching, "tree")) return false;
+    } else if (asked.plan or asked.strategy != null) return false; // Planned: flat (main.zig).
+    if (asked.time_budget != null) return true;
+    // By count: due once a generation after the first was to run whole.
+    return ended >= 2 * @as(u64, asked.generation orelse exploration_generation);
+}
+
+/// A generation's size where the request gives none (main.zig's on 32 to 47 workers).
+const exploration_generation = 32;
+
+/// A run this serve saw end by itself, judged once: one exploration_missing finds gets its
+/// `unexplored` file and its state is failed. Reporting alone: nothing of the run changes.
+fn exploration_judge(server: *Server, id: u32, connection: *duckdb.Connection) void {
+    const shared = server.shared;
+    const run = run_get(server, id) orelse return;
+    const status = run.status orelse return;
+    // Stopped, drained or broken: said already, and no verdict on its exploration.
+    if (run.stopped or run.draining or (status != 0 and status != 3)) {
+        shared.exploration_known[id] = true;
+        return;
+    }
+    const text = run_file(server, id, "request.json") catch return;
+    const asked = std.json.parseFromSliceLeaky(RunRequest, server.arena, text, .{ .ignore_unknown_fields = true }) catch return;
+    const Counts = struct { ended: u64, returned: u64 };
+    const counts_sql = "SELECT count(*) AS ended, count(parent) AS returned FROM timelines";
+    const counts = (connection.row(Counts, server.arena, counts_sql, .{}) catch return) orelse return;
+    shared.exploration_known[id] = true;
+    if (!exploration_missing(&asked, counts.ended, counts.returned)) return;
+    const why = print(server, "failed to explore: none of its {d} timelines came from a return, the tree never branched " ++
+        "(a budget under a few generations, or memory fitting fewer VMs than workers)\n", .{counts.ended}) catch return;
+    const directory = run_directory(server, id) catch return;
+    const path = std.fs.path.join(server.arena, &.{ directory, "unexplored" }) catch return;
+    std.Io.Dir.cwd().writeFile(server.io, .{ .sub_path = path, .data = why }) catch return;
+    {
+        shared.lock();
+        defer shared.unlock();
+        for (shared.runs[0..shared.run_count]) |*kept| {
+            if (kept.id == id) kept.unexplored = true;
+        }
+    }
+    generation_next(server, id);
+    std.debug.print("[serve] run {d} {s}", .{ id, why });
+}
+
+test "a tree that had a return due and never branched is a failed run" {
+    const hunt: RunRequest = .{ .time_budget = "2h" };
+    try std.testing.expect(exploration_missing(&hunt, 73, 0)); // aws-hunt run 18.
+    try std.testing.expect(!exploration_missing(&hunt, 1773, 1203)); // Run 17.
+    try std.testing.expect(!exploration_missing(&hunt, 0, 0)); // Its setup failed: said already.
+    const flat: RunRequest = .{ .time_budget = "2h", .branching = "flat" };
+    try std.testing.expect(!exploration_missing(&flat, 73, 0)); // Asked none.
+    // A few timelines by count: no return was due before two generations.
+    const few: RunRequest = .{ .branches = 8 };
+    try std.testing.expect(!exploration_missing(&few, 8, 0));
+    const many: RunRequest = .{ .branches = 64, .generation = 16 };
+    try std.testing.expect(exploration_missing(&many, 64, 0));
+    const run: Run = .{ .id = 18, .pid = 0, .status = 0, .unexplored = true };
+    try std.testing.expectEqualStrings("failed", state(&run));
 }
 
 fn run_directory(server: *Server, id: u32) ![]const u8 {
