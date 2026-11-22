@@ -5,7 +5,7 @@
 # them (their pid files). `stop` takes the runs too (they live in its cgroup): before KVM is
 # reloaded. Idempotent. Run as root.
 # Usage: serve.sh <user> start|stop [--reserved-cores N] [--siblings on|off]
-#   [--margin-branches N|auto] [--machines-per-cpu N]
+#   [--margin-branches N|auto] [--machines-per-cpu N] [--public-listen <address:port>|off]
 #   Every exploration on the host is one of its runs (~/.determinismo, src/runs.zig): serve
 #   shows them however they were started.
 #   --reserved-cores N: N physical cores (with their hyperthreads) for the user's own sessions
@@ -16,6 +16,9 @@
 #   session's VM waits for memory (DETERMINISMO_SESSIONS_MEMORY_MIB, cpus.zig): cores without
 #   memory to run VMs on are no reservation (a hunt left a check one VM at a time, srv3
 #   2026-10-28), and memory held back for nobody kept a hunt's holders from being made.
+#   --public-listen <address:port>|off: the page live and read only on that address too (serve
+#   --public-listen: a CI hunt's machine, its tunnel in front); off removes it. Kept in
+#   /etc/determinismo/public-listen. Default none.
 #   --siblings on|off: VMs on a core's second hyperthread too, once every core's first is busy
 #   (DETERMINISMO_SMT, cpus.zig). Kept in /etc/determinismo/siblings. Default off.
 #   --margin-branches N|auto: how many branches before an exact stop the guest's clock starts
@@ -40,12 +43,14 @@ reserved_given=
 siblings_given=
 margin_given=
 machines_given=
+public_given=
 while [ $# -gt 0 ]; do
   case $1 in
     --reserved-cores) reserved_given=${2:?--reserved-cores needs a number}; shift 2 ;;
     --siblings) siblings_given=${2:?--siblings needs on or off}; shift 2 ;;
     --margin-branches) margin_given=${2:?--margin-branches needs a number or auto}; shift 2 ;;
     --machines-per-cpu) machines_given=${2:?--machines-per-cpu needs a number}; shift 2 ;;
+    --public-listen) public_given=${2:?--public-listen needs an address or off}; shift 2 ;;
     *) echo "error: unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -90,6 +95,14 @@ case $machines_given in
   *) echo "error: --machines-per-cpu takes a number" >&2; exit 2 ;;
 esac
 machines=$(cat "$machines_config" 2>/dev/null || true)
+public_config=/etc/determinismo/public-listen
+case $public_given in
+  off) rm -f "$public_config" ;;
+  "") ;;
+  *:[0-9]*) mkdir -p "$(dirname "$public_config")"; echo "$public_given" > "$public_config" ;;
+  *) echo "error: --public-listen takes address:port or off" >&2; exit 2 ;;
+esac
+public=$(cat "$public_config" 2>/dev/null || true)
 margin=$(cat "$margin_config" 2>/dev/null || echo auto)
 if [ "$margin" = auto ]; then
   margin=
@@ -195,7 +208,7 @@ WorkingDirectory=$home/determinismo
 # The runs' cores theirs alone: everything else on the reserved ones (isolate.sh), as root.
 ExecStartPre=+$home/determinismo/infra/host/isolate.sh ${own_cpus:--} ${run_cpus:--}
 # The UI page read from the repository's file at each request: a UI change ships as a copy.
-ExecStart=$home/determinismo/zig-out/bin/determinismo serve --listen $listen \\
+ExecStart=$home/determinismo/zig-out/bin/determinismo serve --listen $listen ${public:+--public-listen $public} \\
   --ui $home/determinismo/src/ui/index.html --bb $home/opt/bb/bb --kernel $home/guest/vmlinuz \\
   --initrd $home/guest/base.cpio --append quiet --cache $home/cache --memory-mib 4096${margin:+ --margin-branches $margin}${machines:+ --machines-per-cpu $machines}
 # Restarts stop serve alone: its runs go on, adopted by the next.
