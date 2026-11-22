@@ -5590,6 +5590,8 @@ fn run_stop(server: *Server, id: u32, drain: bool, why: []const u8, out: *std.Io
         if (run.id == id) break run;
     } else return error.NotFound;
     if (run.status != null) return error.NotRunning;
+    // A pid of 0 or less signals a process group (serve's own at 0).
+    if (run.pid <= 0) return error.NotRunning;
     if (linux.errno(linux.kill(run.pid, if (drain) .USR2 else .TERM)) != .SUCCESS) return error.NotRunning;
     const directory = try run_directory(server, run.id);
     const path = try std.fs.path.join(server.arena, &.{ directory, if (drain) "draining" else "stopped" });
@@ -5726,6 +5728,7 @@ fn pid_note(server: *Server, directory: []const u8, pid: linux.pid_t) void {
 /// yet, waits for the next look (a minute at most: then its explorer ended before writing it).
 fn runs_discover(server: *Server) !void {
     const shared = server.shared;
+    runs_adopt(server);
     const runs_path = try std.fs.path.join(server.arena, &.{ server.options.data_directory, "runs" });
     for (try host_runs.ids(server.arena, runs_path)) |id| {
         const known = for (shared.runs[0..shared.run_count]) |run| {
@@ -5781,6 +5784,38 @@ fn runs_discover(server: *Server) !void {
 const claim_grace_s = 60;
 
 /// runs_discover from the watcher, with the lock held.
+/// Runs an explorer resumed from a command line (runs.adopt_note), taken as running again as
+/// run_resume takes its own: their pages, stops and the host's guards see them. One that ended
+/// again meanwhile is reaped as an adopted run, its status its record's.
+fn runs_adopt(server: *Server) void {
+    const shared = server.shared;
+    const named = host_runs.adopted_take(server.arena, server.options.data_directory) catch return;
+    for (named) |id| {
+        const run = for (shared.runs[0..shared.run_count]) |*run| {
+            if (run.id == id) break run;
+        } else continue; // Not known yet: discovery finds it running.
+        if (run.status == null) continue; // Running: this serve's own resume, or adopted.
+        const directory = run_directory(server, id) catch continue;
+        // Not stopped any more, judged again as it ends, and its last end's status not its own.
+        for ([_][]const u8{ "stopped", "unexplored", "exit" }) |name| {
+            const path = std.fs.path.join(server.arena, &.{ directory, name }) catch continue;
+            std.Io.Dir.cwd().deleteFile(server.io, path) catch {};
+        }
+        shared.exploration_known[id] = false;
+        // Its explorer gone already, the resume's end is its record's: its timelines ingested
+        // once more (never a pid of 0, which a stop would send to serve's own process group).
+        const pid = host_runs.running_pid(server.arena, directory) orelse {
+            const record = run_file(server, id, "record.jsonl") catch "";
+            run.* = .{ .id = id, .pid = 0, .status = recorded_status(record) };
+            holders_drop(server, run);
+            continue;
+        };
+        assert(pid > 0);
+        run.* = .{ .id = id, .pid = pid, .adopted = true };
+        std.debug.print("[serve] run {d} resumed from a command line: running\n", .{id});
+    }
+}
+
 fn runs_discover_locked(shared: *Shared) void {
     var request_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer request_arena.deinit();

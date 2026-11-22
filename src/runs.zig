@@ -52,6 +52,43 @@ pub fn claim(arena: std.mem.Allocator, io: std.Io, data: []const u8) !Claimed {
     return error.TooManyRuns;
 }
 
+/// `<data>/adopt/<id>`: a run an explorer resumed from a command line (`explore --resume`), said
+/// to serve, which looks at a run's directory once and so showed it ended while it ran: a stop
+/// through serve answered that it was not running and no guard of the host saw it (the
+/// branching measure's resume, srv4, 2026-11-22). serve takes each as running (runs_adopt).
+pub fn adopt_note(arena: std.mem.Allocator, data: []const u8, id: u32) !void {
+    assert(id > 0 and id < runs_max);
+    const directory = try std.fs.path.joinZ(arena, &.{ data, "adopt" });
+    switch (linux.errno(linux.mkdirat(linux.AT.FDCWD, directory, 0o755))) {
+        .SUCCESS, .EXIST => {},
+        else => return error.AdoptNote,
+    }
+    const path = try std.fmt.allocPrintSentinel(arena, "{s}/{d}", .{ directory, id }, 0);
+    const opened = linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true }, 0o644);
+    if (linux.errno(opened) != .SUCCESS) return error.AdoptNote;
+    _ = linux.close(@intCast(opened));
+}
+
+/// The runs adopt_note named, each note deleted as it is read.
+pub fn adopted_take(arena: std.mem.Allocator, data: []const u8) ![]u32 {
+    const directory = try std.fs.path.join(arena, &.{ data, "adopt" });
+    const named = try ids(arena, directory);
+    for (named) |id| {
+        const path = try std.fmt.allocPrintSentinel(arena, "{s}/{d}", .{ directory, id }, 0);
+        _ = linux.unlink(path);
+    }
+    return named;
+}
+
+/// The id of `directory` when it is a run's, `<data>/runs/<id>` (absolute), else null.
+pub fn id_in(data: []const u8, directory: []const u8) ?u32 {
+    const parent = std.fs.path.dirname(directory) orelse return null;
+    if (!std.mem.eql(u8, std.fs.path.basename(parent), "runs")) return null;
+    if (!std.mem.eql(u8, std.fs.path.dirname(parent) orelse return null, data)) return null;
+    const id = std.fmt.parseInt(u32, std.fs.path.basename(directory), 10) catch return null;
+    return if (id > 0 and id < runs_max) id else null;
+}
+
 /// The run whose `<name>` (its events, record or tapes, asked elsewhere) links to `target`, if
 /// any: a new run there would replace that one's (runs 69 to 71 on srv3 shared /tmp/rmq, and
 /// serve could open only one: DuckDB attaches a file once).
@@ -367,4 +404,22 @@ test "claim: ids in order, never one twice; the pid lock tells a running run" {
     try running_mark(arena, first.directory);
     try std.testing.expectEqual(linux.getpid(), running_pid(arena, first.directory).?);
     try std.testing.expectError(error.RunRunning, running_mark(arena, first.directory));
+}
+
+test "adopt: a resume's note, read once; a run's directory's id" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try absolute(arena, try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{&tmp.sub_path}));
+    try std.testing.expectEqual(0, (try adopted_take(arena, data)).len); // None said: no directory.
+    try adopt_note(arena, data, 12);
+    try adopt_note(arena, data, 12); // Said twice before serve looked: once.
+    try std.testing.expectEqualSlices(u32, &.{12}, try adopted_take(arena, data));
+    try std.testing.expectEqual(0, (try adopted_take(arena, data)).len);
+    try std.testing.expectEqual(12, id_in(data, try directory_of(arena, data, 12)).?);
+    try std.testing.expectEqual(null, id_in(data, "/elsewhere/runs/12"));
+    try std.testing.expectEqual(null, id_in(data, try std.fmt.allocPrint(arena, "{s}/runs/x", .{data})));
+    try std.testing.expectEqual(null, id_in(data, try std.fmt.allocPrint(arena, "{s}/other/12", .{data})));
 }

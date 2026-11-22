@@ -1255,6 +1255,14 @@ fn run_register(arena: std.mem.Allocator, io: std.Io, arguments: *Arguments) !vo
         break :claimed run.directory;
     };
     try runs.running_mark(arena, directory);
+    // A resume, said to serve once its explorer holds the run (runs.adopt_note): it showed the
+    // run ended. Its own resumes say it too, and serve has them running already.
+    if (arguments.resume_run) {
+        const data = try runs.data_directory(arena, arguments.data_directory);
+        if (runs.id_in(data, try runs.absolute(arena, directory))) |id| runs.adopt_note(arena, data, id) catch |err| {
+            say("[determinismo] serve not told of this resume ({s}): it shows the run ended\n", .{@errorName(err)});
+        };
+    }
     arguments.run_directory = directory;
     const Placed = struct { name: []const u8, path: *?[]const u8 };
     for ([_]Placed{

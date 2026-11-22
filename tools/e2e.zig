@@ -271,7 +271,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "draws", check_draws },                       .{ "exit-stack", check_exit_stack },                 .{ "plan-calls", check_plan_calls },
         .{ "services", check_services },                 .{ "sites", check_sites },                           .{ "client", check_client },
         .{ "session-exact", check_session_exact },       .{ "java-watch", check_java_watch },                 .{ "raft-558", check_raft_558 },
-        .{ "jvm-caches", check_jvm_caches },             .{ "guest-panic", check_guest_panic },
+        .{ "jvm-caches", check_jvm_caches },             .{ "guest-panic", check_guest_panic },               .{ "resume-seen", check_resume_seen },
     };
     // A check's whole name runs it alone (check.sh's `ui` ran guidance and quiet too).
     var exact = std.mem.eql(u8, only, "tla");
@@ -5706,6 +5706,92 @@ fn check_resume(context: *Context) !void {
         }, "resume ({s}): killed at {d} timelines, resumed: {d} timelines, once each (the whole " ++
             "run: {d})", .{ branching, interrupted.len, resumed.len, expected.len });
     }
+}
+
+/// A run resumed from a command line (`explore --resume` of a run serve knows) is serve's again:
+/// running while its explorer runs, and stopped through serve. serve looked at a run's directory
+/// once, so such a resume showed the run ended while it ran, and a stop through serve answered
+/// that it was not running (the branching measure's resume, srv4, 2026-11-22).
+fn check_resume_seen(context: *Context) !void {
+    const arena = context.arena;
+    const address = "127.0.0.1:7921";
+    const url = "http://" ++ address;
+    const data = try std.fs.path.join(arena, &.{ context.scratch, "serve-resume-seen" });
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{ context.determinismo, "serve", "--listen", address, "--data", data });
+    try argv.appendSlice(arena, context.machine);
+    var server = try std.process.spawn(context.io, .{ .argv = argv.items, .stdout = .ignore, .stderr = .ignore });
+    defer server.kill(context.io);
+    for (0..50) |_| {
+        const runs: []const u8 = curl(context, &.{url ++ "/runs"}) catch "";
+        if (runs.len > 0) break;
+        sleep_ms(100);
+    }
+    const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
+    const record = try std.fs.path.join(arena, &.{ context.scratch, "resume-seen.jsonl" });
+    // Many timelines: the resume still runs when serve is asked to stop it.
+    const system = [_][]const u8{
+        "--program",  program, "--scenario", "bank", "--seed", "7",  "--branching", "flat",
+        "--branches", "400",   "--jobs",     "3",    "--data", data, "--record",    record,
+    };
+    var command: std.ArrayList(u8) = .empty;
+    try command.print(arena, "exec '{s}' explore", .{context.determinismo});
+    for (context.machine) |part| try command.print(arena, " '{s}'", .{part});
+    for (system) |part| try command.print(arena, " '{s}'", .{part});
+    var first = try std.process.spawn(context.io, .{ .argv = &.{ "sh", "-c", command.items }, .stdout = .ignore, .stderr = .ignore });
+    for (0..6000) |_| {
+        const text = std.Io.Dir.cwd().readFileAlloc(context.io, record, arena, .limited(1 << 24)) catch "";
+        if (std.mem.count(u8, text, "{\"branch\":") >= 6) break;
+        sleep_ms(50);
+    }
+    _ = std.os.linux.kill(first.id.?, .TERM);
+    _ = try first.wait(context.io);
+    var before: []const u8 = "";
+    for (0..600) |_| {
+        before = curl(context, &.{url ++ "/runs/1"}) catch "";
+        if (before.len > 0 and std.mem.indexOf(u8, before, "\"state\":\"running\"") == null) break;
+        sleep_ms(100);
+    }
+    // Resumed from the command line, as a person or a script would.
+    try command.appendSlice(arena, " --resume");
+    var again = try std.process.spawn(context.io, .{ .argv = &.{ "sh", "-c", command.items }, .stdout = .ignore, .stderr = .ignore });
+    var seen = false;
+    for (0..300) |_| {
+        const run: []const u8 = curl(context, &.{url ++ "/runs/1"}) catch "";
+        if (std.mem.indexOf(u8, run, "\"state\":\"running\"") != null) {
+            seen = true;
+            break;
+        }
+        sleep_ms(100);
+    }
+    const stop: []const u8 = curl(context, &.{ "-X", "POST", url ++ "/runs/1/stop" }) catch "";
+    // Ended by that stop (TERM): its explorer a zombie here within a minute.
+    const stat_path = try std.fmt.allocPrint(arena, "/proc/{d}/stat", .{again.id.?});
+    var exited = false;
+    for (0..600) |_| {
+        const stat = std.Io.Dir.cwd().readFileAlloc(context.io, stat_path, arena, .limited(4096)) catch "";
+        const close = std.mem.lastIndexOfScalar(u8, stat, ')') orelse break;
+        if (close + 2 < stat.len and stat[close + 2] == 'Z') {
+            exited = true;
+            break;
+        }
+        sleep_ms(100);
+    }
+    _ = std.os.linux.kill(again.id.?, .KILL);
+    _ = try again.wait(context.io);
+    var after: []const u8 = "";
+    for (0..600) |_| {
+        after = curl(context, &.{url ++ "/runs/1"}) catch "";
+        if (std.mem.indexOf(u8, after, "\"state\":\"stopped\"") != null) break;
+        sleep_ms(100);
+    }
+    expect_all(context, &.{
+        .{ "the run killed partway reads ended", std.mem.indexOf(u8, before, "\"state\":\"interrupted\"") != null },
+        .{ "resumed from a command line, serve shows it running", seen },
+        .{ "a stop through serve reaches it", std.mem.indexOf(u8, stop, "\"state\":\"stopped\"") != null },
+        .{ "its explorer ended by that stop", exited },
+        .{ "and serve shows it stopped", std.mem.indexOf(u8, after, "\"state\":\"stopped\"") != null },
+    }, "resume-seen: a command line's resume of serve's run 1 shown running ({}), ended by serve's stop ({})", .{ seen, exited });
 }
 
 /// A record_timelines line's index.
