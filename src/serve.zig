@@ -5796,8 +5796,9 @@ fn runs_adopt(server: *Server) void {
         } else continue; // Not known yet: discovery finds it running.
         if (run.status == null) continue; // Running: this serve's own resume, or adopted.
         const directory = run_directory(server, id) catch continue;
-        // Not stopped any more, judged again as it ends, and its last end's status not its own.
-        for ([_][]const u8{ "stopped", "unexplored", "exit" }) |name| {
+        // Not stopped any more, judged again as it ends (its notes too), and its last end's
+        // status not its own.
+        for ([_][]const u8{ "stopped", "unexplored", "jvm-cache", "exit" }) |name| {
             const path = std.fs.path.join(server.arena, &.{ directory, name }) catch continue;
             std.Io.Dir.cwd().deleteFile(server.io, path) catch {};
         }
