@@ -4530,14 +4530,15 @@ if (reportEmbedded) {
     + (going ? " The run goes on: this page takes each newer recording as it comes." : "");
   document.querySelector("aside .brand")?.after(note);
   // A copy of a run still going: a newer recording beside it (stamp.json, written with each:
-  // infra/host/report-static.sh) reloads it; asked each minute (from a file, nothing to ask).
+  // infra/host/report-static.sh) reloads it; asked every 10 s (a live mirror records every
+  // ~20 s; from a file, nothing to ask).
   if (going && location.protocol.startsWith("http")) {
     setInterval(async () => {
       try {
         const stamp = await (await fetch("stamp.json", { cache: "no-store" })).json();
         if (stamp.recorded && stamp.recorded > reportEmbedded.recorded) location.reload();
       } catch { /* None yet. */ }
-    }, 60000);
+    }, 10000);
   }
 }
 // ?record (see reportEmbedded): the run's report, then each property's page, each once the page
