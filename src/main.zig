@@ -27,6 +27,7 @@ const activity = @import("activity.zig");
 const saver_zig = @import("core").saver;
 const build_options = @import("build_options");
 const prepare = @import("prepare.zig");
+const schema = @import("determinismo").schema;
 const kubernetes = @import("kubernetes.zig");
 const serve = @import("serve.zig");
 const mcp = @import("mcp.zig");
@@ -263,7 +264,7 @@ const usage =
     \\       determinismo validate (--program <p> | --compose <file> | --kubernetes <dir>)
     \\                            [--profile <p>] [--cache <dir>] [--no-faults ...]   (the system
     \\                            resolved without booting it, and what would keep a run from
-    \\                            testing it: invalid commands, scenarios with no driver)
+    \\                            testing it: invalid commands, scenarios with nothing to start)
     \\       determinismo script  <events.jsonl>       (a branch's shape, for --script)
     \\       determinismo tla     --spec <Spec.tla> --events <events.jsonl> [--tla2tools <jar>]
     \\       determinismo quint   --spec <Spec.qnt> --events <events.jsonl[.zst] | directory>
@@ -1527,7 +1528,7 @@ fn command_mcp(init: std.process.Init, argv: []const [:0]const u8) !void {
 /// [--cache <dir>] [--faults ...] [--no-faults ...]`: the system resolved, its images pulled or
 /// built and its test templates found, without booting it, and what would keep a run from
 /// testing it, as Antithesis's `snouty validate` checks a configuration before a launch: a
-/// scenario with no driver command (the composer refuses it), several setup commands, files
+/// scenario with nothing to start (no driver and no first command), several setup commands, files
 /// named as commands that cannot run. Its nodes and scenarios listed; exit status 1 with any
 /// problem (a system that does not resolve fails as explore would, with its error).
 fn command_validate(arena: std.mem.Allocator, io: std.Io, arguments: *Arguments) !u8 {
@@ -1540,24 +1541,24 @@ fn command_validate(arena: std.mem.Allocator, io: std.Io, arguments: *Arguments)
     var problems: u32 = 0;
     for (system.scenarios) |scenario| {
         print("  scenario {s}{s}{s}\n", .{ scenario.name, if (scenario.node != null) " in " else "", scenario.node orelse "" });
-        var drivers: u32 = 0;
         var setups: u32 = 0;
         for (scenario.commands) |command| {
             print("    {s:<17} {s}\n", .{ @tagName(command.kind), command.name });
-            drivers += @intFromBool(switch (command.kind) {
-                .parallel_driver, .serial_driver, .singleton_driver, .anytime => true,
-                else => false,
-            });
             setups += @intFromBool(command.kind == .setup);
         }
         for (scenario.invalid) |invalid| {
             print("    INVALID  {s}: {s} (never run: \"test templates hold only valid commands\" fails)\n", .{ invalid.path, invalid.why });
             problems += 1;
         }
-        if (drivers == 0) {
-            print("    PROBLEM  no driver command (parallel_driver_, serial_driver_, singleton_driver_ or " ++
-                "anytime_): the composer refuses the scenario\n", .{});
-            problems += 1;
+        switch (validate_driverless(scenario.commands)) {
+            .drivers => {},
+            .note => print("    NOTE     no driver command: after its first_ command the composer starts " ++
+                "nothing, the system's own processes the workload (Antithesis's docs ask for a driver)\n", .{}),
+            .problem => {
+                print("    PROBLEM  no driver command (parallel_driver_, serial_driver_, singleton_driver_ or " ++
+                    "anytime_) and no first_ command: nothing starts the workload\n", .{});
+                problems += 1;
+            },
         }
         if (setups > 1) {
             print("    PROBLEM  {d} setup commands: the composer takes one\n", .{setups});
@@ -1568,6 +1569,35 @@ fn command_validate(arena: std.mem.Allocator, io: std.Io, arguments: *Arguments)
         system.nodes.len, system.scenarios.len, problems, if (problems == 1) "problem" else "problems",
     });
     return @intFromBool(problems > 0);
+}
+
+/// What validate says of a scenario with no driver command. Antithesis's docs ask for one, and
+/// say nothing of refusing a template without: their formalized Raft projects run one of a single
+/// first_start_workload, which touches a file while the driver container's own process runs the
+/// workload (calibration lines 19-21; validate called it refused while run 2125 ran it). A
+/// first_ command is a note; nothing at all to start is a problem.
+const Driverless = enum { drivers, note, problem };
+
+fn validate_driverless(commands: []const schema.Command) Driverless {
+    var first = false;
+    for (commands) |command| switch (command.kind) {
+        .parallel_driver, .serial_driver, .singleton_driver, .anytime => return .drivers,
+        .first => first = true,
+        else => {},
+    };
+    return if (first) .note else .problem;
+}
+
+test validate_driverless {
+    const driver: schema.Command = .{ .kind = .parallel_driver, .name = "parallel_driver_ops" };
+    const first: schema.Command = .{ .kind = .first, .name = "first_start_workload" };
+    const finally: schema.Command = .{ .kind = .finally, .name = "finally_check" };
+    try std.testing.expectEqual(.drivers, validate_driverless(&.{ first, driver }));
+    // Antithesis's formalized Raft projects: first_start_workload alone, the driver
+    // container's own process the workload (calibration lines 19-21, run 2125).
+    try std.testing.expectEqual(.note, validate_driverless(&.{first}));
+    try std.testing.expectEqual(.problem, validate_driverless(&.{finally}));
+    try std.testing.expectEqual(.problem, validate_driverless(&.{}));
 }
 
 /// Builds the disks of the program's system and records what was resolved.

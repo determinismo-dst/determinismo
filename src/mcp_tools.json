@@ -17,7 +17,7 @@
   },
   {
     "name": "validate",
-    "description": "Check a system before a run, without booting it (as Antithesis's snouty validate): it is resolved (images pulled or built, test templates found), its nodes and each scenario's commands listed, and what would keep a run from testing it named: files named as test commands that cannot run (not executable, no shebang), a scenario with no driver command, several setup commands, an image not built for linux/amd64. Its last line counts the problems.",
+    "description": "Check a system before a run, without booting it (as Antithesis's snouty validate): it is resolved (images pulled or built, test templates found), its nodes and each scenario's commands listed, and what would keep a run from testing it named: files named as test commands that cannot run (not executable, no shebang), a scenario with nothing to start (no driver and no first command; first commands alone are a note), several setup commands, an image not built for linux/amd64. Its last line counts the problems.",
     "inputSchema": {
       "type": "object",
       "properties": {
