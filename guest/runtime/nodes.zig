@@ -440,6 +440,7 @@ pub fn exec(
         .workdir = running.workdir,
         .user = running.user,
         .ulimits = node.ulimits, // As docker exec: the container's limits.
+        .hostname = node.hostname, // Its HOSTNAME as the start's (docker exec: the container's).
     };
     paths.root = root; // The node's root as this namespace sees it.
     const launch = try Launch.init(arena, &exec_node, &paths, if (options.coverage) .exec_covered else .exec);
@@ -3726,7 +3727,14 @@ const Launch = struct {
         }
         var env_kept: usize = 0;
         for (node.env) |entry| env_kept += @intFromBool(!knob_sets(knob_entries[0..knob_count], entry));
-        if (knob_count + env_kept + platform_environment.len + 5 >= environment_max) {
+        // Its hostname in HOSTNAME, as Docker and Podman set it in a container's environment, for
+        // its start and the commands run in it (the node's own entry wins): Antithesis's
+        // formalized Raft projects name each node's forwarded log lines by it, and without it
+        // every line came from "unknown" (line 19's trial run 2115: one node's term after
+        // another's read as a term going backwards; election safety and the logs' agreement could
+        // not fail).
+        const hostname_given = env_sets(knob_entries[0..knob_count], "HOSTNAME") or env_sets(node.env, "HOSTNAME");
+        if (knob_count + env_kept + platform_environment.len + 6 >= environment_max) {
             return error.TooManyEnvironmentEntries;
         }
         // Every JVM the node's start runs with determinismo's coverage agent (java_options); not
@@ -3745,7 +3753,7 @@ const Launch = struct {
         for (covered) |entry| covered_added += @intFromBool(entry != null and entry.?.replaces == null);
         const wipes = if (kind == .start) wipes_of(paths) else 0;
         const envp_count = knob_count + env_kept + platform_environment.len + 1 + @intFromBool(wipes > 0) +
-            @intFromBool(kind == .start) + covered_added;
+            @intFromBool(kind == .start) + covered_added + @intFromBool(!hostname_given);
         const envp = try arena.allocSentinel(?[*:0]const u8, envp_count, null);
         var path_value: []const u8 = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
         var filled: usize = 0;
@@ -3762,6 +3770,10 @@ const Launch = struct {
             const added = entry orelse continue;
             if (added.replaces != null) continue;
             envp[filled] = added.entry.ptr;
+            filled += 1;
+        }
+        if (!hostname_given) {
+            envp[filled] = try std.fmt.allocPrintSentinel(arena, "HOSTNAME={s}", .{node.hostname orelse node.name}, 0);
             filled += 1;
         }
         for (envp[0..filled]) |entry| {
@@ -4172,6 +4184,20 @@ fn knob_sets(knob_entries: []const []const u8, entry: []const u8) bool {
         if (knob_entry.len > name_end and knob_entry[name_end] == '=' and std.mem.eql(u8, knob_entry[0..name_end], entry[0..name_end])) return true;
     }
     return false;
+}
+
+/// Whether `entries` (NAME=value) set `name`.
+fn env_sets(entries: []const []const u8, name: []const u8) bool {
+    for (entries) |entry| {
+        if (entry.len > name.len and entry[name.len] == '=' and std.mem.eql(u8, entry[0..name.len], name)) return true;
+    }
+    return false;
+}
+
+test env_sets {
+    try std.testing.expect(env_sets(&.{ "PATH=/bin", "HOSTNAME=raft1" }, "HOSTNAME"));
+    try std.testing.expect(!env_sets(&.{ "HOSTNAMES=x", "PATH=/bin" }, "HOSTNAME"));
+    try std.testing.expect(!env_sets(&.{}, "HOSTNAME"));
 }
 
 test "a knob's entry replaces the node's own of its name" {

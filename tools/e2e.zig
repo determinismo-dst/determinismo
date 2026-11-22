@@ -234,7 +234,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "mutate", check_mutate },                         .{ "interleave", check_interleave },               .{ "checks", check_host_checks },
         .{ "pausing", check_pausing },                       .{ "shrink", check_shrink },                       .{ "shrink-plugin", check_shrink_plugin },
         .{ "holds", check_holds },                           .{ "coverage-set", check_coverage_set },           .{ "horizons", check_horizon_replays },
-        .{ "inject", check_inject },                         .{ "learned-limit", check_learned_limit },         .{ "sysctls", check_sysctls },
+        .{ "inject", check_inject },                         .{ "learned-limit", check_learned_limit },         .{ "sysctls", check_sysctls },                       .{ "hostname", check_hostname },
         .{ "self-driven", check_self_driven },               .{ "aim", check_aim },                             .{ "aftershock", check_aftershock },
         .{ "record-power-loss", check_record_power_loss },   .{ "errno-storm", check_errno_storm },             .{ "compose", check_compose },
         .{ "shards", check_shards },                         .{ "stress", check_stress },                       .{ "controller", check_controller },
@@ -9801,6 +9801,23 @@ fn check_self_driven(context: *Context) !void {
         .{ "its first command ran", first != null and hit_count(first.?) == 1 },
         .{ "the system ran ten seconds past it and said so", line != null and hit_count(line.?) == 1 and failing != null and failing.? == 0 },
     }, "self-driven: a template with a first command alone runs the system for its length", .{});
+}
+
+/// A Compose service's hostname is in its processes' HOSTNAME, its start command's and a command
+/// run in it, as Docker and Podman set it in a container's environment. Antithesis's formalized
+/// Raft projects name each node's forwarded log lines by it: without it every line came from
+/// "unknown" (line 19's trial run 2115: one node's term after another's read as a term going
+/// backwards, and election safety and the logs' agreement could not fail).
+fn check_hostname(context: *Context) !void {
+    const compose = "tests/antithesis-compat/hostname/compose.yaml";
+    const report = try explore(context, &.{ "--compose", compose, "--scenario", "named", "--seed", "1", "--branches", "1" });
+    const message = "the node's processes have its hostname in HOSTNAME";
+    const line = for_line(report, message);
+    const failing = failing_in(report, message);
+    expect_all(context, &.{
+        .{ "the test command reported", line != null and hit_count(line.?) == 1 },
+        .{ "the start command and the test command had the service's hostname", failing != null and failing.? == 0 },
+    }, "hostname: a service's Compose hostname in its processes' HOSTNAME", .{});
 }
 
 /// A Compose service's namespaced kernel settings (`sysctls`) are set in its node: its test command

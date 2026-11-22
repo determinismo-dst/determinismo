@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: MIT
+# A service's hostname in its processes' HOSTNAME, as Docker and Podman set it in a container's
+# environment: Antithesis's formalized Raft projects name each node's forwarded log lines by it.
+# Its start command keeps the HOSTNAME of its environment, and its test command says, in the
+# Antithesis SDK's format, whether both are the file's hostname. Run with:
+#   determinismo explore ... --compose tests/antithesis-compat/hostname/compose.yaml --scenario named
+services:
+  client:
+    build: ./client
+    container_name: compat-client
+    hostname: named-host
+    command: [/usr/local/bin/ready]
