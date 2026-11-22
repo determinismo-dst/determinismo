@@ -5,6 +5,29 @@ set -euo pipefail
 user=${1:?usage: $0 <user>}
 export DEBIAN_FRONTEND=noninteractive
 
+# A host just booted may run apt on its own (cloud-init, apt-daily catching up on an image days
+# old: setup found dpkg's lock held on an AWS machine, 2026-11-22): waited for, 15 minutes at
+# most, by its processes and by its locks' inodes in /proc/locks (not by the name unattended-upgr:
+# also unattended-upgrade-shutdown, which never exits). One starting later: apt's own lock timeout.
+apt_busy() {
+  pgrep -x "apt-get|apt|dpkg|apt.systemd.dai" > /dev/null && return 0
+  local lock inode
+  for lock in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock; do
+    inode=$(stat -c %i "$lock" 2> /dev/null) && grep -q ":$inode " /proc/locks && return 0
+  done
+  return 1
+}
+apt_wait() {
+  for _ in $(seq 180); do
+    apt_busy || return 0
+    sleep 5
+  done
+  echo "error: apt still busy after 15 minutes" >&2
+  return 1
+}
+apt_get() { apt-get -o DPkg::Lock::Timeout=300 "$@"; }
+apt_wait
+
 # The running kernel's flavor, kept: amd64 (srv4), or cloud-amd64 (Debian's cloud images, EC2's
 # AMIs among them: KVM a module there too, 2026-11-07). Its headers: the newest on a first
 # provisioning, then pinned (below); a later run asks for the running kernel's, since asking for
@@ -23,9 +46,9 @@ if [ -d /sys/firmware/efi ] && dpkg -s grub-efi-amd64 >/dev/null 2>&1 && [ -e /e
   dpkg --configure -a
 fi
 
-apt-get update -q
-apt-get -y -q full-upgrade
-apt-get -y -q install \
+apt_get update -q
+apt_get -y -q full-upgrade
+apt_get -y -q install \
   build-essential bc bison flex libelf-dev libssl-dev dwarves zstd \
   "$headers" linux-perf msr-tools cpuid numactl gdb \
   git curl rsync tmux htop sudo nftables unattended-upgrades \
