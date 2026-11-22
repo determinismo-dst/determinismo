@@ -29,7 +29,7 @@ const Nodes = struct { race: sdk.Node };
 const System = sdk.System(Nodes);
 
 pub fn main(init: std.process.Init) !void {
-    return System.main(init, .{ .describe = describe, .scenarios = .{ .race = race, .held = held, .held_release = held_release, .held_later = held_later } });
+    return System.main(init, .{ .describe = describe, .scenarios = .{ .race = race, .held = held, .held_release = held_release, .held_later = held_later, .held_crowd = held_crowd } });
 }
 
 fn describe(d: *System.Describe) !void {
@@ -88,6 +88,10 @@ fn describe(d: *System.Describe) !void {
     // its threads ordered by Node.hold alone.
     const held_profile = try d.profile("held");
     held_profile.node(.race, .{ .binary = "zig-out/bin/race-held", .faults = faults });
+    // Threads stepping past a held point's entry beside the ones it holds
+    // (examples/race/race_crowd.zig), for scenario `held_crowd`.
+    const crowd_profile = try d.profile("held_crowd");
+    crowd_profile.node(.race, .{ .binary = "zig-out/bin/race-crowd", .faults = faults });
 }
 
 /// Scenario `held` (profile `held`): Node.hold on `race_held.act`, every thread that enters it
@@ -224,6 +228,42 @@ fn hold_later_armed(context: *System.Context) !void {
     hold.release();
     sdk.event("race_held_later", .{ .armed = armed_seen, .held_before = held_before, .held_after = held_after });
     sdk.always(armed_seen and held_after and !held_before, "a later hold point holds only once armed", .{ .armed = armed_seen, .held_before = held_before });
+}
+
+/// Scenario `held_crowd` (profile `held_crowd`): Node.hold on `race_crowd.visit` for argument
+/// 1000 with `--every`, three threads stepping past its entry with other arguments all along:
+/// each of the eight threads that call it with 1000 held. Red before det-nodes hold stopped a
+/// process's other threads during a step past an entry (a thread passed the entry unseen then).
+fn held_crowd(s: *System.Scenario) void {
+    s.faults = false;
+    s.singleton_driver("hold", hold_crowd);
+}
+
+/// race_crowd.zig's threads that call `visit` with the held argument, all at once.
+const crowd_marked = 8;
+
+fn hold_crowd(context: *System.Context) !void {
+    sdk.sleep_ms(200 + sdk.random_below(800));
+    const hold = try context.nodes.race.hold(&.{ "race_crowd.visit", "--arg", "rdi=0x3e8", "--every" }, 10_000);
+    if (!hold.armed()) {
+        hold.release();
+        return error.NotArmed;
+    }
+    var held_count: u32 = 0;
+    var polled = [_]linux.pollfd{.{ .fd = hold.output, .events = linux.POLL.IN, .revents = 0 }};
+    while (held_count < crowd_marked) {
+        // The eight go in within race_crowd's spread (300 ms) once the breakpoint is in: none
+        // comes after seconds.
+        const ready = linux.poll(&polled, polled.len, 3000);
+        if (linux.errno(ready) != .SUCCESS or ready == 0) break;
+        var buffer: [256]u8 = undefined;
+        const said = hold_line(hold, &buffer);
+        if (said.len == 0 or std.mem.startsWith(u8, said, "{\"held\":null")) break;
+        if (std.mem.startsWith(u8, said, "{\"held\":")) held_count += 1;
+    }
+    hold.release();
+    sdk.event("race_held_crowd", .{ .held = held_count });
+    sdk.always(held_count == crowd_marked, "each thread at a held point's entry is held while others step past it", .{ .held = held_count });
 }
 
 fn race(s: *System.Scenario) void {

@@ -341,6 +341,13 @@ const Hold = struct {
     count: u32 = 0,
     tids: [threads_max]linux.pid_t = undefined,
     threads: u32 = 0,
+    /// Threads found stopped at a point's breakpoint while others stepped past it (others_stop),
+    /// left stopped there for the main loop, first in first out. Rewound and let go instead,
+    /// they hit it again at once and the next step past found them again: in race_test.zig's
+    /// `held_crowd` the three threads stepping past all along kept the eight with the held
+    /// argument from ever being held (none in 4 of 4 timelines).
+    queued: [threads_max]linux.pid_t = undefined,
+    queued_count: u32 = 0,
 
     fn track(hold: *Hold, tid: linux.pid_t) void {
         for (hold.tids[0..hold.threads]) |known| if (known == tid) return;
@@ -356,6 +363,7 @@ const Hold = struct {
             hold.threads -= 1;
             break;
         }
+        hold.unqueue(tid);
         for (hold.points[0..hold.count]) |*point| {
             if (point.held != null and point.held.? == tid) point.held = null;
         }
@@ -459,9 +467,7 @@ const Hold = struct {
             point.passing_g = 0;
             hold.note(if (same_thread) "passing_back" else "passing_moved", index, tid, 0);
             if (point.inserted) {
-                if (!hold.byte_write(point.entry, point.original)) return;
-                point.inserted = false;
-                hold.step_over(tid, point);
+                hold.step_past(tid, point);
                 return;
             }
         }
@@ -492,6 +498,69 @@ const Hold = struct {
             hold.note("held", index, tid, 0);
             return; // Left stopped.
         }
+        hold.step_past(tid, point);
+    }
+
+    /// The threads stopped while a point's byte is out for one thread's step past its entry:
+    /// running, another passed the entry unseen (jtl-data run 14: the Raft PoC walk's vote
+    /// request from O to C, sent beside its request to V while that one stepped past the point,
+    /// in 10 of 86 walks; race_test.zig's `held_crowd`). Each gives back the stop it was found
+    /// in (its signal); one stopped at a breakpoint stays stopped, queued for the main loop.
+    const Paused = struct {
+        tids: [threads_max]linux.pid_t = undefined,
+        signals: [threads_max]u32 = undefined,
+        count: u32 = 0,
+    };
+
+    fn others_stop(hold: *Hold, tid: linux.pid_t, paused: *Paused) void {
+        var tids: [threads_max]linux.pid_t = undefined;
+        const threads = hold.threads;
+        @memcpy(tids[0..threads], hold.tids[0..threads]);
+        for (tids[0..threads]) |other| {
+            // Held or queued: stopped already.
+            if (other == tid or hold.held_by(other) != null or hold.is_queued(other)) continue;
+            if (linux.errno(linux.ptrace(ptrace_interrupt, other, 0, 0, 0)) != .SUCCESS) continue;
+            var status: i32 = 0;
+            if (linux.errno(linux.wait4(other, &status, wait_all, null)) != .SUCCESS) continue;
+            const word: u32 = @bitCast(status);
+            if (!linux.W.IFSTOPPED(word)) {
+                hold.forget(other);
+                continue;
+            }
+            const stop: u32 = @backingInt(linux.W.STOPSIG(word));
+            const event = word >> 16;
+            var signal: u32 = 0;
+            if (event == 0 and stop == signal_trap) {
+                var regs: Regs = undefined;
+                const read = linux.errno(linux.ptrace(ptrace_getregs, other, 0, @intFromPtr(&regs), 0)) == .SUCCESS;
+                if (read and hold.point_at(regs[rip_index]) != null) {
+                    // A hit not seen yet: left stopped for the main loop, which takes it first.
+                    hold.queue(other);
+                    continue;
+                }
+                signal = stop;
+            } else if (event == 0) {
+                signal = stop;
+            }
+            // An event's stop (this interrupt, a clone) gives nothing back; a clone's new thread
+            // waits stopped for the main loop.
+            paused.tids[paused.count] = other;
+            paused.signals[paused.count] = signal;
+            paused.count += 1;
+        }
+    }
+
+    fn others_resume(paused: *const Paused) void {
+        for (paused.tids[0..paused.count], paused.signals[0..paused.count]) |other, signal| {
+            _ = linux.ptrace(ptrace_cont, other, 0, signal, 0);
+        }
+    }
+
+    /// `tid` past a point's entry, its byte out meanwhile and every other thread stopped.
+    fn step_past(hold: *Hold, tid: linux.pid_t, point: *Point) void {
+        var paused: Paused = .{};
+        hold.others_stop(tid, &paused);
+        defer others_resume(&paused);
         if (!hold.byte_write(point.entry, point.original)) return;
         point.inserted = false;
         hold.step_over(tid, point);
@@ -513,7 +582,7 @@ const Hold = struct {
                 gone = true;
                 break;
             }
-            const stop: u32 = @intFromEnum(linux.W.STOPSIG(@bitCast(status)));
+            const stop: u32 = @backingInt(linux.W.STOPSIG(@bitCast(status)));
             if (stop == signal_trap) break;
             signal = stop; // A signal came first: given with the step.
         }
@@ -576,10 +645,13 @@ const Hold = struct {
     fn finish(hold: *Hold) void {
         for (hold.tids[0..hold.threads]) |tid| {
             if (hold.held_by(tid) != null) continue;
-            if (linux.errno(linux.ptrace(ptrace_interrupt, tid, 0, 0, 0)) != .SUCCESS) continue;
-            var status: i32 = 0;
-            if (linux.errno(linux.wait4(tid, &status, wait_all, null)) != .SUCCESS) continue;
-            if (!linux.W.IFSTOPPED(@bitCast(status))) continue;
+            // A queued thread is stopped already (at its breakpoint, rewound below).
+            if (!hold.is_queued(tid)) {
+                if (linux.errno(linux.ptrace(ptrace_interrupt, tid, 0, 0, 0)) != .SUCCESS) continue;
+                var status: i32 = 0;
+                if (linux.errno(linux.wait4(tid, &status, wait_all, null)) != .SUCCESS) continue;
+                if (!linux.W.IFSTOPPED(@bitCast(status))) continue;
+            }
             var regs: Regs = undefined;
             if (linux.errno(linux.ptrace(ptrace_getregs, tid, 0, @intFromPtr(&regs), 0)) != .SUCCESS) continue;
             if (hold.point_at(regs[rip_index])) |index| {
@@ -592,6 +664,35 @@ const Hold = struct {
             if (point.held) |tid| out("{{\"released\":{d},\"point\":{d}}}\n", .{ tid, index });
         }
         for (hold.tids[0..hold.threads]) |tid| _ = linux.ptrace(ptrace_detach, tid, 0, 0, 0);
+    }
+
+    fn queue(hold: *Hold, tid: linux.pid_t) void {
+        assert(!hold.is_queued(tid));
+        assert(hold.queued_count < threads_max);
+        hold.queued[hold.queued_count] = tid;
+        hold.queued_count += 1;
+    }
+
+    fn is_queued(hold: *const Hold, tid: linux.pid_t) bool {
+        for (hold.queued[0..hold.queued_count]) |queued| if (queued == tid) return true;
+        return false;
+    }
+
+    fn unqueue(hold: *Hold, tid: linux.pid_t) void {
+        for (hold.queued[0..hold.queued_count], 0..) |queued, index| {
+            if (queued != tid) continue;
+            std.mem.copyForwards(linux.pid_t, hold.queued[index .. hold.queued_count - 1], hold.queued[index + 1 .. hold.queued_count]);
+            hold.queued_count -= 1;
+            return;
+        }
+    }
+
+    /// The first queued thread, out of the queue.
+    fn dequeue(hold: *Hold) ?linux.pid_t {
+        if (hold.queued_count == 0) return null;
+        const tid = hold.queued[0];
+        hold.unqueue(tid);
+        return tid;
     }
 
     fn held_by(hold: *const Hold, tid: linux.pid_t) ?u32 {
@@ -712,7 +813,17 @@ pub fn run(arena: std.mem.Allocator, options: Options) !u8 {
     out("{{\"armed\":{d},\"threads\":{d},\"breakpoints\":{d}}}\n", .{ hold.pid, hold.threads, inserted });
     hold.note(if (hold.go) "start_go" else "start", 0, hold.pid, 0);
 
+    // Queued hits and new stops take turns (below).
+    var serve_queue = false;
     while (!release_all.load(.acquire)) {
+        // The blocked signals let through at every turn, without waiting: a queue the stepping
+        // threads refill all along kept the loop from the wait below, the only place they were
+        // let through, and a release asked meanwhile (SIGTERM, SIGUSR1) waited forever
+        // (race_test.zig's held_crowd at seed 1: timeline 2 ran on for minutes past its eight
+        // holds, its driver's release never seen).
+        var no_wait: linux.timespec = .{ .sec = 0, .nsec = 0 };
+        _ = linux.ppoll(&.{}, 0, &no_wait, &open);
+        if (release_all.load(.acquire)) break;
         if (timed_out.load(.acquire) and !hold.held_any()) break;
         if (release_some.swap(false, .acq_rel)) {
             var commands: [256]u8 = undefined;
@@ -725,13 +836,33 @@ pub fn run(arena: std.mem.Allocator, options: Options) !u8 {
                 for (released[0..hold.count], 0..) |release, index| if (release) hold.release(@intCast(index));
             }
         }
+        // Hits others_stop found, in order, in turn with new stops: queued ones only after new
+        // stops would starve behind the threads stepping past all along, and new stops only
+        // after an empty queue would never come (a clone's new thread left at its first stop
+        // while the stepping threads refill the queue).
+        serve_queue = !serve_queue;
+        const queued = if (serve_queue) hold.dequeue() else null;
+        if (queued) |tid| {
+            var regs: Regs = undefined;
+            if (linux.errno(linux.ptrace(ptrace_getregs, tid, 0, @intFromPtr(&regs), 0)) == .SUCCESS) {
+                if (hold.point_at(regs[rip_index])) |index| {
+                    hold.hit(tid, index, &regs);
+                    continue;
+                }
+            }
+            _ = linux.ptrace(ptrace_cont, tid, 0, 0, 0);
+            continue;
+        }
         var status: i32 = 0;
         const result = linux.wait4(-1, &status, wait_all | wait_no_hang, null);
         if (linux.errno(result) == .INTR) continue;
         if (linux.errno(result) != .SUCCESS) break; // No tracee left.
         if (result == 0) {
+            // Nothing stopped and queued threads left: their turn, no wait (stopped, they send
+            // no SIGCHLD, and all of a process's threads may be among them).
+            if (hold.queued_count > 0) continue;
             // Nothing stopped: wait for a signal (a tracee's stop is SIGCHLD), the blocked ones
-            // let through for the wait only.
+            // let through for the wait.
             _ = linux.ppoll(&.{}, 0, null, &open);
             continue;
         }
@@ -742,7 +873,7 @@ pub fn run(arena: std.mem.Allocator, options: Options) !u8 {
             continue;
         }
         hold.track(tid);
-        const stop: u32 = @intFromEnum(linux.W.STOPSIG(word));
+        const stop: u32 = @backingInt(linux.W.STOPSIG(word));
         const event = word >> 16;
         if (event == ptrace_event_clone or event == ptrace_event_stop) {
             _ = linux.ptrace(ptrace_cont, tid, 0, 0, 0);
@@ -872,4 +1003,17 @@ test commands_parse {
     commands_parse("release 1\nnoise\narm 2\nrelease 3\nrelease 9\narm x\n", &released, &armed);
     try std.testing.expect(!released[0] and released[1] and !released[2] and released[3]);
     try std.testing.expect(!armed[0] and !armed[1] and armed[2] and !armed[3]);
+}
+
+test "queued hits come back first in, first out, and a thread gone leaves the queue" {
+    var hold: Hold = .{ .node = "n", .pid = 1, .memory = -1 };
+    hold.queue(11);
+    hold.queue(12);
+    hold.queue(13);
+    try std.testing.expect(hold.is_queued(12));
+    hold.unqueue(12);
+    try std.testing.expect(!hold.is_queued(12));
+    try std.testing.expectEqual(@as(?linux.pid_t, 11), hold.dequeue());
+    try std.testing.expectEqual(@as(?linux.pid_t, 13), hold.dequeue());
+    try std.testing.expectEqual(@as(?linux.pid_t, null), hold.dequeue());
 }

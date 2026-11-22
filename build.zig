@@ -497,6 +497,17 @@ pub fn build(b: *std.Build) void {
         }),
     });
     phases.node_binary(b, "race-test", race_held);
+    // Threads stepping past a held point's entry beside the ones it holds, for the profile
+    // `held_crowd`. Debug, as race-held.
+    const race_crowd = b.addExecutable(.{
+        .name = "race-crowd",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/race/race_crowd.zig"),
+            .target = target,
+            .optimize = .Debug,
+        }),
+    });
+    phases.node_binary(b, "race-test", race_crowd);
 
     // The guest's base initramfs, built on the host from the guest runtime above.
     const initramfs = b.addExecutable(.{
