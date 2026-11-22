@@ -336,7 +336,9 @@ classpath), `determinismo.session` drives sessions and runs:
   differed, the whole share again at a difference) and each failing property's first failing timeline
   at its end, and judges "timelines replay to their recorded history" (`explore
   --verify-replays <percent>`, HTTP `verify_replays`; 100 replays them all, 0 none). `priority: true` (HTTP) gives a run's VMs the CPUs
-  before other runs': a check beside a hunt, which goes on with the CPUs left. A timeline that
+  before other runs': a check beside a hunt, which goes on with the CPUs left. `reserved: true`
+  (HTTP) puts a run on the host's reserved cores, out of the hunts' (serve.sh's reserved scope):
+  a CI job or a sanity check beside a calibration, whose cores stay its own. A timeline that
   did not replay keeps its output beside the tapes (`replay-<n>.log`), its events
   (`replay-<n>-events`), and its line in the results says where it parted from the run's events:
   the last checkpoint both passed and the first line that differs on each side (the events carry

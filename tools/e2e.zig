@@ -272,6 +272,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "services", check_services },                 .{ "sites", check_sites },                           .{ "client", check_client },
         .{ "session-exact", check_session_exact },       .{ "java-watch", check_java_watch },                 .{ "raft-558", check_raft_558 },
         .{ "jvm-caches", check_jvm_caches },             .{ "guest-panic", check_guest_panic },               .{ "resume-seen", check_resume_seen },
+        .{ "reserved-run", check_reserved_run },
     };
     // A check's whole name runs it alone (check.sh's `ui` ran guidance and quiet too).
     var exact = std.mem.eql(u8, only, "tla");
@@ -5792,6 +5793,64 @@ fn check_resume_seen(context: *Context) !void {
         .{ "its explorer ended by that stop", exited },
         .{ "and serve shows it stopped", std.mem.indexOf(u8, after, "\"state\":\"stopped\"") != null },
     }, "resume-seen: a command line's resume of serve's run 1 shown running ({}), ended by serve's stop ({})", .{ seen, exited });
+}
+
+/// A run asked `reserved: true` runs on the host's reserved cores, out of serve's (a scope of the
+/// user's manager, as a session's fork): a CI job or a sanity check beside a calibration, which
+/// took 2 of its 35 cores (srv4's run 2126, 2026-11-22). A run asked without it stays on serve's.
+/// On a host with reserved cores (the user's slice's CPUs, isolate.sh): srv4's.
+fn check_reserved_run(context: *Context) !void {
+    const arena = context.arena;
+    const address = "127.0.0.1:7922";
+    const url = "http://" ++ address;
+    const data = try std.fs.path.join(arena, &.{ context.scratch, "serve-reserved-run" });
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{ "env", "DETERMINISMO_RESERVED_SCOPE=1", context.determinismo, "serve", "--listen", address, "--data", data });
+    try argv.appendSlice(arena, context.machine);
+    var server = try std.process.spawn(context.io, .{ .argv = argv.items, .stdout = .ignore, .stderr = .ignore });
+    defer server.kill(context.io);
+    for (0..50) |_| {
+        const runs: []const u8 = curl(context, &.{url ++ "/runs"}) catch "";
+        if (runs.len > 0) break;
+        sleep_ms(100);
+    }
+    const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
+    const cpus_of = struct {
+        /// A process's allowed CPUs, read from /proc.
+        fn of(c: *Context, pid_text: []const u8) []const u8 {
+            const pid = std.mem.trim(u8, pid_text, " \n");
+            if (pid.len == 0) return "";
+            const command = std.fmt.allocPrint(c.arena, "grep Cpus_allowed_list /proc/{s}/status | cut -f2", .{pid}) catch return "";
+            const result = run_kept(c, &.{ "sh", "-c", command }) catch return "";
+            return std.mem.trim(u8, result.stdout, " \t\n");
+        }
+    }.of;
+    const serve_cpus = cpus_of(context, try std.fmt.allocPrint(arena, "{d}", .{server.id.?}));
+    var explorer_cpus: [2][]const u8 = .{ "", "" };
+    for ([_]bool{ true, false }, 0..) |asked_reserved, index| {
+        const asked = try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(.{
+            .program = program,
+            .scenario = "bank",
+            .seed = 1,
+            .branches = 400,
+            .reserved = asked_reserved,
+        }, .{})});
+        _ = try curl(context, &.{ "-X", "POST", "-d", asked, url ++ "/runs" });
+        const id = index + 1;
+        const pid_path = try std.fmt.allocPrint(arena, "{s}/runs/{d}/pid", .{ data, id });
+        for (0..600) |_| {
+            const pid_text = std.Io.Dir.cwd().readFileAlloc(context.io, pid_path, arena, .limited(64)) catch "";
+            explorer_cpus[index] = cpus_of(context, pid_text);
+            if (explorer_cpus[index].len > 0) break;
+            sleep_ms(100);
+        }
+        _ = curl(context, &.{ "-X", "POST", try std.fmt.allocPrint(arena, "{s}/runs/{d}/stop", .{ url, id }) }) catch "";
+    }
+    expect_all(context, &.{
+        .{ "serve's CPUs read", serve_cpus.len > 0 },
+        .{ "a run asked reserved runs off serve's CPUs", explorer_cpus[0].len > 0 and !std.mem.eql(u8, explorer_cpus[0], serve_cpus) },
+        .{ "a run asked without it on serve's", std.mem.eql(u8, explorer_cpus[1], serve_cpus) },
+    }, "reserved-run: serve on {s}, a run asked reserved on {s}, one not on {s}", .{ serve_cpus, explorer_cpus[0], explorer_cpus[1] });
 }
 
 /// A record_timelines line's index.

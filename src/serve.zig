@@ -1827,6 +1827,11 @@ pub const RunRequest = struct {
     /// Its VMs take CPUs before other runs' (DETERMINISMO_CPU_PRIORITY, cpus.zig): a check
     /// beside a hunt, which goes on with the CPUs it leaves.
     priority: bool = false,
+    /// On the host's reserved cores, out of the hunts' (reserved: a scope of the user's
+    /// manager), as a session's fork is: a CI job or a sanity check beside a calibration, whose
+    /// cores stay its own. A new run took the run cores whatever its client's CPUs (srv4's
+    /// run 2126 took 2 of a calibration's 35 for 1.5 minutes, 2026-11-22). Its resumes too.
+    reserved: bool = false,
     /// The commit of the determinismo that ran it ("-dirty": with uncommitted changes).
     build: ?[]const u8 = null,
     /// The explorer that ran it, kept by content as its kernel and initramfs are (artifacts/):
@@ -2139,8 +2144,9 @@ fn run_start(server: *Server, asked_as_given: RunRequest, out: *std.Io.Writer) !
     };
     const output = try std.fs.path.join(server.arena, &.{ directory, "output.log" });
     // Its explorer holds the run's pid file (runs.zig): how a restarted server finds it running.
-    // A session's fork's futures are someone's looking, not a hunt: on the reserved cores.
-    const launched = if (asked.from_snapshot != null) try reserved(server, argv.items) else argv.items;
+    // A session's fork's futures are someone's looking, not a hunt: on the reserved cores, and
+    // so is a run asked there.
+    const launched = if (run_reserved(&asked)) try reserved(server, argv.items) else argv.items;
     const pid = try spawn(server, launched, output, try run_environment(server.arena, &asked), .fresh);
     pid_note(server, directory, pid);
     runs_insert(shared, .{ .id = id, .pid = pid });
@@ -5671,7 +5677,8 @@ fn run_resume(server: *Server, id: u32, out: *std.Io.Writer) !u16 {
     const same_build = std.mem.eql(u8, run_build, build_options.commit);
     const same_core = core_same(&asked, build_options.core_id, host_core.kvm_identity(server.arena), host_runs.state_format);
     resume_note(server, output, run_build, same_build, same_core);
-    const pid = try spawn(server, argv.items, output, try run_environment(server.arena, &asked), .appended);
+    const launched = if (run_reserved(&asked)) try reserved(server, argv.items) else argv.items;
+    const pid = try spawn(server, launched, output, try run_environment(server.arena, &asked), .appended);
     const stopped_path = try std.fs.path.join(server.arena, &.{ directory, "stopped" });
     std.Io.Dir.cwd().deleteFile(server.io, stopped_path) catch {};
     // It explores again: judged again as it ends.
@@ -6620,6 +6627,18 @@ fn listen_address(server: *const Server) []const u8 {
 
 fn print(server: *Server, comptime format: []const u8, arguments: anytype) ![]const u8 {
     return std.fmt.allocPrint(server.arena, format, arguments);
+}
+
+/// Whether a run's explorer goes on the reserved cores (reserved): one asked there, or a
+/// session's fork.
+fn run_reserved(asked: *const RunRequest) bool {
+    return asked.reserved or asked.from_snapshot != null;
+}
+
+test run_reserved {
+    try std.testing.expect(!run_reserved(&.{}));
+    try std.testing.expect(run_reserved(&.{ .reserved = true }));
+    try std.testing.expect(run_reserved(&.{ .from_snapshot = "s" }));
 }
 
 /// Starts `argv` in the background with its output (both streams) in `output_path`.
