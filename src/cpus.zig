@@ -208,6 +208,42 @@ pub var claim_shares: bool = false;
 /// after its TurnMemory.
 const claim_soft_offset = @sizeOf(TurnMemory);
 
+/// Other runs' learned claims (their turn files' claim_soft), each read once in a look.
+const RunSofts = struct {
+    runs: [16]u64 = undefined,
+    softs: [16]u64 = undefined,
+    count: u32 = 0,
+
+    /// What `run` learned its VMs hold, 0 when it has not (or its turn file is gone: its run
+    /// ended, and its claims count at their guests' size).
+    fn of(cache: *RunSofts, directory: []const u8, run: u64) u64 {
+        for (cache.runs[0..cache.count], cache.softs[0..cache.count]) |known, soft| {
+            if (known == run) return soft;
+        }
+        const soft = turn_soft(directory, run);
+        if (cache.count < cache.runs.len) {
+            cache.runs[cache.count] = run;
+            cache.softs[cache.count] = soft;
+            cache.count += 1;
+        }
+        return soft;
+    }
+};
+
+/// A run's learned claim from its turn file (Pool.claim_soft_set), 0 when there is none.
+fn turn_soft(directory: []const u8, run: u64) u64 {
+    if (directory.len == 0) return 0;
+    var path_buffer: [160]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buffer, "{s}/run-{d}.turn", .{ directory, run }, 0) catch return 0;
+    const opened = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(opened) != .SUCCESS) return 0;
+    const fd: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(fd);
+    var bytes: [8]u8 = @splat(0);
+    if (linux.pread(fd, &bytes, bytes.len, claim_soft_offset) != bytes.len) return 0;
+    return std.mem.bytesToValue(u64, &bytes);
+}
+
 fn run_of_this_process() u64 {
     return @intCast(run_key orelse linux.getpid());
 }
@@ -648,10 +684,15 @@ pub const Pool = struct {
         // check's VM waiting while the hunt ran (srv3, 2026-10-29).
         const total = meminfo("MemTotal:");
         if (total == 0) return true; // Unknown: never a reason to wait.
-        // A VM of this run's counts as what the run learned its VMs hold, where that is less
-        // than its guest's size (claim_soft); any other run's as its guest's size.
+        // A VM that branches from its run's snapshot counts as what its run learned its VMs
+        // hold, where that is less than its guest's size (claim_soft): this run's, and any other
+        // run's from that run's turn file. Counted at its guest's size by every other run, a
+        // hunt's 35 VMs of 6 GiB guests were 210 GiB of a 187.6 GiB host while they held 2.4 GiB
+        // each: nothing beside it was admitted, a second serve's runs waiting 10 minutes
+        // (srv4, run 2122, 2026-11-22).
         const soft = pool.claim_soft();
         const mine = run_of_this_process();
+        var softs: RunSofts = .{};
         var claimed: u64 = 0;
         for (pool.host_fds[0..pool.host_count]) |fd| {
             const probe = linux.flock(fd, std.posix.LOCK.SH | std.posix.LOCK.NB);
@@ -662,8 +703,13 @@ pub const Pool = struct {
             var claim: CpuClaim = .{};
             const got = linux.pread(fd, std.mem.asBytes(&claim), @sizeOf(CpuClaim), 0);
             if (linux.errno(got) != .SUCCESS or got < @sizeOf(u64)) continue;
-            const softened = soft != 0 and got == @sizeOf(CpuClaim) and claim.run == mine and claim.shares != 0;
-            claimed += if (softened) @min(claim.bytes, soft) else claim.bytes;
+            const run_soft = if (got != @sizeOf(CpuClaim) or claim.shares == 0)
+                0
+            else if (claim.run == mine)
+                soft
+            else
+                softs.of(pool.directory_buffer[0..pool.directory_size], claim.run);
+            claimed += if (run_soft != 0) @min(claim.bytes, run_soft) else claim.bytes;
         }
         claimed += nodes_claimed(pool.directory_buffer[0..pool.directory_size]);
         claimed += machines_scan(pool.directory_buffer[0..pool.directory_size], null);
@@ -1619,6 +1665,43 @@ test "a VM's memory claim counts while its CPU is held" {
     try std.testing.expect(other.claim_fits(1 << 20));
     holder.give(held);
     try std.testing.expect(other.claim_fits(total / 2)); // Given back: its claim no longer counts.
+}
+
+test "another run's VMs count at what their run learned they hold" {
+    const total = meminfo("MemTotal:");
+    if (total == 0) return error.SkipZigTest;
+    const saved_key = run_key;
+    defer run_key = saved_key;
+    const saved_bytes = claim_bytes;
+    defer claim_bytes = saved_bytes;
+    const saved_shares = claim_shares;
+    defer claim_shares = saved_shares;
+    // Two runs of one host: a hunt's VMs branching from its snapshot, and another run looking.
+    const hunt_key: linux.pid_t = linux.getpid() + 100000;
+    const other_key: linux.pid_t = linux.getpid() + 200000;
+    var hunt: Pool = undefined;
+    run_key = hunt_key;
+    try hunt.open();
+    defer hunt.close();
+    var other: Pool = undefined;
+    run_key = other_key;
+    try other.open();
+    defer other.close();
+    hunt.available_counts = false; // The claims' accounting alone (fits has the rest).
+    other.available_counts = false;
+    claim_bytes = total / 2; // Its guests' size: half the host.
+    claim_shares = true;
+    hunt.claim_soft_set(1 << 20); // What the hunt learned each of its VMs holds: 1 MiB.
+    run_key = hunt_key;
+    const held = hunt.take();
+    run_key = other_key;
+    // Counted as the hunt learned, not as its guests' size (run 2122: 210 GiB of a 187.6 GiB
+    // host claimed by 35 VMs that held 2.4 GiB each, nothing else admitted beside it).
+    try std.testing.expect(other.claim_fits(total / 2));
+    hunt.claim_soft_set(0); // Taken back: its guests' size again.
+    try std.testing.expect(!other.claim_fits(total / 2));
+    run_key = hunt_key;
+    hunt.give(held);
 }
 
 /// What a run learns its VMs come to hold, from the host's memory while they run. A claim is a
