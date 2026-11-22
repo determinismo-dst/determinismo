@@ -26,6 +26,10 @@
 //	                                      configuration automatically (the issue's change)
 //	{"op":"digest","index":N}           → {"index","term","digest"} of the applied entry at N
 //	{"op":"campaign"}                   → this node campaigns
+//	{"op":"led"}                        → {"terms"}: the terms this node led, from its file `led`
+//	                                      (a term appended as it becomes leader, not synced: a
+//	                                      record for the workload's election safety, outside raft's
+//	                                      storage; a power loss may cut its tail, a crash keeps it)
 package main
 
 import (
@@ -61,6 +65,10 @@ type node struct {
 	storage *raft.MemoryStorage
 	dir     string
 	entries *os.File
+
+	// The terms it led (the file `led` and its lines), for the election-safety check.
+	led      *os.File
+	ledTerms []uint64
 
 	mu       sync.Mutex
 	proposed []func(*raft.RawNode)
@@ -189,8 +197,37 @@ func (n *node) lastIndex() uint64 {
 	return last
 }
 
+// loadLed reads the terms the node led before this start: whole lines only (a power loss may
+// have cut the last one).
+func (n *node) loadLed() {
+	f, err := os.OpenFile(filepath.Join(n.dir, "led"), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644)
+	if err != nil {
+		log.Fatal(err)
+	}
+	n.led = f
+	data, _ := io.ReadAll(f)
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines[:len(lines)-1] {
+		if term, err := strconv.ParseUint(line, 10, 64); err == nil && term > 0 {
+			n.ledTerms = append(n.ledTerms, term)
+		}
+	}
+}
+
+// noteLed records `term` as led by this node: in memory and appended to its file, unsynced.
+func (n *node) noteLed(term uint64) {
+	if len(n.ledTerms) > 0 && n.ledTerms[len(n.ledTerms)-1] == term {
+		return
+	}
+	n.ledTerms = append(n.ledTerms, term)
+	if _, err := fmt.Fprintf(n.led, "%d\n", term); err != nil {
+		log.Printf("led: %v", err)
+	}
+}
+
 // load repopulates the MemoryStorage from the files; true when there were none.
 func (n *node) load() bool {
+	n.loadLed()
 	entriesPath := filepath.Join(n.dir, "entries")
 	f, err := os.OpenFile(entriesPath, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
@@ -375,7 +412,12 @@ func (n *node) run() {
 		for n.rn.HasReady() {
 			rd := n.rn.Ready()
 			if rd.SoftState != nil {
-				trace("role", map[string]any{"state": rd.SoftState.RaftState.String(), "lead": rd.SoftState.Lead, "term": n.rn.Status().Term})
+				status := n.rn.Status()
+				term := status.GetTerm()
+				trace("role", map[string]any{"state": rd.SoftState.RaftState.String(), "lead": rd.SoftState.Lead, "term": term})
+				if rd.SoftState.RaftState == raft.StateLeader {
+					n.noteLed(term)
+				}
 			}
 			if n.async {
 				// The storage work goes to its threads; the rest out now (MsgVote among it:
@@ -650,6 +692,8 @@ func (n *node) handle(req request) any {
 	case "campaign":
 		n.proposed = append(n.proposed, func(rn *raft.RawNode) { _ = rn.Campaign() })
 		return map[string]any{"ok": true}
+	case "led":
+		return map[string]any{"ok": true, "terms": append([]uint64{}, n.ledTerms...)}
 	}
 	return map[string]any{"ok": false, "err": "unknown op"}
 }

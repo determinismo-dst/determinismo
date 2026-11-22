@@ -404,7 +404,9 @@ fn walk(context: *System.Context) !void {
     hold.release();
     const back = stage(context, "crashed", f);
     sdk.event("joint_crash", .{ .crash = crash, .held = held });
-    sdk.sometimes(held and crash, "the follower crashed between its entries' write and its HardState's", .{});
+    // Computed, not cataloged: a walk's own control, which joint_blind's timelines never run (run
+    // 2114 listed it unreached, its timeline 2299 having the very crash blind).
+    sdk.assert_computed(.sometimes, held and crash, "the follower crashed between its entries' write and its HardState's", .{});
     // 3. F and O cut off from C, 4 and 5 past an election timeout.
     for ([_][]const u8{ f, o }) |inside| {
         for ([_][]const u8{ c, "n4", "n5" }) |outside| link(inside, outside, "down");
@@ -440,8 +442,44 @@ fn digest_at(context: *System.Context, name: []const u8, index: u64) ?Digest {
     return if (d.ok) d else null;
 }
 
-/// State machine safety: no two nodes applied different entries at one index.
+/// A node's `led` reply: up to thousands of terms in a long timeline.
+const led_reply_max = 256 * 1024;
+const Led = struct { ok: bool = false, terms: []const u64 = &.{} };
+
+/// The terms `name` led (its file `led`, kept across its crashes), null when it does not answer.
+fn led_terms(context: *System.Context, arena: std.mem.Allocator, name: []const u8) ?[]const u64 {
+    const buffer = arena.alloc(u8, led_reply_max) catch return null;
+    const line = ask(context, name, "{\"op\":\"led\"}\n", buffer) catch return null;
+    const led = std.json.parseFromSliceLeaky(Led, arena, line, .{ .ignore_unknown_fields = true }) catch return null;
+    return if (led.ok) led.terms else null;
+}
+
+/// Election safety (Raft §5.2): no two nodes led one term. #558's leader in the old
+/// configuration beside the new one's, in one term (run 2114's timeline 2096: n5 and n3 in term
+/// 13), shows here even when the two leaders' entries were alike (both their empty no-ops) and
+/// replicas agree held. A node that does not answer is left out.
+fn one_leader_per_term(context: *System.Context, arena: std.mem.Allocator) void {
+    var led: [node_names.len][]const u64 = @splat(&.{});
+    for (node_names, &led) |name, *terms| terms.* = led_terms(context, arena, name) orelse &.{};
+    var term: u64 = 0;
+    var first: []const u8 = "";
+    var second: []const u8 = "";
+    pairs: for (0..node_names.len) |a| for (a + 1..node_names.len) |b| for (led[a]) |led_term| {
+        if (std.mem.indexOfScalar(u64, led[b], led_term) == null) continue;
+        term = led_term;
+        first = node_names[a];
+        second = node_names[b];
+        break :pairs;
+    };
+    sdk.always(term == 0, "at most one leader per term", .{ .term = term, .first = first, .second = second });
+}
+
+/// Election safety, then state machine safety: no two nodes applied different entries at one
+/// index.
 fn replicas_agree(context: *System.Context) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    one_leader_per_term(context, arena_state.allocator());
     var applied: [node_names.len]u64 = undefined;
     for (node_names, &applied) |name, *count| count.* = state_of(context, name).applied;
     for (0..node_names.len) |a| for (a + 1..node_names.len) |b| {
@@ -451,8 +489,11 @@ fn replicas_agree(context: *System.Context) !void {
             const first = digest_at(context, node_names[a], index) orelse continue;
             const second = digest_at(context, node_names[b], index) orelse continue;
             sdk.always(first.term == second.term and first.digest == second.digest, "replicas agree on the entries they applied", .{
-                .first = node_names[a], .second = node_names[b], .index = index,
-                .first_term = first.term, .second_term = second.term,
+                .first = node_names[a],
+                .second = node_names[b],
+                .index = index,
+                .first_term = first.term,
+                .second_term = second.term,
             });
         }
     };
@@ -557,7 +598,8 @@ fn walk_async_vote(context: *System.Context) !void {
     const second = leads(context, c, 0, first.term);
     const twice = second.lead == second.id and second.term == first.term;
     sdk.event("async_vote_stage", .{ .stage = "led_again", .node = c, .back_term = back.term, .term = second.term, .twice = twice });
-    sdk.sometimes(twice, "a candidate led one term twice, its term and vote never written the first time", .{});
+    // Computed, not cataloged: the async_vote walk's, never run in other scenarios.
+    sdk.assert_computed(.sometimes, twice, "a candidate led one term twice, its term and vote never written the first time", .{});
     // 4. y at C: at x's index and term, in a different log; L keeps x.
     propose(context, c, "y");
     sdk.sleep_ms(1000 + sdk.random_below_named("async_vote.after_ms", 1500));

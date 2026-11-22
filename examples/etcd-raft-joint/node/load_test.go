@@ -69,3 +69,27 @@ func TestEntriesAfterATornTailLoad(t *testing.T) {
 		t.Fatalf("entries appended after a torn tail: the log's last index is %d, want 5", last)
 	}
 }
+
+// The terms a node led come back at its next start (the election-safety check reads them after
+// crashes); a line a power loss cut is no term.
+func TestLedTermsLoad(t *testing.T) {
+	dir := t.TempDir()
+	n := &node{dir: dir, storage: raft.NewMemoryStorage()}
+	n.load()
+	n.noteLed(3)
+	n.noteLed(3)
+	n.noteLed(7)
+	if _, err := n.led.WriteString("1"); err != nil {
+		t.Fatal(err)
+	}
+	n.led.Close()
+	n.entries.Close()
+
+	again := &node{dir: dir, storage: raft.NewMemoryStorage()}
+	again.load()
+	defer again.entries.Close()
+	defer again.led.Close()
+	if len(again.ledTerms) != 2 || again.ledTerms[0] != 3 || again.ledTerms[1] != 7 {
+		t.Fatalf("led terms after a restart: %v, want [3 7]", again.ledTerms)
+	}
+}
