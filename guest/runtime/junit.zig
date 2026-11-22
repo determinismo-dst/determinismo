@@ -23,7 +23,11 @@ pub fn cases(arena: std.mem.Allocator, report: []const u8) ![]const Case {
             at = close;
         }
         const class = attribute(tag, "classname") orelse "";
-        const name = attribute(tag, "name") orelse continue;
+        const named = attribute(tag, "name") orelse continue;
+        // Kaocha's kaocha-junit-xml names a test by its whole id (`ns/var`) beside the namespace
+        // as the classname: the namespace once (`ns::var`, as clojure.test.junit's reads).
+        const name = if (class.len > 0 and named.len > class.len + 1 and
+            std.mem.startsWith(u8, named, class) and named[class.len] == '/') named[class.len + 1 ..] else named;
         const full = if (class.len > 0) try std.fmt.allocPrint(arena, "{s}::{s}", .{ class, name }) else name;
         const failure = std.mem.indexOf(u8, body, "<failure") orelse std.mem.indexOf(u8, body, "<error");
         var message: []const u8 = "";
@@ -106,6 +110,25 @@ test "a JUnit report's cases: failures and errors fail with their message, skips
     try std.testing.expect(!found[4].failed);
     try std.testing.expect(found[5].failed);
     try std.testing.expectEqualStrings("expected: (= 1 (abs -2))\n  actual: (not (= 1 2))", found[5].message);
+}
+
+test "a name that repeats its classname (Kaocha's ns/var ids) is not prefixed twice" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const report =
+        \\<testsuite>
+        \\<testcase name="determinismo-demo.failures-test/racy-counter" classname="determinismo-demo.failures-test"><failure>no</failure></testcase>
+        \\<testcase name="clojure.core-test.add-watch/test-add-watch" classname="clojure.core-test.add-watch"></testcase>
+        \\<testcase name="clojure.core-test.add-watcher/x" classname="clojure.core-test.add-watch"></testcase>
+        \\</testsuite>
+    ;
+    const found = try cases(arena_state.allocator(), report);
+    try std.testing.expectEqual(@as(usize, 3), found.len);
+    try std.testing.expectEqualStrings("determinismo-demo.failures-test::racy-counter", found[0].name);
+    try std.testing.expect(found[0].failed);
+    try std.testing.expectEqualStrings("clojure.core-test.add-watch::test-add-watch", found[1].name);
+    // Another namespace that only starts like the classname keeps its whole name.
+    try std.testing.expectEqualStrings("clojure.core-test.add-watch::clojure.core-test.add-watcher/x", found[2].name);
 }
 
 test "a failure's message keeps its element's text: a cut attribute gives way to the whole text, a summary comes first" {
