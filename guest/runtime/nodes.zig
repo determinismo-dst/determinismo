@@ -3734,7 +3734,12 @@ const Launch = struct {
         // another's read as a term going backwards; election safety and the logs' agreement could
         // not fail).
         const hostname_given = env_sets(knob_entries[0..knob_count], "HOSTNAME") or env_sets(node.env, "HOSTNAME");
-        if (knob_count + env_kept + platform_environment.len + 6 >= environment_max) {
+        // Its user's home in HOME, as runc sets it from the image's /etc/passwd when the
+        // environment has none (the node's own entry wins): examples/ci-kaocha's setup ran
+        // Clojure's CLI with no HOME, which made /.clojure instead of using what the image fetched
+        // under /root (srv4, 2026-11-23).
+        const home_given = env_sets(knob_entries[0..knob_count], "HOME") or env_sets(node.env, "HOME");
+        if (knob_count + env_kept + platform_environment.len + 7 >= environment_max) {
             return error.TooManyEnvironmentEntries;
         }
         // Every JVM the node's start runs with determinismo's coverage agent (java_options); not
@@ -3753,7 +3758,7 @@ const Launch = struct {
         for (covered) |entry| covered_added += @intFromBool(entry != null and entry.?.replaces == null);
         const wipes = if (kind == .start) wipes_of(paths) else 0;
         const envp_count = knob_count + env_kept + platform_environment.len + 1 + @intFromBool(wipes > 0) +
-            @intFromBool(kind == .start) + covered_added + @intFromBool(!hostname_given);
+            @intFromBool(kind == .start) + covered_added + @intFromBool(!hostname_given) + @intFromBool(!home_given);
         const envp = try arena.allocSentinel(?[*:0]const u8, envp_count, null);
         var path_value: []const u8 = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
         var filled: usize = 0;
@@ -3776,6 +3781,12 @@ const Launch = struct {
             envp[filled] = try std.fmt.allocPrintSentinel(arena, "HOSTNAME={s}", .{node.hostname orelse node.name}, 0);
             filled += 1;
         }
+        const ids: ?Ids = if (node.user) |user| try user_resolve(arena, paths.root, user) else null;
+        if (!home_given) {
+            const home = home_in(arena, paths.root, if (ids) |i| i.uid else 0);
+            envp[filled] = try std.fmt.allocPrintSentinel(arena, "HOME={s}", .{home}, 0);
+            filled += 1;
+        }
         for (envp[0..filled]) |entry| {
             const text = std.mem.span(entry.?);
             if (std.mem.startsWith(u8, text, "PATH=")) path_value = text["PATH=".len..];
@@ -3792,7 +3803,6 @@ const Launch = struct {
             const draw = sdk.random_below_named(start_draw_name, std.math.maxInt(u32));
             envp[envp_count - 1] = try std.fmt.allocPrintSentinel(arena, "DETERMINISMO_DRAW={d}", .{draw}, 0);
         }
-        const ids: ?Ids = if (node.user) |user| try user_resolve(arena, paths.root, user) else null;
         var launch: Launch = .{
             .root = paths.root,
             .hostname = node.hostname orelse node.name,
@@ -4184,6 +4194,42 @@ fn knob_sets(knob_entries: []const []const u8, entry: []const u8) bool {
         if (knob_entry.len > name_end and knob_entry[name_end] == '=' and std.mem.eql(u8, knob_entry[0..name_end], entry[0..name_end])) return true;
     }
     return false;
+}
+
+/// The home directory of `uid` in a passwd file's lines (`name:x:uid:gid:gecos:home:shell`), or
+/// null when it has no such user or an empty home.
+fn home_of(passwd: []const u8, uid: u32) ?[]const u8 {
+    var lines = std.mem.tokenizeScalar(u8, passwd, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.splitScalar(u8, line, ':');
+        _ = fields.next(); // Name.
+        _ = fields.next(); // Password.
+        const id = std.fmt.parseInt(u32, fields.next() orelse continue, 10) catch continue;
+        if (id != uid) continue;
+        _ = fields.next(); // Group.
+        _ = fields.next(); // Its comment.
+        const home = fields.next() orelse return null;
+        return if (home.len > 0) home else null;
+    }
+    return null;
+}
+
+/// HOME for `uid` in the node at `root`, as runc sets it when a container's environment has none:
+/// its home in the image's /etc/passwd, else "/".
+fn home_in(arena: std.mem.Allocator, root: []const u8, uid: u32) []const u8 {
+    var buffer: [path_size_max]u8 = undefined;
+    const path = print_z(&buffer, "{s}/etc/passwd", .{root}) catch return "/";
+    const passwd = read_file(arena, path, 1 << 20) catch return "/";
+    return home_of(passwd, uid) orelse "/";
+}
+
+test home_of {
+    const passwd = "root:x:0:0:root:/root:/bin/sh\nbroken line\napp:x:1000:1000:App,,,:/srv/app:/bin/sh\nnohome:x:7:7:::/bin/sh\n";
+    try std.testing.expectEqualStrings("/root", home_of(passwd, 0).?);
+    try std.testing.expectEqualStrings("/srv/app", home_of(passwd, 1000).?);
+    try std.testing.expectEqual(null, home_of(passwd, 999));
+    try std.testing.expectEqual(null, home_of(passwd, 7));
+    try std.testing.expectEqual(null, home_of("", 0));
 }
 
 /// Whether `entries` (NAME=value) set `name`.

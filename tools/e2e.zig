@@ -272,7 +272,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "services", check_services },                 .{ "sites", check_sites },                           .{ "client", check_client },
         .{ "session-exact", check_session_exact },       .{ "java-watch", check_java_watch },                 .{ "raft-558", check_raft_558 },
         .{ "jvm-caches", check_jvm_caches },             .{ "guest-panic", check_guest_panic },               .{ "resume-seen", check_resume_seen },
-        .{ "reserved-run", check_reserved_run },
+        .{ "reserved-run", check_reserved_run },         .{ "home", check_home },
     };
     // A check's whole name runs it alone (check.sh's `ui` ran guidance and quiet too).
     var exact = std.mem.eql(u8, only, "tla");
@@ -10064,6 +10064,22 @@ fn check_hostname(context: *Context) !void {
         .{ "the test command reported", line != null and hit_count(line.?) == 1 },
         .{ "the start command and the test command had the service's hostname", failing != null and failing.? == 0 },
     }, "hostname: a service's Compose hostname in its processes' HOSTNAME", .{});
+}
+
+/// A Compose service's user's home is in its processes' HOME, its start command's and a command
+/// run in it, as runc (Docker, Podman) sets it from the image's /etc/passwd when the environment
+/// has none: examples/ci-kaocha's setup ran Clojure's CLI with no HOME, which made /.clojure
+/// instead of using what its image fetched under /root (srv4, 2026-11-23).
+fn check_home(context: *Context) !void {
+    const compose = "tests/antithesis-compat/home/compose.yaml";
+    const report = try explore(context, &.{ "--compose", compose, "--scenario", "home", "--seed", "1", "--branches", "1" });
+    const message = "the node's processes have its user's home in HOME";
+    const line = for_line(report, message);
+    const failing = failing_in(report, message);
+    expect_all(context, &.{
+        .{ "the test command reported", line != null and hit_count(line.?) == 1 },
+        .{ "the start command and the test command had the user's home", failing != null and failing.? == 0 },
+    }, "home: a service's user's home in its processes' HOME", .{});
 }
 
 /// A Compose service's namespaced kernel settings (`sysctls`) are set in its node: its test command

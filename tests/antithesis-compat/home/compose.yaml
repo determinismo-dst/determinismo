@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: MIT
+# A service's user's home in its processes' HOME, as runc (Docker, Podman) sets it from the
+# image's /etc/passwd when the container's environment has none: Clojure's CLI and Maven look for
+# what the image fetched at build under $HOME (examples/ci-kaocha), and a node without HOME made
+# them use /.clojure. Its start command keeps the HOME of its environment, and its test command
+# says, in the Antithesis SDK's format, whether both are its user's home. Run with:
+#   determinismo explore ... --compose tests/antithesis-compat/home/compose.yaml --scenario home
+services:
+  client:
+    build: ./client
+    container_name: compat-home
+    command: [/usr/local/bin/ready]
