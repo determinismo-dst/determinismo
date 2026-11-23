@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: MIT
+# The JVM caches' check (tools/e2e.zig's jvm-caches): one node whose JVMs start on a JDK AOT cache
+# that determinismo trains again beside the coverage agent (its image's labels):
+#   determinismo explore ... --compose tests/jvm-caches/compose.yaml --scenario main
+services:
+  app:
+    build:
+      context: ../..
+      dockerfile: tests/jvm-caches/Dockerfile
+    labels:
+      determinismo.no-faults: "true"

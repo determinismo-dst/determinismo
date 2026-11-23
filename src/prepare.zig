@@ -431,10 +431,11 @@ fn node_resolve(
     } else false;
     var image: ImageConfig = .{};
     const disk = if (node.source.image) |reference| disk: {
-        const with = if (files) try image_with_files(context, node, reference) else reference;
+        const trained = try jvm_caches(context, node, reference);
+        const with = if (files) try image_with_files(context, node, trained) else trained;
         break :disk try image_disk(context, with, &image, &target.digest, created);
     } else if (node.source.build) |build| disk: {
-        const built = try image_build(context, try mutant_build(context, node, build));
+        const built = try jvm_caches(context, node, try image_build(context, try mutant_build(context, node, build)));
         const with = if (files) try image_with_files(context, node, built) else built;
         break :disk try image_disk(context, with, &image, &target.digest, created);
     } else if (files) {
@@ -1212,6 +1213,127 @@ fn sdk_context(context: Context) ![]const u8 {
         if (!exists(context, directory)) return err;
     };
     return directory;
+}
+
+/// The image's label naming the script that makes its JVM caches (an AOT cache, a CDS archive),
+/// docs/CI.md: prepare runs it again with java.instrument among the modules, as every JVM of
+/// the node starts with our coverage agent, so that its caches load (aws-hunt run 18: refused at
+/// 1,255 of 1,441 starts, a restarted server serving a median 75 virtual s later).
+const jvm_caches_label_name = "determinismo.jvm-caches";
+
+/// The label's value as `podman image inspect --format` prints it, or none (absent: empty, or
+/// Go's "<no value>").
+fn jvm_caches_label(printed: []const u8) ?[]const u8 {
+    const value = std.mem.trim(u8, printed, " \t\r\n");
+    if (value.len == 0 or std.mem.eql(u8, value, "<no value>")) return null;
+    return value;
+}
+
+/// The derived image's Dockerfile: the node's image, its caches made again by its script with
+/// the module the agent adds at every start (JDK_JAVA_OPTIONS reaches every `java`, not the
+/// image's own runtime: set for that one RUN alone). The agent's hash in it keys podman's cache:
+/// a new agent trains again.
+fn jvm_caches_dockerfile(arena: std.mem.Allocator, base: []const u8, script: []const u8, jars: []const u8, agent: []const u8) ![]const u8 {
+    // Then every file at time 0, as the guest's erofs gives them (the cache records the time
+    // and size of each classpath jar, the JDK's too), and the training.
+    // `<class prefixes, comma-separated> <jar or glob>...`: what the cache's classes are
+    // instrumented from, ahead (a cache's classes pass the agent by: Datalevin's lines fell from
+    // 22,084 to 9,102 trained alone, 97% kept with its jars instrumented first).
+    var words = std.mem.tokenizeAny(u8, jars, " \t");
+    const prefixes = words.next() orelse return error.JvmJarsLabel;
+    const globs = std.mem.trim(u8, words.rest(), " \t");
+    if (globs.len == 0) return error.JvmJarsLabel;
+    return std.fmt.allocPrint(arena,
+        \\FROM {[base]s}
+        \\COPY determinismo-coverage.jar /opt/determinismo/instrument.jar
+        \\RUN DETERMINISMO_AGENT={[agent]s} sh -ec 'set --; for jar in {[globs]s}; do set -- "$@" "$jar" "$jar.det"; done; java -cp /opt/determinismo/instrument.jar DeterminismoCoverage instrument {[prefixes]s} "$@"; for jar in {[globs]s}; do mv "$jar.det" "$jar"; done'
+        \\RUN find / -xdev \( -path /proc -o -path /sys -o -path /dev -o -path /run \) -prune -o -exec touch -h -d @0 {{}} +
+        \\RUN DETERMINISMO_AGENT={[agent]s} JDK_JAVA_OPTIONS=--add-modules=java.instrument {[script]s}
+        \\
+    , .{ .base = base, .agent = agent, .globs = globs, .prefixes = prefixes, .script = script });
+}
+
+/// The image's label naming what its caches' classes are instrumented from ahead (`<class
+/// prefixes> <jars>...`), jvm_caches_dockerfile: without it its caches are not made again,
+/// their classes would pass the coverage agent by.
+const jvm_jars_label_name = "determinismo.jvm-jars";
+
+/// The node's image with its JVM caches made again (jvm_caches_label), or the image as it was:
+/// no label, or its script failed (said; its own caches stay, refused at each start as the
+/// run's jvm-cache note says). podman's build cache keys it: the image, the script, the agent.
+fn jvm_caches(context: Context, node: *const schema.Node, reference: []const u8) ![]const u8 {
+    const script = jvm_caches_label(image_label(context, reference, jvm_caches_label_name)) orelse return reference;
+    const jars = jvm_caches_label(image_label(context, reference, jvm_jars_label_name)) orelse {
+        std.debug.print("[determinismo] {s}: its JVM caches not made again: no {s} label (its caches' " ++
+            "classes would pass the coverage agent by, uncovered), docs/CI.md\n", .{ node.name, jvm_jars_label_name });
+        return reference;
+    };
+    const agent = agent_jar(context) orelse {
+        std.debug.print("[determinismo] {s}: its JVM caches not made again: no coverage agent beside " ++
+            "this explorer\n", .{node.name});
+        return reference;
+    };
+    const base = try image_id(context, reference);
+    const cwd = std.Io.Dir.cwd();
+    const staging = try own_path(context, try path_join(context, &.{ context.cache, "staging", node.name }), "jvm-caches");
+    defer cwd.deleteTree(context.io, staging) catch {};
+    try cwd.createDirPath(context.io, staging);
+    try cwd.writeFile(context.io, .{ .sub_path = try path_join(context, &.{ staging, "determinismo-coverage.jar" }), .data = agent });
+    const hash = try std.fmt.allocPrint(context.arena, "{x:0>16}", .{std.hash.Wyhash.hash(0, agent)});
+    const dockerfile = jvm_caches_dockerfile(context.arena, base, script, jars, hash) catch |err| {
+        std.debug.print("[determinismo] {s}: its JVM caches not made again: its {s} label is " ++
+            "`<class prefixes> <jars>...` ({s})\n", .{ node.name, jvm_jars_label_name, @errorName(err) });
+        return reference;
+    };
+    try cwd.writeFile(context.io, .{ .sub_path = try path_join(context, &.{ staging, "Dockerfile" }), .data = dockerfile });
+    const trained = image_build(context, .{ .context = staging }) catch |err| {
+        std.debug.print("[determinismo] {s}: its JVM caches not made again ({s} failed: {s}): its image's own " ++
+            "caches stay, refused beside the coverage agent\n", .{ node.name, script, @errorName(err) });
+        return reference;
+    };
+    std.debug.print("[determinismo] {s}: its JVM caches made again with the coverage agent's module ({s})\n", .{ node.name, script });
+    return trained;
+}
+
+/// The coverage agent's jar (beside this executable, as the guest's initramfs takes it), or none.
+fn agent_jar(context: Context) ?[]const u8 {
+    var exe_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const size = std.os.linux.readlink("/proc/self/exe", &exe_buffer, exe_buffer.len);
+    if (std.os.linux.errno(size) != .SUCCESS) return null;
+    const directory = std.fs.path.dirname(exe_buffer[0..size]) orelse return null;
+    const jar = path_join(context, &.{ directory, "determinismo-coverage.jar" }) catch return null;
+    return std.Io.Dir.cwd().readFileAlloc(context.io, jar, context.arena, .limited(64 << 20)) catch null;
+}
+
+/// An image's label as `podman image inspect --format` prints it ("" when podman fails).
+fn image_label(context: Context, reference: []const u8, name: []const u8) []const u8 {
+    const format = std.fmt.allocPrint(context.arena, "{{{{index .Config.Labels \"{s}\"}}}}", .{name}) catch return "";
+    return tool(context, &.{ "podman", "image", "inspect", "--format", format, reference }) catch "";
+}
+
+test "an image's JVM caches are made again with the agent's module, keyed by the agent" {
+    try std.testing.expectEqual(@as(?[]const u8, null), jvm_caches_label("<no value>\n"));
+    try std.testing.expectEqual(@as(?[]const u8, null), jvm_caches_label("\n"));
+    try std.testing.expectEqualStrings("/opt/train.sh", jvm_caches_label("/opt/train.sh\n").?);
+    const dockerfile = try jvm_caches_dockerfile(std.testing.allocator, "sha256:abc", "/opt/train.sh", "datalevin,com.alipay.sofa.jraft /opt/app/*.jar /opt/jraft.jar", "0123abcd");
+    defer std.testing.allocator.free(dockerfile);
+    try std.testing.expectEqualStrings(
+        \\FROM sha256:abc
+        \\COPY determinismo-coverage.jar /opt/determinismo/instrument.jar
+        \\RUN DETERMINISMO_AGENT=0123abcd sh -ec 'set --; for jar in /opt/app/*.jar /opt/jraft.jar; do set -- "$@" "$jar" "$jar.det"; done; java -cp /opt/determinismo/instrument.jar DeterminismoCoverage instrument datalevin,com.alipay.sofa.jraft "$@"; for jar in /opt/app/*.jar /opt/jraft.jar; do mv "$jar.det" "$jar"; done'
+        \\RUN find / -xdev \( -path /proc -o -path /sys -o -path /dev -o -path /run \) -prune -o -exec touch -h -d @0 {} +
+        \\RUN DETERMINISMO_AGENT=0123abcd JDK_JAVA_OPTIONS=--add-modules=java.instrument /opt/train.sh
+        \\
+    , dockerfile);
+    // Every file at time 0 before the training, as the guest's erofs gives them: the cache
+    // records each classpath jar's time and size, the JDK's too.
+    try std.testing.expect(std.mem.indexOf(u8, dockerfile, "-prune -o -exec touch -h -d @0 {} +\nRUN DETERMINISMO_AGENT") != null);
+    // The build's own mounts left alone: touching /proc failed the RUN (srv4, 2026-11-23).
+    try std.testing.expect(std.mem.indexOf(u8, dockerfile, "-path /proc -o -path /sys -o -path /dev -o -path /run") != null);
+    // The agent is in instructions (podman's cache keys instructions, never comments).
+    try std.testing.expect(std.mem.indexOf(u8, dockerfile, "RUN DETERMINISMO_AGENT=0123abcd JDK_JAVA_OPTIONS") != null);
+    // Jars without class prefixes, or none at all: no recipe.
+    try std.testing.expectError(error.JvmJarsLabel, jvm_caches_dockerfile(std.testing.allocator, "b", "/t.sh", "datalevin", "a"));
 }
 
 fn image_build(context: Context, build: schema.Build) ![]const u8 {

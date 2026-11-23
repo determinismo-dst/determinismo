@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: MIT
+# The JVM caches' control (tools/e2e.zig's jvm-caches): the same image without its caches' label,
+# so its own cache, trained without the agent's module, is refused at each JVM's start.
+services:
+  app:
+    build:
+      context: ../..
+      dockerfile: tests/jvm-caches/Dockerfile
+      args:
+        CACHES: ""
+    labels:
+      determinismo.no-faults: "true"
