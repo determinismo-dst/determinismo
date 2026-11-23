@@ -5766,11 +5766,15 @@ fn check_resume_seen(context: *Context) !void {
         sleep_ms(100);
     }
     const stop: []const u8 = curl(context, &.{ "-X", "POST", url ++ "/runs/1/stop" }) catch "";
-    // Ended by that stop (TERM): its explorer a zombie here within a minute.
+    // Ended by that stop (TERM) within a minute: a zombie here, or gone (its /proc entry with it:
+    // the first run of this check read a missing entry as running).
     const stat_path = try std.fmt.allocPrint(arena, "/proc/{d}/stat", .{again.id.?});
     var exited = false;
     for (0..600) |_| {
-        const stat = std.Io.Dir.cwd().readFileAlloc(context.io, stat_path, arena, .limited(4096)) catch "";
+        const stat = std.Io.Dir.cwd().readFileAlloc(context.io, stat_path, arena, .limited(4096)) catch {
+            exited = true;
+            break;
+        };
         const close = std.mem.lastIndexOfScalar(u8, stat, ')') orelse break;
         if (close + 2 < stat.len and stat[close + 2] == 'Z') {
             exited = true;
@@ -5816,11 +5820,14 @@ fn check_reserved_run(context: *Context) !void {
     }
     const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
     const cpus_of = struct {
-        /// A process's allowed CPUs, read from /proc.
+        /// A process's allowed CPUs, read from /proc once it runs determinismo (a reserved run's pid is
+        /// systemd-run's until it has moved into its scope and executed the explorer: the first run
+        /// of this check read it before, on serve's CPUs).
         fn of(c: *Context, pid_text: []const u8) []const u8 {
             const pid = std.mem.trim(u8, pid_text, " \n");
             if (pid.len == 0) return "";
-            const command = std.fmt.allocPrint(c.arena, "grep Cpus_allowed_list /proc/{s}/status | cut -f2", .{pid}) catch return "";
+            const command = std.fmt.allocPrint(c.arena, "case \"$(readlink /proc/{s}/exe)\" in */determinismo) " ++
+                "grep Cpus_allowed_list /proc/{s}/status | cut -f2;; esac", .{ pid, pid }) catch return "";
             const result = run_kept(c, &.{ "sh", "-c", command }) catch return "";
             return std.mem.trim(u8, result.stdout, " \t\n");
         }
