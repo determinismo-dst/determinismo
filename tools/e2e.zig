@@ -154,6 +154,13 @@ pub fn main(init: std.process.Init) !void {
     const cwd = std.Io.Dir.cwd();
     try cwd.copyFile(try std.fs.path.join(arena, &.{ guest, "vmlinuz" }), cwd, kernel, init.io, .{});
     try cwd.copyFile(try std.fs.path.join(arena, &.{ guest, "base.cpio" }), cwd, initrd, init.io, .{});
+    // Its tools whole beside it, under its content's name (det-initramfs): the runs keep them
+    // with it (runs.initrd_keep), and guest-panic maps a trace with them.
+    const tools = try std.fmt.allocPrint(arena, "{x:0>16}-tools.cpio", .{std.hash.Wyhash.hash(0, try cwd.readFileAlloc(init.io, initrd, arena, .unlimited))});
+    cwd.copyFile(try std.fs.path.join(arena, &.{ guest, tools }), cwd, try std.fs.path.join(arena, &.{ scratch, tools }), init.io, .{}) catch |err| switch (err) {
+        error.FileNotFound => {}, // An image of an earlier det-initramfs.
+        else => return err,
+    };
     var context = Context{
         .arena = arena,
         .io = init.io,
@@ -264,7 +271,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "draws", check_draws },                       .{ "exit-stack", check_exit_stack },                 .{ "plan-calls", check_plan_calls },
         .{ "services", check_services },                 .{ "sites", check_sites },                           .{ "client", check_client },
         .{ "session-exact", check_session_exact },       .{ "java-watch", check_java_watch },                 .{ "raft-558", check_raft_558 },
-        .{ "jvm-caches", check_jvm_caches },
+        .{ "jvm-caches", check_jvm_caches },             .{ "guest-panic", check_guest_panic },
     };
     // A check's whole name runs it alone (check.sh's `ui` ran guidance and quiet too).
     var exact = std.mem.eql(u8, only, "tla");
@@ -8508,6 +8515,63 @@ fn check_jvm_caches(context: *Context) !void {
         .{ "the unlabeled image's caches not made again", !said[1] },
         .{ "its JVMs refuse their cache beside the agent (a refusal is seen)", refused[1] > 0 },
     }, "jvm-caches: refusals in {d} labeled and {d} unlabeled timelines' events; named lines {}", .{ refused[0], refused[1], lines[0] });
+}
+
+/// A guest tool's panic maps to its lines (docs/DEBUGGING.md): the image packs our tools without
+/// their debug sections (tools/elf_strip.zig), and det-initramfs leaves them whole beside it,
+/// named by its content (runs.initrd_keep keeps them with a run). A SIGSEGV sent to det-sinks at a
+/// moment prints Zig's trace from the image's copy, its functions and addresses but no lines;
+/// addr2line maps an address of it to a source line with the whole det-sinks.
+fn check_guest_panic(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
+    const tapes = try std.fs.path.join(arena, &.{ context.scratch, "guest-panic-tapes" });
+    const base = try explore(context, &.{
+        "--program",   program, "--scenario", "bank", "--seed",     "11",  "--timeline", "30s",
+        "--branching", "flat",  "--branches", "1",    "--tape-dir", tapes,
+    });
+    var recorded: [1]Branch = undefined;
+    expect(context, parse_branches(base, &recorded) == 1, "guest-panic: recorded one timeline", .{});
+    const tape = try std.fs.path.join(arena, &.{ tapes, "branch-0.jsonl" });
+    const output = try explore(context, &.{
+        "--program", program,                                  "--scenario",    "bank", "--timeline", "30s", "--tape", tape,
+        "--exec",    "kill -SEGV $(pidof det-sinks); sleep 2", "--at-vtime-ms", "3000",
+    });
+    const said = std.mem.indexOf(u8, output, "Segmentation fault at address") != null;
+    // A frame of det-sinks: `???:?:?: 0x<address> in <function> (/opt/determinismo/bin/det-sinks)`.
+    var address: []const u8 = "";
+    var unlined = false;
+    if (std.mem.indexOf(u8, output, " (/opt/determinismo/bin/det-sinks)")) |end| {
+        const line = output[(std.mem.lastIndexOfScalar(u8, output[0..end], '\n') orelse 0)..end];
+        // `???:?:?`, then the address: the console's colours split it from its colon.
+        unlined = std.mem.indexOf(u8, line, "???:?:?") != null;
+        if (std.mem.indexOf(u8, line, "0x")) |at| {
+            const rest = line[at..];
+            address = rest[0 .. std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len];
+        }
+    }
+    // The tools whole beside the run's image, under its content's name.
+    const initrd = for (context.machine, 0..) |flag, index| {
+        if (std.mem.eql(u8, flag, "--initrd")) break context.machine[index + 1];
+    } else unreachable;
+    const image = try std.Io.Dir.cwd().readFileAlloc(context.io, initrd, arena, .unlimited);
+    const directory = std.fs.path.dirname(initrd) orelse ".";
+    const tools = try std.fmt.allocPrint(arena, "{s}/{x:0>16}-tools.cpio", .{ directory, std.hash.Wyhash.hash(0, image) });
+    const whole = try std.fs.path.join(arena, &.{ context.scratch, "guest-panic-tools" });
+    try std.Io.Dir.cwd().createDirPath(context.io, whole);
+    const unpacked = try run_kept(context, &.{ "sh", "-c", try std.fmt.allocPrint(arena, "cd {s} && cpio -id det-sinks < {s}", .{ whole, tools }) });
+    const kept = unpacked.term == .exited and unpacked.term.exited == 0;
+    var mapped: []const u8 = "";
+    if (kept and address.len > 0) {
+        const lines = try run_kept(context, &.{ "addr2line", "-f", "-i", "-e", try std.fs.path.join(arena, &.{ whole, "det-sinks" }), address });
+        mapped = std.mem.trim(u8, lines.stdout, " \n");
+    }
+    expect_all(context, &.{
+        .{ "a SIGSEGV to det-sinks prints Zig's trace", said },
+        .{ "its frames name det-sinks's functions without lines (the image's copy stripped)", address.len > 0 and unlined },
+        .{ "the tools whole lie beside the image, named by its content", kept },
+        .{ "addr2line maps a frame's address to a source line with the whole det-sinks", std.mem.indexOf(u8, mapped, ".zig:") != null },
+    }, "guest-panic: frame {s}, mapped to \"{s}\"", .{ address, mapped });
 }
 
 /// A `sometimes` made true comes first among a timeline's new behaviors: the tree returns just

@@ -6495,7 +6495,11 @@ fn machine_kept(server: *Server, memory_mib: ?u32, seed: u64) ![]const []const u
     while (index + 1 < argv.items.len) : (index += 1) {
         const flag = argv.items[index];
         if (!std.mem.eql(u8, flag, "--kernel") and !std.mem.eql(u8, flag, "--initrd")) continue;
-        argv.items[index + 1] = try artifact_keep(server, argv.items[index + 1]);
+        // The initramfs with its tools whole (runs.initrd_keep): its guest's panics map to lines.
+        argv.items[index + 1] = if (std.mem.eql(u8, flag, "--initrd"))
+            try host_runs.initrd_keep(server.arena, server.io, server.options.data_directory, argv.items[index + 1])
+        else
+            try artifact_keep(server, argv.items[index + 1]);
         index += 1;
     }
     if (memory_mib) |mib| try argv.appendSlice(server.arena, &.{ "--memory-mib", try print(server, "{d}", .{mib}) });

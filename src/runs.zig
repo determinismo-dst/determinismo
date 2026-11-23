@@ -190,6 +190,29 @@ pub fn artifact_keep(arena: std.mem.Allocator, io: std.Io, data: []const u8, pat
     return kept;
 }
 
+/// An initramfs kept by content (artifact_keep), with the guest's tools whole that det-initramfs
+/// wrote beside the image under its content's name (`<hash>-tools.cpio`: the image packs them
+/// stripped of their debug sections) kept beside it in artifacts/: a guest tool's panic, its
+/// functions and addresses, maps to lines after a deploy (docs/DEBUGGING.md). None beside it
+/// (an image of an earlier det-initramfs): the image alone.
+pub fn initrd_keep(arena: std.mem.Allocator, io: std.Io, data: []const u8, path: []const u8) ![]const u8 {
+    const kept = try artifact_keep(arena, io, data, path);
+    const name = try std.fmt.allocPrint(arena, "{s}-tools.cpio", .{std.fs.path.basename(kept)[0..16]});
+    const target = try std.fs.path.join(arena, &.{ data, "artifacts", name });
+    const cwd = std.Io.Dir.cwd();
+    cwd.access(io, target, .{}) catch {
+        const source = try std.fs.path.join(arena, &.{ std.fs.path.dirname(path) orelse ".", name });
+        const bytes = cwd.readFileAlloc(io, source, arena, .unlimited) catch |err| switch (err) {
+            error.FileNotFound => return kept,
+            else => return err,
+        };
+        const staging = try std.fmt.allocPrint(arena, "{s}.staging-{d}-{d}", .{ target, linux.getpid(), linux.gettid() });
+        try cwd.writeFile(io, .{ .sub_path = staging, .data = bytes });
+        try cwd.rename(staging, cwd, target, io);
+    };
+    return kept;
+}
+
 /// The library a kept explorer's test programs reach the SDK through on the host (sdk/clojure's
 /// determinismo.ffi: libdeterminismo.so and its .json, beside the build's binary; a jank one's
 /// header, libdeterminismo.h), kept beside it as `<explorer>.libdeterminismo.so`, `.json` and
@@ -288,6 +311,38 @@ fn write_all(fd: linux.fd_t, bytes: []const u8) void {
         if (linux.errno(result) != .SUCCESS) return; // A terminal gone: the file still gets it.
         written += result;
     }
+}
+
+test "an initramfs is kept with its tools whole beside it, by the image's content name" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try absolute(arena, try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{&tmp.sub_path}));
+    const cwd = std.Io.Dir.cwd();
+    const guest = try std.fs.path.join(arena, &.{ root, "guest" });
+    const data = try std.fs.path.join(arena, &.{ root, "data" });
+    try cwd.createDirPath(io, guest);
+    const image = try std.fs.path.join(arena, &.{ guest, "base.cpio" });
+    try cwd.writeFile(io, .{ .sub_path = image, .data = "an image" });
+    const name = try std.fmt.allocPrint(arena, "{x:0>16}-tools.cpio", .{std.hash.Wyhash.hash(0, "an image")});
+    try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(arena, &.{ guest, name }), .data = "its tools" });
+    const kept = try initrd_keep(arena, io, data, image);
+    try std.testing.expect(std.mem.endsWith(u8, kept, "-base.cpio"));
+    try std.testing.expectEqualStrings(name[0..16], std.fs.path.basename(kept)[0..16]);
+    const tools = try std.fs.path.join(arena, &.{ data, "artifacts", name });
+    try std.testing.expectEqualStrings("its tools", try cwd.readFileAlloc(io, tools, arena, .limited(64)));
+    // Kept again (a resume, its --initrd the kept copy, named `<hash>-<hash>-base.cpio` then, as
+    // artifact_keep names a copy of a copy): its tools found by the same leading hash.
+    const again = try initrd_keep(arena, io, data, kept);
+    try std.testing.expectEqualStrings(name[0..16], std.fs.path.basename(again)[0..16]);
+    // An image with no tools beside it: kept alone.
+    try cwd.writeFile(io, .{ .sub_path = image, .data = "an older image" });
+    const older = try initrd_keep(arena, io, data, image);
+    const none = try std.fmt.allocPrint(arena, "{s}-tools.cpio", .{std.fs.path.basename(older)[0..16]});
+    try std.testing.expectError(error.FileNotFound, cwd.access(io, try std.fs.path.join(arena, &.{ data, "artifacts", none }), .{}));
 }
 
 test "claim: ids in order, never one twice; the pid lock tells a running run" {

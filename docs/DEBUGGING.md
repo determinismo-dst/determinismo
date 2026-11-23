@@ -259,3 +259,21 @@ that run drew (`sets`): what this one will draw from. determinismo.debug's `open
 determinismo.api's `start-run` take `:plan true` and return the plan; `execute` makes it real.
 clients/jank-viz draws a planned session as a dashed row where it would leave its timeline, the
 part it would replay bracketed above that one.
+
+
+## Where one of determinismo's guest tools panicked
+
+The guest's own tools (det-nodes, det-composer, det-runner, ...) are packed into its image
+without their debug sections (tools/elf_strip.zig: DWARF named the tree they were built in, and
+made every image's bytes depend on it). A panic of one of them names its functions and their
+addresses, not their lines:
+
+    thread 412 panic: ...
+    ???:?:?: 0x107977d in nodes.restart (/opt/determinismo/bin/det-nodes)
+
+The tools whole are kept beside the image, named by its content: a run's machine.json names its
+initramfs (`artifacts/<hash>-base.cpio`), and `artifacts/<hash>-tools.cpio` beside it holds them.
+The lines (`-i`: the functions inlined into it too), from any shell with binutils:
+
+    mkdir t && cd t && cpio -id det-nodes < ~/.determinismo/artifacts/<hash>-tools.cpio
+    addr2line -f -i -e det-nodes 0x107977d

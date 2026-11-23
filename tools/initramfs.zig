@@ -20,6 +20,12 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+const elf_strip = @import("elf_strip.zig");
+
+/// The guest's tools, packed without their debug sections (elf_strip.zig: DWARF names the tree
+/// they were built in, so an image's bytes depended on it; 92 MB of 17 tools came to 14 MB, in
+/// every VM's memory). Their symbols stay: a panic names its functions and addresses, which the
+/// host's whole binaries (zig-out/bin) map to lines.
 const runtime = [_][]const u8{
     "det-init",        "det-nodes",   "det-composer", "det-faults",  "det-agent",
     "det-stop-faults", "det-profile", "det-core",     "det-podlogs", "det-sinks",
@@ -81,8 +87,55 @@ pub fn main(init: std.process.Init) !void {
         .e2fsck = e2fsck.?,
     });
     const archive = try archive_write(arena, entries);
-    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = out.?, .data = archive });
-    std.debug.print("{s}: {d} entries, {d} bytes\n", .{ out.?, entries.len, archive.len });
+    // The tools whole beside it, named by the image's content (the name a run's kept copy takes,
+    // runs.artifact_keep's): a run keeps them with the image (runs.initrd_keep), and a guest
+    // tool's panic maps to its lines (docs/DEBUGGING.md). Written first, so no image is ever
+    // without them. Earlier images' archives are removed from this output directory alone,
+    // never from a data directory's artifacts/: the copies kept there are what old runs'
+    // replays and mappings use.
+    const cwd = std.Io.Dir.cwd();
+    const directory = std.fs.path.dirname(out.?) orelse ".";
+    const tools = try tools_name(arena, archive);
+    var whole: std.ArrayList(Entry) = .empty;
+    for (runtime) |name| try whole.append(arena, .{
+        .path = name,
+        .mode = mode_executable,
+        .data = try cwd.readFileAlloc(init.io, try std.fs.path.join(arena, &.{ bin.?, name }), arena, .unlimited),
+    });
+    const tools_path = try std.fs.path.join(arena, &.{ directory, tools });
+    try cwd.writeFile(init.io, .{ .sub_path = tools_path, .data = try archive_write(arena, whole.items) });
+    var listed = try cwd.openDir(init.io, directory, .{ .iterate = true });
+    defer listed.close(init.io);
+    var iterator = listed.iterate();
+    while (try iterator.next(init.io)) |entry| {
+        if (tools_of_an_image(entry.name) and !std.mem.eql(u8, entry.name, tools)) try listed.deleteFile(init.io, entry.name);
+    }
+    try cwd.writeFile(init.io, .{ .sub_path = out.?, .data = archive });
+    std.debug.print("{s}: {d} entries, {d} bytes; its tools whole in {s}\n", .{ out.?, entries.len, archive.len, tools });
+}
+
+/// The name of an image's whole tools: `<its content's hash>-tools.cpio`, the hash
+/// runs.artifact_keep names the image's kept copy by.
+fn tools_name(arena: std.mem.Allocator, image: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{x:0>16}-tools.cpio", .{std.hash.Wyhash.hash(0, image)});
+}
+
+fn tools_of_an_image(name: []const u8) bool {
+    if (name.len != 16 + "-tools.cpio".len or !std.mem.endsWith(u8, name, "-tools.cpio")) return false;
+    for (name[0..16]) |c| if (!std.ascii.isHex(c) or std.ascii.isUpper(c)) return false;
+    return true;
+}
+
+test "an image's whole tools are named by its content, as its kept copy is" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const name = try tools_name(arena, "an image");
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena, "{x:0>16}", .{std.hash.Wyhash.hash(0, "an image")}), name[0..16]);
+    try std.testing.expect(tools_of_an_image(name));
+    try std.testing.expect(!tools_of_an_image("base.cpio"));
+    try std.testing.expect(!tools_of_an_image("0123456789ABCDEF-tools.cpio"));
+    try std.testing.expect(!tools_of_an_image("0123456789abcdef-tools.cpio.staging"));
 }
 
 const Inputs = struct { bin: []const u8, module: []const u8, busybox: []const u8, e2fsck: []const u8 };
@@ -98,7 +151,7 @@ fn entries_collect(arena: std.mem.Allocator, io: std.Io, inputs: Inputs) ![]Entr
         try entries.append(arena, .{
             .path = try std.fmt.allocPrint(arena, "opt/determinismo/bin/{s}", .{name}),
             .mode = mode_executable,
-            .data = try cwd.readFileAlloc(io, path, arena, .unlimited),
+            .data = try elf_strip.elf_debug_stripped(arena, try cwd.readFileAlloc(io, path, arena, .unlimited)),
         });
     }
     // libvoidstar.so (Antithesis's), and libdeterminismo.so with its interface: for test
@@ -278,4 +331,8 @@ test archive_write {
     try std.testing.expectEqualStrings("a", archive[110..111]);
     try std.testing.expect(std.mem.indexOf(u8, archive, "TRAILER!!!") != null);
     try std.testing.expectEqual(@as(usize, 0), archive.len % 512);
+}
+
+test {
+    _ = elf_strip;
 }

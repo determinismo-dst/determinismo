@@ -1386,7 +1386,7 @@ fn run_request_write(
     arguments.kernel_path = kernel_kept;
     arguments.raw_argv = try argv_with(arena, arguments.raw_argv, "--kernel", kernel_kept);
     if (arguments.initrd_path) |path| {
-        const initrd_kept = try runs.artifact_keep(arena, io, data, path);
+        const initrd_kept = try runs.initrd_keep(arena, io, data, path);
         try machine.appendSlice(arena, &.{ "--initrd", initrd_kept });
         arguments.initrd_path = initrd_kept;
         arguments.raw_argv = try argv_with(arena, arguments.raw_argv, "--initrd", initrd_kept);
