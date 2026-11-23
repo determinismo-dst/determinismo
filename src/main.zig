@@ -3417,6 +3417,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         wait_deadline_ns = branches.deadline_ns;
         const held = if (branches.pool) |pool| (pool.take_unless(wait_over) orelse break) else null;
         defer if (held) |cpu| branches.pool.?.give(cpu);
+        if (held != null) if (timeline_admission) |admitted| @atomicStore(u64, admitted, 1, .monotonic);
         // Its strategy hears it start first, and may give it another seed (another random
         // future) and, from the setup snapshot, its own clock, which its tape's header then
         // says (a replay takes them from there).
@@ -4141,6 +4142,8 @@ fn explore_tree(
     // Said once a generation: it completed while the last judgment's nodes were being made.
     var waiting_said = false;
     var sampled_ns: u64 = 0;
+    // When the progress line was last said (said no oftener while the loop looks for room).
+    var progressed_ns: u64 = monotonic_ns();
     // Whether the run's holders went at its ending (below).
     var holders_dropped = false;
     // The explorer's own pool, for its run's claims alone (claims_look): its timelines' processes
@@ -4232,9 +4235,17 @@ fn explore_tree(
             say("[determinismo] tree: generation {d} complete while generation {d}'s " ++
                 "nodes are made: it waits, timelines going on\n", .{ pending.generation + 1, pending.generation });
         };
-        // Timelines start as CPUs free up, in the queue's order; none past the budget, and none
-        // without room for its summary beside every running one's.
-        if (!late and running_count < jobs and batch.summaries.count + running_count < batch.items.len) if (try queue_take(arena, &state, judging != null, branches.snapshot)) |place| {
+        // Timelines start as CPUs free up, in the queue's order; none past the budget, none
+        // without room for its summary beside every running one's, and none ahead of the VMs
+        // that fit in memory (timeline_gated), but a recorded one.
+        const startable = !late and running_count < jobs and batch.summaries.count + running_count < batch.items.len;
+        const waiting = if (timeline_admissions) |admissions| timelines_waiting(running[0..running_count], admissions) else 0;
+        state.gated = startable and claims_pool_open and queue_offers(&state, judging != null) and
+            !queue_recorded(&state) and timeline_gated(&claims_pool, waiting);
+        state.filler_waits = startable and queue_filler_held(&state, judging != null);
+        state.filler_held += @intFromBool(startable and queue_filler_held(&state, judging != null));
+        state.queue_held += @intFromBool(state.gated);
+        if (startable and !state.gated) if (try queue_take(arena, &state, judging != null, branches.snapshot)) |place| {
             // A resumed run's recorded timeline: its summary, not the timeline again.
             if (state.resumed) |resumed| if (resumed.summaries.get(place.index)) |bytes| {
                 summary_load(&batch.items[batch.summaries.count], bytes);
@@ -4279,10 +4290,13 @@ fn explore_tree(
             // Every half minute without a timeline finishing, what the run is doing: a long
             // timeline (minutes) otherwise leaves its output silent.
             status_write(branches.arguments.run_directory, running[0..running_count], branches.multiverse, state.generation, &busy);
-            // Shorter while a judgment's nodes are made: they are collected between waits.
-            const wait_ms: i32 = if (judging != null) judging_poll_ms else progress_interval_ms;
+            // Shorter while a judgment's nodes are made (they are collected between waits) and
+            // while memory holds the queue back: the one waiting is let in without a timeline's end.
+            const wait_ms: i32 = if (judging != null or state.gated) judging_poll_ms else progress_interval_ms;
             const finished = try timeline_wait(running[0..running_count], branches.multiverse, &batch.summaries, wait_ms) orelse {
                 if (judging != null) continue;
+                if (state.gated and monotonic_ns() -| progressed_ns < progress_interval_ms * std.time.ns_per_ms) continue;
+                progressed_ns = monotonic_ns();
                 const held = if (claims_pool_open) claims_pool.run_held() else null;
                 progress_print(running[0..running_count], held, branches.multiverse, state.generation);
                 continue;
@@ -4307,6 +4321,8 @@ fn explore_tree(
     }
     for (state.queue.items[state.queue_head..]) |entry| node_free(entry.snapshot, branches.snapshot);
     for (batch.plan.items) |entry| node_free(entry.snapshot, branches.snapshot);
+    say("[determinismo] tree: {d} looks held queued filler for a judgment's makers, {d} held the " ++
+        "queue for memory\n", .{ state.filler_held, state.queue_held });
     if (branches.arguments.record_path) |record| try behaviors_write(context, &state, record);
     if (state.change) |*target| {
         target.summarize(state.next_index);
@@ -4415,6 +4431,62 @@ fn queue_use(arena: std.mem.Allocator, state: *TreeState, snapshot: *const Snaps
     entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
 }
 
+/// Whether the queue has a timeline to start (queue_take): one queued, or a fresh one while a
+/// judgment's nodes are made; no filler while that judgment's makers wait for memory, but one a
+/// resume has recorded, which loads its summary and asks for no VM.
+fn queue_offers(state: *const TreeState, judging: bool) bool {
+    if (queue_held_back(state, judging)) return false;
+    if (state.queue_head < state.queue.items.len) return true;
+    return judging and state.next_index < state.total;
+}
+
+/// Whether what the queue would give now, queued or fresh, is filler held for a judgment's
+/// makers (queue_offers).
+fn queue_held_back(state: *const TreeState, judging: bool) bool {
+    if (!judging or !state.makers_short) return false;
+    if (state.queue_head < state.filler_start or queue_recorded(state)) return false;
+    return state.queue_head < state.queue.items.len or state.next_index < state.total;
+}
+
+/// Whether that is filler already queued: a fresh one was refused before 2026-11-22 too, so
+/// only this counts as the queue's hold acting (filler_held).
+fn queue_filler_held(state: *const TreeState, judging: bool) bool {
+    return queue_held_back(state, judging) and state.queue_head < state.queue.items.len;
+}
+
+/// Whether the queue's next timeline is one a resumed run recorded.
+fn queue_recorded(state: *const TreeState) bool {
+    if (state.queue_head == state.queue.items.len) return false;
+    const resumed = state.resumed orelse return false;
+    return resumed.summaries.contains(state.queue.items[state.queue_head].index);
+}
+
+/// Started timelines whose VMs were never admitted (timeline_admissions).
+fn timelines_waiting(running: []const Running, admissions: *const [jobs_max]u64) u32 {
+    var waiting: u32 = 0;
+    for (running) |timeline| waiting += @intFromBool(@atomicLoad(u64, &admissions[timeline.slot], .monotonic) == 0);
+    return waiting;
+}
+
+/// What the claims' learning takes for the workers with a timeline (ClaimLearning.sample learns
+/// while every one has): all of them while memory alone keeps the rest from taking one
+/// (`memory_idle`: the queue held for it, or its queued filler for makers that wait for it), as
+/// when they took one and waited; a first claim then only at a plateau. Otherwise such a run
+/// would learn no claim, its VMs its guests' size for good, and stay short.
+fn learning_workers(started: u32, jobs: u32, memory_idle: bool) u32 {
+    return if (memory_idle) jobs else started;
+}
+
+/// Whether memory keeps the queue's next timeline from a worker: one started waits for its VM,
+/// and there is no room for those waiting and it (`pool`: cpus.Pool's room). Taken ahead of the
+/// VMs that fit, timelines stood in the admission's line before whatever a judgment planned
+/// after them: 48 workers, 17 VMs of 10 GiB guests on 192 GiB, 31 in line, and no returned
+/// timeline ran in 2 hours (aws-hunt run 18; srv4's run 1145 the same). One waits, so that a
+/// VM's room never idles; the rest stay in the queue, whose order is the tree's.
+fn timeline_gated(pool: anytype, waiting: u32) bool {
+    return waiting > 0 and !pool.room(waiting + 1);
+}
+
 /// The next planned timeline, if any.
 fn queue_next(state: *TreeState) ?Planned {
     if (state.queue_head == state.queue.items.len) return null;
@@ -4438,9 +4510,8 @@ fn queue_take(arena: std.mem.Allocator, state: *TreeState, judging: bool, setup:
     // and the judgment waits on them (run 2106: its judgments went from 35 s to over 538 s, the
     // filler most of its timelines; held to new ones alone, 21 minutes of a 2 hour hunt whose
     // returns never ran, 2026-11-22). What a judgment planned is before the filler, and starts.
-    if (judging and state.makers_short and state.queue_head >= state.filler_start) return null;
+    if (!queue_offers(state, judging)) return null;
     if (queue_next(state)) |place| return place;
-    if (!judging) return null;
     index_settle(state);
     if (state.next_index >= state.total) return null;
     report.record(.{ .fresh = .{ .generation = state.generation, .index = state.next_index } });
@@ -4661,13 +4732,39 @@ fn deciding_strategy(exploration: *const Exploration) bool {
 /// for 48 ms): the pages its guest wrote, its VMM's, and the explorer's it shares since its
 /// fork (about 1.4 GiB on srv4, so a little high); not the snapshot pages it reads, the nodes'.
 /// 0 for a process gone or unreadable.
-fn vms_held_most(running: []const Running) u64 {
+fn vms_held_most(running: []const Running, admissions: *const [jobs_max]u64) u64 {
     var most: u64 = 0;
-    for (running) |entry| {
-        if (entry.short) continue; // Ended already, not reaped yet.
+    for (running) |*entry| {
+        if (!vm_counts(entry, admissions)) continue;
         most = @max(most, rss_anon(entry.pid));
     }
     return most;
+}
+
+/// Whether a timeline's VM is one the claims' learning reads, or ends short of memory: admitted
+/// (one in line holds only what it shares with the explorer since its fork, 1.6 GiB in run 2125,
+/// and killed it frees nothing and is the next in line again), and not ended already.
+fn vm_counts(timeline: *const Running, admissions: *const [jobs_max]u64) bool {
+    if (timeline.short) return false; // Ended already, not reaped yet.
+    return @atomicLoad(u64, &admissions[timeline.slot], .monotonic) != 0;
+}
+
+/// The run's timelines whose VMs count: the claims' learning's admitted, not the run's CPU
+/// claims, which are its makers' and its verifier's replays' too.
+fn vms_admitted(running: []const Running, admissions: *const [jobs_max]u64) u32 {
+    var admitted: u32 = 0;
+    for (running) |*entry| admitted += @intFromBool(vm_counts(entry, admissions));
+    return admitted;
+}
+
+/// The one to end short of memory: the youngest that counts.
+fn vms_youngest(running: []Running, admissions: *const [jobs_max]u64) ?*Running {
+    var youngest: ?*Running = null;
+    for (running) |*entry| {
+        if (!vm_counts(entry, admissions)) continue;
+        if (youngest == null or entry.start_ns > youngest.?.start_ns) youngest = entry;
+    }
+    return youngest;
 }
 
 fn rss_anon(pid: linux.pid_t) u64 {
@@ -4720,11 +4817,7 @@ fn claims_look(state: *TreeState, pool: ?*cpus.Pool, running: []Running, jobs: u
     state.claims_looked_ns = now;
     if (state.claims.short(cpus.memory_available(), cpus.memory_reserve())) {
         claims_pool.claim_soft_set(0);
-        var youngest: ?*Running = null;
-        for (running) |*entry| {
-            if (entry.short) continue; // Ended already, not reaped yet.
-            if (youngest == null or entry.start_ns > youngest.?.start_ns) youngest = entry;
-        }
+        const youngest = if (timeline_admissions) |admissions| vms_youngest(running, admissions) else null;
         if (youngest) |entry| {
             entry.short = true;
             _ = linux.kill(entry.pid, .KILL);
@@ -4737,7 +4830,12 @@ fn claims_look(state: *TreeState, pool: ?*cpus.Pool, running: []Running, jobs: u
         return;
     }
     const held_before = state.claims.held_max;
-    state.claims.sample(vms_held_most(running), claims_pool.run_held(), @intCast(running.len), jobs, state.ended);
+    const memory_idle = running.len < jobs and (state.gated or state.filler_waits);
+    const workers = learning_workers(@intCast(running.len), jobs, memory_idle);
+    state.claims.memory_idle = memory_idle;
+    if (timeline_admissions) |admissions| {
+        state.claims.sample(vms_held_most(running, admissions), vms_admitted(running, admissions), workers, jobs, state.ended);
+    }
     const claim = state.claims.claim(cpus.claim_bytes);
     claims_pool.claim_soft_set(claim);
     // Said at its first look that counts, and whenever its VMs' claim goes below their guest's
@@ -4780,6 +4878,12 @@ var returns_started: u32 = 0;
 /// with the workers, mapped by the explorer before its first fork; a slot a running timeline.
 var timeline_vtimes: ?*[jobs_max]u64 = null;
 var timeline_slots: std.StaticBitSet(jobs_max) = .empty;
+/// Beside their virtual times, whether each running timeline's VM was ever admitted (its take of
+/// a CPU): the others wait. Not read from the run's CPU claims, which count its verifier's
+/// replays and its makers, and not a timeline finishing with its CPU given.
+var timeline_admissions: ?*[jobs_max]u64 = null;
+/// In a timeline's process, its own of these.
+var timeline_admission: ?*u64 = null;
 /// The run's learned timeline limit (timeline_limit.zig): the explorer's, fed each timeline's
 /// summary as it arrives (timeline_wait); a tree's worker, forked for its one timeline, reads the
 /// explorer's as it was then (learned_stop).
@@ -4816,11 +4920,12 @@ fn learner_note(summary: *const Summary) void {
 
 fn timeline_vtimes_map() !*[jobs_max]u64 {
     if (timeline_vtimes) |known| return known;
-    const size = std.mem.alignForward(usize, jobs_max * @sizeOf(u64), std.heap.page_size_min);
+    const size = std.mem.alignForward(usize, 2 * jobs_max * @sizeOf(u64), std.heap.page_size_min);
     const address = linux.mmap(null, size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED, .ANONYMOUS = true }, -1, 0);
     if (linux.errno(address) != .SUCCESS) return error.ProgressMap;
     const vtimes: *[jobs_max]u64 = @ptrFromInt(address);
     timeline_vtimes = vtimes;
+    timeline_admissions = @ptrFromInt(address + @sizeOf([jobs_max]u64));
     return vtimes;
 }
 
@@ -4944,6 +5049,8 @@ fn timeline_start(
     const slot: u16 = @intCast(free.findFirstSet() orelse return error.NoTimelineSlot);
     timeline_slots.set(slot);
     @atomicStore(u64, &vtimes[slot], 0, .monotonic);
+    const admitted = &timeline_admissions.?[slot];
+    @atomicStore(u64, admitted, 0, .monotonic);
     const explorer = linux.getpid();
     const pid = linux.fork();
     if (linux.errno(pid) != .SUCCESS) return error.Fork;
@@ -4953,6 +5060,7 @@ fn timeline_start(
         _ = linux.close(pipe[0]);
         nodes_close_but(state, branches.plan.?[0].snapshot);
         options.progress = &vtimes[slot]; // Its VM made from these (VM.init).
+        timeline_admission = admitted;
         var one = Summaries{ .items = batch.scratch }; // Its own copy: sent back whole.
         var mine = branches;
         mine.summaries = &one;
@@ -5499,6 +5607,16 @@ const TreeState = struct {
     /// jobs, short of room for the next): no filler starts meanwhile (queue_take), as it would
     /// take the room they wait for.
     makers_short: bool = false,
+    /// Memory keeps the queue's next timeline from a worker at the loop's last look
+    /// (timeline_gated).
+    gated: bool = false,
+    /// A judgment's makers, short of memory, keep queued filler from one at that look
+    /// (queue_filler_held: not a fresh one, refused since before the queue held any).
+    filler_waits: bool = false,
+    /// The loop's looks that held queued filler for a judgment's makers, and the queue for memory: said
+    /// as the tree ends, so a run shows whether either ever acted.
+    filler_held: u64 = 0,
+    queue_held: u64 = 0,
     /// The disk holders of generations not judged yet fill the run's disk budget
     /// (holders.Registry.disk_full): timelines start with no disk for their holders meanwhile.
     holders_disk_full: bool = false,
@@ -9568,6 +9686,7 @@ test "no fresh timeline starts while a judgment's makers wait for memory; a plan
     state.queue_head = 0;
     state.filler_start = 0;
     state.makers_short = true;
+    state.resumed = null;
     state.users = .empty;
     state.base = 7;
     state.generation = 5;
@@ -9600,6 +9719,7 @@ test "no queued filler starts while a judgment's makers wait for memory" {
     state.queue_head = 0;
     state.filler_start = 0;
     state.makers_short = true;
+    state.resumed = null;
     state.users = .empty;
     state.base = 7;
     state.generation = 0;
@@ -9618,6 +9738,213 @@ test "no queued filler starts while a judgment's makers wait for memory" {
     // Room again, and with no judgment waiting: the filler starts.
     state.makers_short = false;
     try std.testing.expectEqual(@as(u32, 48), (try queue_take(arena, &state, true, setup)).?.index);
+}
+
+test "a recorded timeline needs no VM: held back with no filler" {
+    const arena = std.testing.allocator;
+    var resumed: Resumed = .{};
+    defer resumed.summaries.deinit(arena);
+    try resumed.summaries.put(arena, 48, "");
+    var state: TreeState = undefined;
+    state.queue = .empty;
+    state.queue_head = 0;
+    state.filler_start = 0;
+    state.makers_short = true;
+    state.users = .empty;
+    state.resumed = &resumed;
+    defer state.queue.deinit(arena);
+    defer state.users.deinit(arena);
+    const setup: *const Snapshot = @ptrFromInt(@alignOf(Snapshot));
+    try queue_fill(arena, &state, .{ .index = 48, .seed = 1, .snapshot = setup });
+    try queue_fill(arena, &state, .{ .index = 49, .seed = 1, .snapshot = setup });
+    // Recorded (a resume loads its summary): taken though makers wait for memory.
+    try std.testing.expectEqual(@as(?u32, 48), if (try queue_take(arena, &state, true, setup)) |taken| taken.index else null);
+    // The next is not: it waits.
+    try std.testing.expectEqual(@as(?u32, null), if (try queue_take(arena, &state, true, setup)) |taken| taken.index else null);
+}
+
+test "workers take no timeline ahead of the VMs that fit: a judgment's branch runs next but one" {
+    // 48 workers, 17 VMs that fit, 144 timelines queued at the launch (aws-hunt run 18): every
+    // worker took one, and 31 waited for memory ahead of the first judgment's branches for good.
+    const jobs = 48;
+    const fit = 17;
+    const arena = std.testing.allocator;
+    var state: TreeState = undefined;
+    state.queue = .empty;
+    state.queue_head = 0;
+    state.filler_start = 0;
+    state.makers_short = false;
+    state.users = .empty;
+    state.resumed = null;
+    state.next_index = 400;
+    state.total = 400;
+    defer state.queue.deinit(arena);
+    defer state.users.deinit(arena);
+    const setup: *const Snapshot = @ptrFromInt(@alignOf(Snapshot));
+    for (0..48) |index| try queue_push(arena, &state, .{ .index = @intCast(index), .seed = 1, .snapshot = setup });
+    for (48..144) |index| try queue_fill(arena, &state, .{ .index = @intCast(index), .seed = 1, .snapshot = setup });
+    const Fits = struct {
+        admitted: u32,
+        fn room(fits: @This(), vms: u32) bool {
+            return fits.admitted + vms <= fit;
+        }
+    };
+    var running: [jobs]Running = undefined;
+    var admissions: [jobs_max]u64 = @splat(0);
+    var started: u32 = 0;
+    while (started < jobs) {
+        const waiting = timelines_waiting(running[0..started], &admissions);
+        if (timeline_gated(Fits{ .admitted = started - waiting }, waiting)) break;
+        _ = (try queue_take(arena, &state, false, setup)) orelse break;
+        running[started].slot = @intCast(started);
+        if (started < fit) admissions[started] = 1; // The admission's: as many as fit.
+        started += 1;
+    }
+    try std.testing.expectEqual(@as(u32, fit + 1), started); // Those that fit, and one waiting.
+    try queue_plan(arena, &state, .{ .index = 144, .seed = 1, .snapshot = setup, .generation = 1 });
+    // The first to end lets the one waiting in: the branch is the next one taken. The loop's
+    // order is the queue's, so nothing of the first generation is left before it but that one.
+    running[0] = running[started - 1];
+    started -= 1;
+    admissions[running[0].slot] = 1; // The one in line, admitted into the room freed.
+    const waiting = timelines_waiting(running[0..started], &admissions);
+    try std.testing.expect(!timeline_gated(Fits{ .admitted = fit }, waiting));
+    while (try queue_take(arena, &state, false, setup)) |taken| {
+        if (taken.index == 144) break;
+        try std.testing.expect(taken.index < 48); // Never the filler before it.
+    } else return error.BranchNeverTaken;
+}
+
+test "a run gated by memory learns its claim as with every worker's timeline taken" {
+    const mib: u64 = 1 << 20;
+    const gib: u64 = 1 << 30;
+    // ParadeDB's run 2098: 4 VMs of 32 GiB guests fit, 40 workers. Gated, 5 timelines taken:
+    // learned as the 40 taken were (2.6 GB held once flat: 3.9 GB claimed), not never.
+    var gated: cpus.ClaimLearning = .{};
+    for ([_]u64{ 2200, 2400, 2550 }) |held| gated.sample(held * mib, 4, learning_workers(5, 40, true), 40, 0);
+    try std.testing.expectEqual(@as(u64, 0), gated.claim(32 * gib)); // Young and growing: not yet.
+    for (0..cpus.ClaimLearning.plateau_looks) |_| gated.sample(2600 * mib, 4, learning_workers(5, 40, true), 40, 0);
+    try std.testing.expectEqual(3900 * mib, gated.claim(32 * gib));
+    // Its 2.2 GB fault: a judgment's looks, the VMs young and few, take nothing down.
+    for (0..200) |_| gated.sample(1400 * mib, 2, learning_workers(3, 40, true), 40, 45);
+    try std.testing.expectEqual(3900 * mib, gated.claim(32 * gib));
+    // Workers idle for another reason (nothing queued, not memory): nothing counted, as before.
+    var idle: cpus.ClaimLearning = .{};
+    for (0..100) |_| idle.sample(2 * gib, 4, learning_workers(5, 40, false), 40, 50);
+    try std.testing.expectEqual(@as(u64, 0), idle.claim(32 * gib));
+}
+
+test "a learned claim rises as the VMs grow while workers are idle" {
+    const gib: u64 = 1 << 30;
+    var learning: cpus.ClaimLearning = .{};
+    learning.sample(2 * gib, 40, 40, 40, 40);
+    try std.testing.expectEqual(3 * gib, learning.claim(32 * gib));
+    // Filler held for a judgment's makers: 20 workers idle, and what the running VMs hold grows.
+    learning.sample(3 * gib, 20, 20, 40, 60);
+    try std.testing.expectEqual(3 * gib / 2 * 3, learning.claim(32 * gib));
+    // Nothing learned yet: idle workers still teach nothing.
+    var young: cpus.ClaimLearning = .{};
+    young.sample(2 * gib, 20, 20, 40, 60);
+    try std.testing.expectEqual(@as(u64, 0), young.claim(32 * gib));
+}
+
+test "a replay's claim is no running timeline" {
+    // Run 2125, 20:08: 35 started, the run's 35 claims 34 timelines' and a replay's.
+    var running: [35]Running = undefined;
+    var admissions: [jobs_max]u64 = @splat(0);
+    for (&running, 0..) |*timeline, slot| timeline.slot = @intCast(slot);
+    for (admissions[0..34]) |*admitted| admitted.* = 1;
+    try std.testing.expectEqual(@as(u32, 1), timelines_waiting(&running, &admissions));
+}
+
+test "makers in line hold no timeline back" {
+    // 34 started and running, one maker holding a CPU, five more in line, no room for another.
+    var running: [34]Running = undefined;
+    var admissions: [jobs_max]u64 = @splat(0);
+    for (&running, 0..) |*timeline, slot| timeline.slot = @intCast(slot);
+    for (admissions[0..34]) |*admitted| admitted.* = 1;
+    const full = struct {
+        fn room(_: @This(), _: u32) bool {
+            return false;
+        }
+    }{};
+    const waiting = timelines_waiting(&running, &admissions);
+    try std.testing.expectEqual(@as(u32, 0), waiting);
+    try std.testing.expect(!timeline_gated(full, waiting)); // A judged branch may take its place in line.
+    try std.testing.expect(timeline_gated(full, 1)); // A second may not.
+}
+
+test "nothing is offered past the run's timeline limit" {
+    var state: TreeState = undefined;
+    state.queue = .empty;
+    state.queue_head = 0;
+    state.filler_start = 0;
+    state.makers_short = false;
+    state.resumed = null;
+    state.next_index = 400;
+    state.total = 400;
+    try std.testing.expect(!queue_offers(&state, true));
+}
+
+test "a timeline whose VM gave its CPU back is not waiting" {
+    // 35 admitted, one of them finishing: its CPU given, not reaped yet.
+    var running: [35]Running = undefined;
+    var admissions: [jobs_max]u64 = @splat(0);
+    for (&running, 0..) |*timeline, slot| timeline.slot = @intCast(slot);
+    for (admissions[0..35]) |*admitted| admitted.* = 1;
+    try std.testing.expectEqual(@as(u32, 0), timelines_waiting(&running, &admissions));
+}
+
+test "a fresh timeline refused while makers are short is no held filler" {
+    var state: TreeState = undefined;
+    state.queue = .empty;
+    state.queue_head = 0;
+    state.filler_start = 0;
+    state.makers_short = true;
+    state.resumed = null;
+    state.next_index = 10;
+    state.total = 400;
+    // Refused before f02c124 too: it shows nothing of that fix acting.
+    try std.testing.expect(!queue_filler_held(&state, true));
+    try std.testing.expect(queue_held_back(&state, true)); // It waits, as it did: no queued filler held.
+    state.next_index = 400; // At the run's limit: nothing waits for memory.
+    try std.testing.expect(!queue_held_back(&state, true));
+}
+
+test "a timeline never admitted teaches no claim: only the explorer's memory is its" {
+    // Run 2125, 20:24: young ones in line showed 1.6 GiB, the explorer's own.
+    var running: [2]Running = undefined;
+    var admissions: [jobs_max]u64 = @splat(0);
+    for (&running, 0..) |*timeline, slot| {
+        timeline.slot = @intCast(slot);
+        timeline.short = false;
+    }
+    admissions[0] = 1;
+    try std.testing.expect(vm_counts(&running[0], &admissions));
+    try std.testing.expect(!vm_counts(&running[1], &admissions));
+    try std.testing.expectEqual(@as(u32, 1), vms_admitted(&running, &admissions));
+}
+
+test "short of memory, the youngest admitted ends, never the one in line" {
+    var running: [3]Running = undefined;
+    var admissions: [jobs_max]u64 = @splat(0);
+    for (&running, 0..) |*timeline, slot| {
+        timeline.slot = @intCast(slot);
+        timeline.short = false;
+        timeline.start_ns = 100 + slot;
+    }
+    admissions[0] = 1;
+    admissions[1] = 1; // The third waits: killed, it frees nothing and comes back first in the queue.
+    try std.testing.expectEqual(@as(?*Running, &running[1]), vms_youngest(&running, &admissions));
+}
+
+test "a first claim learned while workers wait on memory needs the plateau, however many ended" {
+    const gib: u64 = 1 << 30;
+    var learning: cpus.ClaimLearning = .{ .memory_idle = true };
+    learning.sample(2 * gib, 2, 40, 40, 45); // One look, at one young VM.
+    try std.testing.expectEqual(@as(u64, 0), learning.claim(32 * gib));
+    for (0..cpus.ClaimLearning.plateau_looks) |_| learning.sample(2 * gib, 2, 40, 40, 45);
+    try std.testing.expectEqual(3 * gib, learning.claim(32 * gib));
 }
 
 test "the tree passes over a number a timeline extending another took, and plans the same again resumed" {

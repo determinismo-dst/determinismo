@@ -718,6 +718,13 @@ pub const Pool = struct {
         return fits(0, bytes, std.math.maxInt(u64) / 2, available, reserve_bytes());
     }
 
+    /// Whether `vms` more of this run's VMs fit in memory beside every VM admitted: what its
+    /// explorer asks before a worker takes a timeline (main.zig's timeline_gated).
+    pub fn room(pool: *Pool, vms: u32) bool {
+        assert(vms > 0);
+        return pool.claim_fits(pool.claim_now() * vms);
+    }
+
     /// Whether a VM of this run fits, memory-wise (above half the reserve, checked apart): its
     /// claim beside the others (claim_fits), or, with none of the run's VMs running, its own
     /// nodes holding memory (stalled_alone).
@@ -1721,6 +1728,8 @@ pub const ClaimLearning = struct {
     recent_count: u32 = 0,
     /// The run said a claim under its guests' size.
     softened: bool = false,
+    /// Its workers without a timeline wait on memory at this look (the explorer sets it).
+    memory_idle: bool = false,
     /// Memory ran short after that: its claims are its guests' size until this many timelines
     /// ended (as many more as it has workers), then half again more room than before each time
     /// (margin_halves). For good, one short look cost a run its learned claim for hours.
@@ -1749,8 +1758,14 @@ pub const ClaimLearning = struct {
     pub fn sample(learning: *ClaimLearning, held: u64, admitted: u32, workers: u32, jobs: u32, ended: u64) void {
         learning.ended_seen = ended;
         learning.jobs_seen = jobs;
-        if (admitted == 0 or workers < jobs) return;
-        if (ended >= jobs) {
+        if (admitted == 0) return;
+        // Learned: never less than one holds, however many workers have a timeline (filler held
+        // for a judgment's makers leaves some idle while the VMs running grow).
+        if (learning.held_max != 0) learning.held_max = @max(learning.held_max, held);
+        if (workers < jobs) return;
+        // With workers idle on memory a first claim waits for the plateau below, however many
+        // ended: the few VMs admitted may all be young, and one look at one would set it.
+        if (ended >= jobs and (!learning.memory_idle or learning.held_max != 0)) {
             learning.held_max = @max(learning.held_max, held);
             return;
         }
@@ -1967,11 +1982,13 @@ test "a run's VMs count as what the run learned they hold, another run's as its 
     try std.testing.expectEqual(@as(u32, 1), other.run_held());
     try std.testing.expect(!other.claim_fits(total / 2));
     try std.testing.expectEqual(total / 2, other.claim_now());
+    try std.testing.expect(!other.room(1)); // The gate's question (Pool.room), the same claims.
     // The run learned its VMs hold an eighth of the host: the VM running counts as that, and
     // the next one asks for that.
     holder.claim_soft_set(total / 8);
     try std.testing.expectEqual(total / 8, other.claim_now());
     try std.testing.expect(other.claim_fits(total / 2));
+    try std.testing.expect(other.room(1) and !other.room(8));
     // A VM of another run on that CPU: its guest's size, whatever this run learned.
     const elsewhere: u64 = run_of_this_process() + 1;
     _ = linux.pwrite(holder.fds[held.slot], std.mem.asBytes(&elsewhere), @sizeOf(u64), @offsetOf(CpuClaim, "run"));
