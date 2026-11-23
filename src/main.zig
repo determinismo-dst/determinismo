@@ -3870,12 +3870,32 @@ const Summaries = struct {
     }
 };
 
+/// Why a return is a replay from its parent's start, its parent's earliest holder known or not
+/// (Registry.earliest): before it, after it (those at or before the moment taken or gone), or
+/// none at all (`no_holder`: a timeline of an earlier generation, its holders gone with its
+/// judgment, none on disk). Silent until 2026-11-23, though late in a long run most replays
+/// were so (calibration run 2125: generation 44's 6 moments, 4 in generation 0's timelines).
+const ReplayWhy = enum { before_holders, holders_gone, no_holder };
+
+fn replay_why(first: ?u64, vtime_ns: u64) ReplayWhy {
+    const earliest = first orelse return .no_holder;
+    return if (earliest > vtime_ns) .before_holders else .holders_gone;
+}
+
+test "a return to a timeline that kept no holder says why it replays" {
+    try std.testing.expectEqual(ReplayWhy.before_holders, replay_why(5000, 1000));
+    try std.testing.expectEqual(ReplayWhy.holders_gone, replay_why(1000, 5000));
+    try std.testing.expectEqual(ReplayWhy.no_holder, replay_why(null, 5000));
+}
+
 /// Antithesis's exploration, as a tree: every branch is a potential branch point. The first
 /// generation starts from the setup snapshot; after each, the branches that reached behaviors
 /// no branch before them had are returned to (Go-Explore): a snapshot at the moment just after
 /// the new behavior (replaying the branch to it), and new branches from there, with their own
 /// seeds. Some branches of every generation start from the setup snapshot again. A generation
-/// is planned only from the ones before it, so the tree is the same whatever the workers.
+/// is planned only from the ones before it; which timelines form it follows the order they
+/// finish in, so the same seed can grow another tree on other workers (each timeline, and any
+/// moment of it, replays exactly, and a resumed run judges its recorded generations again).
 const tree = struct {
     /// Timelines per generation by default, and the unit of `--generation`.
     const generation_base = 16;
@@ -5989,7 +6009,7 @@ const Judging = struct {
     branches_planned: u32 = 0,
     made: Made = .{},
 
-    const Made = struct { all: u32 = 0, held: u32 = 0, disk: u32 = 0, before: u32 = 0, gone: u32 = 0, unloaded: u32 = 0 };
+    const Made = struct { all: u32 = 0, held: u32 = 0, disk: u32 = 0, before: u32 = 0, gone: u32 = 0, none: u32 = 0, unloaded: u32 = 0 };
 };
 
 /// A generation complete (the timelines that finished since the last): what each reached that
@@ -6070,6 +6090,7 @@ fn judge_plan_one(arena: std.mem.Allocator, branches: Branches, state: *TreeStat
     judging.made.disk += @intFromBool(making.disk != null);
     judging.made.before += @intFromBool(making.before_holders);
     judging.made.gone += @intFromBool(making.holders_gone);
+    judging.made.none += @intFromBool(making.no_holder);
     judging.made.unloaded += @intFromBool(making.unloaded);
     const path = try arena.alloc(tape.Segment, parent.path.len + 1);
     @memcpy(path[0..parent.path.len], parent.path);
@@ -6264,6 +6285,7 @@ fn tree_judge_begin(
         var from_disk: ?holders.Held = null;
         var before_holders = false;
         var holders_gone = false;
+        var no_holder = false;
         if (state.holding) if (state.registry.take(back.branch, back.vtime_ns)) |taken| {
             if (taken.disk) |on_disk| from_disk = on_disk else {
                 makings[making_count] = .{
@@ -6282,14 +6304,22 @@ fn tree_judge_begin(
             // (one serves one return: RabbitMQ 1927 returned to one moment three times in a
             // generation) or gone (left for memory). `later` alone took both for the first.
             const first = state.registry.earliest(back.branch);
-            before_holders = first != null and first.? > back.vtime_ns;
-            holders_gone = first != null and first.? <= back.vtime_ns;
+            const why = replay_why(first, back.vtime_ns);
+            before_holders = why == .before_holders;
+            holders_gone = why == .holders_gone;
+            no_holder = why == .no_holder;
             if (first) |first_ns| say("[determinismo] tree: a return to timeline {d} at {d} ms, " ++
                 "{s} at {d} ms (it began at {d} ms): a replay\n", .{
                 back.branch,
                 back.vtime_ns / std.time.ns_per_ms,
                 if (before_holders) "before its first holder" else "its holders before it taken or gone, the first",
                 first_ns / std.time.ns_per_ms,
+                parent.snapshot.events.last_vtime_ns / std.time.ns_per_ms,
+            }) else say("[determinismo] tree: a return to timeline {d} at {d} ms, the timeline " ++
+                "keeps no holder (one of an earlier generation, its holders gone with its judgment, " ++
+                "none on disk; it began at {d} ms): a replay\n", .{
+                back.branch,
+                back.vtime_ns / std.time.ns_per_ms,
                 parent.snapshot.events.last_vtime_ns / std.time.ns_per_ms,
             });
         };
@@ -6311,6 +6341,7 @@ fn tree_judge_begin(
             .tape_directory = branches.arguments.tape_directory,
             .before_holders = before_holders,
             .holders_gone = holders_gone,
+            .no_holder = no_holder,
             .disk = if (from_disk) |on_disk| .{
                 .held = on_disk,
                 .branch = back.branch,
@@ -6450,9 +6481,10 @@ fn tree_judge_end(
     say("[determinismo] tree: generation {d}: {d} branches, {d} new behaviors " ++
         "({d} known); {d} moments returned to ({d} from holders in memory, {d} from holders on disk, " ++
         "{d} replayed from the parent's start, {d} of them before its first holder, {d} with its holders before it taken or gone, " ++
+        "{d} whose timeline keeps no holder, " ++
         "{d} with a holder on disk that did not load); " ++
         "judged in {d:.1} s (timelines going on meanwhile, {d} of its makers waited for room); a timeline's ending {d:.0} s ({d} measured)\n", .{
-        generation,                                                                     done.len,      judging.reached_count,                                                state.seen.count(),         made.all, made.held, made.disk, made.all - made.held - made.disk, made.before, made.gone, made.unloaded,
+        generation,                                                                     done.len,      judging.reached_count,                                                state.seen.count(),         made.all, made.held, made.disk, made.all - made.held - made.disk, made.before, made.gone, made.none, made.unloaded,
         @as(f64, @floatFromInt(monotonic_ns() - judging.start_ns)) / std.time.ns_per_s, makers_waited, @as(f64, @floatFromInt(state.novelty.cost_ms())) / std.time.ms_per_s, state.novelty.ending_count,
     });
     // Its summaries the spare ones again (the next judgment's).
@@ -7206,6 +7238,8 @@ const NodeMaking = struct {
     /// Replayed from the parent's start although it had holders at or before the moment: taken
     /// by another return (a holder serves one) or gone (left for memory).
     holders_gone: bool = false,
+    /// Replayed from its parent's start: its timeline keeps no holder at all (replay_why).
+    no_holder: bool = false,
     /// Loaded from a holder on disk (holders.Disk), then replayed on to the moment as a holder
     /// does; a replay from the parent's start when it cannot be loaded (null again then, and
     /// `unloaded` set: node_make_finish).
