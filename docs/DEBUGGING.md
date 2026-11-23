@@ -277,3 +277,8 @@ The lines (`-i`: the functions inlined into it too), from any shell with binutil
 
     mkdir t && cd t && cpio -id det-nodes < ~/.determinismo/artifacts/<hash>-tools.cpio
     addr2line -f -i -e det-nodes 0x107977d
+
+A tool that crashes on a signal (its trace as above, then "no process crashes: det-sinks"
+failing) also gets a `crash_stack` event, whose frames name no function either: each is
+`{"address":"0x1031e21","at":"det-sinks+0x30e21"}`, the offset in the stripped copy. Its
+`address` goes to addr2line the same way.
