@@ -5766,24 +5766,23 @@ fn check_resume_seen(context: *Context) !void {
         sleep_ms(100);
     }
     const stop: []const u8 = curl(context, &.{ "-X", "POST", url ++ "/runs/1/stop" }) catch "";
-    // Ended by that stop (TERM) within a minute: a zombie here, or gone (its /proc entry with it:
-    // the first run of this check read a missing entry as running).
-    const stat_path = try std.fmt.allocPrint(arena, "/proc/{d}/stat", .{again.id.?});
+    // Ended by that stop (TERM) within a minute: reaped here, as this check's own child (reading
+    // its /proc stat read nothing: a /proc file's size is 0).
+    const resumed = again.id.?;
     var exited = false;
     for (0..600) |_| {
-        const stat = std.Io.Dir.cwd().readFileAlloc(context.io, stat_path, arena, .limited(4096)) catch {
-            exited = true;
-            break;
-        };
-        const close = std.mem.lastIndexOfScalar(u8, stat, ')') orelse break;
-        if (close + 2 < stat.len and stat[close + 2] == 'Z') {
+        var status: i32 = 0;
+        const reaped = std.os.linux.wait4(resumed, &status, std.os.linux.W.NOHANG, null);
+        if (std.os.linux.errno(reaped) == .SUCCESS and reaped == @as(usize, @intCast(resumed))) {
             exited = true;
             break;
         }
         sleep_ms(100);
     }
-    _ = std.os.linux.kill(again.id.?, .KILL);
-    _ = try again.wait(context.io);
+    if (!exited) {
+        _ = std.os.linux.kill(resumed, .KILL);
+        _ = try again.wait(context.io);
+    }
     var after: []const u8 = "";
     for (0..600) |_| {
         after = curl(context, &.{url ++ "/runs/1"}) catch "";
@@ -5809,7 +5808,11 @@ fn check_reserved_run(context: *Context) !void {
     const url = "http://" ++ address;
     const data = try std.fs.path.join(arena, &.{ context.scratch, "serve-reserved-run" });
     var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(arena, &.{ "env", "DETERMINISMO_RESERVED_SCOPE=1", context.determinismo, "serve", "--listen", address, "--data", data });
+    // As srv4's serve unit has them: the reserved scope on, and the user manager's runtime
+    // directory, which systemd-run --user needs (a check's unit has none: "Failed to connect to
+    // user scope bus").
+    const runtime = try std.fmt.allocPrint(arena, "XDG_RUNTIME_DIR=/run/user/{d}", .{std.os.linux.getuid()});
+    try argv.appendSlice(arena, &.{ "env", "DETERMINISMO_RESERVED_SCOPE=1", runtime, context.determinismo, "serve", "--listen", address, "--data", data });
     try argv.appendSlice(arena, context.machine);
     var server = try std.process.spawn(context.io, .{ .argv = argv.items, .stdout = .ignore, .stderr = .ignore });
     defer server.kill(context.io);
