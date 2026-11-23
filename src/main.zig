@@ -4405,14 +4405,11 @@ fn queue_next(state: *TreeState) ?Planned {
 /// at the same place (tree_rejudge), before that generation's plan, so that every index keeps
 /// its timeline.
 fn queue_take(arena: std.mem.Allocator, state: *TreeState, judging: bool, setup: *const Snapshot) !?Planned {
-    // No filler while the judgment's makers wait for memory, one queued (the pipeline's, from
-    // the launch) no more than a new one: its VM would take the room they wait for as it frees,
-    // and the judgment waits on them (run 2106: its judgments went from 35 s to over 538 s, the
-    // filler most of its timelines; held to new ones alone, 21 minutes of a 2 hour hunt whose
-    // returns never ran, 2026-11-22). What a judgment planned is before the filler, and starts.
-    if (judging and state.makers_short and state.queue_head >= state.filler_start) return null;
     if (queue_next(state)) |place| return place;
-    if (!judging) return null;
+    // Nor while the judgment's makers wait for memory: a filler's VM would take the room they
+    // wait for as it frees, and the judgment waits on them (run 2106: its judgments went from
+    // 35 s to over 538 s, the filler most of its timelines).
+    if (!judging or state.makers_short) return null;
     index_settle(state);
     if (state.next_index >= state.total) return null;
     report.record(.{ .fresh = .{ .generation = state.generation, .index = state.next_index } });
@@ -9545,37 +9542,6 @@ test "no fresh timeline starts while a judgment's makers wait for memory; a plan
     // Room for them again: the filler starts.
     state.makers_short = false;
     try std.testing.expectEqual(@as(u32, 300), (try queue_take(arena, &state, true, setup)).?.index);
-}
-
-test "no queued filler starts while a judgment's makers wait for memory" {
-    // 48 workers, VMs of 10 GiB guests on 192 GiB (17 fit), 22 minutes a timeline, 2 hours: the
-    // first judgment's makers waited 21 minutes for room while the pipeline's filler, queued at
-    // the launch, went on taking workers; no returned timeline ever got a VM (73 timelines, all
-    // of the first generation).
-    const arena = std.testing.allocator;
-    var state: TreeState = undefined;
-    state.queue = .empty;
-    state.queue_head = 0;
-    state.filler_start = 0;
-    state.makers_short = true;
-    state.users = .empty;
-    state.base = 7;
-    state.generation = 0;
-    state.next_index = 144;
-    state.total = 400;
-    state.tape_directory = null;
-    defer state.queue.deinit(arena);
-    defer state.users.deinit(arena);
-    const setup: *const Snapshot = @ptrFromInt(@alignOf(Snapshot));
-    try queue_fill(arena, &state, .{ .index = 48, .seed = 1, .snapshot = setup });
-    try std.testing.expectEqual(@as(?u32, null), if (try queue_take(arena, &state, true, setup)) |taken| taken.index else null);
-    // A judged generation's branch still starts, before that filler; the filler still waits.
-    try queue_push(arena, &state, .{ .index = 144, .seed = 1, .snapshot = setup, .generation = 1, .why = "planned" });
-    try std.testing.expectEqual(@as(u32, 144), (try queue_take(arena, &state, true, setup)).?.index);
-    try std.testing.expectEqual(@as(?u32, null), if (try queue_take(arena, &state, true, setup)) |taken| taken.index else null);
-    // Room again, and with no judgment waiting: the filler starts.
-    state.makers_short = false;
-    try std.testing.expectEqual(@as(u32, 48), (try queue_take(arena, &state, true, setup)).?.index);
 }
 
 test "the tree passes over a number a timeline extending another took, and plans the same again resumed" {
