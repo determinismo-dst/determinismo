@@ -1,2 +1,3 @@
 import DeterminismoTests.Toy
+import DeterminismoTests.Locks
 import DeterminismoTests.Main

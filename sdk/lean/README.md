@@ -10,7 +10,8 @@ determinismo tape repeats a timeline of the real system.
 | `Determinismo.Decide` | decisions (`decide`, `decideWeighted`, `decideRare`, `pick`), their sources (a seed, a path), `violate` |
 | `Determinismo.Disk` | a file's disk, cache and pending writes; syncs, failed syncs (EIO: never retried, read back until a power loss), power losses (a prefix of the pending writes, one torn); theorems |
 | `Determinismo.Cluster` | nodes running a system's code (`Behavior`: start from the disk, receive, tick, request) in a world of lost, duplicated, reordered and partitioned messages (one way too), power losses, process kills, halts, failed syncs, clock skew, swarm testing; client histories; `invariant` and `final` properties |
-| `Determinismo.Threads` | a process's threads, each step atomic, the next thread a decision (`thread.next`): every interleaving within bounds; deadlocks |
+| `Determinismo.Threads` | a process's threads, each step atomic, the next thread a decision (`thread.next`): every interleaving within bounds; deadlocks; the story (`Process.note`) |
+| `Determinismo.Locks` | a mutex and a reader-writer lock (writer priority optional, as folly's `SharedMutex`), taken with a `try` in a step (`none`: the step blocks) |
 | `Determinismo.History` | linearizability of a client history against a sequential model (unanswered operations may take effect later or never; failed ones never) |
 | `Determinismo.Search` | `explore` (timelines from seeds), `exhaust` (every timeline within bounds, depth first), `shrink`, `tape` (a counterexample as determinismo's named decisions) |
 
@@ -27,7 +28,9 @@ real system by determinismo; a property that holds in every timeline within boun
     lake build
     lake exe determinismo-lean-tests
 
-The tests: decisions replayed and enumerated, the disk's fault semantics, linearizability, and a
-register on a write-ahead log in three variants: acknowledging before its sync (found), ignoring
+The tests: decisions replayed and enumerated, the disk's fault semantics, linearizability, locks
+(opposite orders deadlock, a release in a thread's last step frees its waiter, a reader taking a
+writer-priority lock again behind a waiting writer deadlocks), and a register on a write-ahead log
+in three variants: acknowledging before its sync (found), ignoring
 a failed sync (found), and correct (nothing in 3,000 random timelines each with power losses and
 with failed syncs, nor in all 4,919 timelines of a small world).

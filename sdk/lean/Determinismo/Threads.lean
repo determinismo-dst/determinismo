@@ -38,6 +38,10 @@ instance {M L : Type} : Chaotic (Process M L) where
 
 abbrev ProcessM (M L : Type) := EStateM Stop (Process M L)
 
+/-- A line of the process's story (`Process.log`), stamped with its step. -/
+def Process.note {M L : Type} (line : String) : ProcessM M L Unit :=
+  modify fun p => { p with log := p.log.push s!"{p.steps}: {line}" }
+
 /-- A program: a thread's step on the shared memory (it may decide: a thread's own randomness). -/
 structure Program (M L : Type) where
   step : Nat → L → ProcessM M L (StepResult L)
@@ -58,15 +62,16 @@ def interleave {M L : Type} (prog : Program M L) (maxSteps : Nat)
       return
     let some t ← pick (σ := Process M L) "thread.next" ready | return
     let some locals := p.threads.getD t none | return
-    let before := p.memory
     match ← prog.step t locals with
     | .ran locals' =>
       modify fun p => { p with threads := p.threads.set! t (some locals'), steps := p.steps + 1 }
       -- A step that ran may unblock the others (approximated: any step).
-      let _ := before
       blocked := []
     | .blocked => blocked := t :: blocked
-    | .done => modify fun p => { p with threads := p.threads.set! t none, steps := p.steps + 1 }
+    | .done =>
+      modify fun p => { p with threads := p.threads.set! t none, steps := p.steps + 1 }
+      -- A thread's last step may release what the others wait for (a lock's unlock).
+      blocked := []
 
 /-- Runs a process from a source of decisions: how it ended. -/
 def runProcess {M L : Type} (start : Process M L) (body : ProcessM M L Unit) (source : Source)

@@ -1,5 +1,6 @@
 import Determinismo
 import DeterminismoTests.Toy
+import DeterminismoTests.Locks
 
 /-! The library's tests: `lake exe determinismo-lean-tests` (exit 1 when one fails). -/
 
@@ -77,6 +78,20 @@ def decisions : List Check :=
     { name := "a weighted draw stays in range",
       ok := (List.range 200).all fun i => (drawWeighted (mkStdGen i) [1, 0, 5]).1 ∈ [0, 2] } ]
 
+def locks : List Check :=
+  let complete (r : Exhausted) := match r with | .complete _ => true | _ => false
+  let deadlock (r : Exhausted) := match r with | .found c => c.property == "deadlock" | _ => false
+  let opposite := #[[Locks.Act.lockA, .lockB, .unlockB, .unlockA], [.lockB, .lockA, .unlockA, .unlockB]]
+  let same := #[[Locks.Act.lockA, .lockB, .unlockB, .unlockA], [.lockA, .lockB, .unlockB, .unlockA]]
+  let lastRelease := #[[Locks.Act.lockA, .unlockA], [.lockA, .unlockA]]
+  let reread := #[[Locks.Act.rlock, .rlock, .runlock, .runlock], [.announce, .wlock, .wunlock]]
+  [ { name := "two mutexes taken in opposite orders deadlock", ok := deadlock (exhaust (Locks.run opposite true) 10000) },
+    { name := "taken in the same order: every interleaving ends", ok := complete (exhaust (Locks.run same true) 10000) },
+    { name := "a lock released in a thread's last step frees its waiter", ok := complete (exhaust (Locks.run lastRelease true) 10000) },
+    { name := "writer priority: a reader taking it again behind a waiting writer deadlocks",
+      ok := deadlock (exhaust (Locks.run reread true) 10000) },
+    { name := "reader priority: the same never deadlocks", ok := complete (exhaust (Locks.run reread false) 10000) } ]
+
 def toyConfig (syncErrors : Bool) : Config :=
   { nodes := 3, steps := 40, recovery := 40, clientOps := 6,
     faults := { syncErrors, skew := false } }
@@ -91,7 +106,7 @@ def describe (c : Counterexample) : String :=
 
 def main : IO UInt32 := do
   let mut failed := 0
-  for c in decisions ++ disk ++ history do
+  for c in decisions ++ disk ++ history ++ locks do
     IO.println s!"{if c.ok then "ok  " else "FAIL"} {c.name}"
     if !c.ok then failed := failed + 1
   -- The toy register, end to end.

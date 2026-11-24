@@ -4,3 +4,4 @@ import Determinismo.Cluster
 import Determinismo.History
 import Determinismo.Search
 import Determinismo.Threads
+import Determinismo.Locks
