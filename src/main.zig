@@ -254,6 +254,8 @@ const usage =
     \\                            once, written to disk first, as under memory pressure: to check it)
     \\                            [--holders-retain]   (in-run snapshots in memory kept past their
     \\                            generation's judgment, until room is needed: an arm to measure)
+    \\                            [--no-holders-writeback]   (a snapshot written to disk left to the
+    \\                            kernel's dirty thresholds, not started at once: an arm to measure)
     \\                            [--holders-budget <GB>]   (the kept snapshots' room on disk;
     \\                            default: half the disk's free space above its reserve)
     \\                            [--data <dir>]   (the host's runs, where this one goes:
@@ -615,6 +617,9 @@ const Arguments = struct {
     /// --holders-retain: holders in memory kept past their generation's judgment (holders.zig
     /// Registry.retain), an arm to measure; off by default.
     holders_retain: bool = false,
+    /// --no-holders-writeback: a saved holder's writeback left to the kernel's dirty thresholds
+    /// (holders.writeback), an arm to measure; on by default.
+    holders_writeback: bool = true,
     /// Every holder in memory leaves at once, written to disk first (holders.Owner.leave_always).
     holders_leave: bool = false,
     /// The kept holders' budget on disk, in GB (`--holders-budget`); null: half the disk's free
@@ -1764,10 +1769,10 @@ test "fault exclusions: a pattern det-faults would not take is a usage error; on
     try std.testing.expectEqualStrings(pattern, try std.fmt.hexToBytes(&decoded, words.next().?));
     // None asked: no word.
     const plain = try parse_arguments(arena, &.{ "determinismo", "explore", "--kernel", "vmlinuz" });
-    // Retention off unless asked.
-    try std.testing.expect(!plain.holders_retain);
-    const arms = try parse_arguments(arena, &.{ "determinismo", "explore", "--kernel", "vmlinuz", "--holders-retain" });
-    try std.testing.expect(arms.holders_retain);
+    // The holders' two arms: retention off and writeback on unless asked.
+    try std.testing.expect(!plain.holders_retain and plain.holders_writeback);
+    const arms = try parse_arguments(arena, &.{ "determinismo", "explore", "--kernel", "vmlinuz", "--holders-retain", "--no-holders-writeback" });
+    try std.testing.expect(arms.holders_retain and !arms.holders_writeback);
     try std.testing.expect(std.mem.indexOf(u8, try cmdline_build(arena, "console=ttyS0", &plain, null), key) == null);
 }
 
@@ -3999,6 +4004,7 @@ fn explore_tree(
     } else null else null;
     if (holding) registry.disk = disk;
     registry.retain = holding and branches.arguments.holders_retain;
+    holders.writeback = branches.arguments.holders_writeback;
     if (holding) if (branches.arguments.holders_budget_gb) |gb| {
         registry.kept_budget = gb << 30;
     };
@@ -8722,6 +8728,10 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
         }
         if (std.mem.eql(u8, argv[index], "--holders-retain")) {
             arguments.holders_retain = true;
+            continue;
+        }
+        if (std.mem.eql(u8, argv[index], "--no-holders-writeback")) {
+            arguments.holders_writeback = false;
             continue;
         }
         if (std.mem.eql(u8, argv[index], "--holders-leave")) {

@@ -13,7 +13,10 @@ const std = @import("std");
 const linux = std.os.linux;
 const assert = std.debug.assert;
 
-pub const Kind = enum { setup, timeline, node_memory, node_disk, node_replay, verify, judge };
+/// `holder_save`: a holder's files written to disk (holders.zig's saves, their writeback started),
+/// inside the interval of the timeline that saved it: what the run spends writing holders, beside
+/// what loading them costs (node_disk).
+pub const Kind = enum { setup, timeline, node_memory, node_disk, node_replay, verify, judge, holder_save };
 pub const kind_count = @typeInfo(Kind).@"enum".field_names.len;
 
 /// The run's log in this process (forks inherit it; CLOEXEC: programs exec'd do not).
@@ -302,6 +305,7 @@ test minutes {
         \\{"a":"setup","s":1000000,"e":1030000,"v":0,"w":0}
         \\{"a":"timeline","s":1030000,"e":1150000,"v":600000,"w":12000,"i":3}
         \\{"a":"node_replay","s":1050000,"e":1070000,"v":0,"w":0}
+        \\{"a":"holder_save","s":1040000,"e":1045500,"v":0,"w":0}
         \\{"a":"sample","t":1065000,"r":3,"n":1,"q":5,"m":20480,"o":[]}
         \\{"a":"sample","t":1170000,"r":2,"n":0,"q":0,"m":30720,"o":[[1030000,3],[1160000,9]]}
         \\{"a":"found","t":1100000,"n":7,"k":70}
@@ -317,6 +321,7 @@ test minutes {
     try std.testing.expectEqual(30000, first.busy_ms[@backingInt(Kind.timeline)]);
     try std.testing.expectEqual(150000, first.vtime_ms); // A quarter of its 600 s.
     try std.testing.expectEqual(10000, first.busy_ms[@backingInt(Kind.node_replay)]);
+    try std.testing.expectEqual(5500, first.busy_ms[@backingInt(Kind.holder_save)]);
     try std.testing.expectEqual(10000, activity.minutes[1].busy_ms[@backingInt(Kind.node_replay)]);
     try std.testing.expectEqual(1, activity.minutes[1].samples);
     try std.testing.expectEqual(7, activity.minutes[1].found);

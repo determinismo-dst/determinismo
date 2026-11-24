@@ -24,6 +24,7 @@ const Snapshot = @import("core").snapshot;
 const VM = @import("core").vm;
 const fd_pass = @import("fd_pass.zig");
 const cpus = @import("cpus.zig");
+const activity = @import("activity.zig");
 
 /// Holders a timeline keeps at most: past it, the one closest to the one before it goes, so the
 /// replays from a holder to a later moment stay short wherever the moment is.
@@ -160,8 +161,10 @@ pub fn setup_origin_write(setup: *const Snapshot, disk: *const Disk) ?Origin {
         const pages = setup.memory_size / std.heap.page_size_min;
         const hashes = std.heap.page_allocator.alloc(u64, pages) catch linux.exit_group(1);
         @memset(hashes, 0);
+        const saving_ms = activity.now_ms();
         Snapshot.disk_save(setup, memory, setup.memory_fd, hashes, disk.directory, name, null, false) catch linux.exit_group(1);
         Snapshot.disk_hashes_save(hashes, disk.directory, name) catch linux.exit_group(1);
+        saved(disk.directory, name, saving_ms);
         linux.exit_group(0);
     }
     var status: i32 = 0;
@@ -1148,8 +1151,10 @@ pub const Owner = struct {
         if (sync) {
             const memory: []align(std.heap.page_size_min) const u8 = vm.memory;
             const written = written: {
+                const saving_ms = activity.now_ms();
                 Snapshot.disk_save(owner.snapshot, memory, vm.memory_fd, hashes, disk.directory, name, base, point.idle) catch break :written false;
                 Snapshot.disk_hashes_save(hashes, disk.directory, name) catch break :written false;
+                saved(disk.directory, name, saving_ms);
                 break :written true;
             };
             // A failed write leaves no file (its node made by a replay) and the hashes partly
@@ -1165,10 +1170,12 @@ pub const Owner = struct {
             machine_forget(vm);
             cpus.forked_without_cpu();
             const memory: []align(std.heap.page_size_min) const u8 = vm.memory;
+            const saving_ms = activity.now_ms();
             Snapshot.disk_save(owner.snapshot, memory, vm.memory_fd, hashes, disk.directory, name, base, point.idle) catch
                 linux.exit_group(1);
             // For the timelines whose nodes are made from it (their first holders' base).
             Snapshot.disk_hashes_save(hashes, disk.directory, name) catch linux.exit_group(1);
+            saved(disk.directory, name, saving_ms);
             linux.exit_group(0);
         }
         if (linux.errno(pid) != .SUCCESS) return;
@@ -1205,8 +1212,10 @@ pub const Owner = struct {
         var name_buffer: [Snapshot.disk_name_max]u8 = undefined;
         const name = Disk.name(&name_buffer, owner.branch, moment);
         const memory: []align(std.heap.page_size_min) const u8 = vm.memory;
+        const saving_ms = activity.now_ms();
         Snapshot.disk_save(owner.snapshot, memory, vm.memory_fd, hashes, disk.directory, name, base, owner.point.idle) catch return;
         Snapshot.disk_hashes_save(hashes, disk.directory, name) catch return;
+        saved(disk.directory, name, saving_ms);
     }
 
     /// A disk holder written (or being written): the next one's base, kept among the timeline's.
@@ -1376,14 +1385,81 @@ pub const Owner = struct {
             _ = write_all(socket, &.{1});
             linux.exit_group(1);
         }
+        const saving_ms = activity.now_ms();
         Snapshot.disk_save(owner.snapshot, memory, vm.memory_fd, ladder.hashes, ladder.directory, name, base, owner.point.idle) catch {
             _ = write_all(socket, &.{1});
             linux.exit_group(1);
         };
+        // Its bytes on their way to the disk now, not once gigabytes are dirty (writeback_start).
+        saved(ladder.directory, name, saving_ms);
         _ = write_all(socket, &.{0});
         linux.exit_group(0);
     }
 };
+
+/// Starts the writeback of a holder's files just saved (Snapshot.disk_save's `<name>.mem` and
+/// `<name>.state`, disk_hashes_save's `<name>.hashes` where written), not waiting for it: the
+/// files started. Left to the kernel, its writeback
+/// begins past dirty_background_ratio (srv4: 10% of 187 GiB), and any overlay unmount on that
+/// filesystem then waits for all of it: podman's export sat 17 minutes in sync_filesystem beside
+/// run 2067's holders (15-18 GB dirty, 2026-11-18), its storage lock held. Not src/core's
+/// disk_save, whose edit moves every run's pin.
+/// Each saved holder's writeback started at once (writeback_start); `--no-holders-writeback`
+/// turns it off, for its A/B. Set before the run's processes fork, which inherit it.
+pub var writeback: bool = true;
+
+/// A holder's files saved (disk_save, its hashes): their writeback started, and the save's wall
+/// time from `start_ms` said to the run's activity (`holder_save`).
+fn saved(directory: []const u8, name: []const u8, start_ms: u64) void {
+    if (writeback) _ = writeback_start(directory, name);
+    activity.interval(.holder_save, start_ms, activity.now_ms(), .{});
+}
+
+fn writeback_start(directory: []const u8, name: []const u8) u32 {
+    var started: u32 = 0;
+    for ([_][]const u8{ "mem", "state", "hashes" }) |kind| {
+        var buffer: [4096]u8 = undefined;
+        const path = std.fmt.bufPrintSentinel(&buffer, "{s}/{s}.{s}", .{ directory, name, kind }, 0) catch continue;
+        const opened = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(opened) != .SUCCESS) continue;
+        const fd: linux.fd_t = @intCast(opened);
+        defer _ = linux.close(fd);
+        // SYNC_FILE_RANGE_WRITE alone: its pages queued for writing, never waited for.
+        const write_only: usize = 2;
+        const result = linux.syscall4(.sync_file_range, @as(usize, @intCast(fd)), 0, 0, write_only);
+        started += @intFromBool(linux.errno(result) == .SUCCESS);
+    }
+    return started;
+}
+
+test "a holder's saved files have their writeback started" {
+    var directory_buffer: [64]u8 = undefined;
+    const directory = std.fmt.bufPrint(&directory_buffer, "/tmp/determinismo-writeback-{d}", .{linux.getpid()}) catch unreachable;
+    var path_buffer: [128]u8 = undefined;
+    const directory_z = std.fmt.bufPrintSentinel(&path_buffer, "{s}", .{directory}, 0) catch unreachable;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mkdir(directory_z, 0o700)));
+    defer {
+        for ([_][]const u8{ "h1-2.mem", "h1-2.state" }) |file| {
+            var buffer: [128]u8 = undefined;
+            _ = linux.unlink(std.fmt.bufPrintSentinel(&buffer, "{s}/{s}", .{ directory, file }, 0) catch unreachable);
+        }
+        var buffer: [128]u8 = undefined;
+        _ = linux.rmdir(std.fmt.bufPrintSentinel(&buffer, "{s}", .{directory}, 0) catch unreachable);
+    }
+    // None saved: nothing to start.
+    try std.testing.expectEqual(@as(u32, 0), writeback_start(directory, "h1-2"));
+    for ([_][]const u8{ "h1-2.mem", "h1-2.state" }) |file| {
+        var buffer: [128]u8 = undefined;
+        const path = std.fmt.bufPrintSentinel(&buffer, "{s}/{s}", .{ directory, file }, 0) catch unreachable;
+        const opened = linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true }, 0o600);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(opened));
+        const fd: linux.fd_t = @intCast(opened);
+        defer _ = linux.close(fd);
+        const page: [4096]u8 = @splat(7);
+        try std.testing.expectEqual(@as(usize, page.len), linux.write(fd, &page, page.len));
+    }
+    try std.testing.expectEqual(@as(u32, 2), writeback_start(directory, "h1-2"));
+}
 
 /// Ends a holder set aside (Registry.set_aside) without writing it.
 pub fn end(held: Held) void {
