@@ -464,6 +464,12 @@ pub const Registry = struct {
     /// The run's Disk: a holder that left for memory wrote itself there first (Owner.leave_to_disk),
     /// where `take` finds it.
     disk: ?*const Disk = null,
+    /// Holders in memory stay past their generation's judgment (--holders-retain, an arm): a later
+    /// return to an older timeline takes one instead of replaying it from its start (calibration
+    /// run 2125: late judgments waited minutes on such replays, 105 GB available at its median).
+    /// Each still leaves for memory on its own (`leaves`, VMs and makers first); the oldest goes
+    /// when the registry is full.
+    retain: bool = false,
 
     /// A generation's (the largest, of per_timeline_max each).
     const entries_max = 256 * per_timeline_max;
@@ -484,6 +490,8 @@ pub const Registry = struct {
         going: bool = false,
         base_at: ?u32 = null,
         dependents: u32 = 0,
+        /// A holder in memory kept past its generation's judgment (Registry.retain).
+        retained: bool = false,
     };
 
     pub fn init(registry: *Registry, arena: std.mem.Allocator) !void {
@@ -507,7 +515,7 @@ pub const Registry = struct {
         var on_disk: u64 = 0;
         const first = registry.count;
         for (kept) |held| {
-            if (registry.count == entries_max) {
+            if (registry.count == entries_max and !registry.retained_evict()) {
                 if (!held.disk) kill(held.pid); // Never with generations of at most 256 timelines.
                 continue;
             }
@@ -530,6 +538,19 @@ pub const Registry = struct {
         if (on_disk == 0) return;
         registry.pending_bytes += on_disk;
         registry.kept_trim(); // The kept ones make room, the oldest first.
+    }
+
+    /// The oldest retained holder (Registry.retain) ended and its place freed, entries keeping their
+    /// order; false when none is retained.
+    fn retained_evict(registry: *Registry) bool {
+        const at = for (registry.entries[0..registry.count], 0..) |entry, index| {
+            if (entry.retained) break index;
+        } else return false;
+        const entry = registry.entries[at];
+        if (!entry.taken and entry.held.pid > 0) kill(entry.held.pid);
+        std.mem.copyForwards(Entry, registry.entries[at .. registry.count - 1], registry.entries[at + 1 .. registry.count]);
+        registry.count -= 1;
+        return true;
     }
 
     /// A holder's socket, where the snapshot comes back as from a node-making child, and its
@@ -619,6 +640,8 @@ pub const Registry = struct {
             // Judged: out of the pending bytes (kept ones counted again as kept, below).
             if (theirs) registry.pending_bytes -|= entry.bytes + entry.extra;
             if (!theirs) {
+                // A retained one a return took since: served, its place freed.
+                if (entry.retained and entry.taken) continue;
                 registry.entries[staying] = entry;
                 staying += 1;
             } else if (entry.held.disk or registry.left_to_disk(entry)) {
@@ -645,6 +668,12 @@ pub const Registry = struct {
                 registry.kept[registry.kept_count] = kept;
                 registry.kept_count += 1;
                 registry.kept_bytes += kept.bytes;
+            } else if (registry.retain and !entry.taken) {
+                // Kept past its judgment, in memory, for a later return (Registry.retain).
+                var kept = entry;
+                kept.retained = true;
+                registry.entries[staying] = kept;
+                staying += 1;
             } else {
                 if (!entry.taken) {
                     dying[dying_count] = entry.held.pid;
@@ -1936,6 +1965,41 @@ test "a judged generation's holders in memory are ended together, each gone and 
         try std.testing.expectEqual(linux.E.SRCH, linux.errno(linux.kill(pid, @fromBackingInt(@intCast(0)))));
     }
     try std.testing.expectEqual(@as(u64, 0), disk.bytes_of(2, 10));
+}
+
+test "retained, a judged generation's holder in memory stays for later returns; the oldest goes when full" {
+    var pids: [2]linux.pid_t = undefined;
+    for (&pids) |*pid| {
+        const forked = linux.fork();
+        if (forked == 0) {
+            while (true) _ = linux.nanosleep(&.{ .sec = 60, .nsec = 0 }, null);
+        }
+        pid.* = @intCast(forked);
+    }
+    defer for (pids) |pid| {
+        _ = linux.kill(pid, .KILL);
+        var status: i32 = 0;
+        _ = linux.wait4(pid, &status, 0, null);
+    };
+    var kept: [4]Registry.Entry = undefined;
+    var registry: Registry = .{ .explorer = 0, .kept = &kept, .retain = true };
+    registry.entries[0] = .{ .held = .{ .pid = pids[0], .worker = 0, .id = 0, .vtime_ns = 10, .disk = false }, .branch = 1, .taken = false };
+    registry.count = 1;
+    registry.release_listed(&.{1});
+    registry.trims_wait();
+    // Judged, still there: a later return to timeline 1 finds it, its process alive.
+    try std.testing.expectEqual(@as(u32, 1), registry.count);
+    try std.testing.expectEqual(@as(?u64, 10), registry.earliest(1));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.kill(pids[0], @fromBackingInt(@intCast(0)))));
+    // Full: the next timeline's holder takes the oldest retained one's place.
+    while (registry.count < Registry.entries_max) : (registry.count += 1) {
+        registry.entries[registry.count] = .{ .held = .{ .pid = 0, .worker = 0, .id = 0, .vtime_ns = 10, .disk = false }, .branch = 7, .taken = true };
+    }
+    registry.add(2, &.{.{ .pid = pids[1], .worker = 0, .id = 0, .vtime_ns = 20, .disk = false }});
+    try std.testing.expectEqual(@as(?u64, null), registry.earliest(1));
+    try std.testing.expectEqual(@as(?u64, 20), registry.earliest(2));
+    // Ended and reaped (kill waits for it): gone.
+    try std.testing.expectEqual(linux.E.SRCH, linux.errno(linux.kill(pids[0], @fromBackingInt(@intCast(0)))));
 }
 
 test "a timeline's dropped holders, left on disk as bases, count in the budget and go with its last kept one" {
