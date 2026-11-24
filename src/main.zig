@@ -158,7 +158,7 @@ const usage =
     \\                            then, in virtual time, ends as hung)
     \\                            [--timeline-limit-learned <multiple>]   (2: a tree's timeline
     \\                            stops, cut short and without a verdict, this many times the
-    \\                            longest normal end past its branch point, once 40 ended; 0: off)
+    \\                            normal ends' 99th percentile past the branch point, once 40 ended; 0: off)
     \\                            [--retroactive '<text>']...   (output lines with it are left out
     \\                            of the events; a replay of a timeline writes them)
     \\                            [--changed <diff file | git range>]   (a targeted run: the tree
@@ -548,7 +548,7 @@ const Arguments = struct {
     changed_repository: ?[]const u8 = null,
     /// A timeline's ceiling of virtual time: one that has not finished by then ends as hung.
     timeline_limit_ns: ?u64 = std.time.ns_per_hour,
-    /// The learned timeline limit's multiple of the longest normal end (timeline_limit.zig); 0:
+    /// The learned timeline limit's multiple of the normal ends' 99th percentile (timeline_limit.zig); 0:
     /// the explicit limit alone.
     timeline_limit_learned: u32 = (timeline_limit.Learner{}).multiple,
     /// Retroactive logging: output lines with these texts are left out of an exploration's
@@ -2822,11 +2822,15 @@ fn command_explore(
     try multiverse.learned_limit_judge(learned_stopped, learned_cuts, learned_cut_first);
     // What set it, beside its cuts: a slow but sound system told from a hang.
     if (timeline_learner.limit_ns()) |limit| say("[determinismo] learned timeline limit: {d:.1} s past a " ++
-        "branch point (twice timeline {?d}'s normal end, {d:.1} s past its own; {d} normal ends, {d} needed); " ++
-        "{d} of {d} timelines with it cut there\n", .{
-        @as(f64, @floatFromInt(limit)) / 1e9,                       timeline_learner.longest_index,
-        @as(f64, @floatFromInt(timeline_learner.longest_ns)) / 1e9, timeline_learner.ends,
-        timeline_learner.min_ends,                                  learned_cuts,
+        "branch point (twice {d:.1} s, its normal ends' 99th percentile; the longest, timeline {?d}'s, " ++
+        "{d:.1} s; {d} normal ends, {d} needed); {d} of {d} timelines with it cut there\n", .{
+        @as(f64, @floatFromInt(limit)) / 1e9,
+        @as(f64, @floatFromInt(timeline_learner.kept_longest_ns())) / 1e9,
+        timeline_learner.longest_index,
+        @as(f64, @floatFromInt(timeline_learner.longest_ns)) / 1e9,
+        timeline_learner.ends,
+        timeline_learner.min_ends,
+        learned_cuts,
         learned_stopped,
     });
     multiverse.summarize(monotonic_ns() - time_start_ns);

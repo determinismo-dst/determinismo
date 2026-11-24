@@ -1129,7 +1129,7 @@ const guidance_stuck_sql =
 
 /// The learned limit's property, as the explorer names it (report.learned_limit_property: a test
 /// in main.zig holds the two the same), and as a SQL string's text.
-pub const learned_limit_property = "timelines end within the run's learned limit (twice its longest normal end past a branch point)";
+pub const learned_limit_property = "timelines end within the run's learned limit (twice its normal ends' 99th percentile past a branch point)";
 const learned_limit_property_sql = sql_text(learned_limit_property);
 
 /// `text` inside a SQL string literal: each single quote doubled.
@@ -2041,7 +2041,7 @@ test "the learned limit's property: of the timelines that ran with its stop, tho
     defer connection.close();
     const Property = struct { status: []const u8, hit: u64, failing: u64, first: ?u32, first_ns: ?u64 };
     const learned_sql = "SELECT status, timelines_hit, timelines_failing, first_failing_timeline, " ++
-        "first_failure_ns FROM (" ++ properties_sql ++ ") WHERE message = 'timelines end within the run''s learned limit (twice its longest normal end past a branch point)'";
+        "first_failure_ns FROM (" ++ properties_sql ++ ") WHERE message = 'timelines end within the run''s learned limit (twice its normal ends'' 99th percentile past a branch point)'";
     // Timeline 1 ran before the run learned a limit (no stop of its own): no row yet.
     const timelines_path = try std.fs.path.join(arena, &.{ directory, "timelines.jsonl" });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = timelines_path, .data = timeline_line(1, 700, "[]") });

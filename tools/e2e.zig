@@ -7798,7 +7798,7 @@ fn check_learned_limit(context: *Context) !void {
     const property = "timelines replay to their recorded history";
     const failing = failing_in(report, property);
     // Never hidden: each cut fails the learned limit's own property.
-    const learned = failing_in(report, "timelines end within the run's learned limit (twice its longest normal end past a branch point)");
+    const learned = failing_in(report, "timelines end within the run's learned limit (twice its normal ends' 99th percentile past a branch point)");
     expect_all(context, &.{
         .{ "hanging timelines cut short at the learned limit, past their branch point", cut > 0 and cut_at_limit == cut },
         .{ "the ones before it learned held the explicit limit, hung", hung > 0 },

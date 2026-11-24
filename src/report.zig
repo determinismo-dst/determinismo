@@ -243,7 +243,7 @@ const logging_property = "logging output stays under 200 MB per hour of virtual 
 pub const replays_property = "timelines replay to their recorded history";
 /// The run's learned timeline limit (timeline_limit.zig) cuts a timeline short without a verdict:
 /// this says so, so a deadlock it cut is never hidden (a slow but sound timeline fails it too).
-pub const learned_limit_property = "timelines end within the run's learned limit (twice its longest normal end past a branch point)";
+pub const learned_limit_property = "timelines end within the run's learned limit (twice its normal ends' 99th percentile past a branch point)";
 const logging_bytes_per_hour_max = 200 * 1000 * 1000;
 
 /// Properties across all branches of an exploration.
