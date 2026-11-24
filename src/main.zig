@@ -158,7 +158,8 @@ const usage =
     \\                            then, in virtual time, ends as hung)
     \\                            [--timeline-limit-learned <multiple>]   (2: a tree's timeline
     \\                            stops, cut short and without a verdict, this many times the
-    \\                            normal ends' 99th percentile past the branch point, once 40 ended; 0: off)
+    \\                            normal ends' 99th percentile past the branch point, once 40 ended,
+    \\                            never under 5 minutes until 400 ended, 30 s after; 0: off)
     \\                            [--retroactive '<text>']...   (output lines with it are left out
     \\                            of the events; a replay of a timeline writes them)
     \\                            [--changed <diff file | git range>]   (a targeted run: the tree
@@ -2837,13 +2838,17 @@ fn command_explore(
     // What set it, beside its cuts: a slow but sound system told from a hang.
     if (timeline_learner.limit_ns()) |limit| say("[determinismo] learned timeline limit: {d:.1} s past a " ++
         "branch point (twice {d:.1} s, its normal ends' 99th percentile; the longest, timeline {?d}'s, " ++
-        "{d:.1} s; {d} normal ends, {d} needed); {d} of {d} timelines with it cut there\n", .{
+        "{d:.1} s; {d} normal ends, {d} needed; never under {d:.0} s until {d} of them, {d:.0} s after); " ++
+        "{d} of {d} timelines with it cut there\n", .{
         @as(f64, @floatFromInt(limit)) / 1e9,
         @as(f64, @floatFromInt(timeline_learner.kept_longest_ns())) / 1e9,
         timeline_learner.longest_index,
         @as(f64, @floatFromInt(timeline_learner.longest_ns)) / 1e9,
         timeline_learner.ends,
         timeline_learner.min_ends,
+        @as(f64, @floatFromInt(timeline_learner.floor_ns)) / 1e9,
+        timeline_learner.floor_ends,
+        @as(f64, @floatFromInt(timeline_learner.learned_floor_ns)) / 1e9,
         learned_cuts,
         learned_stopped,
     });

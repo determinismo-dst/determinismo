@@ -17,8 +17,12 @@
 //!   very slow end does not lift it for good (Turso's calibration run 2165: one normal end of
 //!   2,554 s set the limit near 5,100 s while the 99th percentile was 333 s, and 28 of 35
 //!   workers held hung timelines past 600 s an hour in). It follows the run's ends, up or down.
-//! - Off until `min_ends` normal ends (as claims learning waits for its 40), and never under
-//!   `floor_ns`: a run whose first timelines all end quickly keeps room for a slow one.
+//! - Off until `min_ends` normal ends (as claims learning waits for its 40), and under
+//!   `floor_ns` only past `floor_ends` of them: a run whose first timelines all end quickly
+//!   keeps room for a slow one, while one that has seen hundreds goes by them (Turso's
+//!   calibration run 2179: 1,683 normal ends, 99th percentile 76.8 s past the branch point, the
+//!   longest 143.8 s, while 63 hung timelines held the 5-minute floor, 85% of its core time).
+//!   Never under `learned_floor_ns` either way.
 
 const std = @import("std");
 
@@ -28,6 +32,9 @@ pub const Learner = struct {
     multiple: u32 = 2,
     min_ends: u32 = 40,
     floor_ns: u64 = 5 * std.time.ns_per_min,
+    /// Normal ends past which the run's own set the limit under `floor_ns`.
+    floor_ends: u32 = 400,
+    learned_floor_ns: u64 = 30 * std.time.ns_per_s,
     ends: u32 = 0,
     longest_ns: u64 = 0,
     /// The timeline whose normal end is the longest of all: said beside the limit, to tell a slow
@@ -67,7 +74,8 @@ pub const Learner = struct {
     /// How long a timeline may run past its branch point; null while there is nothing to go by.
     pub fn limit_ns(learner: *const Learner) ?u64 {
         if (learner.multiple == 0 or learner.ends < learner.min_ends) return null;
-        return @max(learner.floor_ns, learner.kept_longest_ns() *| learner.multiple);
+        const floor = if (learner.ends < learner.floor_ends) learner.floor_ns else learner.learned_floor_ns;
+        return @max(floor, learner.kept_longest_ns() *| learner.multiple);
     }
 
     fn bucket_of(length_ns: u64) usize {
@@ -125,4 +133,27 @@ test "one long normal end does not set the limit: the top hundredth is left out"
     try std.testing.expect(limit >= 2 * 333 * s);
     try std.testing.expect(limit < 2 * 400 * s);
     try std.testing.expectEqual(@as(?u32, 52_000), learner.longest_index); // Still said.
+}
+
+test "past floor_ends normal ends, the run's own ends set the limit under the floor" {
+    // Turso's calibration run 2179 (stress with an unreliable libc), 22 minutes in: 1,683 normal
+    // ends, median 2.2 s and 99th percentile 76.8 s past the branch point, the longest 143.8 s,
+    // while 63 hung timelines held the 5-minute floor each: 85% of the run's core time. Twice the
+    // 99th percentile, 154 s, cut no normal end of them.
+    var learner: Learner = .{};
+    const s = std.time.ns_per_s;
+    for (0..1660) |i| learner.note(.normal, @intCast(i), 2 * s);
+    for (1660..1683) |i| learner.note(.normal, @intCast(i), 76 * s);
+    learner.note(.normal, 9_000, 143 * s);
+    const limit = learner.limit_ns().?;
+    try std.testing.expect(limit >= 2 * 76 * s);
+    try std.testing.expect(limit < 2 * 90 * s);
+    // Before them, the floor's room: a run's first ends may all be its quick ones.
+    var early: Learner = .{};
+    for (0..100) |i| early.note(.normal, @intCast(i), 2 * s);
+    try std.testing.expectEqual(@as(?u64, 5 * std.time.ns_per_min), early.limit_ns());
+    // Past them, never under the learned floor: a run whose ends are all a second long.
+    var quick: Learner = .{};
+    for (0..500) |i| quick.note(.normal, @intCast(i), 1 * s);
+    try std.testing.expectEqual(@as(?u64, 30 * s), quick.limit_ns());
 }
