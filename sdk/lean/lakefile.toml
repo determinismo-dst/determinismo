@@ -1,0 +1,13 @@
+name = "determinismo"
+version = "0.1.0"
+defaultTargets = ["Determinismo", "DeterminismoTests", "determinismo-lean-tests"]
+
+[[lean_lib]]
+name = "Determinismo"
+
+[[lean_lib]]
+name = "DeterminismoTests"
+
+[[lean_exe]]
+name = "determinismo-lean-tests"
+root = "DeterminismoTests.Main"
