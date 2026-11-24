@@ -58,6 +58,7 @@ pub const Verifier = struct {
         argv: []const [:0]const u8,
         record: []const u8,
         tapes: []const u8,
+        events: ?[]const u8,
         percent: u32,
         jobs: u32,
         held: []const linux.fd_t,
@@ -66,9 +67,9 @@ pub const Verifier = struct {
         const results_path = try std.fmt.allocPrint(arena, "{s}.replays", .{record});
         std.Io.Dir.cwd().deleteFile(io, results_path) catch {};
         const replayer: Replayer = .{
-            .base = try system_pinned(arena, io, try program_kept(arena, io, try replay_argv(arena, argv, cpus.run_key orelse linux.getpid()), tapes), argv),
+            .base = try system_pinned(arena, io, try program_kept(arena, io, try replay_argv(arena, argv, cpus.run_key orelse linux.getpid()), tapes), argv, events),
             .tapes = tapes,
-            .events = flag_value(argv, "--events-dir"),
+            .events = events,
             .from_snapshot = flag_value(argv, "--from-snapshot") != null,
         };
         const explorer = linux.getpid();
@@ -275,10 +276,11 @@ fn program_kept(
 /// The system as the run booted it, for the replays: its pin beside the run's events (main.zig,
 /// prepare.zig's), unless the run named one. Rebuilt instead, an image whose build is not
 /// reproducible is another system, other inputs, and its replays refused their tapes
-/// (run 1209: TapeInputsDiffer in three of three).
-fn system_pinned(arena: std.mem.Allocator, io: std.Io, base: []const []const u8, argv: []const [:0]const u8) ![]const []const u8 {
+/// (run 1209: TapeInputsDiffer in three of three); and each replay asks podman for every node's
+/// image, behind its lock. `events`: the run's events directory, as the explorer resolved it.
+fn system_pinned(arena: std.mem.Allocator, io: std.Io, base: []const []const u8, argv: []const [:0]const u8, events_directory: ?[]const u8) ![]const []const u8 {
     if (flag_value(argv, "--system") != null) return base;
-    const events = flag_value(argv, "--events-dir") orelse return base;
+    const events = events_directory orelse return base;
     const pin = try std.fs.path.join(arena, &.{ events, "system.pin.json" });
     std.Io.Dir.cwd().access(io, pin, .{}) catch return base;
     return std.mem.concat(arena, []const u8, &.{ base, &.{ "--system", pin } });
@@ -297,7 +299,8 @@ fn finish_requested(_: linux.SIG) callconv(.c) void {
 }
 
 /// What a replay needs: the explorer's arguments for it, the run's tapes, and the run's events
-/// (`--events-dir`), to place where a replay parts from them.
+/// directory (the explorer's own: `--events-dir`, or its run directory's, as serve starts a run
+/// and a command line registers one), to boot its pinned system and place where a replay parts.
 const Replayer = struct {
     base: []const []const u8,
     tapes: []const u8,
@@ -831,13 +834,24 @@ test system_pinned {
     const base = [_][]const u8{ "/proc/self/exe", "explore", "--program", "p" };
     const argv = [_][:0]const u8{ "determinismo", "explore", "--program", "p", "--events-dir", events_z };
     // No pin beside the events: the replays build the system as the run did.
-    try std.testing.expectEqual(base.len, (try system_pinned(arena.allocator(), io, &base, &argv)).len);
+    try std.testing.expectEqual(base.len, (try system_pinned(arena.allocator(), io, &base, &argv, events)).len);
     try tmp.dir.writeFile(io, .{ .sub_path = "system.pin.json", .data = "{}" });
-    const pinned = try system_pinned(arena.allocator(), io, &base, &argv);
+    const pinned = try system_pinned(arena.allocator(), io, &base, &argv, events);
     try std.testing.expectEqual(base.len + 2, pinned.len);
     try std.testing.expectEqualStrings("--system", pinned[base.len]);
     try std.testing.expect(std.mem.endsWith(u8, pinned[base.len + 1], "/system.pin.json"));
+    // A run serve started (--run-directory) or one a command line registered names no events
+    // directory: the explorer's own (its run directory's events) finds the pin all the same.
+    // The verifier looked in its arguments alone, and every replay of such a run prepared its
+    // system again, asking podman for each node's image (one waited behind podman's lock in a
+    // whole disk's sync, 2026-11-18; line 24's replays had no --system, 2026-11-24).
+    const unnamed = [_][:0]const u8{ "determinismo", "explore", "--program", "p", "--run-directory", "r" };
+    const from_run = try system_pinned(arena.allocator(), io, &base, &unnamed, events);
+    try std.testing.expectEqual(base.len + 2, from_run.len);
+    try std.testing.expectEqualStrings("--system", from_run[base.len]);
     // A run that named its system: kept as it is (replay_argv keeps the flag).
     const named = [_][:0]const u8{ "determinismo", "explore", "--system", "s.pin.json", "--events-dir", events_z };
-    try std.testing.expectEqual(base.len, (try system_pinned(arena.allocator(), io, &base, &named)).len);
+    try std.testing.expectEqual(base.len, (try system_pinned(arena.allocator(), io, &base, &named, events)).len);
+    // No events directory at all: as before, the replays build the system.
+    try std.testing.expectEqual(base.len, (try system_pinned(arena.allocator(), io, &base, &unnamed, null)).len);
 }
