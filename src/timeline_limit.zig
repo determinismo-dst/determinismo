@@ -14,13 +14,13 @@
 //! - Measured from the branch point: a branch made late in a timeline has as long as one made
 //!   at the setup.
 //! - Twice the longest normal end after the top hundredth of them is left out: one sound but
-//!   very slow end does not lift it for good (Turso's calibration run 2165: one normal end of
+//!   very slow end does not lift it for good (calibration run 2165: one normal end of
 //!   2,554 s set the limit near 5,100 s while the 99th percentile was 333 s, and 28 of 35
 //!   workers held hung timelines past 600 s an hour in). It follows the run's ends, up or down.
 //! - Off until `min_ends` normal ends (as claims learning waits for its 40), and under
 //!   `floor_ns` only past `floor_ends` of them: a run whose first timelines all end quickly
-//!   keeps room for a slow one, while one that has seen hundreds goes by them (Turso's
-//!   calibration run 2179: 1,683 normal ends, 99th percentile 76.8 s past the branch point, the
+//!   keeps room for a slow one, while one that has seen hundreds goes by them (calibration
+//!   run 2179: 1,683 normal ends, 99th percentile 76.8 s past the branch point, the
 //!   longest 143.8 s, while 63 hung timelines held the 5-minute floor, 85% of its core time).
 //!   Never under `learned_floor_ns` either way.
 
@@ -121,7 +121,7 @@ test "a learned limit: from normal ends only, from the branch point, following t
 }
 
 test "one long normal end does not set the limit: the top hundredth is left out" {
-    // Turso's calibration run 2165: 11,387 normal ends, median 8 s and 99th percentile 333 s, but
+    // Calibration run 2165: 11,387 normal ends, median 8 s and 99th percentile 333 s, but
     // one of 2,554 s (timeline 52) set the limit near 5,100 s, and 28 of 35 workers held hung
     // timelines past 600 s an hour in.
     var learner: Learner = .{};
@@ -136,7 +136,7 @@ test "one long normal end does not set the limit: the top hundredth is left out"
 }
 
 test "past floor_ends normal ends, the run's own ends set the limit under the floor" {
-    // Turso's calibration run 2179 (stress with an unreliable libc), 22 minutes in: 1,683 normal
+    // a calibration run (2179, its I/O through an unreliable libc), 22 minutes in: 1,683 normal
     // ends, median 2.2 s and 99th percentile 76.8 s past the branch point, the longest 143.8 s,
     // while 63 hung timelines held the 5-minute floor each: 85% of the run's core time. Twice the
     // 99th percentile, 154 s, cut no normal end of them.
