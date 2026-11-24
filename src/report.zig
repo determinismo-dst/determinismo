@@ -320,6 +320,9 @@ pub const Multiverse = struct {
         /// Where it was to stop (virtual time), its horizon (Planned.horizon_ns): a replay of it
         /// stops there too (replays.zig), or it runs on past where the timeline was cut.
         horizon_ns: ?u64 = null,
+        /// It ran with the run's learned limit as its stop (main.zig's learned_stop): what the
+        /// learned limit's property counts, serve's too (store.zig), from the record.
+        learned_stop: bool = false,
         /// How long its CPU waited for the host's memory before it started, and for the CPU
         /// (cpus.Held).
         memory_wait_ns: u64 = 0,
@@ -444,6 +447,7 @@ pub const Multiverse = struct {
             .generation = branch.generation,
             .why = branch.why,
             .horizon_ns = branch.horizon_ns,
+            .learned_stop = branch.learned_stop,
             // What judges logging volume (logging_judge), for serve's properties too.
             .output_bytes = vm.events.output_bytes,
             .output_span_ns = vm.events.output_span_ns(state.tsc / tsc_per_ns),

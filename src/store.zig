@@ -31,7 +31,7 @@ pub const duckdb = @import("duckdb.zig");
 
 pub const file_name = "events.duckdb";
 /// The tables' shape: a database of another version is rebuilt from the files.
-const schema_version = 12;
+const schema_version = 13;
 
 /// Paths of the events' JSON that searches read most (the UI's): kept as columns, their text
 /// (`->>`) and their JSON type, which a condition reads instead of parsing every event
@@ -231,6 +231,16 @@ fn tables_ensure(connection: *duckdb.Connection, arena: std.mem.Allocator) !void
             \\UPDATE schema_version SET version = 9;
         );
     };
+    // Version 12 lacks whether a timeline ran with the run's learned limit as its stop (the
+    // learned limit's property, until then the explorer's alone): the column added in place,
+    // null for every timeline from before (their runs list no such property, as before).
+    if (known) |found| if (found.version >= 3 and found.version <= 12) {
+        try connection.exec("ALTER TABLE timelines ADD COLUMN IF NOT EXISTS learned_stop BOOLEAN");
+        if (found.version == 12) {
+            try connection.exec("UPDATE schema_version SET version = 13");
+            return;
+        }
+    };
     // Version 9 lacks the summaries (what a run's pages read, made as timelines are ingested:
     // summaries_tables_sql): the tables made and filled in place from its events, once, when
     // the database is next opened. 70 s for the largest (flecs's stress run 969: 15 GB, 245
@@ -242,7 +252,7 @@ fn tables_ensure(connection: *duckdb.Connection, arena: std.mem.Allocator) !void
         try connection.exec("DROP TABLE IF EXISTS draws;\n" ++ draws_table_sql);
         try connection.exec(views_sql);
         try summaries_fill(connection, arena, .{ .events = "TRUE", .timelines = "TRUE" }, true);
-        try connection.exec("UPDATE schema_version SET version = 12");
+        try connection.exec("UPDATE schema_version SET version = 13");
         return;
     };
     // Version 10 has the summaries but the faults' (the map's marks of them): made in place
@@ -256,7 +266,7 @@ fn tables_ensure(connection: *duckdb.Connection, arena: std.mem.Allocator) !void
     // for the timelines before it (nothing noted their draws), filled as later ones arrive.
     if (known) |found| if (found.version >= 10 and found.version <= 11) {
         try connection.exec("DROP VIEW IF EXISTS timeline_draws; DROP TABLE IF EXISTS draws;\n" ++ draws_table_sql);
-        try connection.exec("UPDATE schema_version SET version = 12");
+        try connection.exec("UPDATE schema_version SET version = 13");
         return;
     };
     // Another version (or none): rebuilt, then ingested again from the files.
@@ -333,7 +343,8 @@ const schema_sql =
     \\    path JSON,
     \\    output_bytes UBIGINT,
     \\    output_span_ns UBIGINT,
-    \\    extends UINTEGER
+    \\    extends UINTEGER,
+    \\    learned_stop BOOLEAN
     \\);
     \\CREATE TABLE steps (
     \\    branch UINTEGER, step UINTEGER, ancestor UINTEGER, from_ns UBIGINT, to_ns UBIGINT
@@ -840,7 +851,7 @@ pub fn ingest(
         \\    wall_ns: 'UBIGINT', events: 'UBIGINT', events_hash: 'VARCHAR', generation: 'UINTEGER',
         \\    why: 'VARCHAR', path: 'STRUCT(branch UINTEGER, seed UBIGINT, vtime_ns UBIGINT)[]',
         \\    output_bytes: 'UBIGINT', output_span_ns: 'UBIGINT',
-        \\    extends: 'STRUCT(branch UINTEGER, vtime_ns UBIGINT)'}})
+        \\    extends: 'STRUCT(branch UINTEGER, vtime_ns UBIGINT)', learned_stop: 'BOOLEAN'}})
     , .{timelines});
     // Timelines ingested under schema 3 lack their output (the logging property's): taken from
     // the file, once, so runs from before the property show it too.
@@ -995,7 +1006,7 @@ fn ingest_batch(
         \\        any_value(events), any_value(events_hash), any_value(generation), any_value(why),
         \\        any_value(path[-1].branch), coalesce(any_value(path[-1].vtime_ns), 0),
         \\        any_value(path)::JSON, any_value(output_bytes), any_value(output_span_ns),
-        \\        any_value(extends.branch)
+        \\        any_value(extends.branch), any_value(learned_stop)
         \\    FROM {s} WHERE "index" IN ({s}) GROUP BY "index";
     , .{ timelines_read, indices.written(), timelines_read, indices.written() }, 0));
     // What the run's pages read of these timelines, made once here (summaries_tables_sql): after
@@ -1116,6 +1127,20 @@ const guidance_stuck_sql =
     \\
 ;
 
+/// The learned limit's property, as the explorer names it (report.learned_limit_property: a test
+/// in main.zig holds the two the same), and as a SQL string's text.
+pub const learned_limit_property = "timelines end within the run's learned limit (twice its longest normal end past a branch point)";
+const learned_limit_property_sql = sql_text(learned_limit_property);
+
+/// `text` inside a SQL string literal: each single quote doubled.
+fn sql_text(comptime text: []const u8) []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (text) |c| out = out ++ (if (c == '\'') "''" else &[_]u8{c});
+        return out;
+    }
+}
+
 pub const properties_sql =
     \\WITH RECURSIVE per AS (
     \\    -- Each timeline's verdicts, made once at its ingest (summaries_fill), never from its
@@ -1197,6 +1222,23 @@ pub const properties_sql =
     \\    count(*), count(*), 0, NULL, NULL, min(branch), count(*), count(*), 'report.zig', NULL, NULL,
     \\    NULL, NULL
     \\FROM explored HAVING count(output_span_ns) > 0
+    \\UNION ALL
+    \\-- The run's learned timeline limit (timeline_limit.zig, report.learned_limit_judge): of the
+    \\-- timelines that ran with it as their stop, those cut there (moment_reached) fail it, the
+    \\-- cut's moment the failure's. Until 2026-11-24 the explorer's report alone said it (run
+    \\-- 2165's 138 cuts, absent from its properties here).
+    \\SELECT 'always', '
+++ learned_limit_property_sql ++
+    \\',
+    \\    CASE WHEN count(*) FILTER (WHERE outcome = 'moment_reached') > 0 THEN 'failing'
+    \\        ELSE 'passing' END,
+    \\    count(*), count(*) FILTER (WHERE outcome <> 'moment_reached'),
+    \\    count(*) FILTER (WHERE outcome = 'moment_reached'),
+    \\    min(branch) FILTER (WHERE outcome = 'moment_reached'),
+    \\    arg_min(vtime_ns, branch) FILTER (WHERE outcome = 'moment_reached'), min(branch), count(*),
+    \\    count(*) FILTER (WHERE outcome <> 'moment_reached'), 'timeline_limit.zig', NULL, NULL,
+    \\    NULL, NULL
+    \\FROM explored WHERE learned_stop HAVING count(*) > 0
     \\UNION ALL
     \\-- Guidance that cannot be guiding (docs/ANTITHESIS_EXPLORATION.md, F; Antithesis's Tetris,
     \\-- six years capped by a misread line count): a guidance assertion's distance, or an
@@ -1980,6 +2022,81 @@ test "a run without a timeline shows its setup's events as timeline 0 (setup mod
     , .{});
     try testing.expectEqual(2, seen.len);
     try testing.expectEqual(Event{ .timeline = 0, .seq = 2 }, seen[1]);
+}
+
+test "the learned limit's property: of the timelines that ran with its stop, those cut there fail it" {
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/events", .{&tmp.sub_path});
+    try fixture_write(io, directory);
+    var failure: duckdb.Failure = .{};
+    var database = try duckdb.Database.open(":memory:", .{ .threads = 1 }, &failure);
+    defer database.close();
+    const store = try Store.attach(&database, arena, directory, "run_1", &failure);
+    var connection = try store.connect(&database, arena, &failure);
+    defer connection.close();
+    const Property = struct { status: []const u8, hit: u64, failing: u64, first: ?u32, first_ns: ?u64 };
+    const learned_sql = "SELECT status, timelines_hit, timelines_failing, first_failing_timeline, " ++
+        "first_failure_ns FROM (" ++ properties_sql ++ ") WHERE message = 'timelines end within the run''s learned limit (twice its longest normal end past a branch point)'";
+    // Timeline 1 ran before the run learned a limit (no stop of its own): no row yet.
+    const timelines_path = try std.fs.path.join(arena, &.{ directory, "timelines.jsonl" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = timelines_path, .data = timeline_line(1, 700, "[]") });
+    try testing.expectEqual(1, try ingest(&connection, arena, io, directory));
+    try testing.expectEqual(0, (try connection.rows(Property, arena, learned_sql, .{})).len);
+    // Timeline 2 ran with the learned stop and was cut there, timeline 3 with it and ended
+    // before it: the property fails in 2, its moment the cut's.
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = timelines_path, .data = comptime timeline_line(1, 700, "[]") ++
+        "{\"index\":2,\"outcome\":\"moment_reached\",\"vtime_ns\":470,\"wall_ns\":10,\"path\":[],\"learned_stop\":true}\n" ++
+        "{\"index\":3,\"outcome\":\"shutdown\",\"vtime_ns\":580,\"wall_ns\":10,\"path\":" ++ fixture_path ++ ",\"learned_stop\":true}\n" });
+    try testing.expectEqual(2, try ingest(&connection, arena, io, directory));
+    const judged = try connection.rows(Property, arena, learned_sql, .{});
+    try testing.expectEqual(1, judged.len);
+    try testing.expectEqualStrings("failing", judged[0].status);
+    try testing.expectEqual(2, judged[0].hit);
+    try testing.expectEqual(1, judged[0].failing);
+    try testing.expectEqual(2, judged[0].first.?);
+    try testing.expectEqual(470, judged[0].first_ns.?);
+}
+
+test "a version 12 database gains learned_stop in place, its timelines from before without it" {
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/events", .{&tmp.sub_path});
+    try fixture_write(io, directory);
+    var failure: duckdb.Failure = .{};
+    var database = try duckdb.Database.open(":memory:", .{ .threads = 1 }, &failure);
+    defer database.close();
+    var connection = try database.connect(&failure);
+    defer connection.close();
+    try schema_ensure(&connection, arena);
+    // As version 12 left it: a timeline, no learned_stop.
+    try connection.exec(
+        \\ALTER TABLE timelines DROP COLUMN learned_stop;
+        \\UPDATE schema_version SET version = 12;
+        \\INSERT INTO timelines (branch, outcome) VALUES (7, 'moment_reached');
+    );
+    try schema_ensure(&connection, arena);
+    const Kept = struct { branch: u32, version: u32, learned_stop: ?bool };
+    const kept = (try connection.row(Kept, arena,
+        \\SELECT branch, (SELECT version FROM schema_version), learned_stop FROM timelines
+    , .{})).?;
+    try testing.expectEqual(Kept{ .branch = 7, .version = schema_version, .learned_stop = null }, kept);
+    // Its columns in the order an ingest inserts them: a new timeline's learned_stop lands there.
+    const timelines_path = try std.fs.path.join(arena, &.{ directory, "timelines.jsonl" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = timelines_path, .data = "{\"index\":1,\"outcome\":\"moment_reached\"," ++
+        "\"vtime_ns\":700,\"wall_ns\":10,\"path\":[],\"learned_stop\":true}\n" });
+    try testing.expectEqual(1, try ingest(&connection, arena, io, directory));
+    const Stop = struct { learned_stop: ?bool };
+    const stop = (try connection.row(Stop, arena, "SELECT learned_stop FROM timelines WHERE branch = 1", .{})).?;
+    try testing.expectEqual(true, stop.learned_stop.?);
 }
 
 test "a version 3 database gains the timelines' output in place, filled by the next ingest" {

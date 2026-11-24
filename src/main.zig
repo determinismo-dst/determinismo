@@ -3676,6 +3676,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
             .extends = if (exploration.extend) |extend| extend.extends else null,
             .generation = place.generation,
             .horizon_ns = stop_ns,
+            .learned_stop = stop_learned,
             .why = if (exploration.extend) |extend| try std.fmt.allocPrint(context.arena, "A session's: timeline {d} up to {d:.3} s, its own from there (its steps, what came from outside).", .{
                 extend.extends.branch, @as(f64, @floatFromInt(extend.extends.vtime_ns)) / 1e9,
             }) else place.why,
@@ -4890,6 +4891,7 @@ var timeline_admission: ?*u64 = null;
 var timeline_learner: timeline_limit.Learner = .{};
 /// The learned limit's property (report.learned_limit_property), counted by the explorer as
 /// summaries arrive: timelines that ran with a learned stop, those cut there, the first of them.
+/// serve's store judges it the same from the record (each line's learned_stop).
 var learned_stopped: u32 = 0;
 var learned_cuts: u32 = 0;
 var learned_cut_first: ?u32 = null;
@@ -9550,6 +9552,10 @@ test {
     _ = @import("core").replay_snapshots;
     _ = @import("bundle.zig");
     _ = @import("timeline_limit.zig");
+}
+
+test "serve's store names the learned limit's property as the explorer does" {
+    try std.testing.expectEqualStrings(report.learned_limit_property, @import("store.zig").learned_limit_property);
 }
 
 test "a judged generation's plan starts before the filler, whenever it is judged" {
