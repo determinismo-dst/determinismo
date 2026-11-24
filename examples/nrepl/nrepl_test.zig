@@ -19,6 +19,12 @@
 //!   output is its own                what an evaluation prints comes back to it, nothing else
 //!   interrupts land                  an interrupted long evaluation ends interrupted (or done)
 //!   the server recovers              after faults, a new session evaluates again
+//!   a connection serves on after a value fails to print
+//!                                    after faults, a value whose printing throws is answered as
+//!                                    an error and the connection answers its next request
+//!   an evaluation in a namespace that does not exist is refused
+//!                                    after faults, an eval naming a missing `ns` gets no value
+//!                                    (nREPL: the namespace "must exist already")
 //!
 //! And proof (github.com/nrepl/proof, Dockerfile.proof), nREPL's compatibility suite, run from a
 //! node of its own: whole once on the fresh server in the setup (its verdicts the baseline), by
@@ -573,6 +579,53 @@ fn recovers(context: *System.Context) !void {
         sdk.assert_unreachable("the server never evaluates again", .{ .err = @errorName(err) });
         return err;
     };
+    // With the faults over and the server evaluating, a request that gets no reply is the
+    // server's doing, not the network's.
+    try print_error_serves_on(context.nodes.nrepl.address);
+    try missing_namespace_refused(context.nodes.nrepl.address);
+}
+
+/// A value whose printing throws (a lazy sequence realized as the server prints it) is answered
+/// as an error, and the same connection then answers its next request.
+fn print_error_serves_on(address: [4]u8) !void {
+    var client = Client.init();
+    client.timeout_ms = 30_000;
+    try client.open(address, port);
+    defer client.close();
+    const form = "(map (fn [_] (throw (ex-info \"print\" {}))) [1])";
+    const failed = client.eval(form) catch |err| {
+        sdk.always(false, "a connection serves on after a value fails to print", .{ .err = @errorName(err), .request = "the failing value" });
+        return;
+    };
+    sdk.always(failed.value == null and (failed.eval_error or failed.err.len > 0 or failed.ex != null), "errors are answered", .{
+        .form = form,
+        .value = failed.value orelse "",
+    });
+    const next = client.eval("(+ 1 1)") catch |err| {
+        sdk.always(false, "a connection serves on after a value fails to print", .{ .err = @errorName(err), .request = "the next" });
+        return;
+    };
+    sdk.always(std.mem.eql(u8, next.value orelse "", "2"), "a connection serves on after a value fails to print", .{
+        .err = "",
+        .request = next.value orelse "",
+    });
+}
+
+/// An evaluation naming a namespace that does not exist is refused, not run in another (nREPL's
+/// eval: the supplied namespace must exist already; the reference server answers
+/// namespace-not-found).
+fn missing_namespace_refused(address: [4]u8) !void {
+    var client = Client.init();
+    try client.open(address, port);
+    defer client.close();
+    var ns_buffer: [48]u8 = undefined;
+    const ns = try std.fmt.bufPrint(&ns_buffer, "determinismo-missing-{d}", .{sdk.random_below(1 << 30)});
+    const reply = try client.call(&.{ .{ "op", "eval" }, .{ "code", "(str *ns*)" }, .{ "ns", ns } });
+    sdk.always(reply.done, "requests finish", .{});
+    sdk.always(reply.value == null, "an evaluation in a namespace that does not exist is refused", .{
+        .ns = ns,
+        .value = reply.value orelse "",
+    });
 }
 
 fn evaluates(address: [4]u8) !void {
