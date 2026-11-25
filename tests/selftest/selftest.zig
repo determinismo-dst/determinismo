@@ -164,6 +164,7 @@ pub fn main(init: std.process.Init) !void {
             .ending = ending_scenario,
             .ending_signal = ending_signal_scenario,
             .ending_fail = ending_fail_scenario,
+            .own_sigkill = own_sigkill_scenario,
             .sinks = sinks_scenario,
             .aim = aim_scenario,
             .slow = slow_scenario,
@@ -746,6 +747,36 @@ fn fails(_: *System.Context) !void {
 
 fn ending_fail_eventually(_: *System.Context) !void {
     sdk.reachable("an eventually command ran after failing drivers", .{});
+}
+
+/// A start that died of SIGKILL on its own (the OOM killer's signal, a kill from outside) is
+/// judged by its status, though no minimum drive reaped it before the eventually command's kill:
+/// reaped there, it was reported killed by the composer and never judged (CE2's remainder, the
+/// Lean replica of determinismo). Half the timelines have their first start kill itself at once,
+/// long before the ending; the others sleep until the ending kills them.
+fn own_sigkill_scenario(s: *System.Scenario) void {
+    s.parallel_driver("oom", oom_driver);
+    s.eventually("after_oom", own_sigkill_eventually);
+}
+
+const oom_first_path = "/tmp/det-selftest-oom-first";
+
+fn oom_driver(_: *System.Context) !void {
+    const flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true };
+    const first = linux.open(oom_first_path, flags, 0o644);
+    if (linux.errno(first) == .SUCCESS) {
+        _ = linux.close(@intCast(first));
+        if (sdk.random_below(2) == 0) {
+            sdk.event("killed_self", .{});
+            _ = linux.kill(linux.getpid(), .KILL);
+        }
+    }
+    const long = linux.timespec{ .sec = 30, .nsec = 0 };
+    _ = linux.nanosleep(&long, null);
+}
+
+fn own_sigkill_eventually(_: *System.Context) !void {
+    sdk.reachable("an eventually command ran after a start killed itself", .{});
 }
 
 fn clock_jitter_scenario(s: *System.Scenario) void {

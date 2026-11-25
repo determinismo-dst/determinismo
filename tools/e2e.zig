@@ -254,7 +254,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "swarm", check_swarm },                             .{ "metastable", check_metastable },                 .{ "file_error", check_file_error },
         .{ "retroactive", check_retroactive },                 .{ "epoch", check_epoch },                           .{ "drive", check_drive },
         .{ "hang", check_hang },                               .{ "pinned", check_pinned },                         .{ "slow", check_slow }, .{ "slot-wait", check_slot_wait },
-        .{ "ending-window", check_ending_window },             .{ "ending-killed", check_ending_killed },           .{ "sought", check_sought },
+        .{ "ending-window", check_ending_window },             .{ "ending-killed", check_ending_killed }, .{ "own-sigkill", check_own_sigkill },           .{ "sought", check_sought },
         .{ "optimize", check_optimize },                       .{ "states", check_states },                         .{ "crash-points", check_crash_points },
         .{ "nodes-down", check_nodes_down },                   .{ "stale-pid", check_stale_pid },                   .{ "memory-growth", check_memory_growth },
         .{ "upgrade", check_upgrade },                         .{ "knobs", check_knobs },                           .{ "quorum", check_quorum },
@@ -9129,6 +9129,32 @@ fn check_slot_wait(context: *Context) !void {
         .{ "drivers stopped starting in some", stopped > 0 },
         .{ "no driver started past the stop", late == 0 },
     }, "slot-wait: {d} starts of the holder, {d} timelines stopped starting, {d} starts past the stop", .{ held, stopped, late });
+}
+
+/// A start that died of its own SIGKILL is judged by its status (137), never reported as the
+/// composer's kill, though with no minimum drive nothing reaped it before the eventually command
+/// killed the rest (CE2's remainder, the Lean replica of determinismo): own_sigkill's first start
+/// kills itself in half the timelines, the other starts sleep until the ending kills them.
+fn check_own_sigkill(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "det-selftest" });
+    const events = try std.fmt.allocPrint(arena, "{s}/own-sigkill", .{context.scratch});
+    _ = try explore(context, &.{
+        "--program",    program, "--scenario",  "own_sigkill", "--seed",      "1",    "--branches", "16",
+        "--events-dir", events,  "--min-drive", "0",           "--drive-max", "none", "--no-swarm",
+    });
+    try events_plain(context, events);
+    const script = try std.fmt.allocPrint(arena,
+        \\cd {s}; cat branch-*.jsonl | grep -c killed_self; cat branch-*.jsonl | grep -c '"command":"oom","status":137'
+    , .{events});
+    const counted = try run_kept(context, &.{ "sh", "-c", script });
+    var words = std.mem.tokenizeAny(u8, counted.stdout, " \n");
+    const killed_self = std.fmt.parseInt(u32, words.next() orelse "0", 10) catch 0;
+    const judged = std.fmt.parseInt(u32, words.next() orelse "0", 10) catch 0;
+    expect_all(context, &.{
+        .{ "timelines whose first start killed itself", killed_self > 0 },
+        .{ "every start that killed itself judged by its status (137)", judged == killed_self },
+    }, "own-sigkill: {d} starts killed themselves, {d} judged by their status", .{ killed_self, judged });
 }
 
 /// Who killed a command decides its verdict (the blind Lean replica of the platform's CE1 and
