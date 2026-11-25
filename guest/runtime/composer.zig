@@ -485,8 +485,11 @@ pub fn main(init: std.process.Init) !void {
     const self_driven = drivers + singletons + composer.kind_count(.anytime) == 0;
     if (self_driven and (composer.node == null or composer.program != null)) return error.NoDriverCommands;
 
-    sdk.event("composer_start", .{ .commands = composer.command_count });
+    // The wall clock's start drawn and applied first: a session opened at composer_start (a
+    // person's REPL, a check's moment) sees its clock leap before its first step, never after
+    // it. No new draw, the draws' order as before.
     clock_start_draw();
+    sdk.event("composer_start", .{ .commands = composer.command_count });
     drivers_cpu_draw();
     if (script_read(arena)) |script| {
         run_script(&composer, &script);

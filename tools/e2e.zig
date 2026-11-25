@@ -8840,6 +8840,8 @@ fn check_clock_start(context: *Context) !void {
     const arena = context.arena;
     const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
     var reads: [2][3]?u64 = .{ .{ null, null, null }, .{ null, null, null } };
+    // The first timeline's wall clock at composer_start (a session's usual moment), each round.
+    var at_start: [2]?u64 = .{ null, null };
     for ([_][]const u8{ "", "0" }, 0..) |max, round| {
         const tapes = try std.fmt.allocPrint(arena, "{s}/clock-start-tapes-{d}", .{ context.scratch, round });
         var arguments: std.ArrayList([]const u8) = .empty;
@@ -8859,6 +8861,11 @@ fn check_clock_start(context: *Context) !void {
             if (max.len > 0) try at.appendSlice(arena, &.{ "--clock-start-max", max });
             reads[round][look] = try wall_seconds(arena, try explore(context, at.items));
         }
+        const first = try std.fmt.allocPrint(arena, "{s}/branch-{d}.jsonl", .{ tapes, recorded[0].index });
+        var at: std.ArrayList([]const u8) = .empty;
+        try at.appendSlice(arena, &.{ "--program", program, "--scenario", "bank", "--timeline", "30s", "--tape", first, "--until", "event=composer_start", "--exec", "date +%s" });
+        if (max.len > 0) try at.appendSlice(arena, &.{ "--clock-start-max", max });
+        at_start[round] = try wall_seconds(arena, try explore(context, at.items));
     }
     const drawn = reads[0];
     const off = reads[1];
@@ -8873,7 +8880,10 @@ fn check_clock_start(context: *Context) !void {
         .{ "a timeline's replay reads its own start again", drawn[0] != null and drawn[0] == drawn[2] },
         .{ "each start a second to 30 minutes past the guest's own", within },
         .{ "with --clock-start-max 0 the timelines read alike", off[0] != null and off[0] == off[1] },
-    }, "clock-start: timelines read {?d} and {?d} (again {?d}); without a start {?d} and {?d}", .{ drawn[0], drawn[1], drawn[2], off[0], off[1] });
+        // A session opened at composer_start never sees its clock leap after its first step:
+        // the start is applied before the event (jank's REPL check, 89349fc's batch).
+        .{ "at composer_start the clock already reads its drawn start", at_start[0] != null and at_start[1] != null and at_start[0].? >= at_start[1].? + 1 },
+    }, "clock-start: timelines read {?d} and {?d} (again {?d}); without a start {?d} and {?d}; at composer_start {?d} (without {?d})", .{ drawn[0], drawn[1], drawn[2], off[0], off[1], at_start[0], at_start[1] });
 }
 
 /// The wall clock in seconds a `date +%s` step printed (its exec_output text), if one did.
