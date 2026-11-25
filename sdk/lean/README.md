@@ -16,6 +16,7 @@ determinismo tape repeats a timeline of the real system.
 | `Determinismo.Search` | `explore` (timelines from seeds), `exhaust` (every timeline within bounds, depth first), `shrink`, `tape` (a counterexample as determinismo's named decisions) |
 | `Determinismo.Census` | `census` (every timeline within bounds, counted: per property its count and first counterexample), resumable from its `next` (`censusStep`; `pathLine`/`pathOfLine` across processes), `censusIO` (segments under a wall-clock budget, progress after each), `deepen` (iterative deepening: shallow counterexamples first, each timeline counted once), `size` (Knuth's estimate from uniform probes); `Bounds` (a depth cap, per-name option caps) for all of them and for random draws |
 | `Determinismo.Edn` | EDN values and their text (`Edn.render`): cases for Clojure systems (an Elle history, a Datomic transaction, a jank form); JSON is Lean's own `Lean.Json` |
+| `Determinismo.Relation` | transitive (`Plus`) and reflexive-transitive (`Star`) closures with their lemmas (built at either end, joined, mapped along a stronger relation), `Cycle`: for proofs about dependency graphs |
 
 A node's code (`NodeM`): `send`, `readFile`, `append`, `replace`, `truncate`, `sync` (false on a
 failed sync), `now`, `wallclock`, `choose` (its own randomness, a decision), `reply`, `fail`,

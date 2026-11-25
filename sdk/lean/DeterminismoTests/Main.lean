@@ -267,6 +267,15 @@ def connections : List Check :=
       ok := (List.range 100).all fun i =>
         (Conn.runFull (Conn.config true (clientNodes := some [0])) (Source.seeded i)).cluster.history.all (·.node == 0) } ]
 
+/-- The closures on a small graph: 0 → 1 → 2 → 0. -/
+def edge3 (a b : Nat) : Prop := (a = 0 ∧ b = 1) ∨ (a = 1 ∧ b = 2) ∨ (a = 2 ∧ b = 0)
+
+theorem edge3_cycle : Relation.Cycle edge3 0 :=
+  .tail (.tail (.single (Or.inl ⟨rfl, rfl⟩)) (Or.inr (Or.inl ⟨rfl, rfl⟩))) (Or.inr (Or.inr ⟨rfl, rfl⟩))
+
+theorem edge3_star_02 : Relation.Star edge3 0 2 :=
+  Relation.Star.trans (Relation.Star.single (Or.inl ⟨rfl, rfl⟩)) (Relation.Star.single (Or.inr (Or.inl ⟨rfl, rfl⟩)))
+
 def edn : List Check :=
   let op := Edn.map [(.kw "type", .kw "ok"), (.kw "f", .kw "txn"), (.kw "process", .int 0),
     (.kw "value", .vec [.vec [.kw "append", .int 1, .int 2], .vec [.kw "r", .int 1, .vec [.int 2]]])]
