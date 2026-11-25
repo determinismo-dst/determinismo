@@ -5751,15 +5751,9 @@ fn runs_discover(server: *Server) !void {
         const pid_path = try std.fs.path.join(server.arena, &.{ directory, "pid" });
         const has_pid = if (std.Io.Dir.cwd().access(server.io, pid_path, .{})) |_| true else |_| false;
         if (!has_pid and age_s(server.arena, directory) < claim_grace_s) continue;
-        const record = run_file(server, id, "record.jsonl") catch "";
         const stopped = if (run_file(server, id, "stopped")) |_| true else |_| false;
         const draining = if (run_file(server, id, "draining")) |_| true else |_| false;
-        // How its explorer ended, when a server reaped it (exit_note); else what it recorded.
-        const noted = if (run_file(server, id, "exit")) |text|
-            std.fmt.parseInt(u32, text[0 .. std.mem.indexOfScalar(u8, text, ' ') orelse text.len], 10) catch null
-        else |_|
-            null;
-        var run = Run{ .id = id, .pid = 0, .status = noted orelse recorded_status(record), .stopped = stopped, .draining = draining };
+        var run = Run{ .id = id, .pid = 0, .status = ended_status(server, id), .stopped = stopped, .draining = draining };
         run.unexplored = if (run_file(server, id, "unexplored")) |_| true else |_| false;
         // A drain whose explorer ended while no server watched: stopped now.
         if (draining and host_runs.running_pid(server.arena, directory) == null) drained_mark(server, &run);
@@ -5901,6 +5895,47 @@ fn process_alive(server: *Server, pid_text: []const u8, needle: []const u8) bool
     return std.mem.indexOf(u8, cmdline, needle) != null;
 }
 
+/// How a run's explorer ended: its `exit` (explore writes it for a run, exit_note for one this
+/// serve reaped), else its record's last summary (an explorer that died before writing one).
+/// An adopted run read its record alone: an explorer that exited 3 for a catalog's assertion no
+/// timeline reached, every timeline passing, ended "passed" (CE19, the blind Lean replica of
+/// the platform).
+fn ended_status(server: *Server, id: u32) u32 {
+    if (run_file(server, id, "exit")) |text| {
+        const end = std.mem.indexOfScalar(u8, text, ' ') orelse text.len;
+        if (std.fmt.parseInt(u32, std.mem.trim(u8, text[0..end], " \n"), 10)) |status| return status else |_| {}
+    } else |_| {}
+    return recorded_status(run_file(server, id, "record.jsonl") catch "");
+}
+
+test "a run's end is its explorer's exit, then its record's summary" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const cwd = std.Io.Dir.cwd();
+    const run = try std.fs.path.join(arena, &.{ data, "runs", "1" });
+    try cwd.createDirPath(io, run);
+    // Every timeline passed (the summary), the explorer exited 3: a catalog's assertion no
+    // timeline reached, judged once all ran.
+    const passed = "{\"summary\":{\"branches\":2,\"failing_branches\":0}}\n";
+    try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(arena, &.{ run, "record.jsonl" }), .data = passed });
+    try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(arena, &.{ run, "exit" }), .data = "3 exited with status 3\n" });
+    var server: Server = .{
+        .shared = undefined,
+        .options = .{ .listen = "", .data_directory = data, .machine = &.{}, .self = "" },
+        .io = io,
+        .arena = arena,
+    };
+    try std.testing.expectEqual(@as(u32, 3), ended_status(&server, 1));
+    // An explorer that died before its exit: its record's.
+    try cwd.deleteFile(io, try std.fs.path.join(arena, &.{ run, "exit" }));
+    try std.testing.expectEqual(@as(u32, 0), ended_status(&server, 1));
+}
+
 fn recorded_status(record: []const u8) u32 {
     const key = "{\"summary\":";
     const start = std.mem.lastIndexOf(u8, record, key) orelse return status_interrupted;
@@ -5979,8 +6014,7 @@ fn runs_reap(shared: *Shared, ended: []u32) usize {
         if (run.adopted) {
             const directory = run_directory(&server, run.id) catch continue;
             if (host_runs.running_pid(server.arena, directory) != null) continue;
-            const record = run_file(&server, run.id, "record.jsonl") catch "";
-            run.status = recorded_status(record);
+            run.status = ended_status(&server, run.id);
             run.ended_here = true;
             drained_mark(&server, run);
             // Not this serve's child: what its explorer left is found by its session.
