@@ -215,20 +215,7 @@ fn run(arena: std.mem.Allocator, io: std.Io, argv: []const [:0]const u8) !u8 {
     // The explorer writes each timeline's own numbers in (explore's {timeline%N+K}): literal
     // digits wherever the command puts them, a quoted awk program's included.
     const shard_of = try std.fmt.allocPrint(arena, "{{timeline%{d}}}", .{shard_count});
-    // The runner's own sharding ({shard}, {shards}, 1-based), or the shard's part of the list
-    // ({tests}: the lines whose position modulo the shards is the shard's, through xargs, a
-    // name with spaces one argument).
-    const command = if (std.mem.indexOf(u8, config.run, "{tests}") != null) blk: {
-        const inner = try std.mem.replaceOwned(u8, arena, config.run, "{tests}", "\"$@\"");
-        var line: std.ArrayList(u8) = .empty;
-        try line.print(arena, "awk -v n={d} -v i={s} '(NR - 1) % n == i' " ++ tests_path ++ " | tr '\\n' '\\000' | xargs -0 sh -c ", .{ shard_count, shard_of });
-        try shell_quote(arena, &line, inner);
-        try line.appendSlice(arena, " sh");
-        break :blk line.items;
-    } else blk: {
-        const with_shard = try std.mem.replaceOwned(u8, arena, config.run, "{shard}", try std.fmt.allocPrint(arena, "{{timeline%{d}+1}}", .{shard_count}));
-        break :blk try std.mem.replaceOwned(u8, arena, with_shard, "{shards}", try std.fmt.allocPrint(arena, "{d}", .{shard_count}));
-    };
+    const command = try shard_command(arena, config.run, tests_path, shard_count, shard_of, config.junit);
     var script: std.ArrayList(u8) = .empty;
     // The fault injector beside the command, stopped once it ends (undoing what it did).
     if (faults.len > 0) try script.print(arena, "det-faults --only {s} & f=$!; ", .{faults});
@@ -489,6 +476,43 @@ fn shard_failing(output: []const u8) ?u32 {
     return null;
 }
 
+/// A shard's command in its node: the runner's own sharding ({shard}, {shards}, 1-based), or the
+/// shard's part of the list at `list` ({tests}: the lines whose position modulo the shards is
+/// the shard's, through xargs, a name with spaces one argument). A long list makes xargs run the
+/// runner more than once, each run writing the JUnit report over the last, so with a report each
+/// run's is moved aside and all of them make the report (det-assert junit reads every
+/// `<testcase>` in its text): every test of the shard gets its verdict, not only the last run's
+/// (CE21, the Lean replica of determinismo: 1,617 of 2,000 80-byte names lost at 128 KiB).
+fn shard_command(arena: std.mem.Allocator, run_line: []const u8, list: []const u8, shard_count: u32, shard_of: []const u8, junit: ?[]const u8) ![]const u8 {
+    if (std.mem.indexOf(u8, run_line, "{tests}") != null) {
+        var each: std.ArrayList(u8) = .empty;
+        try each.appendSlice(arena, try std.mem.replaceOwned(u8, arena, run_line, "{tests}", "\"$@\""));
+        if (junit) |path| {
+            try each.appendSlice(arena, "; s=$?; if [ -f ");
+            try shell_quote(arena, &each, path);
+            try each.appendSlice(arena, " ]; then mv ");
+            try shell_quote(arena, &each, path);
+            try each.append(arena, ' ');
+            try shell_quote(arena, &each, path);
+            try each.appendSlice(arena, ".determinismo-ci-part.$$; fi; exit $s");
+        }
+        var line: std.ArrayList(u8) = .empty;
+        try line.print(arena, "awk -v n={d} -v i={s} '(NR - 1) % n == i' {s} | tr '\\n' '\\000' | xargs -0 sh -c ", .{ shard_count, shard_of, list });
+        try shell_quote(arena, &line, each.items);
+        try line.appendSlice(arena, " sh");
+        if (junit) |path| {
+            try line.appendSlice(arena, "; s=$?; set -- ");
+            try shell_quote(arena, &line, path);
+            try line.appendSlice(arena, ".determinismo-ci-part.*; if [ -e \"$1\" ]; then cat \"$@\" > ");
+            try shell_quote(arena, &line, path);
+            try line.appendSlice(arena, "; rm -f \"$@\"; fi; exit $s");
+        }
+        return line.items;
+    }
+    const with_shard = try std.mem.replaceOwned(u8, arena, run_line, "{shard}", try std.fmt.allocPrint(arena, "{{timeline%{d}+1}}", .{shard_count}));
+    return std.mem.replaceOwned(u8, arena, with_shard, "{shards}", try std.fmt.allocPrint(arena, "{d}", .{shard_count}));
+}
+
 fn shell_quote(arena: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
     try out.append(arena, '\'');
     for (text) |byte| {
@@ -559,4 +583,29 @@ test "faults: timing, none, or a list of det-faults' kinds with timing's three" 
     try std.testing.expectError(error.BadFaults, faults_only(arena, try parse(arena, "[\"partitoin\"]")));
     try std.testing.expectError(error.BadFaults, faults_only(arena, try parse(arena, "\"all\"")));
     try std.testing.expectError(error.BadFaults, faults_only(arena, try parse(arena, "[]")));
+}
+
+test "every test of a shard is in its JUnit report, however many runs xargs splits the list into" {
+    // CE21 (the Lean replica of determinismo): a shard's list past xargs's command-line size ran
+    // the runner more than once, each run writing the report over the last: only the last
+    // batch's tests got verdicts (1,617 of 2,000 80-byte names lost at GNU's 128 KiB).
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var root_buffer: [4096]u8 = undefined;
+    const root = root_buffer[0..try directory.dir.realPathFile(io, ".", &root_buffer)];
+    const list = try std.fs.path.join(arena, &.{ root, "tests" });
+    const report = try std.fs.path.join(arena, &.{ root, "junit.xml" });
+    var names: std.ArrayList(u8) = .empty;
+    for (0..3000) |i| try names.print(arena, "suite.module.{d:0>6}.a_test_name_long_enough_to_take_eighty_bytes_of_the_line\n", .{i});
+    try directory.dir.writeFile(io, .{ .sub_path = "tests", .data = names.items });
+    const runner = try std.fmt.allocPrint(arena, "for t in {{tests}}; do printf '<testcase classname=\"c\" name=\"%s\"/>\\n' \"$t\"; done > {s}", .{report});
+    const command = try shard_command(arena, runner, list, 1, "0", report);
+    const result = try std.process.run(arena, io, .{ .argv = &.{ "/bin/sh", "-c", command } });
+    try std.testing.expect(result.term == .exited and result.term.exited == 0);
+    const text = try directory.dir.readFileAlloc(io, "junit.xml", arena, .limited(1 << 24));
+    try std.testing.expectEqual(@as(usize, 3000), std.mem.count(u8, text, "<testcase"));
 }
