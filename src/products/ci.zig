@@ -258,6 +258,7 @@ fn run(arena: std.mem.Allocator, io: std.Io, argv: []const [:0]const u8) !u8 {
     // Each shard's verdict: its property's failing timelines among its own.
     const rows = try client.json([]const ShardRow, "POST", try std.fmt.allocPrint(arena, "/runs/{d}/sql", .{started.id}), try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(.{ .sql = shard_sql }, .{})}));
     var verdict: []const u8 = "pass";
+    var failing_timelines: u32 = 0;
     for (1..shard_count + 1) |number| {
         const row: ShardRow = for (rows) |row| {
             if (row.shard == number) break row;
@@ -266,6 +267,7 @@ fn run(arena: std.mem.Allocator, io: std.Io, argv: []const [:0]const u8) !u8 {
         var at = number - 1;
         while (at < setup.tests.len) : (at += shard_count) count += 1;
         const judged = shard_verdict(row, config.timelines);
+        failing_timelines += judged.failing;
         if (verdict_rank(judged.verdict) > verdict_rank(verdict)) verdict = judged.verdict;
         std.debug.print("  shard {d}: {s:<6} {d} tests, failing in {d} of {d} timelines\n", .{
             number, judged.verdict, count, judged.failing, config.timelines,
@@ -274,9 +276,14 @@ fn run(arena: std.mem.Allocator, io: std.Io, argv: []const [:0]const u8) !u8 {
     // Each test's verdict from the timelines' JUnit reports; the job's the worse of the two
     // (a shard failing with no test failing in its report, a crash in teardown, stays a failure).
     if (config.junit != null) {
-        const tests_verdict = try tests_judge(client, &.{started.id}, config.timelines, serve_url);
-        if (verdict_rank(tests_verdict) > verdict_rank(verdict)) verdict = tests_verdict;
+        const tests = try tests_judge(client, &.{started.id}, config.timelines, serve_url);
+        if (verdict_rank(tests.verdict) > verdict_rank(verdict)) verdict = tests.verdict;
+        // Timelines without their report beyond those whose shard failed (a hang, a dead
+        // runner): a run that passed and wrote none, a job set up wrong.
+        if (tests.unreported > failing_timelines) verdict = "error";
     }
+    // Serve stopped the run (no coverage in its first timelines): the job never ran its tests.
+    if (said.stopped_why.len > 0) verdict = "error";
     std.debug.print("determinismo-ci: {s}\n", .{verdict});
     if (std.mem.eql(u8, verdict, "pass")) return 0;
     if (std.mem.eql(u8, verdict, "flaky")) return if (flaky_passes) 0 else 2;
@@ -286,10 +293,15 @@ fn run(arena: std.mem.Allocator, io: std.Io, argv: []const [:0]const u8) !u8 {
 /// A shard's row from shard_sql: of its timelines that stated its property, those it failed in.
 const ShardRow = struct { shard: u32 = 0, failing: u32 = 0, timelines: u32 = 0 };
 
-/// A shard's verdict from its row and the timelines it ran in.
+/// A shard's verdict from its row and the timelines it ran in (docs/CI.md: failing in every
+/// timeline, fail; in some, flaky; in none, pass). A timeline that never stated its property
+/// failed it: its tests hung past its limit, or its runner died (the races and crashes CI here is
+/// for); called the job's "error", "failing in 0 of 3", they exited 1 even with --flaky-passes
+/// (CE27, the Lean replica of determinismo).
 fn shard_verdict(row: ShardRow, timelines: u32) struct { verdict: []const u8, failing: u32 } {
-    const verdict = if (row.timelines < timelines) "error" else if (row.failing == 0) "pass" else if (row.failing >= row.timelines) "fail" else "flaky";
-    return .{ .verdict = verdict, .failing = row.failing };
+    const failing = row.failing + (timelines -| row.timelines);
+    const verdict = if (failing == 0) "pass" else if (failing >= timelines) "fail" else "flaky";
+    return .{ .verdict = verdict, .failing = failing };
 }
 
 test "a shard whose tests hang in one timeline of three is flaky, failing in that one" {
@@ -453,7 +465,7 @@ const test_prefix = "test passes: ";
 /// some), or passing. Prints the tests that did not pass, each with its property's page on
 /// serve (its examples, each failing timeline replayable). "error" when a timeline stated no
 /// test (the run command died before its report).
-fn tests_judge(client: Client, runs: []const u32, timelines: u32, serve_url: []const u8) ![]const u8 {
+fn tests_judge(client: Client, runs: []const u32, timelines: u32, serve_url: []const u8) !struct { verdict: []const u8, unreported: u32 } {
     const arena = client.arena;
     const Property = struct { message: []const u8, timelines_hit: u32 = 0, timelines_failing: u32 = 0 };
     var tests: u32 = 0;
@@ -488,10 +500,8 @@ fn tests_judge(client: Client, runs: []const u32, timelines: u32, serve_url: []c
     std.debug.print("determinismo-ci: {d} tests, {d} failing, {d} flaky", .{ tests, failing, flaky });
     if (unreported > 0) std.debug.print("; {d} timelines without their JUnit report", .{unreported});
     std.debug.print("\n", .{});
-    if (unreported > 0) return "error";
-    if (failing > 0) return "fail";
-    if (flaky > 0) return "flaky";
-    return "pass";
+    const verdict = if (failing > 0) "fail" else if (flaky > 0) "flaky" else "pass";
+    return .{ .verdict = verdict, .unreported = unreported };
 }
 
 fn shard_failing(output: []const u8) ?u32 {
