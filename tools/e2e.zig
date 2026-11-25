@@ -229,7 +229,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "wasm-reach", check_wasm_reach },             .{ "plugins-many", check_plugins_many },             .{ "strategy-follow", check_strategy_follow },
         .{ "steppers", check_steppers },                 .{ "reactive-faults", check_reactive_faults },       .{ "injectors", check_injectors },
         .{ "labels", check_labels },                     .{ "wasm-upload", check_wasm_upload },               .{ "timeline-clocks", check_timeline_clocks },
-        .{ "egress", check_egress },                     .{ "fork-replay", check_fork_replay },                     .{ "ingress", check_ingress },                       .{ "ingress-session", check_ingress_session },
+        .{ "egress", check_egress },                     .{ "fork-replay", check_fork_replay },                     .{ "workload-singleton", check_workload_singleton },                     .{ "ingress", check_ingress },                       .{ "ingress-session", check_ingress_session },
         .{ "moments", check_moments },                   .{ "properties", check_builtin_properties },         .{ "entropy", check_kernel_entropy },
         .{ "quiet", check_quiet_period },                .{ "clock_jitter", check_clock_jitter },             .{ "query", check_query },
         .{ "progress", check_progress_while_quiet },     .{ "network", check_network_faults },                .{ "fault-exclusions", check_fault_exclusions },
@@ -411,6 +411,29 @@ fn moment_ns(output: []const u8) ?u64 {
 /// A timeline with an sdk.fork pull replays from its tape with the run's history: the replayed
 /// pull emits its decision event as the recorded one did (the Lean replica of determinismo's
 /// CE12: one event short from there, so every later checkpoint differed).
+/// A singleton marked as the workload, the timeline drawn without it and the swarm leaving both
+/// nemeses out (the draws forced): the composer keeps a driver and the timeline runs (the Lean
+/// replica of determinismo's CE3: it panicked at run_drivers, no driver phase, no ending).
+fn check_workload_singleton(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "det-selftest" });
+    const events = try std.fs.path.join(arena, &.{ context.scratch, "workload-singleton-events" });
+    const report = try explore(context, &.{
+        "--program",  program,                                                                               "--scenario", "workload_singleton", "--seed", "1", "--branches", "1",
+        "--decide",   "composer.singleton=7,composer.swarm_p=0,composer.swarm nemesis_a=7,composer.swarm nemesis_b=7", "--events-dir", events,
+    });
+    var branches: [1]Branch = undefined;
+    const ran = parse_branches(report, &branches) == 1;
+    try events_plain(context, events);
+    const text = std.Io.Dir.cwd().readFileAlloc(context.io, try std.fmt.allocPrint(arena, "{s}/branch-{d}.jsonl", .{ events, if (ran) branches[0].index else 0 }), arena, .limited(64 << 20)) catch "";
+    expect_all(context, &.{
+        .{ "the timeline ran", ran },
+        .{ "no panic in the composer", std.mem.indexOf(u8, report, "reached unreachable") == null and std.mem.indexOf(u8, text, "reached unreachable") == null },
+        .{ "a nemesis started (the rescue kept a driver)", std.mem.indexOf(u8, text, "nemesis_") != null and std.mem.indexOf(u8, text, "command_start") != null },
+        .{ "the timeline reached its end", std.mem.indexOf(u8, text, "composer_done") != null },
+    }, "workload-singleton: a marked singleton, the timeline without it, the nemeses drawn out", .{});
+}
+
 fn check_fork_replay(context: *Context) !void {
     const arena = context.arena;
     const program = try std.fs.path.join(arena, &.{ context.bin, "det-selftest" });

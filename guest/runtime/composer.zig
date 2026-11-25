@@ -220,11 +220,17 @@ const Composer = struct {
     /// event. None with --no-swarm.
     fn swarm_commands(composer: *Composer) void {
         if (swarm_off()) return;
+        // A workload marked among the swarm's commands only: a marked singleton or `first` is
+        // no driver the swarm keeps, and counting it left the rescue nothing to keep (the
+        // composer then panicked at run_drivers: the Lean replica of determinismo's CE3).
         var workload_marked = false;
         var swarmable: u32 = 0;
+        var drivers: u32 = 0;
         for (composer.commands[0..composer.command_count]) |command| {
-            workload_marked = workload_marked or command.workload;
-            swarmable += @intFromBool(command.kind == .parallel_driver or command.kind == .serial_driver or command.kind == .anytime);
+            const kept_by_swarm = command.kind == .parallel_driver or command.kind == .serial_driver or command.kind == .anytime;
+            workload_marked = workload_marked or (kept_by_swarm and command.workload);
+            swarmable += @intFromBool(kept_by_swarm);
+            drivers += @intFromBool(command.kind == .parallel_driver or command.kind == .serial_driver);
         }
         // A scenario that marks no workload, with four drivers or fewer, keeps them all and
         // weighs them per timeline (1 to 64, powers of two, "composer.weight <name>": a driver
@@ -243,7 +249,8 @@ const Composer = struct {
             return;
         }
         const eighths = 1 + sdk.random_config("composer.swarm_p", 7);
-        // The drivers one of which must stay: the workload's when marked, else every driver.
+        // The commands one of which must stay: the workload's when marked, else every driver, else
+        // (anytime commands alone) every anytime command.
         var needed: u32 = 0;
         var needed_kept: u32 = 0;
         for (composer.commands[0..composer.command_count]) |*command| {
@@ -254,15 +261,14 @@ const Composer = struct {
             command.kept = sdk.random_config(label, 8) < eighths;
             // Asked for (explore's --keep): kept whatever the draw, the draw made all the same.
             if (keep_asked(command.name)) command.kept = true;
-            const counts = if (workload_marked) command.workload else driver;
+            const counts = rescue_counts(command.kind, command.workload, workload_marked, drivers);
             needed += @intFromBool(counts);
             needed_kept += @intFromBool(counts and command.kept);
         }
         if (needed > 0 and needed_kept == 0) {
             var pick_index = sdk.random_below_named("composer.swarm_one", needed);
             for (composer.commands[0..composer.command_count]) |*command| {
-                const driver = command.kind == .parallel_driver or command.kind == .serial_driver;
-                const counts = if (workload_marked) command.workload else driver;
+                const counts = rescue_counts(command.kind, command.workload, workload_marked, drivers);
                 if (!counts) continue;
                 if (pick_index == 0) command.kept = true;
                 pick_index -|= 1;
@@ -657,6 +663,29 @@ fn sleep_until(deadline_ns: u64) void {
 /// seven eighths drawn per timeline ("composer.singleton_eighths"), then the timeline drawn by it
 /// ("composer.singleton"); Antithesis's half of the timelines, copied before, only with
 /// --no-swarm. Never none or all: either kind of timeline stays reachable.
+/// Whether a command counts for the swarm's rescue (one of those counted is kept): the marked
+/// workload's among the swarm's commands when one is marked, else the parallel and serial
+/// drivers, else (none) the anytime commands.
+fn rescue_counts(kind: Kind, workload: bool, workload_marked: bool, drivers: u32) bool {
+    const driver = kind == .parallel_driver or kind == .serial_driver;
+    if (!driver and kind != .anytime) return false;
+    if (workload_marked) return workload;
+    return if (drivers > 0) driver else kind == .anytime;
+}
+
+test rescue_counts {
+    // Marked workload among the drivers: only it.
+    try std.testing.expect(rescue_counts(.parallel_driver, true, true, 3));
+    try std.testing.expect(!rescue_counts(.parallel_driver, false, true, 3));
+    // None marked among them (a marked singleton is no swarm command): every driver.
+    try std.testing.expect(rescue_counts(.parallel_driver, false, false, 2));
+    try std.testing.expect(!rescue_counts(.anytime, false, false, 2));
+    // Anytime commands alone: each of them.
+    try std.testing.expect(rescue_counts(.anytime, false, false, 0));
+    // Never a singleton or an ending.
+    try std.testing.expect(!rescue_counts(.singleton_driver, true, false, 0));
+}
+
 fn singleton_drawn() bool {
     if (swarm_off()) return sdk.random_below(2) == 0;
     const eighths = 1 + sdk.random_config("composer.singleton_eighths", 7);

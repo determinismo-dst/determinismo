@@ -148,6 +148,7 @@ pub fn main(init: std.process.Init) !void {
             .hang_sometimes = hang_sometimes,
             .egress = egress_scenario,
             .fork_pull = fork_pull_scenario,
+            .workload_singleton = workload_singleton_scenario,
             .ingress = ingress_scenario,
             .stress = stress,
             .quiet = quiet_scenario,
@@ -2293,6 +2294,16 @@ fn drivers_scenario(s: *System.Scenario) void {
 }
 
 /// The same three drivers, none marked: the composer keeps them all, weighted per timeline.
+/// A singleton marked as the workload beside two parallel nemeses (tools/e2e.zig:
+/// workload-singleton): a timeline that doesn't draw the singleton still runs a driver (the Lean
+/// replica of determinismo's CE3: the swarm's rescue had nothing to keep, the composer panicked).
+fn workload_singleton_scenario(s: *System.Scenario) void {
+    s.singleton_driver("workload", driver_ran);
+    s.parallel_driver("nemesis_a", driver_ran);
+    s.parallel_driver("nemesis_b", driver_ran);
+    s.workload("workload");
+}
+
 fn drivers_unmarked_scenario(s: *System.Scenario) void {
     s.parallel_driver("workload", driver_ran);
     s.parallel_driver("nemesis_a", driver_ran);
