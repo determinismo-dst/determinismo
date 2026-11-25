@@ -996,8 +996,10 @@ fn check_debugging(context: *Context) !void {
     const tapes = try std.fs.path.join(context.arena, &.{ context.scratch, "debugging-tapes" });
     const record = try std.fs.path.join(context.arena, &.{ context.scratch, "debugging-record.jsonl" });
     const base = try explore(context, &.{
-        "--program",   program, "--scenario", "bank", "--seed",     "11",  "--timeline", "30s",
-        "--branching", "flat",  "--branches", "1",    "--tape-dir", tapes, "--record",   record,
+        "--program",         program, "--scenario", "bank", "--seed",     "11",  "--timeline", "30s",
+        "--branching",       "flat",  "--branches", "1",    "--tape-dir", tapes, "--record",   record,
+        // The tape's inputs are its replays': the wall clock's start off in both.
+        "--clock-start-max", "0",
     });
     var recorded: [1]Branch = undefined;
     expect(context, parse_branches(base, &recorded) == 1, "debugging: recorded one timeline", .{});
@@ -1138,9 +1140,9 @@ fn check_debugging(context: *Context) !void {
     try check_debugging_symbol(context);
     const forks = try std.fs.path.join(context.arena, &.{ context.scratch, "debugging-forks" });
     const forked = try explore(context, &.{
-        "--program",   program, "--scenario",    "bank", "--seed",          "11",   "--timeline",  "30s",
-        "--branching", "flat",  "--from-branch", "0",    "--from-vtime-ms", "3000", "--from-poke", poke,
-        "--branches",  "1",     "--tape-dir",    forks,
+        "--program",   program, "--scenario",    "bank", "--seed",            "11",   "--timeline",  "30s",
+        "--branching", "flat",  "--from-branch", "0",    "--from-vtime-ms",   "3000", "--from-poke", poke,
+        "--branches",  "1",     "--tape-dir",    forks,  "--clock-start-max", "0",
     });
     var fork_branch: [1]Branch = undefined;
     const one = parse_branches(forked, &fork_branch) == 1;
