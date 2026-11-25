@@ -29,7 +29,7 @@ pub fn cases(arena: std.mem.Allocator, report: []const u8) ![]const Case {
         const name = if (class.len > 0 and named.len > class.len + 1 and
             std.mem.startsWith(u8, named, class) and named[class.len] == '/') named[class.len + 1 ..] else named;
         const full = if (class.len > 0) try std.fmt.allocPrint(arena, "{s}::{s}", .{ class, name }) else name;
-        const failure = std.mem.indexOf(u8, body, "<failure") orelse std.mem.indexOf(u8, body, "<error");
+        const failure = element_index(body, "<failure") orelse element_index(body, "<error");
         var message: []const u8 = "";
         if (failure) |start| {
             const element_end = std.mem.indexOfScalarPos(u8, body, start, '>') orelse body.len;
@@ -53,6 +53,37 @@ pub fn cases(arena: std.mem.Allocator, report: []const u8) ![]const Case {
         try out.append(arena, .{ .name = try unescape(arena, full), .failed = failure != null, .message = message });
     }
     return out.items;
+}
+
+/// Where a case's body opens the element `opening` (`<failure`, `<error`), outside what the
+/// test printed: its `<system-out>` and `<system-err>` and any CDATA section. Surefire, jest-junit
+/// and go-junit-report write a case's output in CDATA, as is, and a passing test that printed an
+/// `<error` was judged failing in every timeline (CE16, the Lean replica of determinismo).
+fn element_index(body: []const u8, opening: []const u8) ?usize {
+    var at: usize = 0;
+    scan: while (std.mem.indexOfScalarPos(u8, body, at, '<')) |next| {
+        const rest = body[next..];
+        if (std.mem.startsWith(u8, rest, "<![CDATA[")) {
+            const end = std.mem.indexOfPos(u8, body, next, "]]>") orelse return null;
+            at = end + "]]>".len;
+            continue;
+        }
+        inline for (.{ "system-out", "system-err" }) |captured| {
+            if (std.mem.startsWith(u8, rest, "<" ++ captured)) {
+                const tag_end = std.mem.indexOfScalarPos(u8, body, next, '>') orelse return null;
+                if (body[tag_end - 1] == '/') {
+                    at = tag_end + 1;
+                } else {
+                    const end = std.mem.indexOfPos(u8, body, tag_end, "</" ++ captured ++ ">") orelse return null;
+                    at = end + "</".len + captured.len + ">".len;
+                }
+                continue :scan;
+            }
+        }
+        if (std.mem.startsWith(u8, rest, opening)) return next;
+        at = next + 1;
+    }
+    return null;
 }
 
 fn attribute(tag: []const u8, comptime key: []const u8) ?[]const u8 {
@@ -146,4 +177,29 @@ test "a failure's message keeps its element's text: a cut attribute gives way to
     try std.testing.expectEqualStrings("the case: {:form (let [a 1] (* a 2)) :answer 3}", found[0].message);
     try std.testing.expectEqualStrings("boom\nat f (x.py:3)\nat g (x.py:9)", found[1].message);
     try std.testing.expectEqualStrings("same", found[2].message);
+}
+
+test "a test case's captured output never fails it" {
+    // CE16 (the Lean replica of determinismo): Surefire, jest-junit and go-junit-report write a
+    // case's output in CDATA, as is; a passing test that printed an `<error` or `<failure` element
+    // was judged failing in every timeline. A failure's own text in CDATA still fails its case.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const report =
+        \\<testsuite>
+        \\<testcase classname="api.ErrorsTest" name="renders_503" time="0.1"><system-out><![CDATA[<error code="503">unavailable</error>]]></system-out></testcase>
+        \\<testcase classname="api.ErrorsTest" name="logs_failure" time="0.1"><system-err><![CDATA[<failure reason="timeout"/>]]></system-err></testcase>
+        \\<testcase classname="api.ErrorsTest" name="fails" time="0.1"><system-out><![CDATA[ok]]></system-out><failure message="no">x</failure></testcase>
+        \\<testcase classname="api.ErrorsTest" name="errs" time="0.1"><error message="boom"><![CDATA[at f (x.py:3)]]></error></testcase>
+        \\<testcase classname="api.ErrorsTest" name="quiet" time="0.1"><system-out/><system-err/></testcase>
+        \\</testsuite>
+    ;
+    const found = try cases(arena_state.allocator(), report);
+    try std.testing.expectEqual(@as(usize, 5), found.len);
+    try std.testing.expect(!found[0].failed);
+    try std.testing.expect(!found[1].failed);
+    try std.testing.expect(found[2].failed);
+    try std.testing.expectEqualStrings("no\nx", found[2].message);
+    try std.testing.expect(found[3].failed);
+    try std.testing.expect(!found[4].failed);
 }
