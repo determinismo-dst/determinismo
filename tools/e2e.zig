@@ -229,7 +229,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "wasm-reach", check_wasm_reach },             .{ "plugins-many", check_plugins_many },             .{ "strategy-follow", check_strategy_follow },
         .{ "steppers", check_steppers },                 .{ "reactive-faults", check_reactive_faults },       .{ "injectors", check_injectors },
         .{ "labels", check_labels },                     .{ "wasm-upload", check_wasm_upload },               .{ "timeline-clocks", check_timeline_clocks },
-        .{ "egress", check_egress },                     .{ "fork-replay", check_fork_replay },                     .{ "workload-singleton", check_workload_singleton },                     .{ "length-bounds", check_length_bounds },                     .{ "ingress", check_ingress },                       .{ "ingress-session", check_ingress_session },
+        .{ "egress", check_egress },                     .{ "fork-replay", check_fork_replay },                     .{ "workload-singleton", check_workload_singleton },                     .{ "length-bounds", check_length_bounds },                     .{ "quiet-stop", check_quiet_stop },                     .{ "ingress", check_ingress },                       .{ "ingress-session", check_ingress_session },
         .{ "moments", check_moments },                   .{ "properties", check_builtin_properties },         .{ "entropy", check_kernel_entropy },
         .{ "quiet", check_quiet_period },                .{ "clock_jitter", check_clock_jitter },             .{ "query", check_query },
         .{ "progress", check_progress_while_quiet },     .{ "network", check_network_faults },                .{ "fault-exclusions", check_fault_exclusions },
@@ -417,6 +417,29 @@ fn moment_ns(output: []const u8) ?u64 {
 /// A serial driver and a singleton sleeping 300 s under --timeline 30s: each timeline's driver
 /// phase ends at the length plus its 30 s grace, the driver killed (`length_reached`), not at
 /// 300 s (the Lean replica of determinismo's CE4).
+/// Every load stretch quiet (forced) with no drive length and a 60 s timeline limit: no driver
+/// starts past half the limit, and the timeline ends on its own (the Lean replica of
+/// determinismo's CE5: the stop was checked before a quiet stretch only, and stretches all quiet
+/// slept until the limit).
+fn check_quiet_stop(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "det-selftest" });
+    const events = try std.fs.path.join(arena, &.{ context.scratch, "quiet-stop-events" });
+    const report = try explore(context, &.{
+        "--program",   program, "--scenario", "drivers_unmarked", "--seed", "1", "--branches", "1", "--drive-max", "none",
+        "--timeline-limit", "60s", "--decide", "composer.load=1", "--events-dir", events,
+    });
+    var branches: [1]Branch = undefined;
+    const ran = parse_branches(report, &branches) == 1;
+    try events_plain(context, events);
+    const text = std.Io.Dir.cwd().readFileAlloc(context.io, try std.fmt.allocPrint(arena, "{s}/branch-{d}.jsonl", .{ events, if (ran) branches[0].index else 0 }), arena, .limited(64 << 20)) catch "";
+    expect_all(context, &.{
+        .{ "the timeline ran", ran },
+        .{ "the drivers stopped at half the limit", std.mem.indexOf(u8, text, "\"drivers_stopped\"") != null },
+        .{ "the composer ended on its own", std.mem.indexOf(u8, text, "\"composer_done\"") != null },
+    }, "quiet-stop: stretches all quiet, no drive length, a 60 s limit", .{});
+}
+
 fn check_length_bounds(context: *Context) !void {
     const arena = context.arena;
     const program = try std.fs.path.join(arena, &.{ context.bin, "det-selftest" });

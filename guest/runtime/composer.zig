@@ -784,11 +784,16 @@ fn run_drivers(composer: *Composer, drive_ms_max: ?u32, parallel_max: ?u32) ?u64
         // its median timeline 20 minutes, a tenth at the hour; Group Replication's timeline 222).
         const stop_ns = if (timeline_limit_ns()) |limit_ns| now_ns() + limit_ns / 2 else null;
         for (0..starts) |started| {
+            // The stop checked after a quiet stretch too: checked before only, a driver started
+            // past it once the stretch was slept through, and stretches all quiet slept past the
+            // limit (the Lean replica of determinismo's CE5).
+            while (!load.next(stop_ns orelse std.math.maxInt(u64))) {
+                if (stop_ns) |stop| if (now_ns() >= stop) break;
+            }
             if (stop_ns) |stop| if (now_ns() >= stop) {
                 sdk.event("drivers_stopped", .{ .started = started, .starts = starts });
                 break;
             };
-            while (!load.next(std.math.maxInt(u64))) {}
             driver_start(composer, kinds, load.parallelism);
         }
     }
