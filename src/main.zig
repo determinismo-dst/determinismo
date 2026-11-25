@@ -2327,8 +2327,8 @@ fn persisted_hash(comptime T: type, hasher: *std.hash.Wyhash) void {
 test "what an explorer persists changes only with runs.state_format" {
     // A failure here: the layout changed. Bump runs.state_format and set both below to the new
     // values (a run made before then resumes on its own explorer, never on one that misreads it).
-    try std.testing.expectEqual(@as(u32, 2), runs.state_format);
-    try std.testing.expectEqual(@as(u64, 14215628497550469628), persisted_layout);
+    try std.testing.expectEqual(@as(u32, 3), runs.state_format);
+    try std.testing.expectEqual(@as(u64, 5359976621188398076), persisted_layout);
 }
 
 fn summary_write(fd: linux.fd_t, summary: *const Summary) void {

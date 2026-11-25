@@ -11,8 +11,9 @@ const std = @import("std");
 /// timelines' summaries (record.jsonl.summaries), the record's lines, the holders' registry
 /// and their files' names, the history and the bandit's files. Bumped when any of them changes:
 /// a run made with another keeps its own explorer (serve.zig's core_same). 1: 2026-11-15. 2:
-/// 2026-11-19, a timeline's own clock in its summary (SummaryHeader.jitter_seed).
-pub const state_format: u32 = 2;
+/// 2026-11-19, a timeline's own clock in its summary (SummaryHeader.jitter_seed). 3: 2026-11-25,
+/// each timeline's properties in its record line (report.Recorded), for a resume's verdict.
+pub const state_format: u32 = 3;
 const assert = std.debug.assert;
 const linux = std.os.linux;
 
