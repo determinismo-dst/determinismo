@@ -2,6 +2,7 @@ import Determinismo
 import DeterminismoTests.Toy
 import DeterminismoTests.Locks
 import DeterminismoTests.Sync
+import DeterminismoTests.Conn
 import DeterminismoTests.Boot
 
 /-! The library's tests: `lake exe determinismo-lean-tests` (exit 1 when one fails). -/
@@ -228,6 +229,21 @@ def sync : List Check :=
       ok := Sync.complete (ex (Sync.spawnProgram true true) 1) },
     { name := "cancelled then joined: both threads end", ok := ended.threads.all (·.isNone) && ended.threads.size == 2 } ]
 
+def connections : List Check :=
+  let on := Conn.config true
+  [ { name := "without connections, a message outlives its node's restart (a datagram): found",
+      ok := match explore (Conn.run (Conn.config false)) 2000 with | some c => c.property == "stale" | none => false },
+    { name := "with connections, a node's death takes its messages: never stale",
+      ok := (explore (Conn.run on) 2000).isNone },
+    { name := "a death is seen as a reset in some timelines", ok := Conn.someLog on 300 "reset" },
+    { name := "and dies silently in others", ok := Conn.someLog on 300 "died silently" },
+    { name := "faults kept to node 1: node 0 never killed",
+      ok := !Conn.someLog (Conn.config true (targets := some [1])) 300 "node 0 killed"
+        && Conn.someLog (Conn.config true (targets := some [1])) 300 "node 1 killed" },
+    { name := "clients kept to node 0",
+      ok := (List.range 100).all fun i =>
+        (Conn.runFull (Conn.config true (clientNodes := some [0])) (Source.seeded i)).cluster.history.all (·.node == 0) } ]
+
 def censusChecks : List Check :=
   let whole := census tinyRun
   let half := census tinyRun (maxRuns := 5)
@@ -309,7 +325,7 @@ def describe (c : Counterexample) : String :=
 
 def main : IO UInt32 := do
   let mut failed := 0
-  for c in decisions ++ sync ++ combinatorics ++ censusChecks ++ shrinkChecks ++ disk ++ fileSystem ++ history ++ locks do
+  for c in decisions ++ connections ++ sync ++ combinatorics ++ censusChecks ++ shrinkChecks ++ disk ++ fileSystem ++ history ++ locks do
     IO.println s!"{if c.ok then "ok  " else "FAIL"} {c.name}"
     if !c.ok then failed := failed + 1
   -- The toy register, end to end.

@@ -17,7 +17,12 @@ named decision:
   `Disk` says), process kills (`fault.kill`), partitions (`fault.partition`), lost and duplicated
   messages, failed syncs, clock skew; at most `nodesDownMax` nodes down at once; per timeline each
   kind on or off (`world.swarm.*`, swarm testing);
-- a node's own randomness (`choose`: an election timeout's).
+- a node's own randomness (`choose`: an election timeout's);
+- with `connections`, a node's death ends its connections: what was in flight from or to it is
+  lost, a send to a down node fails, and each live peer sees it (`net.connection.reset`: its
+  `connectionLost` runs) or not (a silent death: a half-open connection, as a peer cut off at the
+  moment learns nothing);
+- `Faults.targets` and `Config.clientNodes` keep faults and clients to some nodes.
 
 A timeline boots every node, runs `steps` events with faults, then `recovery` events without
 (partitions healed, every node started again), then judges. Properties: assertions in the code
@@ -44,6 +49,9 @@ structure Envelope (M : Type) where
   src : NodeId
   dst : NodeId
   msg : M
+  /-- The destination's starts when it was sent (a message from before its last start, with
+  `connections` off, is a datagram outliving the process it was meant for). -/
+  dstStarts : Nat := 0
 
 /-- How a client's operation ended. -/
 inductive Outcome (Res : Type) where
@@ -96,6 +104,8 @@ structure Faults where
   anyOrderWriteback : Bool := false
   /-- Per timeline, each kind drawn on or off. -/
   swarm : Bool := true
+  /-- The nodes power losses, kills, clock skews and evictions may hit (none: any). -/
+  targets : Option (List NodeId) := none
   deriving Repr
 
 structure Config where
@@ -111,6 +121,10 @@ structure Config where
   nodesDownMax : Nat := 1
   /-- Messages between two nodes delivered in order (one TCP connection's). -/
   fifo : Bool := false
+  /-- Messages travel on connections that a node's death ends (see the module's text). -/
+  connections : Bool := false
+  /-- The nodes clients ask (none: any up node). -/
+  clientNodes : Option (List NodeId) := none
   /-- Decisions per timeline at most. -/
   limit : Nat := 100000
   deriving Repr
@@ -146,6 +160,8 @@ structure Cluster (s : Sys) where
   log : Array String := #[]
   /-- The faults are over (the recovery phase). -/
   recovering : Bool := false
+  /-- Nodes that died in this event, their peers not yet told (`connections`). -/
+  died : List NodeId := []
 
 instance {s : Sys} : Chaotic (Cluster s) where
   decisions c := c.decisions
@@ -166,6 +182,8 @@ structure Behavior (s : Sys) where
   request : s.State → Nat → s.Op → NodeM s s.State
   /-- A client's next operation, drawn. -/
   operation : ClusterM s s.Op
+  /-- With `connections`: the connection to `peer` was reset (it died). -/
+  connectionLost : s.State → NodeId → NodeM s s.State := fun state _ => pure state
 
 structure Properties (s : Sys) where
   invariant : Cluster s → Option String := fun _ => none
@@ -191,6 +209,25 @@ code (`nodesDownMax`), `n`'s own start included. -/
 def downBesides (c : Cluster s) (n : NodeId) : List NodeId :=
   (List.range c.nodes.size).filter fun m => m != n && (c.node m).starts > 0 && !c.up m
 
+/-- The up nodes faults may hit. -/
+def targetable (c : Cluster s) : List NodeId :=
+  match c.faults.targets with
+  | some ts => c.upNodes.filter ts.contains
+  | none => c.upNodes
+
+/-- The up nodes clients may ask. -/
+def clientable (c : Cluster s) : List NodeId :=
+  match c.config.clientNodes with
+  | some ns => c.upNodes.filter ns.contains
+  | none => c.upNodes
+
+/-- Node `n` died: with `connections`, its messages in flight lost and its peers to be told. -/
+def connectionsEnd (c : Cluster s) (n : NodeId) : Cluster s :=
+  if c.config.connections then
+    { c with net := c.net.filter (fun e => e.src != n && e.dst != n),
+             died := if c.died.contains n then c.died else c.died ++ [n] }
+  else c
+
 def deliverable (c : Cluster s) : List (Envelope s.Msg) :=
   let open_ := c.net.filter fun e => !c.blocked.contains (e.src, e.dst)
   if c.config.fifo then
@@ -215,7 +252,10 @@ def clusterSize : NodeM s Nat := do pure (← get).nodes.size
 
 def send (dst : NodeId) (msg : s.Msg) : NodeM s Unit := do
   let src ← read
-  modify fun c => { c with net := c.net ++ [{ id := c.nextMessage, src, dst, msg }],
+  let c ← get
+  -- On a connection, a send to a down node fails (nothing to connect to).
+  if c.config.connections && !c.up dst then return
+  modify fun c => { c with net := c.net ++ [{ id := c.nextMessage, src, dst, msg, dstStarts := (c.node dst).starts }],
                            nextMessage := c.nextMessage + 1 }
 
 def file (name : String) : NodeM s (File s.Rec) := do
@@ -343,7 +383,7 @@ def powerLossFiles (n : NodeId) : ClusterM s Unit := do
           else pure 0
         | [] => pure 0
       files := files ++ [(name, f.crash kept torn)]
-  modify fun c => c.setNode n fun nd => { nd with state := none, halted := false, files := files }
+  modify fun c => (c.setNode n fun nd => { nd with state := none, halted := false, files := files }).connectionsEnd n
   note s!"node {n} lost power"
 
 /-- A node's code at node `n`; none when the power went inside it (a crash point): the node is
@@ -359,8 +399,11 @@ def runAt {α : Type} (n : NodeId) (x : NodeM s α) : ClusterM s (Option α) := 
 
 /-- A node's memory after an event's code: down when the code halted. -/
 def settle (n : NodeId) (state : s.State) : ClusterM s Unit :=
-  modify fun c => c.setNode n fun nd =>
-    if nd.halted then { nd with state := none, halted := false } else { nd with state := some state }
+  modify fun c =>
+    let halted := (c.node n).halted
+    let c := c.setNode n fun nd =>
+      if nd.halted then { nd with state := none, halted := false } else { nd with state := some state }
+    if halted then c.connectionsEnd n else c
 
 def startNode (b : Behavior s) (n : NodeId) : ClusterM s Unit := do
   modify fun c => c.setNode n fun nd => { nd with starts := nd.starts + 1 }
@@ -375,8 +418,21 @@ def startNode (b : Behavior s) (n : NodeId) : ClusterM s Unit := do
 def powerLoss (n : NodeId) : ClusterM s Unit := powerLossFiles n
 
 def kill (n : NodeId) : ClusterM s Unit := do
-  modify fun c => c.setNode n fun nd => { nd with state := none }
+  modify fun c => (c.setNode n fun nd => { nd with state := none }).connectionsEnd n
   note s!"node {n} killed"
+
+/-- The live peers of the nodes that died in this event: each told (a reset) or not (silent). -/
+def tellDeaths (b : Behavior s) : ClusterM s Unit := do
+  let died := (← get).died
+  modify fun c => { c with died := [] }
+  for n in died do
+    for m in (← get).upNodes do
+      if m != n then
+        if (← decide (σ := Cluster s) "net.connection.reset" 2) == 1 then
+          note s!"node {m}: connection to node {n} reset"
+          if let some state := ((← get).node m).state then
+            if let some state' ← runAt m (b.connectionLost state n) then settle m state'
+        else note s!"node {m}: connection to node {n} died silently"
 
 /-- A partition: a side drawn, cut from the rest (one way only when drawn so). -/
 def partition : ClusterM s Unit := do
@@ -429,20 +485,20 @@ def possible (c : Cluster s) : List (Event × Nat) :=
   let faulty := !c.recovering
   let up := c.upNodes
   let down := c.downNodes
-  let canTakeDown := faulty && down.length < c.config.nodesDownMax && !up.isEmpty
+  let canTakeDown := faulty && down.length < c.config.nodesDownMax && !c.targetable.isEmpty
   let some_ := c.deliverable
   [ (.deliver, if some_.isEmpty then 0 else 6),
     (.duplicate, if faulty && f.duplicate && !some_.isEmpty then 1 else 0),
     (.drop, if faulty && f.drop && !c.net.isEmpty then 1 else 0),
     (.tick, if up.isEmpty then 0 else 4),
-    (.client, if c.history.size < c.config.clientOps && !up.isEmpty && !c.recovering then 2 else 0),
+    (.client, if c.history.size < c.config.clientOps && !c.clientable.isEmpty && !c.recovering then 2 else 0),
     (.crash, if canTakeDown && f.crash then 1 else 0),
     (.kill, if canTakeDown && f.kill then 1 else 0),
     (.start, if down.isEmpty then 0 else if c.recovering then 4 else 2),
     (.partition, if faulty && f.partition && c.blocked.isEmpty then 1 else 0),
     (.heal, if !c.blocked.isEmpty then (if c.recovering then 8 else 1) else 0),
-    (.skew, if faulty && f.skew then 1 else 0),
-    (.evict, if faulty && f.evict && !up.isEmpty then 1 else 0) ].filter (·.2 > 0)
+    (.skew, if faulty && f.skew && !c.targetable.isEmpty then 1 else 0),
+    (.evict, if faulty && f.evict && !c.targetable.isEmpty then 1 else 0) ].filter (·.2 > 0)
 
 /-- One event, drawn. False when nothing can happen. -/
 def event (b : Behavior s) : ClusterM s Bool := do
@@ -467,25 +523,26 @@ def event (b : Behavior s) : ClusterM s Bool := do
       modify fun c => { c with time := c.time + 1 }
       tickNode b n
   | .client =>
-    if let some n ← pick (σ := Cluster s) "world.client" c.upNodes then clientRequest b n
-  | .crash => if let some n ← pick (σ := Cluster s) "fault.crash" c.upNodes then powerLoss n
-  | .kill => if let some n ← pick (σ := Cluster s) "fault.kill" c.upNodes then kill n
+    if let some n ← pick (σ := Cluster s) "world.client" c.clientable then clientRequest b n
+  | .crash => if let some n ← pick (σ := Cluster s) "fault.crash" c.targetable then powerLoss n
+  | .kill => if let some n ← pick (σ := Cluster s) "fault.kill" c.targetable then kill n
   | .start => if let some n ← pick (σ := Cluster s) "world.start" c.downNodes then startNode b n
   | .partition => partition
   | .heal =>
     modify fun c => { c with blocked := [] }
     note "partition healed"
   | .skew =>
-    if let some n ← pick (σ := Cluster s) "fault.clock.node" c.upNodes then
+    if let some n ← pick (σ := Cluster s) "fault.clock.node" c.targetable then
       let m := c.faults.skewMax
       let v ← decide (σ := Cluster s) "fault.clock.skew" (2 * m + 1)
       let skew : Int := Int.ofNat v - Int.ofNat m
       modify fun c => c.setNode n fun nd => { nd with skew := skew }
       note s!"node {n}'s clock skewed {skew}"
   | .evict =>
-    if let some n ← pick (σ := Cluster s) "fault.evict" c.upNodes then
+    if let some n ← pick (σ := Cluster s) "fault.evict" c.targetable then
       modify fun c => c.setNode n fun nd => { nd with files := nd.files.map fun (name, f) => (name, f.evict) }
       note s!"node {n}'s page cache evicted"
+  tellDeaths b
   modify fun c => { c with step := c.step + 1 }
   return true
 
