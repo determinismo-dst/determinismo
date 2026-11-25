@@ -68,12 +68,30 @@ and Elle 0.2.8's `elle.txn` loads unilog while declaring it for its dev profile 
 `src/elle/` holds Elle 0.2.8 namespaces with fixes, loaded ahead of Elle's jar (`:paths` come
 first), each under Elle's license (EPL-2.0, `src/elle/LICENSE`). All were found by a Lean replica
 of Elle ([determinismo-workloads' workloads/elle/lean](https://github.com/determinismo-dst/determinismo-workloads/tree/main/workloads/elle/lean),
-its findings in UNREPORTED.md) and reproduced on Elle. Elle's own suite with them: 103 tests, its
-failures only the expected outputs they change. `failure-to-observe-test` (now also the
-G-single-realtime its history holds), `lost-update-test` (gains G-single-item, D1),
-`g1c-multi-key-delete-test` (D21), `all-anomalies-test` and rw-register's `checker-test` (the new
-`:fuzzy-read`, D6), `anomalies-prohibited-by-test` (the new `:garbage-read`, D8); list-append's
-`checker-test` can't write its output file here, as on Elle as written.
+its findings in UNREPORTED.md) and reproduced on Elle.
+
+Elle's own suite with them (103 tests): list-append's `checker-test` can't write its output file
+here, as on Elle as written; six tests expect what Elle 0.2.8 answers, and our answers differ:
+- `failure-to-observe-test`: also G-single-realtime, so `not` strong snapshot isolation. The
+  transaction's predicate read misses key 5, which the init had created (value 3) and completed
+  before the transaction began: an anti-dependency into the init, and real time out of it.
+  0.2.8 drops the unborn version from the predicate's version order and misses it (D10).
+- `lost-update-test`: also G-single-item. Two transactions read `[0]` and append to `:x`; nobody
+  read either append. Whichever order the appends took, the second appender read the version
+  before the first's append (an anti-dependency) and follows it (a write dependency): one
+  anti-dependency in the cycle, in every interpretation. 0.2.8 reports only the G2-item it gets
+  by orienting both unread appends as anti-dependencies (D1).
+- `g1c-multi-key-delete-test`: G-single-item, so also `not` repeatable read, where 0.2.8 has
+  G-single. The predicate read returned key 38 = 0, which the other transaction deleted; a
+  predicate read's rows are item reads (Adya's definition, and the namespace's docstring), so the
+  cycle runs through an item anti-dependency (D21).
+- rw-register's `checker-test`: `not` also consistent view and repeatable read. The transaction
+  reads `:x` as 1, then as 2, with no write of its own between: a fuzzy read (Adya's P2), which
+  both prohibit; 0.2.8 judged only the first read of a key (D6).
+- `all-anomalies-test`, `anomalies-prohibited-by-test`: the anomaly catalog gains `:fuzzy-read`
+  (D6) and `:garbage-read` (a read of an element nobody appended, where 0.2.8's list-append
+  threw; D8), and read committed's prohibited set `:garbage-read`.
+
 - `closed_predicate.clj`: writes (`[:w k v]`) get write-write edges (`ww-graph` matched
   `:write`); `versions-after` keeps its unborn branch and `version<` orders `:elle/unborn` first,
   so a predicate anti-dependency on a key the init created is found and explained.
