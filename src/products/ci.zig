@@ -125,6 +125,7 @@ fn run(arena: std.mem.Allocator, io: std.Io, argv: []const [:0]const u8) !u8 {
     // copied without its .git), else the repository's git.
     var job: Job = .{};
     var flaky_passes = false;
+    var reply_max: usize = @import("serve_client.zig").reply_max_default;
     var index: usize = 0;
     while (index < argv.len) : (index += 1) {
         const flag = argv[index];
@@ -147,6 +148,8 @@ fn run(arena: std.mem.Allocator, io: std.Io, argv: []const [:0]const u8) !u8 {
             job.commit = argv[index + 1];
         } else if (std.mem.eql(u8, flag, "--subject")) {
             job.subject = argv[index + 1];
+        } else if (std.mem.eql(u8, flag, "--reply-max")) {
+            reply_max = std.fmt.parseInt(usize, argv[index + 1], 10) catch return usage();
         } else return usage();
         index += 1;
     }
@@ -170,7 +173,7 @@ fn run(arena: std.mem.Allocator, io: std.Io, argv: []const [:0]const u8) !u8 {
     const repository = try working_directory(arena);
     if (config.program) |path| config.program = try std.fs.path.resolve(arena, &.{ repository, path });
     if (config.compose) |path| config.compose = try std.fs.path.resolve(arena, &.{ repository, path });
-    const client: Client = .{ .arena = arena, .io = io, .url = serve_url };
+    const client: Client = .{ .arena = arena, .io = io, .url = serve_url, .reply_max = reply_max };
     // The guest the machines boot (GET /build): a setup's snapshot holds its tools as they were.
     const build = try client.call("GET", "/build", null);
     if (build.status != 200) {
@@ -257,7 +260,7 @@ fn run(arena: std.mem.Allocator, io: std.Io, argv: []const [:0]const u8) !u8 {
         .ci = try job_complete(arena, io, job),
     }, .{ .emit_null_optional_fields = false })}));
     std.debug.print("determinismo-ci: testing: {d} shards of {d} timelines, run {s}/#{d}\n", .{ shard_count, config.timelines, serve_url, started.id });
-    _ = try client.run_wait(started.id, 1000);
+    try client.run_wait(started.id, 1000);
     // What serve said of the run: why it stopped it (no coverage in its first timelines: the
     // job's shards then lack timelines, an "error" with no reason given), or that it ended
     // without coverage.
@@ -509,7 +512,8 @@ fn monotonic_ns() u64 {
 
 fn usage() u8 {
     std.debug.print("usage: determinismo-ci [--config .determinismo/ci.json] [--serve <url>] [--cache <dir>] [--flaky-passes]\n" ++
-        "                      [--repository <name>] [--branch <name>] [--commit <sha>] [--subject <text>]   (default: git's, where it runs)\n", .{});
+        "                      [--repository <name>] [--branch <name>] [--commit <sha>] [--subject <text>]   (default: git's, where it runs)\n" ++
+        "                      [--reply-max <bytes>]   (the largest reply read from serve: 64 MB)\n", .{});
     return 2;
 }
 

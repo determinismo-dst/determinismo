@@ -18,6 +18,9 @@ pub const Client = struct {
     io: std.Io,
     /// serve's URL, e.g. http://127.0.0.1:7878.
     url: []const u8,
+    /// The largest reply read (curl's output): a reply past it ends the call with
+    /// StreamTooLong. determinismo-ci's --reply-max.
+    reply_max: usize = reply_max_default,
 
     pub const Reply = struct { status: u16, body: []const u8 };
 
@@ -38,7 +41,7 @@ pub const Client = struct {
             try argv.appendSlice(client.arena, &.{ "--data-binary", try std.fmt.allocPrint(client.arena, "@{s}", .{file}) });
         }
         try argv.append(client.arena, try std.fmt.allocPrint(client.arena, "{s}{s}", .{ client.url, path }));
-        const result = try std.process.run(client.arena, client.io, .{ .argv = argv.items, .stdout_limit = .limited(64 << 20) });
+        const result = try std.process.run(client.arena, client.io, .{ .argv = argv.items, .stdout_limit = .limited(client.reply_max) });
         if (!result.term.success()) return error.ServeUnreachable;
         const newline = std.mem.lastIndexOfScalar(u8, result.stdout, '\n') orelse return error.BadReply;
         const status = std.fmt.parseInt(u16, std.mem.trim(u8, result.stdout[newline + 1 ..], " \r\n"), 10) catch return error.BadReply;
@@ -78,18 +81,20 @@ pub const Client = struct {
         return reply.status == 200;
     }
 
-    /// A run's state (running, passed, failed, ...) and, once it ended, its output.
-    pub fn run_wait(client: Client, run: u32, poll_ms: u64) ![]const u8 {
+    /// Waits for a run to end. Its output stays on serve: fetched here as well, a CI run's 119 MB
+    /// passed the client's 64 MB read and ended determinismo-ci with StreamTooLong after the run
+    /// had ended well (jank's run 2202), its verdicts never printed; nobody read it.
+    pub fn run_wait(client: Client, run: u32, poll_ms: u64) !void {
         const Run = struct { state: []const u8 = "" };
         while (true) {
             const found = try client.json(Run, "GET", try std.fmt.allocPrint(client.arena, "/runs/{d}", .{run}), null);
-            if (!std.mem.eql(u8, found.state, "running")) break;
+            if (!std.mem.eql(u8, found.state, "running")) return;
             sleep_ms(poll_ms);
         }
-        const reply = try client.call("GET", try std.fmt.allocPrint(client.arena, "/runs/{d}/output", .{run}), null);
-        return reply.body;
     }
 };
+
+pub const reply_max_default: usize = 64 << 20;
 
 pub fn sleep_ms(ms: u64) void {
     const linux = std.os.linux;

@@ -2958,6 +2958,22 @@ fn check_ci(context: *Context) !void {
     // property, so its own verdict: the shard's failing test no longer hides its flaky one.
     const junit_command = try std.mem.replaceOwned(u8, arena, command, "--config ci.json", "--config ci-junit.json");
     const junit = try run_kept(context, &.{ "sh", "-c", junit_command });
+    // The same job read with a reply cap below its run's output: determinismo-ci read the whole
+    // output once the run ended (jank's run 2202: 119 MB past the 64 MB cap, StreamTooLong, the
+    // verdicts never printed), though it uses none of it.
+    const capped_command = try std.mem.replaceOwned(u8, arena, junit_command, "--config ci-junit.json", "--config ci-junit.json --reply-max 262144");
+    const capped = try run_kept(context, &.{ "sh", "-c", capped_command });
+    const capped_judged = std.mem.indexOf(u8, capped.stdout, "3 tests, 1 failing, 1 flaky") != null and
+        std.mem.indexOf(u8, capped.stdout, "StreamTooLong") == null and std.mem.indexOf(u8, capped.stderr, "StreamTooLong") == null;
+    // Its run's output past that cap (the latest run's), so the job had the reply to refuse.
+    const capped_output: usize = capped_size: {
+        const Run = struct { id: u32 };
+        const all = std.json.parseFromSliceLeaky([]const Run, arena, curl(context, &.{url ++ "/runs"}) catch "[]", .{ .ignore_unknown_fields = true }) catch break :capped_size 0;
+        var latest: u32 = 0;
+        for (all) |listed_run| latest = @max(latest, listed_run.id);
+        const text = curl(context, &.{try std.fmt.allocPrint(arena, url ++ "/runs/{d}/output", .{latest})}) catch break :capped_size 0;
+        break :capped_size text.len;
+    };
     const per_test = std.mem.indexOf(u8, junit.stdout, "flaky  tests.test_demo::test_flaky: failing in ") != null and
         std.mem.indexOf(u8, junit.stdout, "fail   tests.test_demo::test_always_wrong: failing in 12 of 12") != null and
         std.mem.indexOf(u8, junit.stdout, "3 tests, 1 failing, 1 flaky") != null and
@@ -3017,6 +3033,8 @@ fn check_ci(context: *Context) !void {
     }, "ci, sharded by the runner:\n{s}", .{sharded.stdout[sharded.stdout.len -| 1500..]});
     expect_all(context, &.{
         .{ "with JUnit: each test its own verdict (one failing everywhere, one flaky), linked to its property", per_test },
+        .{ "a run's output past the client's reply cap: the job still prints its verdicts", capped_judged },
+        .{ "that run's output was past the cap (256 KB)", capped_output > 262144 },
         .{ "the demo's shards: one passes, one is flaky, one fails", kinds(outputs[0]) },
         .{ "a job is one run, its timelines the shards'", std.mem.count(u8, outputs[0], "determinismo-ci: testing: 3 shards of 12 timelines, run ") == 1 },
         .{ "each job's run tagged with where its tests come from (serve's CI page)", job_tagged },
