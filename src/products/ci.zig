@@ -257,10 +257,6 @@ fn run(arena: std.mem.Allocator, io: std.Io, argv: []const [:0]const u8) !u8 {
     if (said.uncovered.len > 0) std.debug.print("determinismo-ci: run {d}: {s}\n", .{ started.id, said.uncovered });
     // Each shard's verdict: its property's failing timelines among its own.
     const ShardRow = struct { shard: u32 = 0, failing: u32 = 0, timelines: u32 = 0 };
-    const shard_sql = "SELECT CAST(json_extract(event, '$.assert.details.shard') AS INTEGER) AS shard, " ++
-        "count(DISTINCT timeline) FILTER (WHERE condition = false) AS failing, count(DISTINCT timeline) AS timelines " ++
-        "FROM timeline_events WHERE name = 'the CI shard''s tests pass' GROUP BY 1 ORDER BY 1";
-    comptime std.debug.assert(std.mem.eql(u8, shard_property, "the CI shard's tests pass")); // Its quote doubled above.
     const rows = try client.json([]const ShardRow, "POST", try std.fmt.allocPrint(arena, "/runs/{d}/sql", .{started.id}), try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(.{ .sql = shard_sql }, .{})}));
     var verdict: []const u8 = "pass";
     for (1..shard_count + 1) |number| {
@@ -286,6 +282,14 @@ fn run(arena: std.mem.Allocator, io: std.Io, argv: []const [:0]const u8) !u8 {
     if (std.mem.eql(u8, verdict, "pass")) return 0;
     if (std.mem.eql(u8, verdict, "flaky")) return if (flaky_passes) 0 else 2;
     return 1;
+}
+
+/// Each shard's verdict from serve's store: its property's failing timelines among its own.
+pub const shard_sql = "SELECT CAST(json_extract(event, '$.assert.details.shard') AS INTEGER) AS shard, " ++
+    "count(DISTINCT timeline) FILTER (WHERE condition = false) AS failing, count(DISTINCT timeline) AS timelines " ++
+    "FROM timeline_events WHERE name = 'the CI shard''s tests pass' GROUP BY 1 ORDER BY 1";
+comptime {
+    std.debug.assert(std.mem.eql(u8, shard_property, "the CI shard's tests pass")); // Its quote doubled above.
 }
 
 /// The setup in a machine of its own: the setup command, the test list, a checkpoint; the
