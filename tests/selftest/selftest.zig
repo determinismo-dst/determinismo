@@ -1460,6 +1460,7 @@ fn disk_faults(context: *System.Context) !void {
     try rewrite_power_loss(&echo, false);
     try rewrite_power_loss(&echo, true);
     try aimed_corruption(&echo);
+    rmw_corruption(&echo);
     // A file renamed into place by a process gone at once, never synced: the guest's rename
     // tracer finds its node by the path (the e2e check counts node_rename_unsynced).
     _ = echo.exec(&.{ "/bin/det-selftest-node", "rename-unsynced", "/data/renamed-exec" }) catch 1;
@@ -1500,6 +1501,35 @@ fn aimed_corruption(echo: *const sdk.Node) !void {
         .beside = beside,
         .after = after,
     });
+}
+
+/// A byte written into a page not in the page cache during a corrupt_reads fault: the kernel reads
+/// the page to merge the write, that read is corrupted, and the write-back stores a byte the node
+/// never wrote. What is stored stays intact but there, and the fault names every read it
+/// corrupted (disk_corrupt_read: node, file, sectors), so a durability judge can tell (CE31, the
+/// Lean replica of determinismo). rmw_checked says how many foreign bytes were stored.
+fn rmw_corruption(echo: *const sdk.Node) void {
+    const written = page_write(echo, "/data/rmw");
+    const fault_ms = 1000;
+    sdk.fault(.{
+        .kind = "disk",
+        .node = echo.name,
+        .failure = "corrupt_reads",
+        .file = "data/rmw",
+        .corrupt_value = 'Z',
+        .duration_ms = fault_ms,
+    });
+    sdk.sleep_ms(100); // The injector applies it.
+    const merged = (echo.exec(&.{ "/bin/det-selftest-node", "byte-write", "/data/rmw", "100" }) catch 1) == 0;
+    sdk.sleep_ms(fault_ms); // Over: the disk healthy again.
+    var buffer: [32]u8 = undefined;
+    const result = echo.exec_output(&.{ "/bin/det-selftest-node", "page-foreign", "/data/rmw", "100" }, &buffer) catch {
+        sdk.event("rmw_checked", .{ .written = written, .merged = merged, .foreign = -1 });
+        return;
+    };
+    const text = std.mem.trim(u8, result.output, " \n");
+    const foreign = if (std.mem.startsWith(u8, text, "foreign ")) std.fmt.parseInt(i64, text["foreign ".len..], 10) catch -1 else -1;
+    sdk.event("rmw_checked", .{ .written = written, .merged = merged, .foreign = foreign });
 }
 
 fn page_write(node: *const sdk.Node, path: []const u8) bool {

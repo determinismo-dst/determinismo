@@ -172,6 +172,37 @@ pub fn main(init: std.process.Init) !void {
         _ = linux.write(1, text.ptr, text.len);
         linux.exit_group(0);
     }
+    if (arguments.len == 4 and std.mem.eql(u8, arguments[1], "byte-write")) {
+        // One byte 'b' written at `offset` of a page not in the page cache (its clean page
+        // dropped first), synced: the kernel reads the page to merge the write (a read-modify-
+        // write), and a disk failing its reads then has that read corrupted.
+        const offset = std.fmt.parseInt(u64, arguments[3], 10) catch linux.exit_group(2);
+        const fd = linux.open(@ptrCast(arguments[2].ptr), .{ .ACCMODE = .RDWR }, 0);
+        if (linux.errno(fd) != .SUCCESS) linux.exit_group(1);
+        _ = linux.fadvise(@intCast(fd), 0, 0, linux.POSIX_FADV.DONTNEED);
+        const byte = "b";
+        const written = linux.pwrite(@intCast(fd), byte, 1, @intCast(offset));
+        const synced = linux.errno(written) == .SUCCESS and written == 1 and linux.errno(linux.fsync(@intCast(fd))) == .SUCCESS;
+        _ = linux.close(@intCast(fd));
+        linux.exit_group(if (synced) 0 else 1);
+    }
+    if (arguments.len == 4 and std.mem.eql(u8, arguments[1], "page-foreign")) {
+        // The page read from the disk itself (O_DIRECT): its bytes the node never wrote (not 'a',
+        // and not the 'b' at `offset`), "foreign <count>".
+        const offset = std.fmt.parseInt(u64, arguments[3], 10) catch linux.exit_group(2);
+        var page: [page_size]u8 align(page_size) = undefined;
+        const fd = linux.open(@ptrCast(arguments[2].ptr), .{ .ACCMODE = .RDONLY, .DIRECT = true }, 0);
+        if (linux.errno(fd) != .SUCCESS) linux.exit_group(1);
+        const size = linux.read(@intCast(fd), &page, page.len);
+        _ = linux.close(@intCast(fd));
+        if (linux.errno(size) != .SUCCESS or size != page.len) linux.exit_group(1);
+        var foreign: u32 = 0;
+        for (page, 0..) |byte, index| foreign += @intFromBool(byte != (if (index == offset) @as(u8, 'b') else 'a'));
+        var line: [32]u8 = undefined;
+        const text = std.fmt.bufPrint(&line, "foreign {d}\n", .{foreign}) catch linux.exit_group(1);
+        _ = linux.write(1, text.ptr, text.len);
+        linux.exit_group(0);
+    }
     if (arguments.len == 3 and std.mem.eql(u8, arguments[1], "rename-unsynced")) {
         // `<path>.tmp` written, never synced, renamed to `<path>`, and the process gone at once:
         // a script's `mv` (the guest's rename tracer finds the node by the path).

@@ -7405,6 +7405,11 @@ fn check_disk(context: *Context) !void {
         "PASS always                hit in    3/3 branches, failing in    0  a disk fault aimed at one " ++
             "file corrupts its reads alone, until it heals",
     });
+    // A byte written into an uncached page during corrupt_reads (CE31, the Lean replica of
+    // determinismo): the merge's read corrupted, the write-back stores a byte the node never
+    // wrote, and the fault names that read (disk_corrupt_read, the aimed file's).
+    const merged_foreign = try query_count(context, &.{ events, "event=rmw_checked and details.foreign>0" });
+    const named_reads = try query_count(context, &.{ events, "event=disk_corrupt_read and details.file=data/rmw" });
     var branches: [3]Branch = undefined;
     const count = parse_branches(report, &branches);
     var same = false;
@@ -7427,6 +7432,8 @@ fn check_disk(context: *Context) !void {
         .{ "a restart reading data its node wrote before it and never synced is said", relied > 0 },
         .{ "a node's disk is checked before it is mounted again (e2fsck -p)", checked > 0 },
         .{ "a disk fault aimed at one file corrupts its reads alone in all 3 timelines", aimed_passes },
+        .{ "a write into an uncached page during corrupt_reads stores a byte the node never wrote", merged_foreign > 0 },
+        .{ "the fault names the reads it corrupted (disk_corrupt_read)", named_reads > 0 },
         .{ "a timeline replays exactly", same },
     }, "disk: a crash keeps what was synced and loses the rest, a wipe loses both; dropped " ++
         "writes vanish, refused ones fail, a slow disk is slow, and it works again; an outage " ++
