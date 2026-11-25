@@ -22,11 +22,21 @@ if [ "$built" = "$tree" ]; then
   echo "== Elle: image $label=$built = checkers/elle $tree: current"
   exit 0
 fi
-running=$(curl -s -m 20 http://127.0.0.1:7878/runs | python3 -c '
+# serve's runs, once it answers: update.sh calls this right after serve's restart, when /runs
+# answers nothing yet, and the count read as unknown refused every rebuild (2026-11-25's deploy
+# left the old image judging). Up to a minute; still unknown after it, refused as before.
+runs_running() {
+  curl -s -m 20 http://127.0.0.1:7878/runs | python3 -c '
 import json, sys
 v = json.load(sys.stdin)
 v = v if isinstance(v, list) else next(x for x in v.values() if isinstance(x, list))
-print(sum(r.get("state") == "running" for r in v))' 2>/dev/null || echo unknown)
+print(sum(r.get("state") == "running" for r in v))' 2>/dev/null
+}
+running=unknown
+for _ in $(seq 1 30); do
+  if count=$(runs_running) && [ -n "$count" ]; then running=$count; break; fi
+  sleep 2
+done
 units=$(systemctl list-units --no-legend --plain 'det-*' 2>/dev/null | wc -l | tr -d ' ')
 if [ "$running" != 0 ] || [ "$units" != 0 ]; then
   echo "== Elle: image $label=${built:-none} != checkers/elle $tree: NOT rebuilt ($running runs," \
