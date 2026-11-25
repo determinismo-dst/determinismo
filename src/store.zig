@@ -1914,6 +1914,61 @@ test "a version 9 database gains its summaries in place, its pages answering as 
     try testing.expectEqualStrings(ingested, try pages_json(&connection, arena));
 }
 
+test "a CI job's timelines without their JUnit report are counted each, a shard's full reports hiding none" {
+    // CE37 (the Lean replica of determinismo): two shards, two timelines each; shard 1 reports
+    // its test in both, shard 2's runner died before its report in one (its shard failing). The
+    // run-wide count (the most timelines any test was reported in) said 0.
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/events", .{&tmp.sub_path});
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, directory);
+    const shard_pass1 =
+        \\{"assert":{"type":"always","message":"the CI shard's tests pass","condition":true,"details":{"shard":1,"status":0}}}
+    ;
+    const shard_pass2 =
+        \\{"assert":{"type":"always","message":"the CI shard's tests pass","condition":true,"details":{"shard":2,"status":0}}}
+    ;
+    const shard_fail2 =
+        \\{"assert":{"type":"always","message":"the CI shard's tests pass","condition":false,"details":{"shard":2,"status":1}}}
+    ;
+    const test_a =
+        \\{"assert":{"type":"always","message":"test passes: t::a","condition":true,"details":{}}}
+    ;
+    const test_b =
+        \\{"assert":{"type":"always","message":"test passes: t::b","condition":true,"details":{}}}
+    ;
+    // Timelines 0 and 2 run shard 1 ({timeline%2}+1), 1 and 3 shard 2; timeline 3's runner died.
+    const files = comptime [_]struct { []const u8, []const u8 }{
+        .{ "setup.jsonl", line(1, 100, "{\"event\":\"node_start\",\"details\":{\"node\":\"app\"}}") },
+        .{ "branch-0.jsonl", line(2, 800, test_a) ++ line(3, 900, shard_pass1) },
+        .{ "branch-1.jsonl", line(4, 800, test_b) ++ line(5, 900, shard_pass2) },
+        .{ "branch-2.jsonl", line(6, 800, test_a) ++ line(7, 900, shard_pass1) },
+        .{ "branch-3.jsonl", line(8, 900, shard_fail2) },
+        .{ "timelines.jsonl", timeline_line(0, 1000, "[]") ++ timeline_line(1, 1000, "[]") ++ timeline_line(2, 1000, "[]") ++ timeline_line(3, 1000, "[]") },
+    };
+    inline for (files) |file| {
+        try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(arena, &.{ directory, file[0] }), .data = file[1] });
+        if (event_files.index_of(file[0])) |index| try event_files.compress(directory, index);
+    }
+    var failure: duckdb.Failure = .{};
+    var database = try duckdb.Database.open(":memory:", .{ .threads = 2 }, &failure);
+    defer database.close();
+    const store = try Store.attach(&database, arena, directory, "run_1", &failure);
+    var attached = try store.connect(&database, arena, &failure);
+    defer attached.close();
+    _ = try ingest(&attached, arena, io, directory);
+    const Row = struct { passed: u64, unreported: u64 };
+    const rows = try attached.rows(Row, arena, @import("products/ci.zig").unreported_sql, .{});
+    try testing.expectEqual(1, rows.len);
+    // Timeline 3 alone, its shard failing (a dead runner: the shard's failure, no job error).
+    try testing.expectEqual(Row{ .passed = 0, .unreported = 1 }, rows[0]);
+}
+
 test "a CI shard's verdict counts the run's timelines, never a session's" {
     // CE28 (the Lean replica of determinismo): a session on a CI job's run (a fix tried at a failing
     // timeline's REPL) changed its shard's verdict: 3 failing timelines and a passing session read
