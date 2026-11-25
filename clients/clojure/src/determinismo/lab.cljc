@@ -741,11 +741,15 @@
       (finally (finish! resumed label {})))
     (assoc @done :session resumed :timeline (dbg/timeline resumed) :lab @state)))
 
-(defn- outcomes [lab from]
-  (let [done (filter (fn [h] (and (:to-ns h) (>= (:to-ns h) from))) (:history (:world lab)))]
-    {:ok (count (filter (fn [h] (= 0 (:status h))) done))
-     :failed (count (remove (fn [h] (= 0 (:status h))) done))
-     :failures (vec (take 6 (map (fn [h] (str (:command h) " " (:status h))) (remove (fn [h] (= 0 (:status h))) done))))}))
+(defn- outcomes
+  "The test commands that ended among `events`: how many exited 0, how many did not, the first
+  of those."
+  [events]
+  (let [done (keep (fn [e] (when (= "command_exit" (get-in e [:event :event])) (get-in e [:event :details]))) events)
+        failed (remove (fn [d] (= 0 (:status d))) done)]
+    {:ok (- (count done) (count failed))
+     :failed (count failed)
+     :failures (vec (take 6 (map (fn [d] (str (:command d) " " (:status d))) failed)))}))
 
 (defn diff
   "What a fault changed: `with` against `without`, two futures of the same checkpoint (each
@@ -774,7 +778,7 @@
     {:lab/diff true
      :from-ns from-ns
      :failing {:new (vec (sort (remove fa fb))) :gone (vec (sort (remove fb fa))) :both (vec (sort (filter fa fb)))}
-     :history {:without (outcomes (:lab without) from-ns) :with (outcomes (:lab with) from-ns)}
+     :history {:without (outcomes a) :with (outcomes b)}
      :events by-name
      :counts {:without (count a) :with (count b)}
      :parted (if parted
