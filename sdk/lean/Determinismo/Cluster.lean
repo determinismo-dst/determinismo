@@ -131,6 +131,11 @@ structure Config where
   connections : Bool := false
   /-- The nodes clients ask (none: any up node). -/
   clientNodes : Option (List NodeId) := none
+  /-- The recovery phase fair, with no decisions: the partition healed, every down node started,
+  then due timers fired, and deliveries (rotating over destinations, each its oldest) and ticks
+  (the up nodes in turn) alternating, so a liveness property fails for the system, never for a
+  starving schedule. -/
+  fairRecovery : Bool := false
   /-- Decisions per timeline at most. -/
   limit : Nat := 100000
   deriving Repr
@@ -545,9 +550,42 @@ def possible (c : Cluster s) : List (Event × Nat) :=
     (.evict, if faulty && f.evict && !c.targetable.isEmpty then 1 else 0),
     (.timer, if c.dueTimers.isEmpty then 0 else 3) ].filter (·.2 > 0)
 
+/-- One event of a fair recovery (`Config.fairRecovery`), no decision taken. -/
+def fairEvent (b : Behavior s) : ClusterM s Bool := do
+  let c ← get
+  if !c.blocked.isEmpty then
+    modify fun c => { c with blocked := [] }
+    note "partition healed"
+  else if let n :: _ := c.downNodes then startNode b n
+  else if let (n, name, _) :: _ := c.dueTimers then
+    modify fun c => { c with timers := c.timers.filter (fun (m, k, _) => !(m == n && k == name)) }
+    note s!"node {n}: timer {name} fired"
+    if let some state := ((← get).node n).state then
+      if let some state' ← runAt n (b.timer state name) then settle n state'
+  else
+    let up := c.upNodes
+    let size := c.nodes.size
+    -- Deliveries and ticks in turn; deliveries rotate over destinations (a backlog to one node
+    -- never holds back another's), ticks over the up nodes.
+    let rotation := (List.range size).map fun i => (c.step / 2 + i) % (max size 1)
+    let next := rotation.findSome? fun d => c.deliverable.find? (·.dst == d)
+    match next with
+    | some e => if c.step % 2 == 0 || up.isEmpty then deliver b e false
+                else
+                  modify fun c => { c with time := c.time + 1 }
+                  tickNode b (up.getD (c.step / 2 % up.length) 0)
+    | none =>
+      if up.isEmpty then return false
+      modify fun c => { c with time := c.time + 1 }
+      tickNode b (up.getD (c.step / 2 % up.length) 0)
+  tellDeaths b
+  modify fun c => { c with step := c.step + 1 }
+  return true
+
 /-- One event, drawn. False when nothing can happen. -/
 def event (b : Behavior s) : ClusterM s Bool := do
   let c ← get
+  if c.recovering && c.config.fairRecovery then return ← fairEvent b
   let options := possible c
   if options.isEmpty then return false
   let index ← decideWeighted (σ := Cluster s) "world.event" (options.map (·.2))

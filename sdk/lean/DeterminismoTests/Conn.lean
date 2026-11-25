@@ -75,4 +75,19 @@ def timed : Behavior sys where
 
 def runTimed (cfg : Config) (source : Source) : Run sys := runCluster timed {} cfg source
 
+/-- Liveness: in the recovery phase each node hears from the other (ghost "heard.<n>"). -/
+def pinging : Behavior sys :=
+  { behavior with
+    receive := fun st _ => do
+      if (← get).recovering then Node.setGhost (s := sys) s!"heard.{← Node.self (s := sys)}" 1
+      pure st }
+
+def hearsBoth : Properties sys where
+  final c := if c.ghostOf "heard.0" == 1 && c.ghostOf "heard.1" == 1 then none
+    else some s!"heard: node 0 {c.ghostOf "heard.0"}, node 1 {c.ghostOf "heard.1"}"
+
+def runLive (fair : Bool) (source : Source) : Ended :=
+  let r := runCluster pinging hearsBoth { config true with recovery := 12, fairRecovery := fair } source
+  { taken := r.taken, violation := r.violation }
+
 end DeterminismoTests.Conn

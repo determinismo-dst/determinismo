@@ -246,6 +246,10 @@ def connections : List Check :=
       ok := let rs := (List.range 200).map fun i => (Conn.runTimed on (Source.seeded i)).cluster
         rs.any (·.ghostOf "fired" > 0) && rs.any (·.ghostOf "received" > 0)
           && rs.any (fun c => c.log.any (fun l => (l.splitOn "killed").length > 1)) },
+    { name := "a random recovery of 12 events can starve a node: a liveness property fails",
+      ok := (explore (Conn.runLive false) 1000).isSome },
+    { name := "a fair recovery starves none: every node hears from the other",
+      ok := (explore (Conn.runLive true) 1000).isNone },
     { name := "clients kept to node 0",
       ok := (List.range 100).all fun i =>
         (Conn.runFull (Conn.config true (clientNodes := some [0])) (Source.seeded i)).cluster.history.all (·.node == 0) } ]
