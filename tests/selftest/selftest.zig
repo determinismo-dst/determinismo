@@ -149,6 +149,8 @@ pub fn main(init: std.process.Init) !void {
             .egress = egress_scenario,
             .fork_pull = fork_pull_scenario,
             .workload_singleton = workload_singleton_scenario,
+            .serial_slow = serial_slow_scenario,
+            .singleton_slow = singleton_slow_scenario,
             .ingress = ingress_scenario,
             .stress = stress,
             .quiet = quiet_scenario,
@@ -2302,6 +2304,21 @@ fn workload_singleton_scenario(s: *System.Scenario) void {
     s.parallel_driver("nemesis_a", driver_ran);
     s.parallel_driver("nemesis_b", driver_ran);
     s.workload("workload");
+}
+
+/// A serial driver, and a singleton, that outlast any timeline length (tools/e2e.zig:
+/// length-bounds): with --timeline 30s each is killed after the length's grace, the faults with
+/// it (the Lean replica of determinismo's CE4: they ran their 300 s).
+fn serial_slow_scenario(s: *System.Scenario) void {
+    s.serial_driver("slow", length_slow_driver);
+}
+
+fn singleton_slow_scenario(s: *System.Scenario) void {
+    s.singleton_driver("slow", length_slow_driver);
+}
+
+fn length_slow_driver(_: *System.Context) !void {
+    sdk.sleep_ms(300_000);
 }
 
 fn drivers_unmarked_scenario(s: *System.Scenario) void {

@@ -229,7 +229,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "wasm-reach", check_wasm_reach },             .{ "plugins-many", check_plugins_many },             .{ "strategy-follow", check_strategy_follow },
         .{ "steppers", check_steppers },                 .{ "reactive-faults", check_reactive_faults },       .{ "injectors", check_injectors },
         .{ "labels", check_labels },                     .{ "wasm-upload", check_wasm_upload },               .{ "timeline-clocks", check_timeline_clocks },
-        .{ "egress", check_egress },                     .{ "fork-replay", check_fork_replay },                     .{ "workload-singleton", check_workload_singleton },                     .{ "ingress", check_ingress },                       .{ "ingress-session", check_ingress_session },
+        .{ "egress", check_egress },                     .{ "fork-replay", check_fork_replay },                     .{ "workload-singleton", check_workload_singleton },                     .{ "length-bounds", check_length_bounds },                     .{ "ingress", check_ingress },                       .{ "ingress-session", check_ingress_session },
         .{ "moments", check_moments },                   .{ "properties", check_builtin_properties },         .{ "entropy", check_kernel_entropy },
         .{ "quiet", check_quiet_period },                .{ "clock_jitter", check_clock_jitter },             .{ "query", check_query },
         .{ "progress", check_progress_while_quiet },     .{ "network", check_network_faults },                .{ "fault-exclusions", check_fault_exclusions },
@@ -414,6 +414,34 @@ fn moment_ns(output: []const u8) ?u64 {
 /// A singleton marked as the workload, the timeline drawn without it and the swarm leaving both
 /// nemeses out (the draws forced): the composer keeps a driver and the timeline runs (the Lean
 /// replica of determinismo's CE3: it panicked at run_drivers, no driver phase, no ending).
+/// A serial driver and a singleton sleeping 300 s under --timeline 30s: each timeline's driver
+/// phase ends at the length plus its 30 s grace, the driver killed (`length_reached`), not at
+/// 300 s (the Lean replica of determinismo's CE4).
+fn check_length_bounds(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "det-selftest" });
+    var ended_s: [2]f64 = .{ 0, 0 };
+    var reached: [2]bool = .{ false, false };
+    for ([_][]const u8{ "serial_slow", "singleton_slow" }, 0..) |scenario, index| {
+        const events = try std.fmt.allocPrint(arena, "{s}/length-bounds-{s}", .{ context.scratch, scenario });
+        const report = try explore(context, &.{
+            "--program", program, "--scenario", scenario, "--seed", "1", "--branches", "1", "--timeline", "30s", "--events-dir", events,
+        });
+        var branches: [1]Branch = undefined;
+        if (parse_branches(report, &branches) != 1) continue;
+        try events_plain(context, events);
+        const text = std.Io.Dir.cwd().readFileAlloc(context.io, try std.fmt.allocPrint(arena, "{s}/branch-{d}.jsonl", .{ events, branches[0].index }), arena, .limited(64 << 20)) catch "";
+        reached[index] = std.mem.indexOf(u8, text, "\"length_reached\"") != null;
+        ended_s[index] = branch_vtime(report) orelse 0;
+    }
+    expect_all(context, &.{
+        .{ "a serial driver past the length is killed after its grace", reached[0] },
+        .{ "its timeline ends long before the driver's 300 s", ended_s[0] > 0 and ended_s[0] < 200 },
+        .{ "a singleton past an asked length is killed after its grace", reached[1] },
+        .{ "its timeline ends long before the driver's 300 s", ended_s[1] > 0 and ended_s[1] < 200 },
+    }, "length-bounds: serial ended at {d:.0} s, singleton at {d:.0} s (--timeline 30s, drivers of 300 s)", .{ ended_s[0], ended_s[1] });
+}
+
 fn check_workload_singleton(context: *Context) !void {
     const arena = context.arena;
     const program = try std.fs.path.join(arena, &.{ context.bin, "det-selftest" });

@@ -401,6 +401,18 @@ const Composer = struct {
         while (composer.running_count > 0) assert(composer.reap(true, true));
     }
 
+    /// A command run alone until it ends, or until `deadline_ns` (a timeline's length: still
+    /// running then, the ending's grace and kill bound it as they bound the parallel drivers).
+    /// Waiting for it to end whatever the length, a serial driver or a singleton ran on past
+    /// the length and its faults with it (the Lean replica of determinismo's CE4).
+    fn run_alone_until(composer: *Composer, command: *const Command, deadline_ns: u64) void {
+        if (deadline_ns == std.math.maxInt(u64)) return composer.run_to_completion(command);
+        assert(composer.running_count == 0);
+        announce(command, "complete");
+        composer.start(command);
+        composer.wait_until(deadline_ns);
+    }
+
     fn run_to_completion(composer: *Composer, command: *const Command) void {
         assert(composer.running_count == 0);
         announce(command, "complete");
@@ -493,7 +505,7 @@ pub fn main(init: std.process.Init) !void {
         sdk.event("self_driven", .{ .ms = length_ns / std.time.ns_per_ms });
         sleep_until(drive_start_ns + length_ns);
     } else if (singleton_timeline) {
-        run_singleton(&composer);
+        length_end_ns = run_singleton(&composer);
     } else {
         length_end_ns = run_drivers(&composer, scenario.drive_ms_max orelse drive_max_default_ms(), scenario.parallel_max);
         while (drive_again(drive_start_ns)) {
@@ -692,7 +704,10 @@ fn singleton_drawn() bool {
     return sdk.random_below_named("composer.singleton", 8) < eighths;
 }
 
-fn run_singleton(composer: *Composer) void {
+/// The singleton timeline's driver phase: its end, when a timeline length was asked
+/// (--timeline: the length bounds it as it bounds the drivers'; a drawn length doesn't, a
+/// singleton running alone to its end by design).
+fn run_singleton(composer: *Composer) ?u64 {
     assert(composer.kind_count(.singleton_driver) > 0);
     // Announced as every driver start is: a script records them (script.zig), and replays them.
     // Unannounced, a singleton scenario's script had no commands, and its replay no driver phase
@@ -707,7 +722,13 @@ fn run_singleton(composer: *Composer) void {
     const driver = composer.pick(.singleton_driver);
     announce(driver, "start");
     composer.start(driver);
+    if (timeline_length_ns()) |length_ns| {
+        const end_ns = now_ns() + length_ns;
+        composer.wait_until(end_ns);
+        return end_ns;
+    }
     composer.wait_all();
+    return null;
 }
 
 /// Parallel and serial drivers in random order and parallelism, with anytime checks mixed in.
@@ -847,7 +868,7 @@ fn driver_start_by(composer: *Composer, kinds: []const Kind, parallelism: u64, d
         .serial_driver => {
             composer.wait_below(1, deadline_ns);
             if (composer.running_count > 0) return;
-            composer.run_to_completion(composer.pick(.serial_driver));
+            composer.run_alone_until(composer.pick(.serial_driver), deadline_ns);
         },
         .parallel_driver, .anytime => {
             composer.wait_below(@intCast(parallelism), deadline_ns);
