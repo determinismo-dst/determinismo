@@ -391,7 +391,8 @@ classpath), `determinismo.session` drives sessions and runs:
   it, the decision `composer.min_drive_ms`; the scenario's `min_drive_ms` or explore's
   `--min-drive` set its maximum, 0 none), then are killed. Within it, any node or command can ask for
   a quiet period: `"$DETERMINISMO_STOP_FAULTS" 5` (also `$ANTITHESIS_STOP_FAULTS`): the fault
-  under way ends and none but clock skips start for 5 seconds (`0` ends a quiet period). And
+  under way ends and no drawn fault but clock skips starts for 5 seconds (`0` ends a quiet
+  period); a fault the scenario asks for (`sdk.fault`) still starts. And
   progress mid-run, not only once faults are over (Antithesis's property catalogs: a store
   serves, a queue moves, in fault-free windows): a singleton driver calling
   `sdk.progress_while_quiet(message, window_ms, interval_ms, operation, arguments)` pauses
