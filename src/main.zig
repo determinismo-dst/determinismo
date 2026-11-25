@@ -2533,7 +2533,7 @@ fn command_explore(
         });
     }
     if (arguments.tape_path) |path| {
-        const overrides = try context.arena.create(tape.Overrides);
+        const overrides = try tape.Overrides.create(context.arena);
         const cwd = std.Io.Dir.cwd();
         const source = try cwd.readFileAlloc(context.io, path, context.arena, .unlimited);
         const scratch = try context.arena.alloc(u8, 64 * 1024);
@@ -2728,7 +2728,7 @@ fn command_explore(
         // Ancestors' tapes are beside this one: what a strategy decided in them, replayed.
         const directory = std.fs.path.dirname(arguments.tape_path.?) orelse ".";
         const ancestor = if (replay.header.chain.len > 0)
-            try context.arena.create(tape.Overrides)
+            try tape.Overrides.create(context.arena)
         else
             undefined;
         // From a snapshot of the branch itself (--tape-snapshot): its ancestors are behind it.
@@ -2743,7 +2743,7 @@ fn command_explore(
         // analysis): the branch itself replayed to the moment, then new branches from there,
         // with their own seeds.
         if (arguments.from_vtime_ms) |ms| {
-            const own = try context.arena.create(tape.Overrides);
+            const own = try tape.Overrides.create(context.arena);
             const recorded = try Recorded.load(context.arena, directory, replay.header.branch, replay.header.branch_seed, own);
             const at = ms * std.time.ns_per_ms;
             const branch_point = replay.header.chain.len > 0;
@@ -3253,7 +3253,7 @@ fn setup_tape_load(context: Context, tape_path: []const u8, header: tape.Header)
         error.FileNotFound => return null,
         else => return err,
     };
-    const overrides = try context.arena.create(tape.Overrides);
+    const overrides = try tape.Overrides.create(context.arena);
     const setup_header = try tape.parse(source, try context.arena.alloc(u8, 64 * 1024), overrides);
     if (setup_header.inputs != header.inputs or setup_header.exploration_seed != header.exploration_seed) {
         say("[determinismo] {s} is another exploration's setup (inputs {x:0>16}, seed {x:0>16})\n", .{
@@ -3438,7 +3438,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         .arena = context.arena,
         .options = options,
         .tape_directory = exploration.tape_directory,
-        .buffer = if (branches.holders != null) try context.arena.create(tape.Overrides) else undefined,
+        .buffer = if (branches.holders != null) try tape.Overrides.create(context.arena) else undefined,
     };
     var position_next: usize = 0;
     while (true) {
@@ -4121,7 +4121,7 @@ fn explore_tree(
         .ladders = ladders,
         .disk = disk,
         .io = context.io,
-        .tape_buffer = try arena.create(tape.Overrides),
+        .tape_buffer = try tape.Overrides.create(arena),
         .resumed = exploration.done,
     };
     // What the setup reached, known before the first generation: each timeline reaches it again
@@ -7495,7 +7495,7 @@ fn node_make_start(
         if (making.chain_from) |setup| {
             from = setup;
             // Each ancestor with its own tape (its overrides), read in turn into one table.
-            const ancestor = arena.create(tape.Overrides) catch linux.exit_group(1);
+            const ancestor = tape.Overrides.create(arena) catch linux.exit_group(1);
             var failure: ?node_core.ChainFailure = null;
             from = node_core.chain(arena, vm, options, from, parent.path, making.tape_directory, ancestor, &failure) catch |err| {
                 const segment = failure.?.segment;
@@ -9481,8 +9481,8 @@ test taped_steps_moment {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const overrides = try std.testing.allocator.create(tape.Overrides);
-    defer std.testing.allocator.destroy(overrides);
+    const overrides = try tape.Overrides.create(std.testing.allocator);
+    defer overrides.destroy();
     const scratch = try std.testing.allocator.alloc(u8, 16 * 1024);
     defer std.testing.allocator.free(scratch);
     const source = "{\"tape\":2,\"inputs\":\"00000000000000aa\",\"exploration_seed\":\"0000000000000007\"," ++

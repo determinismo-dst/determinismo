@@ -5,7 +5,10 @@ const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 
-pub const override_count_max = 1 << 16;
+/// The most overrides a tape holds: the recorder stops taping there (tape_full) and a replay
+/// parses no more. A replay's table is allocated at load from its tape's own count, so a
+/// buffer costs what its longest tape needs, not this.
+pub const override_count_max = 1 << 20;
 const tape_version = 2;
 
 pub const Header = struct {
@@ -126,7 +129,11 @@ pub const checkpoint_interval = 64;
 pub const checkpoint_count_max = 1 << 14;
 
 pub const Overrides = struct {
-    entries: [override_count_max]Override,
+    /// Sized at each load from the tape's own count (allocation at init, fixed after; kept for
+    /// later loads that fit): a fixed table of 65,536 refused a session's tape its recorder wrote
+    /// (CE20, the Lean replica of determinismo).
+    entries: []Override,
+    allocator: std.mem.Allocator,
     count: u32,
     cursor: u32,
     checkpoints: [checkpoint_count_max]Checkpoint = undefined,
@@ -143,6 +150,37 @@ pub const Overrides = struct {
     step_count: u32 = 0,
     step_text: [step_text_max]u8 = undefined,
     step_text_used: u32 = 0,
+
+    /// An empty table, its overrides allocated from `allocator` when a tape is parsed into it.
+    pub fn create(allocator: std.mem.Allocator) !*Overrides {
+        const overrides = try allocator.create(Overrides);
+        overrides.entries = &.{};
+        overrides.allocator = allocator;
+        overrides.count = 0;
+        overrides.cursor = 0;
+        overrides.checkpoint_count = 0;
+        overrides.checkpoint_cursor = 0;
+        overrides.checkpoint_every = 1;
+        overrides.reason_count = 0;
+        overrides.reason_cursor = 0;
+        overrides.step_count = 0;
+        overrides.step_text_used = 0;
+        return overrides;
+    }
+
+    pub fn destroy(overrides: *Overrides) void {
+        overrides.allocator.free(overrides.entries);
+        overrides.allocator.destroy(overrides);
+    }
+
+    /// The table made room for `count` overrides: allocated anew only past its size.
+    fn reserve(overrides: *Overrides, count: usize) !void {
+        if (count > override_count_max) return error.TapeTooLong;
+        if (count <= overrides.entries.len) return;
+        overrides.allocator.free(overrides.entries);
+        overrides.entries = &.{};
+        overrides.entries = try overrides.allocator.alloc(Override, count);
+    }
 
     /// The taped steps, in the order they ran.
     pub fn steps_taped(overrides: *const Overrides) []const Step {
@@ -523,6 +561,8 @@ pub fn parse(source: []const u8, scratch: []u8, overrides: *Overrides) !Header {
     overrides.cursor = 0;
     overrides.reason_count = 0;
     overrides.reason_cursor = 0;
+    // Its overrides counted first (each line the recorder writes starts so), the table sized.
+    try overrides.reserve(std.mem.count(u8, source, "\n{\"pull\":"));
     var lines = std.mem.tokenizeScalar(u8, source, '\n');
     const header_line = lines.next() orelse return error.EmptyTape;
     var fba = std.heap.FixedBufferAllocator.init(scratch);
@@ -552,7 +592,7 @@ pub fn parse(source: []const u8, scratch: []u8, overrides: *Overrides) !Header {
 }
 
 fn override_parse(overrides: *Overrides, value: std.json.Value) !void {
-    if (overrides.count == override_count_max) return error.TapeTooLong;
+    if (overrides.count == overrides.entries.len) return error.TapeTooLong; // Counted before.
     const entry = &overrides.entries[overrides.count];
     entry.pull = @intCast((value.object.get("pull") orelse return error.BadTape).integer);
     const hex = (value.object.get("hex") orelse return error.BadTape).string;
@@ -614,8 +654,8 @@ fn checkpoint_kept(checkpoint: Checkpoint, every: u32) bool {
 }
 
 test "a tape's checkpoints past the array are thinned, never refused" {
-    const overrides = try std.testing.allocator.create(Overrides);
-    defer std.testing.allocator.destroy(overrides);
+    const overrides = try Overrides.create(std.testing.allocator);
+    defer overrides.destroy();
     overrides.checkpoint_count = 0;
     overrides.checkpoint_cursor = 0;
     overrides.checkpoint_every = 1;
@@ -641,8 +681,8 @@ test "a tape's checkpoints past the array are thinned, never refused" {
 test "a tape whose checkpoints all sit on the doubled interval thins again" {
     // The Lean replica's CE14: checkpoints at even multiples only (the others came after kernel
     // lines): one doubling keeps them all, the array stays full.
-    const overrides = try std.testing.allocator.create(Overrides);
-    defer std.testing.allocator.destroy(overrides);
+    const overrides = try Overrides.create(std.testing.allocator);
+    defer overrides.destroy();
     overrides.checkpoint_count = 0;
     overrides.checkpoint_cursor = 0;
     overrides.checkpoint_every = 1;
@@ -725,8 +765,8 @@ test "a tape keeps the clock's jitter its timeline ran with" {
     const scratch = try allocator.alloc(u8, 16 * 1024);
     defer allocator.free(scratch);
     try std.testing.expectEqual(@as(u64, 0x1235), try jitter_seed(buffer[0..size], scratch));
-    const overrides = try allocator.create(Overrides);
-    defer allocator.destroy(overrides);
+    const overrides = try Overrides.create(allocator);
+    defer overrides.destroy();
     const header = try parse(buffer[0..size], scratch, overrides);
     try std.testing.expectEqual(@as(u64, 0x1235), header.tsc_jitter_seed);
     try std.testing.expectEqual(@as(?u64, null), header.clock_jitter_seed);
@@ -778,8 +818,8 @@ fn write_all(fd: linux.fd_t, bytes: []const u8) void {
 
 test "a written tape parses back" {
     const allocator = std.testing.allocator;
-    const overrides = try allocator.create(Overrides);
-    defer allocator.destroy(overrides);
+    const overrides = try Overrides.create(allocator);
+    defer overrides.destroy();
     const scratch = try allocator.alloc(u8, 16 * 1024);
     defer allocator.free(scratch);
     const source = "{\"tape\":2,\"inputs\":\"00000000000000aa\"," ++
@@ -799,8 +839,8 @@ test "a written tape parses back" {
 
 test "a session's steps on its timeline's tape parse back, with their moments" {
     const allocator = std.testing.allocator;
-    const overrides = try allocator.create(Overrides);
-    defer allocator.destroy(overrides);
+    const overrides = try Overrides.create(allocator);
+    defer overrides.destroy();
     const scratch = try allocator.alloc(u8, 16 * 1024);
     defer allocator.free(scratch);
     const source = "{\"tape\":2,\"inputs\":\"00000000000000aa\"," ++
@@ -821,8 +861,8 @@ test "a session's steps on its timeline's tape parse back, with their moments" {
 
 test "a relayed session's polls, thousands of ingress answers, parse: their reason is their kind" {
     const allocator = std.testing.allocator;
-    const overrides = try allocator.create(Overrides);
-    defer allocator.destroy(overrides);
+    const overrides = try Overrides.create(allocator);
+    defer overrides.destroy();
     const scratch = try allocator.alloc(u8, 16 * 1024);
     defer allocator.free(scratch);
     var source: std.ArrayList(u8) = .empty;
@@ -848,8 +888,8 @@ test "a session's 70,560 taped answers parse: a replay reads every tape its reco
     // virtual second, 70,560 in 14 virtual minutes; the recorder wrote them all and the replay's
     // fixed table of 65,536 refused the tape (TapeTooLong), dropping the tree's returns to it.
     const allocator = std.testing.allocator;
-    const overrides = try allocator.create(Overrides);
-    defer allocator.destroy(overrides);
+    const overrides = try Overrides.create(allocator);
+    defer overrides.destroy();
     const scratch = try allocator.alloc(u8, 16 * 1024);
     defer allocator.free(scratch);
     var source: std.ArrayList(u8) = .empty;
@@ -865,8 +905,8 @@ test "a session's 70,560 taped answers parse: a replay reads every tape its reco
 
 test "an extending timeline's tape: what was consumed written back, the connections to come dropped" {
     const allocator = std.testing.allocator;
-    const overrides = try allocator.create(Overrides);
-    defer allocator.destroy(overrides);
+    const overrides = try Overrides.create(allocator);
+    defer overrides.destroy();
     const scratch = try allocator.alloc(u8, 16 * 1024);
     defer allocator.free(scratch);
     const source = "{\"tape\":2,\"inputs\":\"00000000000000aa\",\"exploration_seed\":\"0000000000000007\"," ++
@@ -935,8 +975,8 @@ test "a timeline's number is whoever creates its tape first's: the explorer pass
     var source: [512]u8 = undefined;
     const size = linux.read(fd, &source, source.len);
     const allocator = std.testing.allocator;
-    const overrides = try allocator.create(Overrides);
-    defer allocator.destroy(overrides);
+    const overrides = try Overrides.create(allocator);
+    defer overrides.destroy();
     const scratch = try allocator.alloc(u8, 16 * 1024);
     defer allocator.free(scratch);
     const parsed = try parse(source[0..size], scratch, overrides);
@@ -947,8 +987,8 @@ test "a timeline's number is whoever creates its tape first's: the explorer pass
 
 test "a replay from inside its segment takes the tape from its pull on" {
     const allocator = std.testing.allocator;
-    const overrides = try allocator.create(Overrides);
-    defer allocator.destroy(overrides);
+    const overrides = try Overrides.create(allocator);
+    defer overrides.destroy();
     const scratch = try allocator.alloc(u8, 16 * 1024);
     defer allocator.free(scratch);
     const source = "{\"tape\":2,\"inputs\":\"00000000000000aa\"," ++
@@ -972,8 +1012,8 @@ test "a replay from inside its segment takes the tape from its pull on" {
 
 test "a path round-trips through the header" {
     const allocator = std.testing.allocator;
-    const overrides = try allocator.create(Overrides);
-    defer allocator.destroy(overrides);
+    const overrides = try Overrides.create(allocator);
+    defer overrides.destroy();
     const scratch = try allocator.alloc(u8, 16 * 1024);
     defer allocator.free(scratch);
     var pipe: [2]linux.fd_t = undefined;
@@ -1018,8 +1058,8 @@ test "a tape keeps the machine a strategy decided for its run" {
     try std.testing.expectEqual(machine.epoch_seconds, read.epoch_seconds);
     try std.testing.expectEqual(machine.timer_delay_permille, read.timer_delay_permille);
     try std.testing.expectEqualStrings(machine.custom_faults, read.custom_faults);
-    const overrides = try allocator.create(Overrides);
-    defer allocator.destroy(overrides);
+    const overrides = try Overrides.create(allocator);
+    defer overrides.destroy();
     const header = try parse(buffer[0..size], scratch, overrides);
     try std.testing.expectEqual(machine.modulation_stretch_ns, header.machine.?.modulation_stretch_ns);
     try std.testing.expectEqualStrings(machine.custom_faults, header.machine.?.custom_faults);
@@ -1027,9 +1067,8 @@ test "a tape keeps the machine a strategy decided for its run" {
 
 
 test "a replay past a checkpoint's count diverged" {
-    const overrides = try std.testing.allocator.create(Overrides);
-    defer std.testing.allocator.destroy(overrides);
-    overrides.* = .{ .entries = undefined, .count = 0, .cursor = 0 };
+    const overrides = try Overrides.create(std.testing.allocator);
+    defer overrides.destroy();
     // The tape's checkpoints at events 64, 128 and 192 (guest lines there).
     for ([_]u64{ 64, 128, 192 }, 1..) |events, hash| {
         overrides.checkpoints[overrides.checkpoint_count] = .{ .events = events, .branches = 0, .events_hash = hash };
