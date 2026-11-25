@@ -7552,6 +7552,8 @@ fn check_durability(context: *Context) !void {
         "the echo node", .{ kernel_lines, checkpoints, execs });
     const properties = [_][]const u8{
         "a sync stall holds a node's syncs, and they complete",
+        "a sync stall holds a node's syncs under a durable crash too",
+        "a durable crash goes on after a sync stall over it ends",
         "a crash just before a sync loses the write",
         "a crash just after a sync keeps the write",
         "a write crashed at its sync never returns",

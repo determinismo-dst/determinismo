@@ -1368,6 +1368,7 @@ fn durability_faults(context: *System.Context) !void {
         .written = stalled_written,
     });
     sdk.sleep_ms(5000);
+    try durability_both_kinds(&echo, stall_ms);
     // A crash at the write's first sync, before it: the write's data is gone after the restart
     // (the file may be there, empty: ext4's journal commits every 5 s, and one between its
     // creation and its sync keeps the creation alone).
@@ -1426,6 +1427,31 @@ fn durability_faults(context: *System.Context) !void {
         .started = started,
     });
     sdk.stop_faults(0);
+}
+
+/// A sync_stall and a durable_crash on one node at once, each its own: the guest module kept one
+/// arm a node, so the later replaced the earlier and the first to end disarmed both (CE35, the
+/// Lean replica of determinismo). A stall under a crash that seldom picks still holds every sync;
+/// a crash that picks every sync goes on after a stall over it ended.
+fn durability_both_kinds(echo: *const sdk.Node, stall_ms: u32) !void {
+    sdk.fault(.{ .kind = "sync_stall", .node = echo.name, .one_in = 1, .stall_ms_min = stall_ms, .stall_ms_max = stall_ms, .duration_ms = 4000 });
+    sdk.fault(.{ .kind = "durable_crash", .node = echo.name, .one_in = 1 << 30, .duration_ms = 4000 });
+    sdk.sleep_ms(100); // The injector applies both.
+    const start_ns = monotonic_ns();
+    const written = synced_write(echo, "/data/stalled-under-crash");
+    const took_ns = monotonic_ns() - start_ns;
+    sdk.always(written and took_ns >= 2 * stall_ms * std.time.ns_per_ms, "a sync stall holds a node's syncs under a durable crash too", .{
+        .took_ns = took_ns,
+        .written = written,
+    });
+    sdk.sleep_ms(4000); // Both over.
+    sdk.fault(.{ .kind = "durable_crash", .node = echo.name, .one_in = 1, .duration_ms = 3000 });
+    sdk.fault(.{ .kind = "sync_stall", .node = echo.name, .one_in = 1 << 30, .duration_ms = 300 });
+    sdk.sleep_ms(600); // The stall over; the crash still under way.
+    const crashed_write = synced_write(echo, "/data/crashed-after-stall"); // Killed in its sync.
+    sdk.always(!crashed_write, "a durable crash goes on after a sync stall over it ends", .{});
+    sdk.sleep_ms(3000);
+    try sdk.retry(100, 100, answers, .{echo.address});
 }
 
 /// The node crashes at the first sync of a write of `path` (before it or just after), and is
