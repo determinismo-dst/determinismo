@@ -272,7 +272,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "services", check_services },                 .{ "sites", check_sites },                           .{ "client", check_client },
         .{ "session-exact", check_session_exact },       .{ "java-watch", check_java_watch },                 .{ "raft-558", check_raft_558 },
         .{ "jvm-caches", check_jvm_caches },             .{ "guest-panic", check_guest_panic },               .{ "resume-seen", check_resume_seen },
-        .{ "reserved-run", check_reserved_run },         .{ "home", check_home },
+        .{ "reserved-run", check_reserved_run },         .{ "home", check_home },                             .{ "clock-start", check_clock_start },
     };
     // A check's whole name runs it alone (check.sh's `ui` ran guidance and quiet too).
     var exact = std.mem.eql(u8, only, "tla");
@@ -8694,6 +8694,70 @@ fn check_jvm_caches(context: *Context) !void {
         .{ "the unlabeled image's caches not made again", !said[1] },
         .{ "its JVMs refuse their cache beside the agent (a refusal is seen)", refused[1] > 0 },
     }, "jvm-caches: refusals in {d} labeled and {d} unlabeled timelines' events; named lines {}", .{ refused[0], refused[1], lines[0] });
+}
+
+/// Each timeline's wall clock starts at a moment drawn for it (det-composer's clock_start): two
+/// timelines of one run read different times at the same virtual moment, a replay of either its
+/// own again, both within the default hour past the guest's one start; with --clock-start-max 0
+/// they read alike. A calibration's timelines all printed one fault-injection seed, drawn from
+/// time(NULL): the same time in every timeline.
+fn check_clock_start(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
+    var reads: [2][3]?u64 = .{ .{ null, null, null }, .{ null, null, null } };
+    for ([_][]const u8{ "", "0" }, 0..) |max, round| {
+        const tapes = try std.fmt.allocPrint(arena, "{s}/clock-start-tapes-{d}", .{ context.scratch, round });
+        var arguments: std.ArrayList([]const u8) = .empty;
+        try arguments.appendSlice(arena, &.{
+            "--program",   program, "--scenario", "bank", "--seed",     "11",  "--timeline", "30s",
+            "--branching", "flat",  "--branches", "2",    "--tape-dir", tapes,
+        });
+        if (max.len > 0) try arguments.appendSlice(arena, &.{ "--clock-start-max", max });
+        var recorded: [2]Branch = undefined;
+        if (parse_branches(try explore(context, arguments.items), &recorded) != 2) continue;
+        // The wall clock at 20 s of virtual time (past the setup, so past the start's draw) in
+        // one timeline, the other, and the first again.
+        for ([_]usize{ 0, 1, 0 }, 0..) |which, look| {
+            const tape = try std.fmt.allocPrint(arena, "{s}/branch-{d}.jsonl", .{ tapes, recorded[which].index });
+            var at: std.ArrayList([]const u8) = .empty;
+            try at.appendSlice(arena, &.{ "--program", program, "--scenario", "bank", "--timeline", "30s", "--tape", tape, "--at-vtime-ms", "20000", "--exec", "date +%s" });
+            if (max.len > 0) try at.appendSlice(arena, &.{ "--clock-start-max", max });
+            reads[round][look] = try wall_seconds(arena, try explore(context, at.items));
+        }
+    }
+    const drawn = reads[0];
+    const off = reads[1];
+    const within = for (drawn[0..2]) |read| {
+        const r = read orelse break false;
+        const o = off[0] orelse break false;
+        if (r < o + 1 or r > o + 3600) break false;
+    } else true;
+    expect_all(context, &.{
+        .{ "the wall clock read in every look", drawn[0] != null and drawn[1] != null and drawn[2] != null and off[0] != null and off[1] != null },
+        .{ "two timelines read different wall times at the same virtual moment", drawn[0] != null and drawn[0] != drawn[1] },
+        .{ "a timeline's replay reads its own start again", drawn[0] != null and drawn[0] == drawn[2] },
+        .{ "each start a second to an hour past the guest's own", within },
+        .{ "with --clock-start-max 0 the timelines read alike", off[0] != null and off[0] == off[1] },
+    }, "clock-start: timelines read {?d} and {?d} (again {?d}); without a start {?d} and {?d}", .{ drawn[0], drawn[1], drawn[2], off[0], off[1] });
+}
+
+/// The wall clock in seconds a `date +%s` step printed (its exec_output text), if one did.
+fn wall_seconds(arena: std.mem.Allocator, report: []const u8) !?u64 {
+    for (try exec_texts(arena, report)) |text| {
+        return std.fmt.parseInt(u64, std.mem.trim(u8, text, " \t\r\n"), 10) catch continue;
+    }
+    return null;
+}
+
+test wall_seconds {
+    const arena = std.testing.allocator;
+    var state = std.heap.ArenaAllocator.init(arena);
+    defer state.deinit();
+    const a = state.allocator();
+    const report = "[guest @ 20000000000ns] {\"event\":\"exec_output\",\"details\":{\"text\":\"1794873620\\n\"}}\n";
+    try std.testing.expectEqual(@as(?u64, 1794873620), try wall_seconds(a, report));
+    try std.testing.expectEqual(@as(?u64, null), try wall_seconds(a, "[guest @ 1000000ns] {\"event\":\"exec_output\",\"details\":{\"text\":\"date: bad\"}}\n"));
+    try std.testing.expectEqual(@as(?u64, null), try wall_seconds(a, "nothing here"));
 }
 
 /// A guest tool's panic maps to its lines (docs/DEBUGGING.md): the image packs our tools without

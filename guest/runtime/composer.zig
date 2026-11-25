@@ -463,6 +463,7 @@ pub fn main(init: std.process.Init) !void {
     if (self_driven and (composer.node == null or composer.program != null)) return error.NoDriverCommands;
 
     sdk.event("composer_start", .{ .commands = composer.command_count });
+    clock_start_draw();
     drivers_cpu_draw();
     if (script_read(arena)) |script| {
         run_script(&composer, &script);
@@ -829,6 +830,70 @@ fn driver_start_by(composer: *Composer, kinds: []const Kind, parallelism: u64, d
         else => unreachable,
     }
     pause(sdk.random_below(pause_ns_max));
+}
+
+/// The guest boots at one fixed moment and every timeline parts from the same setup, so a
+/// system seeding from the time (time(NULL), a clock's nanoseconds) drew alike in all of them:
+/// a calibration's 8,093 timelines printed one fault-injection seed. Each timeline's wall clock
+/// now moves forward to a start drawn for it, as its commands begin: log-uniform from a second to
+/// det.clock_start_max_ms= (explore's --clock-start-max; an hour unless asked, 0 none). Never
+/// back, and not past what a setup made to expire (a token's hour, a lease): a timeline failing
+/// on the jump would be no workload's failure. The monotonic clock and the timers' durations
+/// stay; the nodes' own skews (their time namespaces) add to it as before.
+const clock_start_max_default_ms: u64 = std.time.ms_per_hour;
+
+fn clock_start_draw() void {
+    const max_ms = if (cmdline_ms("det.clock_start_max_ms=")) |ns| ns / std.time.ns_per_ms else clock_start_max_default_ms;
+    const bands = clock_start_bands(max_ms);
+    if (bands == 0) return;
+    // How far by name (a strategy steers it, a tape repeats it), where in that band plainly.
+    const band = sdk.random_below_named("composer.clock_start", bands);
+    const range = clock_start_band(max_ms, band);
+    const ms = range.low + sdk.random_below(range.high - range.low + 1);
+    var now: linux.timespec = undefined;
+    _ = linux.clock_gettime(.REALTIME, &now);
+    const moved: i128 = @as(i128, now.sec) * std.time.ns_per_s + now.nsec + @as(i128, ms) * std.time.ns_per_ms;
+    const start = linux.timespec{
+        .sec = @intCast(@divFloor(moved, std.time.ns_per_s)),
+        .nsec = @intCast(@mod(moved, std.time.ns_per_s)),
+    };
+    if (linux.errno(linux.clock_settime(.REALTIME, &start)) != .SUCCESS) {
+        sdk.assert_unreachable("a timeline's wall clock moves to its drawn start", .{ .ms = ms });
+        return;
+    }
+    sdk.event("clock_start", .{ .ms = ms, .max_ms = max_ms });
+}
+
+/// The bands a start is drawn among, each a doubling from a second: [1 s, 2 s), [2 s, 4 s), ...,
+/// the last ending at `max_ms`; none under a second.
+fn clock_start_bands(max_ms: u64) u64 {
+    if (max_ms < std.time.ms_per_s) return 0;
+    return std.math.log2_int(u64, max_ms / std.time.ms_per_s) + 1;
+}
+
+fn clock_start_band(max_ms: u64, band: u64) struct { low: u64, high: u64 } {
+    const low = @as(u64, std.time.ms_per_s) << @intCast(band);
+    return .{ .low = low, .high = @min(max_ms, (low << 1) - 1) };
+}
+
+test clock_start_bands {
+    try std.testing.expectEqual(@as(u64, 0), clock_start_bands(0));
+    try std.testing.expectEqual(@as(u64, 0), clock_start_bands(999));
+    try std.testing.expectEqual(@as(u64, 1), clock_start_bands(1000));
+    // An hour: 1-2 s, 2-4 s, ... 2,048-3,600 s.
+    const hour = std.time.ms_per_hour;
+    try std.testing.expectEqual(@as(u64, 12), clock_start_bands(hour));
+    try std.testing.expectEqual(@as(u64, 1000), clock_start_band(hour, 0).low);
+    try std.testing.expectEqual(@as(u64, 1999), clock_start_band(hour, 0).high);
+    try std.testing.expectEqual(@as(u64, 2_048_000), clock_start_band(hour, 11).low);
+    try std.testing.expectEqual(hour, clock_start_band(hour, 11).high);
+    // Every band within a second to the cap, the bands touching.
+    var band: u64 = 0;
+    while (band < clock_start_bands(hour)) : (band += 1) {
+        const range = clock_start_band(hour, band);
+        try std.testing.expect(range.low >= 1000 and range.low <= range.high and range.high <= hour);
+        if (band > 0) try std.testing.expectEqual(clock_start_band(hour, band - 1).high + 1, range.low);
+    }
 }
 
 /// det.timeline_ms= from the kernel command line (explore's --timeline), in nanoseconds.

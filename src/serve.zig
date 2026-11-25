@@ -1746,6 +1746,8 @@ pub const RunRequest = struct {
     trace_errno: ?u16 = null,
     /// A scenario without a length's driver phase drawn up to this (explore's --drive-max).
     drive_max: ?[]const u8 = null,
+    /// Each timeline's wall clock moved forward up to this (explore's --clock-start-max; "0" none).
+    clock_start_max: ?[]const u8 = null,
     /// Timelines per tree generation (explore's --generation).
     generation: ?u32 = null,
     /// A tree's returns run this long past their moment, then stop (explore's --horizon), and
@@ -3981,6 +3983,7 @@ fn session_futures_start(session: *Session, snapshot: []const u8) !void {
         .keep = original.keep,
         .trace_errno = original.trace_errno,
         .drive_max = original.drive_max,
+        .clock_start_max = original.clock_start_max,
         .history = false,
         .cpu_modulation = original.cpu_modulation,
         .memory_mib = original.memory_mib,
@@ -5560,6 +5563,7 @@ pub fn system_arguments(
     if (asked.decide) |fixed| try argv.appendSlice(arena, &.{ "--decide", fixed });
     if (asked.keep) |names| try argv.appendSlice(arena, &.{ "--keep", names });
     if (asked.drive_max) |length| try argv.appendSlice(arena, &.{ "--drive-max", length });
+    if (asked.clock_start_max) |length| try argv.appendSlice(arena, &.{ "--clock-start-max", length });
     if (asked.trace_errno) |errno| try argv.appendSlice(arena, &.{ "--trace-errno", try std.fmt.allocPrint(arena, "{d}", .{errno}) });
 }
 

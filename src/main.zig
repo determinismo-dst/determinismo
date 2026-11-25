@@ -88,6 +88,9 @@ const usage =
     \\                            then, --branches at most)
     \\                            [--timeline <duration>]   (each timeline's drivers run that long
     \\                            in virtual time; part of the inputs)
+    \\                            [--clock-start-max <duration | 0>]   (each timeline's wall clock
+    \\                            moved forward up to this as its commands begin, log-uniform
+    \\                            from 1 s, so what seeds from the time differs; 1h by default)
     \\                            [--drive-max <duration | none>]   (a scenario without a length
     \\                            of its own: its driver phase drawn up to that long; 20m by
     \\                            default, none: a drawn number of starts; part of the inputs)
@@ -472,6 +475,10 @@ const Arguments = struct {
     /// `--drive-max none`: a drawn number of starts, as before.
     drive_max_ms: ?u64 = drive_max_ms_default,
     drive_max_text: ?[]const u8 = null,
+    /// `--clock-start-max`: each timeline's wall clock moved forward up to this (virtual time,
+    /// log-uniform from a second) as its commands begin, so a system seeding from the time draws
+    /// apart in each (det-composer's clock_start). Null: the composer's hour; 0: none.
+    clock_start_max_ms: ?u64 = null,
     /// The longest a scenario's driver phase is drawn in this exploration (its own drive_ms_max,
     /// else --drive-max), null with --timeline or none: the length the explorer steers (Novelty).
     drive_steered_max_ms: ?u64 = null,
@@ -1774,6 +1781,13 @@ test "fault exclusions: a pattern det-faults would not take is a usage error; on
     try std.testing.expect(!plain.holders_retain and plain.holders_writeback);
     const arms = try parse_arguments(arena, &.{ "determinismo", "explore", "--kernel", "vmlinuz", "--holders-retain", "--no-holders-writeback" });
     try std.testing.expect(arms.holders_retain and !arms.holders_writeback);
+    // The wall clock's drawn start: the composer's hour unless asked, 0 none, a duration otherwise.
+    try std.testing.expectEqual(@as(?u64, null), plain.clock_start_max_ms);
+    const clock_off = try parse_arguments(arena, &.{ "determinismo", "explore", "--kernel", "vmlinuz", "--clock-start-max", "0" });
+    try std.testing.expectEqual(@as(?u64, 0), clock_off.clock_start_max_ms);
+    const clock_ten = try parse_arguments(arena, &.{ "determinismo", "explore", "--kernel", "vmlinuz", "--clock-start-max", "10m" });
+    try std.testing.expectEqual(@as(?u64, 600_000), clock_ten.clock_start_max_ms);
+    try std.testing.expect(std.mem.indexOf(u8, try cmdline_build(arena, "console=ttyS0", &clock_ten, null), "det.clock_start_max_ms=600000") != null);
     try std.testing.expect(std.mem.indexOf(u8, try cmdline_build(arena, "console=ttyS0", &plain, null), key) == null);
 }
 
@@ -1783,7 +1797,7 @@ fn cmdline_build(
     arguments: *const Arguments,
     scenario: ?[]const u8,
 ) ![]const u8 {
-    var parts: [16][]const u8 = undefined; // The base and each word below: 14, room to spare.
+    var parts: [16][]const u8 = undefined; // The base and each word below: 15, room to spare.
     var count: u32 = 0;
     parts[count] = base;
     count += 1;
@@ -1805,6 +1819,10 @@ fn cmdline_build(
     }
     if (arguments.drivers_cpu_weight) |weight| { // det-composer's.
         parts[count] = try std.fmt.allocPrint(arena, "det.drivers_cpu_weight={d}", .{weight});
+        count += 1;
+    }
+    if (arguments.clock_start_max_ms) |ms| { // det-composer's: each timeline's wall clock start.
+        parts[count] = try std.fmt.allocPrint(arena, "det.clock_start_max_ms={d}", .{ms});
         count += 1;
     }
     if (arguments.drive_max_ms) |ms| { // det-composer's: a scenario without a length's.
@@ -9064,6 +9082,8 @@ fn parse_option(
         var parts = std.mem.tokenizeScalar(u8, value, ',');
         while (parts.next()) |part| try entries.append(arena, part);
         arguments.egress_allow = entries.items;
+    } else if (eql(u8, flag, "--clock-start-max")) {
+        arguments.clock_start_max_ms = if (eql(u8, value, "0")) 0 else try duration_parse(value) / std.time.ns_per_ms;
     } else if (eql(u8, flag, "--drive-max")) {
         arguments.drive_max_ms = if (eql(u8, value, "none")) null else try duration_parse(value) / std.time.ns_per_ms;
         arguments.drive_max_text = value;
