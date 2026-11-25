@@ -112,5 +112,7 @@ if systemctl is-active --quiet determinismo-serve.service; then
   sudo infra/host/serve.sh "$USER" start
 fi
 echo "== serve: $(systemctl is-active determinismo-serve.service || true)"
+# Elle's service, rebuilt when checkers/elle changed and nothing runs (elle-image.sh).
+infra/host/elle-image.sh
 EOF
 echo "== $ip updated"
