@@ -167,6 +167,7 @@ pub fn main(init: std.process.Init) !void {
             .sinks = sinks_scenario,
             .aim = aim_scenario,
             .slow = slow_scenario,
+            .slot_wait = slot_wait_scenario,
             .sought = sought_scenario,
             .streak = streak_scenario,
             .streak_blind = streak_blind_scenario,
@@ -2017,6 +2018,24 @@ fn slow_scenario(s: *System.Scenario) void {
 fn slow_driver(_: *System.Context) !void {
     sdk.sleep_ms(3 * std.time.ms_per_s);
     sdk.reachable("a slow driver finished", .{});
+}
+
+/// One slot (parallel_max 1), a driver holding it past half the timeline limit, and another
+/// start waiting for it: the wait ends at the stop, no start after it (a start that waited for
+/// the only slot began past the stop: CE5's other path, the Lean replica of determinismo).
+fn slot_wait_scenario(s: *System.Scenario) void {
+    s.faults = false;
+    s.parallel_max = 1;
+    s.parallel_driver("holding", holding_driver);
+    s.parallel_driver("next", next_driver);
+}
+
+fn holding_driver(_: *System.Context) !void {
+    sdk.sleep_ms(20 * std.time.ms_per_s);
+}
+
+fn next_driver(_: *System.Context) !void {
+    sdk.sleep_ms(100);
 }
 
 /// Half the timelines reach a marked state (a `sometimes` made true), among the selftest's other

@@ -253,7 +253,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "unlist", check_unlist },                           .{ "signal", check_signal },                         .{ "syscall_error", check_syscall_error },
         .{ "swarm", check_swarm },                             .{ "metastable", check_metastable },                 .{ "file_error", check_file_error },
         .{ "retroactive", check_retroactive },                 .{ "epoch", check_epoch },                           .{ "drive", check_drive },
-        .{ "hang", check_hang },                               .{ "pinned", check_pinned },                         .{ "slow", check_slow },
+        .{ "hang", check_hang },                               .{ "pinned", check_pinned },                         .{ "slow", check_slow }, .{ "slot-wait", check_slot_wait },
         .{ "ending-window", check_ending_window },             .{ "ending-killed", check_ending_killed },           .{ "sought", check_sought },
         .{ "optimize", check_optimize },                       .{ "states", check_states },                         .{ "crash-points", check_crash_points },
         .{ "nodes-down", check_nodes_down },                   .{ "stale-pid", check_stale_pid },                   .{ "memory-growth", check_memory_growth },
@@ -9100,6 +9100,35 @@ fn check_slow(context: *Context) !void {
         .{ "\"the guest finishes its scenario\" holds", !unfinished },
         .{ "drivers stopped starting in some", stopped > 0 },
     }, "slow: no driver starts past half the timeline limit; {d} of 8 timelines stopped starting them, none hung", .{stopped});
+}
+
+/// A start waiting for the only slot waits no longer than the drivers' stop (half the timeline
+/// limit): slot_wait's 20 s driver holds the slot past a 30 s limit's 15 s stop, and the start
+/// after it began at 20 s once it ended (CE5's other path, the Lean replica of determinismo).
+/// One round of drivers (composer.again=0): a second round draws its own stop.
+fn check_slot_wait(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
+    const events = try std.fs.path.join(context.arena, &.{ context.scratch, "slot-wait-events" });
+    const report = try explore(context, &.{
+        "--program",        program, "--scenario",  "slot_wait", "--seed",       "1",    "--branches", "8",
+        "--timeline-limit", "30s",   "--branching", "flat",      "--events-dir", events, "--no-swarm",
+        "--decide",         "composer.again=0",
+    });
+    var branches: [8]Branch = undefined;
+    const count = parse_branches(report, &branches);
+    const held = try query_count(context, &.{ events, "event=command_start and details.name=holding" });
+    const stopped = try query_count(context, &.{ events, "event=drivers_stopped" });
+    const late = try query_count(context, &.{
+        events,           "event=command_start",
+        "--not-preceded-by", "event=faults_phase and details.state=start",
+        "--within",       "15",
+    });
+    expect_all(context, &.{
+        .{ "8 timelines", count == 8 },
+        .{ "the slot held in some", held > 0 },
+        .{ "drivers stopped starting in some", stopped > 0 },
+        .{ "no driver started past the stop", late == 0 },
+    }, "slot-wait: {d} starts of the holder, {d} timelines stopped starting, {d} starts past the stop", .{ held, stopped, late });
 }
 
 /// Who killed a command decides its verdict (the blind Lean replica of the platform's CE1 and
