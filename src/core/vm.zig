@@ -339,6 +339,9 @@ advisor: ?Advisor = null,
 /// answered (explore --draws-out: which pull drew each of a failure's last faults).
 pull_note: ?PullNote = null,
 tape_fd: ?linux.fd_t,
+/// Overrides on this timeline's tape so far (tape_override), and whether it filled.
+tape_written: u32 = 0,
+tape_full: bool = false,
 overrides: ?*tape.Overrides,
 /// The driver phase's length bucket the explorer chose from the run's novelty curve: the answer
 /// to det-composer's `composer.drive_ms` decision, unless a replay or a strategy answered it.
@@ -3629,7 +3632,7 @@ fn request_clear(vm: *VM, kind: RequestKind) void {
 fn override_apply(vm: *VM, overrides: *tape.Overrides, pull: u64, value: []u8) !bool {
     const kind = overrides.kind_at(pull) orelse .decision;
     if (!try overrides.apply(pull, value)) return false;
-    if (vm.tape_applied) if (vm.tape_fd) |fd| tape.write_override(fd, pull, value, overrides.reason_text(pull, kind));
+    if (vm.tape_applied) if (vm.tape_fd) |fd| try vm.tape_override(fd, pull, value, overrides.reason_text(pull, kind));
     return true;
 }
 
@@ -3637,8 +3640,35 @@ fn override_apply(vm: *VM, overrides: *tape.Overrides, pull: u64, value: []u8) !
 /// before it began goes on its own tape first, what it applies from now on as it does.
 pub fn tape_extend_begin(vm: *VM) void {
     const fd = vm.tape_fd.?;
-    if (vm.overrides) |overrides| overrides.write_consumed(fd);
+    if (vm.overrides) |overrides| {
+        overrides.write_consumed(fd);
+        vm.tape_written += overrides.cursor;
+    }
     vm.tape_applied = true;
+}
+
+/// The timeline's tape (none: nothing taped), its count of overrides from zero.
+pub fn tape_attach(vm: *VM, fd: ?linux.fd_t) void {
+    vm.tape_fd = fd;
+    vm.tape_written = 0;
+    vm.tape_full = false;
+}
+
+/// An override onto the timeline's tape, override_count_max at most: there the tape says it
+/// is full (a replay stops at that pull, TapeFull) and the timeline says so (`tape_full`),
+/// instead of a tape no replay can read (CE20, the Lean replica of determinismo).
+fn tape_override(vm: *VM, fd: linux.fd_t, pull: u64, value: []const u8, reason: []const u8) !void {
+    if (vm.tape_written >= tape.override_count_max) {
+        if (vm.tape_full) return;
+        vm.tape_full = true;
+        tape.write_full(fd, pull);
+        var buffer: [96]u8 = undefined;
+        const event = std.fmt.bufPrint(&buffer, "{{\"event\":\"tape_full\",\"pull\":{d},\"overrides\":{d}}}", .{ pull, vm.tape_written }) catch unreachable;
+        try vm.events.emit(try vm.moment(), event);
+        return;
+    }
+    tape.write_override(fd, pull, value, reason);
+    vm.tape_written += 1;
 }
 
 fn decide_random(vm: *VM, value: []u8, source: []const u8) !void {
@@ -3648,6 +3678,8 @@ fn decide_random(vm: *VM, value: []u8, source: []const u8) !void {
         if (label) |text| vm.setup_draws.note(text);
     }
     const pull = vm.decisions.pulls;
+    // Past where the tape's recorder stopped taping, nothing answers this replay as its run was.
+    if (vm.overrides) |overrides| if (overrides.past_full(pull)) return error.TapeFull;
     vm.decisions.random(value);
     assert(vm.decisions.pulls == pull + 1);
     vm.last_pull_ns = (try vm.moment()).vtime_ns;
@@ -3665,7 +3697,7 @@ fn decide_random(vm: *VM, value: []u8, source: []const u8) !void {
             std.mem.writeInt(u64, value[0..8], fact, .little);
         }
         const answer = std.mem.readInt(u64, value[0..8], .little);
-        if (vm.tape_fd) |fd| tape.write_override(fd, pull, value, explore_here_reason);
+        if (vm.tape_fd) |fd| try vm.tape_override(fd, pull, value, explore_here_reason);
         try vm.decision_event(pull, source, label, explore_here_reason);
         if (answer == 1) {
             // Its settings, the agent's next action (it waits for it before the scenario).
@@ -3686,7 +3718,7 @@ fn decide_random(vm: *VM, value: []u8, source: []const u8) !void {
         if (!taped) {
             std.mem.writeInt(u64, value[0..8], vm.fork_index, .little);
             vm.fork_index = 0;
-            if (vm.tape_fd) |fd| tape.write_override(fd, pull, value, fork_reason);
+            if (vm.tape_fd) |fd| try vm.tape_override(fd, pull, value, fork_reason);
         }
         // Its event whether answered or replayed, as egress's: a replay's history is the run's
         // (without it a replay of a forked timeline was one event short from there: the Lean
@@ -3698,7 +3730,7 @@ fn decide_random(vm: *VM, value: []u8, source: []const u8) !void {
     if (label) |text| if (std.mem.startsWith(u8, text, egress_channel_prefix) and value.len == 8) {
         const taped = if (vm.overrides) |overrides| try vm.override_apply(overrides, pull, value) else false;
         if (!taped) std.mem.writeInt(u64, value[0..8], @intFromBool(vm.deterministic), .little);
-        if (vm.tape_fd) |fd| tape.write_override(fd, pull, value, egress_channel_reason);
+        if (vm.tape_fd) |fd| try vm.tape_override(fd, pull, value, egress_channel_reason);
         try vm.decision_event(pull, source, label, egress_channel_reason);
         return;
     };
@@ -3727,7 +3759,7 @@ fn decide_random(vm: *VM, value: []u8, source: []const u8) !void {
             }
             // Its bytes too carry the reason (their kind: tape.Kind, no reason kept for it).
             const reason = egress_reason;
-            if (vm.tape_fd) |fd| tape.write_override(fd, pull, value, reason);
+            if (vm.tape_fd) |fd| try vm.tape_override(fd, pull, value, reason);
         }
         // Its event whether answered or replayed: a replay's history is the run's.
         if (status) try vm.decision_event(pull, source, label, egress_reason);
@@ -3763,7 +3795,7 @@ fn decide_random(vm: *VM, value: []u8, source: []const u8) !void {
             }
             // Its bytes too carry the reason (their kind: tape.Kind, no reason kept for it).
             const reason = ingress_reason;
-            if (vm.tape_fd) |fd| tape.write_override(fd, pull, value, reason);
+            if (vm.tape_fd) |fd| try vm.tape_override(fd, pull, value, reason);
         }
         if (status) {
             const answered = std.mem.readInt(u32, value[0..4], .little);
@@ -3800,7 +3832,7 @@ fn decide_random(vm: *VM, value: []u8, source: []const u8) !void {
             }
             // Its bytes too carry the reason (their kind: tape.Kind, no reason kept for it).
             const reason = serve_reason;
-            if (vm.tape_fd) |fd| tape.write_override(fd, pull, value, reason);
+            if (vm.tape_fd) |fd| try vm.tape_override(fd, pull, value, reason);
         }
         // Its event whether answered or replayed, as egress's (CE12, as the fork's above).
         if (status) try vm.decision_event(pull, source, label, serve_reason);
@@ -3828,7 +3860,7 @@ fn decide_random(vm: *VM, value: []u8, source: []const u8) !void {
         });
         if (advice.ended) vm.strategy_ended = true;
         if (advice.overridden) {
-            if (vm.tape_fd) |fd| tape.write_override(fd, pull, value, advice.reason);
+            if (vm.tape_fd) |fd| try vm.tape_override(fd, pull, value, advice.reason);
             if (advice.decision and advice.reason.len > 0) try vm.decision_event(pull, source, label, advice.reason);
         }
         if (advice.done) return;
@@ -3840,7 +3872,7 @@ fn decide_random(vm: *VM, value: []u8, source: []const u8) !void {
         if (!std.mem.startsWith(u8, text, drive_label_prefix) or value.len != 8) return;
         std.mem.writeInt(u64, value[0..8], k, .little);
         const reason = "the driver phase's length from the run's novelty curve";
-        tape.write_override(fd, pull, value, reason);
+        try vm.tape_override(fd, pull, value, reason);
         try vm.decision_event(pull, source, label, reason);
     };
 }

@@ -3304,11 +3304,11 @@ fn explore_snapshot(
     try vm.init(options);
     // After the machine's init, which starts it with none.
     vm.advisor = advisor;
-    vm.tape_fd = tape_fd;
+    vm.tape_attach(tape_fd);
     vm.overrides = taped;
     const outcome = try vm.run_until_exit();
     vm.advisor = null;
-    vm.tape_fd = null;
+    vm.tape_attach(null);
     vm.overrides = null;
     if (outcome != .setup_complete) {
         say("[determinismo] the guest never signalled setup_complete ({s})\n", .{
@@ -3758,9 +3758,9 @@ fn branch_announce(
     place: Planned,
 ) !void {
     if (exploration.extend) |extend| {
-        vm.tape_fd = extend.tape_fd; // Its header there since its number was taken.
+        vm.tape_attach(extend.tape_fd); // Its header there since its number was taken.
     } else if (exploration.tape_directory) |directory| {
-        vm.tape_fd = try open_tape(context.arena, directory, place.index);
+        vm.tape_attach(try open_tape(context.arena, directory, place.index));
         tape.write_header(vm.tape_fd.?, .{
             .inputs = exploration.inputs,
             .exploration_seed = exploration.exploration_seed,

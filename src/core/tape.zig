@@ -136,6 +136,9 @@ pub const Overrides = struct {
     allocator: std.mem.Allocator,
     count: u32,
     cursor: u32,
+    /// Where its recorder stopped taping (override_count_max reached, a `tape_full` line): a
+    /// replay that reaches this pull stops there (TapeFull), the tape having no more.
+    full_at: ?u64 = null,
     checkpoints: [checkpoint_count_max]Checkpoint = undefined,
     checkpoint_count: u32 = 0,
     checkpoint_cursor: u32 = 0,
@@ -158,6 +161,7 @@ pub const Overrides = struct {
         overrides.allocator = allocator;
         overrides.count = 0;
         overrides.cursor = 0;
+        overrides.full_at = null;
         overrides.checkpoint_count = 0;
         overrides.checkpoint_cursor = 0;
         overrides.checkpoint_every = 1;
@@ -285,9 +289,17 @@ pub const Overrides = struct {
         overrides.checkpoint_cursor = overrides.checkpoint_count;
     }
 
+    /// A replay at pull `pull` past where its tape's recorder stopped taping: no answer after
+    /// it is on the tape.
+    pub fn past_full(overrides: *const Overrides, pull: u64) bool {
+        const at = overrides.full_at orelse return false;
+        return pull >= at;
+    }
+
     /// Replaces `value` if pull `pull` was overridden. Pulls arrive in increasing order.
     pub fn apply(overrides: *Overrides, pull: u64, value: []u8) !bool {
         assert(overrides.cursor <= overrides.count);
+        if (overrides.past_full(pull)) return error.TapeFull;
         if (overrides.cursor == overrides.count) return false;
         const entry = &overrides.entries[overrides.cursor];
         if (entry.pull < pull) return error.TapeOutOfOrder; // The replay diverged from the tape.
@@ -383,6 +395,15 @@ pub fn write_override(fd: linux.fd_t, pull: u64, value: []const u8, reason: []co
     }
     writer.writeAll("}\n") catch unreachable;
     write_all(fd, writer.buffered());
+}
+
+/// The tape's end of overrides: its recorder taped override_count_max and stopped at pull
+/// `pull` (a replay stops there: TapeFull).
+pub fn write_full(fd: linux.fd_t, pull: u64) void {
+    assert(fd >= 0);
+    var buffer: [64]u8 = undefined;
+    const line = std.fmt.bufPrint(&buffer, "{{\"tape_full\":{{\"pull\":{d}}}}}\n", .{pull}) catch unreachable;
+    write_all(fd, line);
 }
 
 const extends_key = "\"extends\":";
@@ -559,6 +580,7 @@ pub fn parse(source: []const u8, scratch: []u8, overrides: *Overrides) !Header {
     assert(scratch.len > 0);
     overrides.count = 0;
     overrides.cursor = 0;
+    overrides.full_at = null;
     overrides.reason_count = 0;
     overrides.reason_cursor = 0;
     // Its overrides counted first (each line the recorder writes starts so), the table sized.
@@ -584,6 +606,11 @@ pub fn parse(source: []const u8, scratch: []u8, overrides: *Overrides) !Header {
         }
         if (value.object.get("step") != null) {
             try step_parse(overrides, value);
+            continue;
+        }
+        if (value.object.get("tape_full")) |full| {
+            if (full != .object) return error.BadTape;
+            overrides.full_at = @intCast((full.object.get("pull") orelse return error.BadTape).integer);
             continue;
         }
         try override_parse(overrides, value);
@@ -901,6 +928,27 @@ test "a session's 70,560 taped answers parse: a replay reads every tape its reco
     }
     _ = try parse(source.items, scratch, overrides);
     try std.testing.expectEqual(@as(u32, 70_560), overrides.count);
+}
+
+test "a full tape replays to where its recorder stopped taping, and stops there" {
+    // CE20: past override_count_max the recorder writes `tape_full` and tapes no more; a replay
+    // there has no answer as its run had one, so it stops (TapeFull) instead of diverging.
+    const allocator = std.testing.allocator;
+    const overrides = try Overrides.create(allocator);
+    defer overrides.destroy();
+    const scratch = try allocator.alloc(u8, 16 * 1024);
+    defer allocator.free(scratch);
+    const source = "{\"tape\":2,\"inputs\":\"00000000000000aa\",\"exploration_seed\":\"0000000000000007\"," ++
+        "\"branch\":0,\"branch_seed\":\"00000000000000ff\"}\n" ++
+        "{\"pull\":10,\"hex\":\"07\",\"reason\":\"a strategy's own\"}\n" ++
+        "{\"tape_full\":{\"pull\":50}}\n";
+    _ = try parse(source, scratch, overrides);
+    try std.testing.expectEqual(@as(?u64, 50), overrides.full_at);
+    var one: [1]u8 = undefined;
+    try std.testing.expect(try overrides.apply(10, &one));
+    try std.testing.expect(!try overrides.apply(49, &one));
+    try std.testing.expectError(error.TapeFull, overrides.apply(50, &one));
+    try std.testing.expect(overrides.past_full(51) and !overrides.past_full(49));
 }
 
 test "an extending timeline's tape: what was consumed written back, the connections to come dropped" {
