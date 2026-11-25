@@ -134,7 +134,10 @@ The window, its feed, its handlers and pinned cards are the cards library's
 cards, keyed `:det/card`, the evaluation's card made from what the client did during it, the
 multiverse and the screen as pinned cards) and `src/determinismo/viz/lab.jank` (the lab's pinned
 cards and the handlers of its results); both draw with the cards' primitives, so a draw function
-changed and evaluated is used by the next frame.
+changed and evaluated is used by the next frame. A script driving a hidden window (a test, a
+video's take) clicks what the lab drew by its name: `(apply cards.core/click!
+(determinismo.viz.lab/where ["rq-1" "rq-2"]))` for a link's handle, a node's name, a widget's
+label (`"Partition both ways##l"`, `"+1 s"`).
 
 The first start compiles the packages it builds on. `viz.sh` sets what that needed on macOS: the
 Command Line Tools' compiler, C++17 for ImGui's headers, and no sandbox around the packages'

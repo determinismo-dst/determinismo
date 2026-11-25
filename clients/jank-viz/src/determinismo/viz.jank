@@ -175,9 +175,10 @@
 (declare pin-map!)
 
 (defn- switch-run! [run]
-  (pin-map!)
   (when (not= run (:run @state))
-    (swap! state assoc :run run :timelines [] :marks [] :visits [] :looked #{} :cursor nil :session nil :ghosts [] :planned nil)))
+    (swap! state assoc :run run :timelines [] :marks [] :visits [] :looked #{} :cursor nil :session nil :ghosts [] :planned nil))
+  ;; Pinned once there is a run to draw.
+  (pin-map!))
 
 (defn show-run!
   "Shows run `run`: its multiverse, from serve."
@@ -1537,13 +1538,13 @@
 
 (defn show
   "A value on a card of its own, as an evaluation's would be (the REPL's results go there by
-  themselves). Returns the value."
+  themselves). Returns nil, as the cards' own show: no second card for the evaluation, and a
+  value too long to print stays out of the editor."
   ([value] (show "value" value))
   ([said value]
    (let [made (card-of @state said value nil [])]
      (when made (remember! made))
-     (c/show said (or made value)))
-   value))
+     (c/show said (or made value)))))
 
 (defn clear!
   "No cards in the feed (the pinned ones stay)."

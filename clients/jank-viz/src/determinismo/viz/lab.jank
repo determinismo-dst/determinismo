@@ -90,6 +90,17 @@ namespace detlab
     return std::sqrt(jank::runtime::to_real(a));
   }
 
+  /* The centre of the widget just drawn, in points. */
+  inline double item_x()
+  {
+    return (ImGui::GetItemRectMin().x + ImGui::GetItemRectMax().x) / 2.0;
+  }
+
+  inline double item_y()
+  {
+    return (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) / 2.0;
+  }
+
   inline void same_line()
   {
     ImGui::SameLine();
@@ -138,6 +149,21 @@ namespace detlab
 (def ^:private failures ["errors" "write_errors" "lost_writes" "corrupt_reads" "slow"])
 (def ^:private flavors ["delay_loss" "duplicate" "corrupt" "reorder" "congestion" "burst_loss"])
 (def ^:private disruptions ["stopped" "slowed" "jammed"])
+
+;; Where each thing answering the mouse was last drawn (its centre), by name: a node's, a link's
+;; handle, a widget's label. For a script driving the window (a test, a video's take).
+(defonce ^:private drawn-at (atom {}))
+
+(defn- drawn! [what x y]
+  (let [at [(long x) (long y)]]
+    (when (not= at (get @drawn-at what))
+      (swap! drawn-at assoc what at))))
+
+(defn where
+  "Where `what` was last drawn, [x y] (points): a node's name, [a b] for a link's handle, a
+  widget's label (\"Partition both ways##l\", \"+1 s\")."
+  [what]
+  (get @drawn-at what))
 
 ;; Acting from a button: on a thread of its own (a step takes seconds), the window's own (no
 ;; evaluation's card), one at a time.
@@ -235,7 +261,7 @@ namespace detlab
       (dashed! ax1 ay1 ax2 ay2 color thick)
       (c/line! ax1 ay1 ax2 ay2 color thick))
     (when (not= state :ok)
-      (arrow! (+ ax1 (* 0.62 dx)) (+ ay1 (* 0.62 dy)) dx dy color))))
+      (arrow! (+ ax1 (* 0.72 dx)) (+ ay1 (* 0.72 dy)) dx dy color))))
 
 (defn- worst-of [link]
   (first (filter (fn [s] (or (= s (:ab link)) (= s (:ba link)))) lab/link-states)))
@@ -317,9 +343,11 @@ namespace detlab
               (c/line! (first from) (second from) (first to) (second to) c/rule 1.0)
               (do (direction! from to (:ab link) 3.5)
                   (direction! to from (:ba link) 3.5)))
-            ;; A handle to select it, mid-line.
-            (let [mx (/ (+ (first from) (first to)) 2.0)
-                  my (/ (+ (second from) (second to)) 2.0)
+            ;; A handle to select it, along the line nearer its first end (two diagonals of a
+            ;; square have the same middle).
+            (let [mx (+ (first from) (* 0.42 (- (first to) (first from))))
+                  my (+ (second from) (* 0.42 (- (second to) (second from))))
+                  _ (when interactive (drawn! [(:a link) (:b link)] mx my))
                   worst (worst-of link)
                   chosen (= selected {:link [(:a link) (:b link)]})
                   hover (and interactive (c/inside? (- mx 9) (- my 9) (+ mx 9) (+ my 9)))]
@@ -329,6 +357,8 @@ namespace detlab
                 (swap! ui assoc :selected {:link [(:a link) (:b link)]})))))))
     (draw-runner! (get at "runner"))
     (doseq [node (:nodes w)]
+      (when interactive
+        (let [[nx ny] (get at (:name node))] (drawn! (:name node) nx ny)))
       (when (draw-node! node (get at (:name node)) (= selected {:node (:name node)}) interactive)
         (swap! ui assoc :selected {:node (:name node)})))
     (legend! x (+ y height -18))))
@@ -337,9 +367,18 @@ namespace detlab
 
 (defn- row! [x y] (c/cursor! x y))
 
-(defn- button! [label] (boolean (cpp/detlab.button label)))
+(defn- widget-drawn! [label]
+  (drawn! label (cpp/detlab.item_x) (cpp/detlab.item_y)))
 
-(defn- small-button! [label] (boolean (cpp/detlab.small_button label)))
+(defn- button! [label]
+  (let [pressed (boolean (cpp/detlab.button label))]
+    (widget-drawn! label)
+    pressed))
+
+(defn- small-button! [label]
+  (let [pressed (boolean (cpp/detlab.small_button label))]
+    (widget-drawn! label)
+    pressed))
 
 (defn- same-line! [] (cpp/detlab.same_line))
 
@@ -347,7 +386,8 @@ namespace detlab
   (cpp/detlab.slider label (cpp/unbox (:* int) box) lo hi width))
 
 (defn- checkbox! [label box]
-  (cpp/detlab.checkbox label (cpp/unbox (:* bool) box)))
+  (cpp/detlab.checkbox label (cpp/unbox (:* bool) box))
+  (widget-drawn! label))
 
 (defn- disabled! [on] (cpp/detlab.disabled (boolean on)))
 
