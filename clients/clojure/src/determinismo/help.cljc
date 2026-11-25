@@ -2,8 +2,10 @@
 ;; What determinismo does from a REPL, asked of the REPL itself: every public function of
 ;; determinismo.api (runs, events, replays, a node's file at a moment, timelines from a moment,
 ;; analyses), determinismo.debug (a session held at a moment: the machine's registers and
-;; memory, breakpoints, commands in the guest and its nodes, checkpoints) and determinismo.quint
-;; (a timeline against a Quint spec), with its arguments and documentation. For a person at an
+;; memory, breakpoints, commands in the guest and its nodes, checkpoints), determinismo.lab (a
+;; session's moment as a world: faults injected there, time on, a fault against the same moment
+;; without it), determinismo.lean (a Lean replica's counterexample driven on a session) and
+;; determinismo.quint (a timeline against a Quint spec), with its arguments and documentation. For a person at an
 ;; editor and for an agent at an nREPL alike; the visualization draws what each call answers.
 ;;
 ;;   (require '[determinismo.help :refer [help]])
@@ -14,11 +16,13 @@
   (:require [clojure.string :as str]
             [determinismo.api]
             [determinismo.debug]
+            [determinismo.lab]
+            [determinismo.lean]
             [determinismo.quint]))
 
 (def namespaces
   "The namespaces `help` reads."
-  '[determinismo.api determinismo.debug determinismo.quint])
+  '[determinismo.api determinismo.debug determinismo.lab determinismo.lean determinismo.quint])
 
 (defn- entries
   "Every public function of the namespaces: {:name :args :doc (its first line) :whole}."

@@ -92,6 +92,39 @@ the recorded history.
     (dbg/resume 13 s "loaded")))                      ; a session back there, not from boot
 ```
 
+`determinismo.lab`: a session's moment as a world to act in (clients/jank-viz draws it and acts
+from its buttons). The world at the moment is derived from the timeline's own events and
+`det-nodes list`: each node up, paused, down or halted, each link's directions cut, jammed,
+clogged, slowed or degraded, the faults on with the time they have left, failed properties, the
+test commands' last outcomes. Each action is a step of the session, so it is on its timeline.
+
+```clojure
+(require '[determinismo.lab :as lab])
+(def s (lab/open! 13 {:branch 0 :at-vtime-ms 30000}))  ; a session, the lab on it
+(lab/world)                                             ; {:nodes [...] :links [...] :faults [...] ...}
+(lab/fault! s {:kind "partition_groups" :groups [["n1"] ["n2" "n3"]] :direction "outbound"
+               :duration_ms 3000})                      ; det-faults inject, until it applied
+(lab/advance! s 1000)                                   ; det:wait: what happened meanwhile
+(lab/until! s "event=node_start details.node=n1")       ; det:until (60 s at most)
+(lab/checkpoint! s "before")
+(lab/compare! s {:kind "pause" :node "n2" :duration_ms 2000} {:ms 3000 :control true})
+                                                        ; two futures of a checkpoint, without
+                                                        ; and with the fault: what it changed
+(lab/close! s)
+```
+
+`determinismo.lean`: a Lean replica's counterexample (sdk/lean) driven on a session: its fault
+decisions as det-faults requests against the real nodes, the rest (message deliveries, ticks,
+clients, the model's disk) listed as skipped.
+
+```clojure
+(require '[determinismo.lean :as lean])
+(lean/load! "counterexamples/H1.tape.jsonl" {:nodes ["n1" "n2" "n3"]})  ; its story beside it named
+(lean/next! s)                                          ; one fault, then on to the next one
+(lean/drive! s)                                         ; the rest
+(lean/plan (lean/read-tape path) ["n1" "n2" "n3"] nil {})  ; the plan alone, as data
+```
+
 `determinismo.tap`: what the client does, told to whoever listens (each call's kind and data:
 `:session/open`, `:regs`, `:mem`, `:poke`, `:sh`, `:checkpoint`, `:query`, `:sql`, `:replay`,
 `:run/start` ...),
