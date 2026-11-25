@@ -284,10 +284,13 @@ fn run(arena: std.mem.Allocator, io: std.Io, argv: []const [:0]const u8) !u8 {
     return 1;
 }
 
-/// Each shard's verdict from serve's store: its property's failing timelines among its own.
+/// Each shard's verdict from serve's store: its property's failing timelines among its own, the
+/// run's (explored_timeline_events): a session on the job's run (a fix tried at a failing
+/// timeline's REPL) changed it, 3 failing and a passing session read flaky (CE28, the Lean
+/// replica of determinismo).
 pub const shard_sql = "SELECT CAST(json_extract(event, '$.assert.details.shard') AS INTEGER) AS shard, " ++
     "count(DISTINCT timeline) FILTER (WHERE condition = false) AS failing, count(DISTINCT timeline) AS timelines " ++
-    "FROM timeline_events WHERE name = 'the CI shard''s tests pass' GROUP BY 1 ORDER BY 1";
+    "FROM explored_timeline_events WHERE name = 'the CI shard''s tests pass' GROUP BY 1 ORDER BY 1";
 comptime {
     std.debug.assert(std.mem.eql(u8, shard_property, "the CI shard's tests pass")); // Its quote doubled above.
 }
