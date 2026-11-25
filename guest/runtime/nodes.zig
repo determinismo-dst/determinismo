@@ -825,6 +825,9 @@ const Unallocated = struct {
     ranges: u32 = 0,
     delalloc: u64 = 0,
     unwritten: u64 = 0,
+    /// No extent of the file written yet: its writeback has never run, so the flusher's pass
+    /// starts at its first page (a written file's resumes where the last pass stopped).
+    fresh: bool = true,
 
     fn contains(unallocated: *const Unallocated, page: u64) bool {
         for (unallocated.first[0..unallocated.ranges], unallocated.count[0..unallocated.ranges]) |first, count| {
@@ -854,7 +857,11 @@ fn unallocated_of(fd: linux.fd_t) ?Unallocated {
     var unallocated: Unallocated = .{};
     for (map.extents[0..@min(map.mapped_extents, fiemap_extents_max)]) |extent| {
         const new = extent.flags & (fiemap_extent_delalloc | fiemap_extent_unwritten);
-        if (new == 0 or extent.length == 0) continue;
+        if (extent.length == 0) continue;
+        if (new == 0) {
+            unallocated.fresh = false;
+            continue;
+        }
         const first = extent.logical / partial_page_size;
         const last = (extent.logical + extent.length - 1) / partial_page_size;
         // Adjacent ranges of the two kinds are one run of new data.
@@ -938,9 +945,13 @@ fn partial_file(path: [:0]const u8, random: std.Random, count: *PartialCount) vo
     const total = unallocated.pages();
     if (total > 0) {
         // From the start of a drawn range, ascending through the next ones (wrapping, as the
-        // flusher's cyclic writeback goes on from where its last pass stopped).
+        // flusher's cyclic writeback goes on from where its last pass stopped); a fresh file's
+        // from its first, its writeback never having run: a later range kept and an earlier one
+        // lost left zeros before a kept page (CE17, the Lean replica of determinismo: 13 of 64
+        // seeds on srv4's ext4). The range is drawn either way, the generator's sequence kept.
         var left = 1 + random.uintLessThan(u64, total);
-        var range = random.uintLessThan(u32, unallocated.ranges);
+        const drawn = random.uintLessThan(u32, unallocated.ranges);
+        var range = if (unallocated.fresh) 0 else drawn;
         while (left > 0) : (range = (range + 1) % unallocated.ranges) {
             const run = @min(left, unallocated.count[range]);
             _ = linux.syscall4(.sync_file_range, @as(usize, @intCast(fd)), unallocated.first[range] * partial_page_size, run * partial_page_size, flags);
@@ -1379,6 +1390,39 @@ test "partial persistence draws the same files and pages from the same seed, nes
         return;
     }
     return error.SkipZigTest; // The host wrote the trees back each time: nothing to compare.
+}
+
+test "a fresh file's new data is written back from its first range" {
+    // CE17 (the Lean replica of determinismo): the run of new data began at any drawn range, so a
+    // fresh file could keep a later range and lose an earlier one, zeros before a kept page.
+    var later_first: u32 = 0;
+    var seed: u64 = 1;
+    while (seed <= 64) : (seed += 1) {
+        var path_buffer: [path_size_max]u8 = undefined;
+        const path = try print_z(&path_buffer, ".det-partial-fresh-{d}-{d}", .{ linux.getpid(), seed });
+        const opened = linux.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true }, 0o644);
+        try std.testing.expect(linux.errno(opened) == .SUCCESS);
+        const fd: linux.fd_t = @intCast(opened);
+        defer {
+            _ = linux.close(fd);
+            _ = linux.unlink(path);
+        }
+        // Pages 0 and 4 written, never synced; 1 to 3 a hole: a fresh file with two ranges of
+        // new data (a sparse write, a preallocated layout's first pages).
+        const page: [partial_page_size]u8 = @splat('x');
+        _ = linux.pwrite(fd, &page, page.len, 0);
+        _ = linux.pwrite(fd, &page, page.len, 4 * partial_page_size);
+        const before = unallocated_of(fd) orelse continue;
+        if (before.ranges != 2) continue; // The host's flusher wrote it back first.
+        var prng = std.Random.DefaultPrng.init(seed);
+        var count: PartialCount = .{};
+        partial_file(path, prng.random(), &count);
+        const after = unallocated_of(fd) orelse continue;
+        // Page 4 written back and page 0 not: after the power loss (journal committed) page 0
+        // reads zeros under the file's size, before a kept page.
+        if (!after.contains(4) and after.contains(0)) later_first += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 0), later_first);
 }
 
 /// Two trees walked from the same seed draw the same files and pages. HostWroteBack when the
