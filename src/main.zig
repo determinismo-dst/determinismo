@@ -1149,7 +1149,7 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
         }
     }
     for (unmet.items) |messages| {
-        for (messages) |message| if (!catalog.made_true(message)) {
+        for (messages) |message| if (!catalog.made_true(.sometimes, message)) {
             failing_scenarios += 1;
             break;
         };

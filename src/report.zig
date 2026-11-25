@@ -124,23 +124,32 @@ pub fn snapshot_taken(snapshot: *const Snapshot, wall_ns: u64, memory_wait_ns: u
 /// explores every test template together.
 pub const Catalog = struct {
     arena: std.mem.Allocator,
+    /// By kind and message: a message under two kinds is two properties, each judged as its kind
+    /// (Property.same's rule), whichever timeline noted one first (CE18, CE22: one entry kept the
+    /// first kind and ORed what either reached).
     entries: std.StringArrayHashMapUnmanaged(Entry) = .empty,
 
-    const Entry = struct { kind: Events.Kind, reached: bool };
+    const Entry = struct { kind: Events.Kind, message: []const u8, reached: bool };
+
+    fn key(buffer: []u8, kind: Events.Kind, message: []const u8) ![]const u8 {
+        return std.fmt.bufPrint(buffer, "{s}\x00{s}", .{ @tagName(kind), message });
+    }
 
     pub fn note(catalog: *Catalog, kind: Events.Kind, message: []const u8, reached: bool) !void {
-        const entry = try catalog.entries.getOrPut(catalog.arena, message);
+        const buffer = try catalog.arena.alloc(u8, message.len + 32);
+        const entry = try catalog.entries.getOrPut(catalog.arena, try key(buffer, kind, message));
         if (!entry.found_existing) {
-            entry.key_ptr.* = try catalog.arena.dupe(u8, message);
-            entry.value_ptr.* = .{ .kind = kind, .reached = false };
-        }
+            const message_copy = try catalog.arena.dupe(u8, message);
+            entry.value_ptr.* = .{ .kind = kind, .message = message_copy, .reached = false };
+        } else catalog.arena.free(buffer);
         entry.value_ptr.reached = entry.value_ptr.reached or reached;
     }
 
-    /// Whether a scenario explored reached the assertion as it must be (made true, for a
-    /// `sometimes`).
-    pub fn made_true(catalog: *const Catalog, message: []const u8) bool {
-        const entry = catalog.entries.get(message) orelse return false;
+    /// Whether a scenario explored reached the assertion of this kind as it must be (made
+    /// true, for a `sometimes`).
+    pub fn made_true(catalog: *const Catalog, kind: Events.Kind, message: []const u8) bool {
+        var buffer: [Events.identity_size_max + 32]u8 = undefined;
+        const entry = catalog.entries.get(key(&buffer, kind, message) catch return false) orelse return false;
         return entry.reached;
     }
 
@@ -149,7 +158,8 @@ pub const Catalog = struct {
     pub fn judge(catalog: *const Catalog, every_scenario: bool) u32 {
         var failing: u32 = 0;
         var header = false;
-        for (catalog.entries.keys(), catalog.entries.values()) |message, entry| {
+        for (catalog.entries.values()) |entry| {
+            const message = entry.message;
             if (entry.reached) continue;
             const must = switch (entry.kind) {
                 .always, .sometimes, .reachable => true,
@@ -169,6 +179,26 @@ pub const Catalog = struct {
     }
 };
 
+test "one message under two kinds is two properties in the catalog, whichever was noted first" {
+    // CE18 and CE22 (the Lean replica of determinismo): the catalog kept a message's first kind
+    // and ORed what any kind reached, so an unmet sometimes passed beside its message's reached
+    // always, and a reachable never reached failed or passed by which timeline ended first.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    for ([_]bool{ false, true }) |reachable_first| {
+        var catalog = Catalog{ .arena = arena_state.allocator() };
+        if (reachable_first) try catalog.note(.reachable, "m", false);
+        try catalog.note(.always_or_unreachable, "m", false);
+        if (!reachable_first) try catalog.note(.reachable, "m", false);
+        try std.testing.expectEqual(@as(u32, 1), catalog.judge(true));
+    }
+    var catalog = Catalog{ .arena = arena_state.allocator() };
+    try catalog.note(.sometimes, "s", false);
+    try catalog.note(.always, "s", true);
+    try std.testing.expectEqual(@as(u32, 1), catalog.judge(true));
+    try std.testing.expect(!catalog.made_true(.sometimes, "s") and catalog.made_true(.always, "s"));
+}
+
 test Catalog {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -180,8 +210,9 @@ test Catalog {
     try catalog.note(.sometimes, "reached in two", true);
     try catalog.note(.reachable, "reached nowhere", false);
     try catalog.note(.@"unreachable", "never reached, rightly", false);
-    try std.testing.expect(catalog.made_true("reached in one") and catalog.made_true("reached in two"));
-    try std.testing.expect(!catalog.made_true("reached nowhere") and !catalog.made_true("never noted"));
+    try std.testing.expect(catalog.made_true(.sometimes, "reached in one") and catalog.made_true(.sometimes, "reached in two"));
+    try std.testing.expect(!catalog.made_true(.reachable, "reached nowhere") and !catalog.made_true(.sometimes, "never noted"));
+    try std.testing.expect(!catalog.made_true(.reachable, "reached in one")); // Another kind: another property.
     // Only what no scenario reached, of the kinds that must be reached, and only when every
     // scenario was explored.
     try std.testing.expectEqual(@as(u32, 1), catalog.judge(true));
