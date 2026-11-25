@@ -240,6 +240,12 @@ def connections : List Check :=
     { name := "faults kept to node 1: node 0 never killed",
       ok := !Conn.someLog (Conn.config true (targets := some [1])) 300 "node 0 killed"
         && Conn.someLog (Conn.config true (targets := some [1])) 300 "node 1 killed" },
+    { name := "timers fire once due, never for an earlier process, delayed sends never early",
+      ok := (explore (fun src => let r := Conn.runTimed on src; { taken := r.taken, violation := r.violation }) 1000).isNone },
+    { name := "timers fire and delayed sends arrive in some timelines, kills in some",
+      ok := let rs := (List.range 200).map fun i => (Conn.runTimed on (Source.seeded i)).cluster
+        rs.any (·.ghostOf "fired" > 0) && rs.any (·.ghostOf "received" > 0)
+          && rs.any (fun c => c.log.any (fun l => (l.splitOn "killed").length > 1)) },
     { name := "clients kept to node 0",
       ok := (List.range 100).all fun i =>
         (Conn.runFull (Conn.config true (clientNodes := some [0])) (Source.seeded i)).cluster.history.all (·.node == 0) } ]

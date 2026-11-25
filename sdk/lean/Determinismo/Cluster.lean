@@ -22,7 +22,11 @@ named decision:
   lost, a send to a down node fails, and each live peer sees it (`net.connection.reset`: its
   `connectionLost` runs) or not (a silent death: a half-open connection, as a peer cut off at the
   moment learns nothing);
-- `Faults.targets` and `Config.clientNodes` keep faults and clients to some nodes.
+- `Faults.targets` and `Config.clientNodes` keep faults and clients to some nodes;
+- timers (`Node.setTimer`): due after some ticks, fired as an event (`world.timer` picks among the
+  due), gone with their process; delayed sends (`Node.sendAfter`): deliverable only from a time
+  on; ghost state (`Node.setGhost`, `Cluster.ghost`): values for the properties that no fault
+  touches (what was acknowledged, a node's highest term ever).
 
 A timeline boots every node, runs `steps` events with faults, then `recovery` events without
 (partitions healed, every node started again), then judges. Properties: assertions in the code
@@ -49,6 +53,8 @@ structure Envelope (M : Type) where
   src : NodeId
   dst : NodeId
   msg : M
+  /-- Not deliverable before this time (`Node.sendAfter`). -/
+  notBefore : Nat := 0
   /-- The destination's starts when it was sent (a message from before its last start, with
   `connections` off, is a datagram outliving the process it was meant for). -/
   dstStarts : Nat := 0
@@ -162,6 +168,10 @@ structure Cluster (s : Sys) where
   recovering : Bool := false
   /-- Nodes that died in this event, their peers not yet told (`connections`). -/
   died : List NodeId := []
+  /-- Timers set: node, name, due time. -/
+  timers : List (NodeId × String × Nat) := []
+  /-- Ghost state: named values the properties read, outside every node (no fault touches it). -/
+  ghost : List (String × Int) := []
 
 instance {s : Sys} : Chaotic (Cluster s) where
   decisions c := c.decisions
@@ -184,6 +194,8 @@ structure Behavior (s : Sys) where
   operation : ClusterM s s.Op
   /-- With `connections`: the connection to `peer` was reset (it died). -/
   connectionLost : s.State → NodeId → NodeM s s.State := fun state _ => pure state
+  /-- A timer the node set (`Node.setTimer`) fired. -/
+  timer : s.State → String → NodeM s s.State := fun state _ => pure state
 
 structure Properties (s : Sys) where
   invariant : Cluster s → Option String := fun _ => none
@@ -221,15 +233,23 @@ def clientable (c : Cluster s) : List NodeId :=
   | some ns => c.upNodes.filter ns.contains
   | none => c.upNodes
 
-/-- Node `n` died: with `connections`, its messages in flight lost and its peers to be told. -/
+/-- Node `n` died: its timers gone with its process; with `connections`, its messages in flight
+lost and its peers to be told. -/
 def connectionsEnd (c : Cluster s) (n : NodeId) : Cluster s :=
+  let c := { c with timers := c.timers.filter (·.1 != n) }
   if c.config.connections then
     { c with net := c.net.filter (fun e => e.src != n && e.dst != n),
              died := if c.died.contains n then c.died else c.died ++ [n] }
   else c
 
+/-- Timers due now, of nodes that are up. -/
+def dueTimers (c : Cluster s) : List (NodeId × String × Nat) :=
+  c.timers.filter fun (n, _, due) => due ≤ c.time && c.up n
+
+def ghostOf (c : Cluster s) (key : String) : Int := (c.ghost.lookup key).getD 0
+
 def deliverable (c : Cluster s) : List (Envelope s.Msg) :=
-  let open_ := c.net.filter fun e => !c.blocked.contains (e.src, e.dst)
+  let open_ := c.net.filter fun e => !c.blocked.contains (e.src, e.dst) && e.notBefore ≤ c.time
   if c.config.fifo then
     open_.filter fun e => !(c.net.any fun o => o.src == e.src && o.dst == e.dst && o.id < e.id)
   else open_
@@ -257,6 +277,30 @@ def send (dst : NodeId) (msg : s.Msg) : NodeM s Unit := do
   if c.config.connections && !c.up dst then return
   modify fun c => { c with net := c.net ++ [{ id := c.nextMessage, src, dst, msg, dstStarts := (c.node dst).starts }],
                            nextMessage := c.nextMessage + 1 }
+
+/-- A send delivered no sooner than `ticks` from now (a retry's backoff, a queued reply). -/
+def sendAfter (dst : NodeId) (ticks : Nat) (msg : s.Msg) : NodeM s Unit := do
+  let src ← read
+  let c ← get
+  if c.config.connections && !c.up dst then return
+  modify fun c => { c with net := c.net ++ [{ id := c.nextMessage, src, dst, msg, notBefore := c.time + ticks,
+                                              dstStarts := (c.node dst).starts }],
+                           nextMessage := c.nextMessage + 1 }
+
+/-- A timer named `name` due in `ticks` (the node's earlier one of that name replaced). -/
+def setTimer (name : String) (ticks : Nat) : NodeM s Unit := do
+  let n ← read
+  modify fun c => { c with timers := (n, name, c.time + ticks) :: c.timers.filter (fun (m, k, _) => !(m == n && k == name)) }
+
+def cancelTimer (name : String) : NodeM s Unit := do
+  let n ← read
+  modify fun c => { c with timers := c.timers.filter (fun (m, k, _) => !(m == n && k == name)) }
+
+/-- Ghost state, for the properties: kept across every fault. -/
+def setGhost (key : String) (value : Int) : NodeM s Unit :=
+  modify fun c => { c with ghost := (key, value) :: c.ghost.filter (·.1 != key) }
+
+def ghost (key : String) : NodeM s Int := do pure ((← get).ghostOf key)
 
 def file (name : String) : NodeM s (File s.Rec) := do
   pure (((← get).node (← read)).files.get name)
@@ -476,7 +520,7 @@ def clientRequest (b : Behavior s) (n : NodeId) : ClusterM s Unit := do
     if let some state' ← runAt n (b.request state id op) then settle n state'
 
 inductive Event where
-  | deliver | duplicate | drop | tick | client | crash | kill | start | partition | heal | skew | evict
+  | deliver | duplicate | drop | tick | client | crash | kill | start | partition | heal | skew | evict | timer
   deriving Repr, BEq
 
 /-- The events possible now, each with its weight. -/
@@ -498,7 +542,8 @@ def possible (c : Cluster s) : List (Event × Nat) :=
     (.partition, if faulty && f.partition && c.blocked.isEmpty then 1 else 0),
     (.heal, if !c.blocked.isEmpty then (if c.recovering then 8 else 1) else 0),
     (.skew, if faulty && f.skew && !c.targetable.isEmpty then 1 else 0),
-    (.evict, if faulty && f.evict && !c.targetable.isEmpty then 1 else 0) ].filter (·.2 > 0)
+    (.evict, if faulty && f.evict && !c.targetable.isEmpty then 1 else 0),
+    (.timer, if c.dueTimers.isEmpty then 0 else 3) ].filter (·.2 > 0)
 
 /-- One event, drawn. False when nothing can happen. -/
 def event (b : Behavior s) : ClusterM s Bool := do
@@ -542,6 +587,12 @@ def event (b : Behavior s) : ClusterM s Bool := do
     if let some n ← pick (σ := Cluster s) "fault.evict" c.targetable then
       modify fun c => c.setNode n fun nd => { nd with files := nd.files.map fun (name, f) => (name, f.evict) }
       note s!"node {n}'s page cache evicted"
+  | .timer =>
+    if let some (n, name, _) ← pick (σ := Cluster s) "world.timer" c.dueTimers then
+      modify fun c => { c with timers := c.timers.filter (fun (m, k, _) => !(m == n && k == name)) }
+      note s!"node {n}: timer {name} fired"
+      if let some state := ((← get).node n).state then
+        if let some state' ← runAt n (b.timer state name) then settle n state'
   tellDeaths b
   modify fun c => { c with step := c.step + 1 }
   return true
