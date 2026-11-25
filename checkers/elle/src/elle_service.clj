@@ -15,9 +15,13 @@
 ;; "ops": n, "anomalies": "..."} (the anomalies as Elle prints them, cut short).
 ;;
 ;; Consistency: one of Elle's models, or strict-serializable-per-key: Elle's strict
-;; serializability with real-time order only between operations touching a key in common, i.e.
-;; serializable and each key linearizable (YDB's claim, its team's Jepsen suite's
-;; ydb-serializable model). Its anomalies keep Elle's names (G-single-item-realtime: per key).
+;; serializability with real-time order only between operations touching a key in common (the
+;; ydb-serializable model of YDB's team's Jepsen suite). That is stricter than "serializable and
+;; each key linearizable": every transaction takes effect at one point for all the keys it
+;; touches. A Lean replica of Elle found three transactions serializable with each key
+;; linearizable that this rejects, one transaction's point differing per key (its D18). A
+;; failure under this model may be allowed by that weaker reading: say so beside it. Its
+;; anomalies keep Elle's names (G-single-item-realtime: per key).
 ;;
 ;; &linearizable_keys=true (rw-register): Elle's :linearizable-keys?, each key's version order
 ;; inferred from real time, for a system that claims each key linearizable. Without it Elle

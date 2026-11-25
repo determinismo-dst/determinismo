@@ -37,9 +37,12 @@ POST /check?model=list-append&consistency=strict-serializable
   `w k v`, `delete k null`, `r k v-or-null` and `rp predicate rows`, a predicate `"true"`,
   `["=", a]` or `["mod", a, b]` and rows `[[k, v], ...]`). `consistency`: any of Elle's models (`strict-serializable`,
   `serializable`, `snapshot-isolation`, `read-committed`, ...), or `strict-serializable-per-key`:
-  strict serializability with real-time order only between operations that touch a key in common
-  (serializable, each key linearizable). That is YDB's claim, the `ydb-serializable` model of its
-  team's Jepsen suite. Its anomalies keep Elle's names: `G-single-item-realtime` is then per key.
+  strict serializability with real-time order only between operations that touch a key in common,
+  the `ydb-serializable` model of YDB's team's Jepsen suite. That is stricter than "serializable,
+  each key linearizable": each transaction takes effect at one point for all its keys, so a
+  history whose transactions would need a different point per key fails here though that weaker
+  reading allows it. A failure under this model is reported with that note. Its anomalies keep
+  Elle's names: `G-single-item-realtime` is then per key.
   Elle's real-time graph is replaced JVM-wide while such a check runs, so it runs alone.
 - `linearizable_keys=true` (rw-register): Elle's `:linearizable-keys?`, each key's version
   order inferred from real time, for a system that claims each key linearizable. Without it
