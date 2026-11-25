@@ -90,7 +90,7 @@ const usage =
     \\                            in virtual time; part of the inputs)
     \\                            [--clock-start-max <duration | 0>]   (each timeline's wall clock
     \\                            moved forward up to this as its commands begin, log-uniform
-    \\                            from 1 s, so what seeds from the time differs; 1h by default)
+    \\                            from 1 s, so what seeds from the time differs; 30m by default)
     \\                            [--drive-max <duration | none>]   (a scenario without a length
     \\                            of its own: its driver phase drawn up to that long; 20m by
     \\                            default, none: a drawn number of starts; part of the inputs)
@@ -477,7 +477,7 @@ const Arguments = struct {
     drive_max_text: ?[]const u8 = null,
     /// `--clock-start-max`: each timeline's wall clock moved forward up to this (virtual time,
     /// log-uniform from a second) as its commands begin, so a system seeding from the time draws
-    /// apart in each (det-composer's clock_start). Null: the composer's hour; 0: none.
+    /// apart in each (det-composer's clock_start). Null: the composer's 30 minutes; 0: none.
     clock_start_max_ms: ?u64 = null,
     /// The longest a scenario's driver phase is drawn in this exploration (its own drive_ms_max,
     /// else --drive-max), null with --timeline or none: the length the explorer steers (Novelty).

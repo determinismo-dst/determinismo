@@ -896,11 +896,14 @@ fn driver_start_by(composer: *Composer, kinds: []const Kind, parallelism: u64, d
 /// system seeding from the time (time(NULL), a clock's nanoseconds) drew alike in all of them:
 /// a calibration's 8,093 timelines printed one fault-injection seed. Each timeline's wall clock
 /// now moves forward to a start drawn for it, as its commands begin: log-uniform from a second to
-/// det.clock_start_max_ms= (explore's --clock-start-max; an hour unless asked, 0 none). Never
-/// back, and not past what a setup made to expire (a token's hour, a lease): a timeline failing
-/// on the jump would be no workload's failure. The monotonic clock and the timers' durations
-/// stay; the nodes' own skews (their time namespaces) add to it as before.
-const clock_start_max_default_ms: u64 = std.time.ms_per_hour;
+/// det.clock_start_max_ms= (explore's --clock-start-max; 30 minutes unless asked, 0 none). Never
+/// back, and by default short of what a setup made to last an hour (a token's hour, the
+/// commonest lifetime): the jump and the longest default drive (20 minutes) stay within it, so a
+/// timeline failing on the jump, no workload's failure, takes a credential shorter than that. At
+/// an hour's cap the last band reached the hour itself, and an hour token issued in the setup
+/// expired as the drivers began (CE15, the Lean replica of determinismo). The monotonic clock and
+/// the timers' durations stay; the nodes' own skews (their time namespaces) add to it as before.
+const clock_start_max_default_ms: u64 = 30 * std.time.ms_per_min;
 
 fn clock_start_draw() void {
     const max_ms = if (cmdline_ms("det.clock_start_max_ms=")) |ns| ns / std.time.ns_per_ms else clock_start_max_default_ms;
@@ -954,6 +957,17 @@ test clock_start_bands {
         try std.testing.expect(range.low >= 1000 and range.low <= range.high and range.high <= hour);
         if (band > 0) try std.testing.expectEqual(clock_start_band(hour, band - 1).high + 1, range.low);
     }
+}
+
+test "the default wall clock start and the longest default drive stay within an hour" {
+    // A credential or lease a setup issued for an hour (the commonest lifetime) must outlive the
+    // jump and the drive after it, or the timeline fails on the jump, no workload's failure. At an
+    // hour's cap the last band reached the hour itself: such a token expired as the drivers began
+    // in about 6% of timelines of a 20-minute drive (CE15, the Lean replica of determinismo).
+    const drive_ms_max_default = 20 * std.time.ms_per_min; // explore's --drive-max (main.zig drive_max_ms_default)
+    const bands = clock_start_bands(clock_start_max_default_ms);
+    const jump_max = clock_start_band(clock_start_max_default_ms, bands - 1).high;
+    try std.testing.expect(jump_max + drive_ms_max_default < std.time.ms_per_hour);
 }
 
 /// det.timeline_ms= from the kernel command line (explore's --timeline), in nanoseconds.

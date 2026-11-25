@@ -8800,7 +8800,7 @@ fn check_jvm_caches(context: *Context) !void {
 
 /// Each timeline's wall clock starts at a moment drawn for it (det-composer's clock_start): two
 /// timelines of one run read different times at the same virtual moment, a replay of either its
-/// own again, both within the default hour past the guest's one start; with --clock-start-max 0
+/// own again, both within the default 30 minutes past the guest's one start; with --clock-start-max 0
 /// they read alike. A calibration's timelines all printed one fault-injection seed, drawn from
 /// time(NULL): the same time in every timeline.
 fn check_clock_start(context: *Context) !void {
@@ -8832,13 +8832,13 @@ fn check_clock_start(context: *Context) !void {
     const within = for (drawn[0..2]) |read| {
         const r = read orelse break false;
         const o = off[0] orelse break false;
-        if (r < o + 1 or r > o + 3600) break false;
+        if (r < o + 1 or r > o + 1800) break false;
     } else true;
     expect_all(context, &.{
         .{ "the wall clock read in every look", drawn[0] != null and drawn[1] != null and drawn[2] != null and off[0] != null and off[1] != null },
         .{ "two timelines read different wall times at the same virtual moment", drawn[0] != null and drawn[0] != drawn[1] },
         .{ "a timeline's replay reads its own start again", drawn[0] != null and drawn[0] == drawn[2] },
-        .{ "each start a second to an hour past the guest's own", within },
+        .{ "each start a second to 30 minutes past the guest's own", within },
         .{ "with --clock-start-max 0 the timelines read alike", off[0] != null and off[0] == off[1] },
     }, "clock-start: timelines read {?d} and {?d} (again {?d}); without a start {?d} and {?d}", .{ drawn[0], drawn[1], drawn[2], off[0], off[1] });
 }
