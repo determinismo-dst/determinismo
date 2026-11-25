@@ -12,6 +12,8 @@ const linux = std.os.linux;
 /// report.zig's aggregate_count_max). Events lives on stacks in tests: 4,096 is 1.8 MB.
 pub const property_count_max = 4096;
 pub const message_size_max = 192;
+/// A property's identity: its message, and "#" and 16 hex digits of the whole one's hash when cut.
+pub const identity_size_max = message_size_max + 17;
 pub const parse_buffer_size = 256 * 1024;
 
 pub const Moment = struct { vtime_ns: u64, branches: u64 };
@@ -22,6 +24,10 @@ pub const Property = struct {
     kind: Kind,
     message: [message_size_max]u8,
     message_size: u8,
+    /// For a message cut to message_size_max: the whole message's hash, so messages sharing
+    /// their first bytes stay apart (they merged into one property until the blind Lean replica
+    /// of the platform found it, CE11); 0 for a message that fits.
+    message_hash: u64 = 0,
     hits: u64 = 0,
     trues: u64 = 0,
     first_failure: ?Moment = null,
@@ -38,6 +44,21 @@ pub const Property = struct {
         assert(property.message_size > 0);
         assert(property.message_size <= message_size_max);
         return property.message[0..property.message_size];
+    }
+
+    /// Its name, and for a cut message its whole message's hash: what tells two properties
+    /// apart across timelines and scenarios.
+    pub fn identity(property: *const Property, buffer: *[identity_size_max]u8) []const u8 {
+        if (property.message_hash == 0) return property.name();
+        return std.fmt.bufPrint(buffer, "{s}#{x:0>16}", .{ property.name(), property.message_hash }) catch unreachable;
+    }
+
+    /// One property: the same message (a cut one by its hash too) and the same kind. A message
+    /// with two kinds in two timelines is two properties, each judged as its kind (merged, the
+    /// verdict was the kind of whichever timeline came first: CE9).
+    pub fn same(property: *const Property, other: *const Property) bool {
+        return property.kind == other.kind and property.message_hash == other.message_hash and
+            std.mem.eql(u8, property.name(), other.name());
     }
 
     /// Whether this timeline violates the property: an `always` that was false, an
@@ -1459,8 +1480,10 @@ fn property_get_or_put(events: *Events, kind: Kind, message: []const u8) !*Prope
     assert(events.property_count <= property_count_max);
     if (message.len == 0) return error.BadAssertion;
     const size: u8 = @intCast(@min(message.len, message_size_max));
+    // Never 0 for a cut message: 0 is one that fits.
+    const hash: u64 = if (message.len > message_size_max) std.hash.Wyhash.hash(0, message) | 1 else 0;
     for (events.properties[0..events.property_count]) |*property| {
-        if (std.mem.eql(u8, property.name(), message[0..size])) {
+        if (property.message_hash == hash and std.mem.eql(u8, property.name(), message[0..size])) {
             if (property.kind != kind) {
                 // One property per message (as in Antithesis): a message with two kinds is a
                 // test's mistake, worth saying plainly.
@@ -1475,7 +1498,7 @@ fn property_get_or_put(events: *Events, kind: Kind, message: []const u8) !*Prope
     }
     if (events.property_count == property_count_max) return error.TooManyProperties;
     const property = &events.properties[events.property_count];
-    property.* = .{ .kind = kind, .message = undefined, .message_size = size };
+    property.* = .{ .kind = kind, .message = undefined, .message_size = size, .message_hash = hash };
     @memcpy(property.message[0..size], message[0..size]);
     events.property_count += 1;
     assert(events.property_count <= property_count_max);
@@ -1856,6 +1879,22 @@ test "always fails on the first false condition and records its moment" {
     try events.emit(.{ .vtime_ns = 2, .branches = 20 }, fail);
     try std.testing.expectEqual(@as(u32, 1), events.failing_count());
     try std.testing.expectEqual(@as(u64, 20), events.properties[0].first_failure.?.branches);
+}
+
+test "messages sharing their first message_size_max bytes are two properties" {
+    const parse_buffer = try std.testing.allocator.alloc(u8, parse_buffer_size);
+    defer std.testing.allocator.free(parse_buffer);
+    var events: Events = undefined;
+    events.init(parse_buffer, .{ .log_fd = null });
+    const shared: [message_size_max]u8 = @splat('m');
+    var buffer: [512]u8 = undefined;
+    const reached = try std.fmt.bufPrint(&buffer, "{{\"assert\":{{\"type\":\"sometimes\",\"message\":\"{s}a\",\"condition\":true}}}}", .{&shared});
+    try events.emit(.{ .vtime_ns = 1, .branches = 10 }, reached);
+    const never = try std.fmt.bufPrint(&buffer, "{{\"assert\":{{\"type\":\"sometimes\",\"message\":\"{s}b\",\"condition\":false}}}}", .{&shared});
+    try events.emit(.{ .vtime_ns = 2, .branches = 20 }, never);
+    try std.testing.expectEqual(@as(u32, 2), events.property_count);
+    try std.testing.expectEqual(@as(u64, 1), events.properties[0].trues);
+    try std.testing.expectEqual(@as(u64, 0), events.properties[1].trues);
 }
 
 test "a location names the assertion's class, as Antithesis's SDKs send it" {

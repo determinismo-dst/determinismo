@@ -8051,6 +8051,7 @@ fn events_same(a: *const Events, b: *const Events) bool {
     if (a.property_count != b.property_count) return false;
     for (a.properties[0..a.property_count], b.properties[0..b.property_count]) |*x, *y| {
         if (x.kind != y.kind or x.hits != y.hits or x.trues != y.trues) return false;
+        if (x.message_hash != y.message_hash) return false;
         if (!std.mem.eql(u8, x.name(), y.name()) or !std.mem.eql(u8, x.where(), y.where())) return false;
         if (!std.meta.eql(x.first_failure, y.first_failure)) return false;
     }

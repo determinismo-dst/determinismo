@@ -399,7 +399,8 @@ pub const Multiverse = struct {
     pub fn sometimes_unmet(multiverse: *const Multiverse, arena: std.mem.Allocator) ![]const []const u8 {
         var unmet: std.ArrayList([]const u8) = .empty;
         for (multiverse.aggregates[0..multiverse.aggregate_count]) |*aggregate| {
-            if (aggregate.unmet_here()) try unmet.append(arena, try arena.dupe(u8, aggregate.property.name()));
+            var identity: [Events.identity_size_max]u8 = undefined;
+            if (aggregate.unmet_here()) try unmet.append(arena, try arena.dupe(u8, aggregate.property.identity(&identity)));
         }
         return unmet.toOwnedSlice(arena);
     }
@@ -518,7 +519,7 @@ pub const Multiverse = struct {
 
     fn aggregate_find(multiverse: *Multiverse, property: *const Events.Property) !*Aggregate {
         for (multiverse.aggregates[0..multiverse.aggregate_count]) |*aggregate| {
-            if (std.mem.eql(u8, aggregate.property.name(), property.name())) return aggregate;
+            if (aggregate.property.same(property)) return aggregate;
         }
         if (multiverse.aggregate_count == aggregate_count_max) return error.TooManyProperties;
         multiverse.aggregates[multiverse.aggregate_count] = .{ .property = property.* };
@@ -758,7 +759,8 @@ pub const Multiverse = struct {
                     .branches_failing = 0, // Violations are judged in their scenario.
                 },
             );
-            try catalog.note(aggregate.property.kind, aggregate.property.name(), reached);
+            var identity: [Events.identity_size_max]u8 = undefined;
+            try catalog.note(aggregate.property.kind, aggregate.property.identity(&identity), reached);
         }
     }
 
@@ -875,6 +877,20 @@ test "Multiverse.efficiency" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.5), measured.idle_share, 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 100), measured.clock_reads_per_s, 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 1.5), measured.per_node, 1e-9);
+}
+
+test "one message with two kinds is two properties, whichever timeline came first" {
+    const multiverse = try std.testing.allocator.create(Multiverse);
+    defer std.testing.allocator.destroy(multiverse);
+    multiverse.* = .{};
+    var sometimes = Events.Property{ .kind = .sometimes, .message = undefined, .message_size = 1, .hits = 1, .trues = 1 };
+    sometimes.message[0] = 'm';
+    var always = Events.Property{ .kind = .always, .message = undefined, .message_size = 1, .hits = 1, .trues = 0 };
+    always.message[0] = 'm';
+    try multiverse.merge(&sometimes, 1);
+    try multiverse.merge(&always, 2);
+    try std.testing.expectEqual(@as(u32, 2), multiverse.aggregate_count);
+    try std.testing.expectEqual(@as(u32, 1), multiverse.failing_properties());
 }
 
 test "Multiverse.absorb carries a worker's waits" {
