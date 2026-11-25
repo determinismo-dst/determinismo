@@ -1480,7 +1480,13 @@ fn links_collect(
 ) void {
     const node = &system.nodes[index];
     if (node.faults.runner_links) links_add(faults, count, node, schema.runner_name, .{});
-    for (system.nodes[index + 1 ..]) |peer| links_add(faults, count, node, peer.name, peer.faults);
+    for (system.nodes[index + 1 ..]) |peer| {
+        // An excluded node is in no link fault (faults_collect skips its own): from a node
+        // listed before it too, which gave it partitions and degraded links until the blind
+        // Lean replica of determinismo found it (CE6).
+        if (excluded(peer.name)) continue;
+        links_add(faults, count, node, peer.name, peer.faults);
+    }
 }
 
 fn links_add(
@@ -5029,6 +5035,40 @@ test "a node that takes no network faults keeps its links when another node is i
     var links: [directed_max]Directed = undefined;
     // Both ways with the runner and raft-node-2, none with the monitor.
     try std.testing.expectEqual(@as(u32, 4), disrupted_links(&system, &clog, &links));
+}
+
+test "an excluded node is in no link fault, from a node listed before it or after" {
+    const base = schema.Resolved{
+        .name = "a",
+        .address = "10.0.0.2",
+        .disk = "vdb",
+        .digest = "",
+        .command = &.{"x"},
+        .env = &.{},
+    };
+    var resolved = [3]schema.Resolved{ base, base, base };
+    resolved[1].name = "b";
+    resolved[2].name = "c";
+    const scenario = schema.Scenario{ .name = "s", .commands = &.{} };
+    const system = schema.System{ .profile = "p", .nodes = &resolved, .scenarios = &.{scenario} };
+    const saved_exclusions = exclusions;
+    const saved_read = exclusions_read;
+    defer {
+        exclusions = saved_exclusions;
+        exclusions_read = saved_read;
+    }
+    exclusions = try regex.Regex.compile("^b$");
+    exclusions_read = true;
+    var faults: [faults_max]Fault = undefined;
+    const count = faults_collect(&system, &scenario, &faults);
+    var a_c: u32 = 0;
+    for (faults[0..count]) |fault| {
+        try std.testing.expect(!std.mem.eql(u8, fault.node, "b"));
+        try std.testing.expect(!std.mem.eql(u8, fault.peer, "b"));
+        const a = std.mem.eql(u8, fault.node, "a");
+        if (fault.kind == .partition and a and std.mem.eql(u8, fault.peer, "c")) a_c += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 1), a_c); // The others keep theirs.
 }
 
 test "runner_links: a client node's link with the runner is never faulted" {
