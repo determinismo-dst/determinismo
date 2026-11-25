@@ -717,8 +717,9 @@ fn signaled_driver(_: *System.Context) !void {
     _ = linux.nanosleep(&long, null);
 }
 
+/// Past the length and its 30 s grace (composer.zig's length_grace_ns): the length's kill ends it.
 fn outliving_driver(_: *System.Context) !void {
-    const long = linux.timespec{ .sec = 30, .nsec = 0 };
+    const long = linux.timespec{ .sec = 600, .nsec = 0 };
     _ = linux.nanosleep(&long, null);
 }
 
