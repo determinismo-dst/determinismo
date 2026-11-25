@@ -782,7 +782,7 @@ fn run_drivers(composer: *Composer, drive_ms_max: ?u32, parallel_max: ?u32) ?u64
         const end_ns = now_ns() + length_ns;
         while (now_ns() < end_ns) {
             if (!load.next(end_ns)) continue;
-            driver_start_by(composer, kinds, load.parallelism, end_ns);
+            driver_start_by(composer, kinds, load.parallelism, end_ns, end_ns);
         }
         return end_ns;
     } else {
@@ -802,7 +802,11 @@ fn run_drivers(composer: *Composer, drive_ms_max: ?u32, parallel_max: ?u32) ?u64
                 sdk.event("drivers_stopped", .{ .started = started, .starts = starts });
                 break;
             };
-            driver_start(composer, kinds, load.parallelism);
+            // Its slot waited for until the stop at most: a start that waited past it for the
+            // only slot began after the stop (CE5's other path, the Lean replica of determinismo:
+            // a 400 s driver held it, the next started at 400 s of a 300 s stop). Those running
+            // finish, a serial driver too (no length bounds it here).
+            driver_start_by(composer, kinds, load.parallelism, stop_ns orelse std.math.maxInt(u64), std.math.maxInt(u64));
         }
     }
     return null;
@@ -870,21 +874,18 @@ fn min_drive(composer: *Composer, drive_start_ns: u64, scenario_ms: ?u32) void {
     });
 }
 
-fn driver_start(composer: *Composer, kinds: []const Kind, parallelism: u64) void {
-    driver_start_by(composer, kinds, parallelism, std.math.maxInt(u64));
-}
-
-/// A driver started, its slot waited for until `deadline_ns` at most (none started past it).
-fn driver_start_by(composer: *Composer, kinds: []const Kind, parallelism: u64, deadline_ns: u64) void {
+/// A driver started, its slot waited for until `start_by_ns` at most (none started past it); a
+/// serial driver, running alone, bounded by `run_until_ns` (a timeline's length) as well.
+fn driver_start_by(composer: *Composer, kinds: []const Kind, parallelism: u64, start_by_ns: u64, run_until_ns: u64) void {
     const kind = sdk.random_choice(Kind, kinds);
     switch (kind) {
         .serial_driver => {
-            composer.wait_below(1, deadline_ns);
+            composer.wait_below(1, start_by_ns);
             if (composer.running_count > 0) return;
-            composer.run_alone_until(composer.pick(.serial_driver), deadline_ns);
+            composer.run_alone_until(composer.pick(.serial_driver), run_until_ns);
         },
         .parallel_driver, .anytime => {
-            composer.wait_below(@intCast(parallelism), deadline_ns);
+            composer.wait_below(@intCast(parallelism), start_by_ns);
             if (composer.running_count >= parallelism) return;
             const command = composer.pick(kind);
             announce(command, "start");
