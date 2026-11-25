@@ -67,7 +67,8 @@ and Elle 0.2.8's `elle.txn` loads unilog while declaring it for its dev profile 
 
 `src/elle/` holds Elle 0.2.8 namespaces with fixes, loaded ahead of Elle's jar (`:paths` come
 first), each under Elle's license (EPL-2.0, `src/elle/LICENSE`). All were found by a Lean replica
-of Elle and reproduced on Elle; Elle's own test suite passes with them, except
+of Elle ([determinismo-workloads' workloads/elle/lean](https://github.com/determinismo-dst/determinismo-workloads/tree/main/workloads/elle/lean),
+its findings in UNREPORTED.md) and reproduced on Elle; Elle's own test suite passes with them, except
 `failure-to-observe-test`, which now also reports the G-single-realtime its history holds.
 - `closed_predicate.clj`: writes (`[:w k v]`) get write-write edges (`ww-graph` matched
   `:write`); `versions-after` keeps its unborn branch and `version<` orders `:elle/unborn` first,
