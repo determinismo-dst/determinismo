@@ -843,6 +843,26 @@ test "a relayed session's polls, thousands of ingress answers, parse: their reas
     try std.testing.expectEqual(@as(?Kind, .ingress), overrides.kind_at(701));
 }
 
+test "a session's 70,560 taped answers parse: a replay reads every tape its recorder wrote" {
+    // CE20 (the Lean replica of determinismo): a relayed session's polls tape an answer 84 times a
+    // virtual second, 70,560 in 14 virtual minutes; the recorder wrote them all and the replay's
+    // fixed table of 65,536 refused the tape (TapeTooLong), dropping the tree's returns to it.
+    const allocator = std.testing.allocator;
+    const overrides = try allocator.create(Overrides);
+    defer allocator.destroy(overrides);
+    const scratch = try allocator.alloc(u8, 16 * 1024);
+    defer allocator.free(scratch);
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(allocator);
+    try source.appendSlice(allocator, "{\"tape\":2,\"inputs\":\"00000000000000aa\",\"exploration_seed\":\"0000000000000007\"," ++
+        "\"branch\":0,\"branch_seed\":\"00000000000000ff\"}\n");
+    for (0..70_560) |poll| {
+        try source.print(allocator, "{{\"pull\":{d},\"hex\":\"0000000001000000\",\"reason\":\"{s}\"}}\n", .{ 700 + poll, ingress_reason });
+    }
+    _ = try parse(source.items, scratch, overrides);
+    try std.testing.expectEqual(@as(u32, 70_560), overrides.count);
+}
+
 test "an extending timeline's tape: what was consumed written back, the connections to come dropped" {
     const allocator = std.testing.allocator;
     const overrides = try allocator.create(Overrides);
