@@ -9071,7 +9071,7 @@ fn check_ending_killed(context: *Context) !void {
     const signal_events = try std.fmt.allocPrint(arena, "{s}/ending-signal", .{context.scratch});
     _ = try explore(context, &.{
         "--program",    program,       "--scenario",  "ending_signal", "--seed",     "1",  "--branches", "8",
-        "--events-dir", signal_events, "--min-drive", "0",             "--timeline", "2s",
+        "--events-dir", signal_events, "--min-drive", "0",             "--timeline", "2s", "--no-swarm",
     });
     try events_plain(context, signal_events);
     const signal_script = try std.fmt.allocPrint(arena,

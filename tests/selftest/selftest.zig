@@ -689,9 +689,11 @@ fn ending_finally(_: *System.Context) !void {
 /// A finally command runs only when every command ran to completion, the length's own kills
 /// forgiven: a driver that died by a signal before the length killed the rest is no
 /// completion. The length's forgiveness once wiped every earlier interruption with its own
-/// (CE1, the blind Lean replica of the platform). Half the timelines have their first start
-/// die by SIGKILL at once; the others' starts sleep past a short --timeline.
+/// (CE1, the blind Lean replica of the platform). Half the timelines have signaled_driver's first
+/// start die by SIGKILL at once; outliving sleeps past a short --timeline in every one (run with
+/// --no-swarm), so the length always has commands to kill.
 fn ending_signal_scenario(s: *System.Scenario) void {
+    s.parallel_driver("outliving", outliving_driver);
     s.parallel_driver("signaled", signaled_driver);
     s.finally("after_signal", ending_signal_finally);
 }
@@ -711,6 +713,11 @@ fn signaled_driver(_: *System.Context) !void {
             _ = linux.kill(linux.getpid(), .KILL);
         }
     }
+    const long = linux.timespec{ .sec = 30, .nsec = 0 };
+    _ = linux.nanosleep(&long, null);
+}
+
+fn outliving_driver(_: *System.Context) !void {
     const long = linux.timespec{ .sec = 30, .nsec = 0 };
     _ = linux.nanosleep(&long, null);
 }
