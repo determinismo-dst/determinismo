@@ -5845,7 +5845,7 @@ fn check_resume(context: *Context) !void {
         _ = std.os.linux.kill(child.id.?, .TERM);
         _ = try child.wait(context.io);
         const interrupted = try record_timelines(context, parts);
-        _ = try explore(context, &(system ++ [_][]const u8{ "--record", parts, "--resume" }));
+        const resumed_report = try explore(context, &(system ++ [_][]const u8{ "--record", parts, "--resume" }));
         const expected = try record_timelines(context, whole);
         const resumed = try record_timelines(context, parts);
         const once = resumed.len == 48 and for (resumed[1..], resumed[0 .. resumed.len - 1]) |a, b| {
@@ -5864,13 +5864,62 @@ fn check_resume(context: *Context) !void {
             for (expected, resumed) |a, b| {
                 if (!std.mem.eql(u8, a, b)) break false;
             } else true);
+        // The verdict is the whole record's: every property a recorded timeline failed fails the
+        // resumed run, those before the interruption too; and the complete run resumed once
+        // more is judged from its record, not passed at once (CE29, the blind Lean replica of
+        // the platform: a resume judged only its own timelines).
+        const failed = try recorded_failing(context, parts);
+        const all_failing = for (failed) |message| {
+            if (!report_fails(resumed_report, message)) break false;
+        } else true;
+        var again: std.ArrayList([]const u8) = .empty;
+        try again.appendSlice(arena, &.{ context.determinismo, "explore" });
+        try again.appendSlice(arena, context.machine);
+        try again.appendSlice(arena, &(system ++ [_][]const u8{ "--record", parts, "--resume" }));
+        const complete = try run_kept(context, again.items);
+        const complete_status: u8 = switch (complete.term) {
+            .exited => |code| code,
+            else => 255,
+        };
         expect_all(context, &.{
             .{ "48 timelines recorded, once each", once },
             .{ "those recorded before the interruption kept as they were", kept },
             .{ "flat: the whole run's timelines", as_whole },
+            .{ "the record has failing timelines (the check's premise)", failed.len > 0 },
+            .{ "every property a recorded timeline failed fails the resumed run", all_failing },
+            .{ "the complete run resumed again: failed, from its record", complete_status == 3 and
+                std.mem.indexOf(u8, complete.stderr, "properties failing in them") != null },
         }, "resume ({s}): killed at {d} timelines, resumed: {d} timelines, once each (the whole " ++
-            "run: {d})", .{ branching, interrupted.len, resumed.len, expected.len });
+            "run: {d}); {d} properties failing in the record, resumed again: exit {d}", .{ branching, interrupted.len, resumed.len, expected.len, failed.len, complete_status });
     }
+}
+
+/// The properties a record's timelines failed (each branch line's "failing"), once each.
+fn recorded_failing(context: *Context, record: []const u8) ![]const []const u8 {
+    const text = try std.Io.Dir.cwd().readFileAlloc(context.io, record, context.arena, .limited(1 << 28));
+    var names: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "{\"branch\":")) continue;
+        const Line = struct { branch: struct { failing: []const []const u8 = &.{} } };
+        const parsed = std.json.parseFromSliceLeaky(Line, context.arena, line, .{ .ignore_unknown_fields = true }) catch continue;
+        for (parsed.branch.failing) |name| {
+            const known = for (names.items) |other| {
+                if (std.mem.eql(u8, other, name)) break true;
+            } else false;
+            if (!known) try names.append(context.arena, name);
+        }
+    }
+    return names.items;
+}
+
+/// Whether the explorer's summary fails a property (its "  FAIL <kind> ... <message>" line).
+fn report_fails(report: []const u8, message: []const u8) bool {
+    var lines = std.mem.tokenizeScalar(u8, report, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "  FAIL ") and std.mem.indexOf(u8, line, message) != null) return true;
+    }
+    return false;
 }
 
 /// A run resumed from a command line (`explore --resume` of a run serve knows) is serve's again:

@@ -2020,7 +2020,22 @@ const Resumed = struct {
     generations: std.ArrayList([]const u32) = .empty,
     /// The fresh timelines taken while each generation was judged (queue_take), in order.
     fresh: std.ArrayList(Fresh) = .empty,
+    /// The recorded timelines' properties (report.Recorded), counted in the resumed run's
+    /// verdict as its own timelines' are (Multiverse.recorded_merge).
+    recorded: std.ArrayList(RecordedOf) = .empty,
+    /// Recorded timelines whose properties the record lacks (an older record's, or past its
+    /// line's room): their verdicts are not counted, and the resume says how many.
+    recorded_partial: u32 = 0,
+
+    /// The recorded timelines' properties in the run's verdict: those still recorded (one whose
+    /// summary the interruption cut runs again, and counts then).
+    fn merge_into(resumed: *const Resumed, multiverse: *report.Multiverse) !void {
+        for (resumed.recorded.items) |*entry| {
+            if (resumed.done.contains(entry.index)) try multiverse.recorded_merge(&entry.property, entry.index);
+        }
+    }
 };
+const RecordedOf = struct { index: u32, property: report.Recorded };
 const Fresh = struct { generation: u32, index: u32 };
 const ReturnKey = struct { generation: u32, branch: u32, vtime_ns: u64 };
 
@@ -2095,6 +2110,9 @@ const RecordLine = struct {
         generation: u32 = 0,
         path: []const struct { branch: u32, vtime_ns: u64 } = &.{},
         extends: ?tape.Extends = null,
+        /// Null in a record from before timelines kept them (report.Recorded).
+        properties: ?[]const report.Recorded = null,
+        properties_all: bool = true,
     } = null,
     generation: ?struct { number: u32, branches: []const u32 } = null,
     fresh: ?Fresh = null,
@@ -2152,6 +2170,10 @@ fn resume_read(context: Context, arguments: *const Arguments, inputs: u64) !*con
             // A timeline extending one of the run's (a session's): not the explorer's to resume.
             if (branch.extends != null) continue;
             try resumed.done.put(context.arena, branch.index, {});
+            if (branch.properties) |properties| {
+                for (properties) |property| try resumed.recorded.append(context.arena, .{ .index = branch.index, .property = property });
+                if (!branch.properties_all) resumed.recorded_partial += 1;
+            } else resumed.recorded_partial += 1;
             if (branch.path.len > 0) {
                 const last = branch.path[branch.path.len - 1];
                 const key: ReturnKey = .{ .generation = branch.generation, .branch = last.branch, .vtime_ns = last.vtime_ns };
@@ -2182,13 +2204,28 @@ fn resume_read(context: Context, arguments: *const Arguments, inputs: u64) !*con
         }
         for (missing.items) |index| _ = resumed.done.remove(index);
     }
-    say("[determinismo] resuming {s}: {d} timelines recorded, skipped\n", .{ path, resumed.done.count() });
+    say("[determinismo] resuming {s}: {d} timelines recorded, skipped, their properties counted\n", .{ path, resumed.done.count() });
+    if (resumed.recorded_partial > 0) say("[determinismo] {d} of them without their properties in " ++
+        "the record (an older record, or more than its line holds): their verdicts not counted\n", .{resumed.recorded_partial});
     const left = for (0..arguments.branches) |index| {
         if (!resumed.done.contains(@intCast(index))) break true;
     } else false;
     if (!left) {
-        say("[determinismo] the run is complete: all {d} timelines recorded\n", .{arguments.branches});
-        std.process.exit(0);
+        // Judged from its record, as the run that recorded it would have been (a complete run
+        // resumed once exited 0 here whatever its timelines failed: CE29). A catalog's
+        // assertions no timeline reached are judged by the runs that ran timelines.
+        const multiverse = try context.arena.create(report.Multiverse);
+        multiverse.* = .{};
+        try resumed.merge_into(multiverse);
+        const failing = multiverse.failing_properties();
+        say("[determinismo] the run is complete: all {d} timelines recorded, {d} properties failing in them\n", .{ arguments.branches, failing });
+        const status: u8 = if (failing > 0) 3 else 0;
+        if (exploration_is_run(arguments)) if (arguments.run_directory) |directory| {
+            const text = try std.fmt.allocPrint(context.arena, "{d} exited with status {d}\n", .{ status, status });
+            const exit_path = try std.fs.path.join(context.arena, &.{ directory, "exit" });
+            std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = exit_path, .data = text }) catch {};
+        };
+        std.process.exit(status);
     }
     return resumed;
 }
@@ -2788,6 +2825,8 @@ fn command_explore(
     };
     const multiverse = try context.arena.create(report.Multiverse);
     multiverse.* = .{ .nodes = system_nodes(arguments.system) };
+    // A resumed run's recorded timelines count in its verdict as its own do (CE29).
+    if (exploration.done) |resumed| try resumed.merge_into(multiverse);
     const branches = Branches{
         .snapshot = start,
         .setup = snapshot,

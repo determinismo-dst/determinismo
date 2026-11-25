@@ -19,11 +19,30 @@ pub var record_fd: ?std.os.linux.fd_t = null;
 /// ends, after its events, as its `branch` line has it; the events database ingests what it
 /// lists (store.zig). Opened as record_fd is.
 pub var timelines_fd: ?std.os.linux.fd_t = null;
-const record_line_size_max = 64 * 1024;
+const record_line_size_max = 128 * 1024;
 
 /// A timeline extending another in a run already recorded (explore --extend) adds its own
 /// line alone: the run's header, snapshot, generations and summary are the run's, written once.
 pub var record_branches_only: bool = false;
+
+/// A timeline's property as its record line keeps it (each one it evaluated): what judges it
+/// across timelines, for a resumed run's verdict (main.zig's resume_read, Multiverse.recorded_merge).
+/// Before them a resume judged only its own timelines: a failure before the stop ended "passed"
+/// (CE29, the blind Lean replica of the platform).
+pub const Recorded = struct {
+    message: []const u8,
+    /// A cut message's whole hash (Events.Property.message_hash), 0 for one that fits.
+    hash: u64 = 0,
+    kind: Events.Kind,
+    hits: u64,
+    trues: u64,
+    failure: ?Events.Moment = null,
+};
+
+/// The record line's room for a timeline's properties: a line past record_line_size_max is
+/// dropped whole, so the ones past this are left out and the line says so (properties_all).
+const recorded_bytes_max = 40 * 1024;
+var recorded_buffer: [Events.property_count_max]Recorded = undefined;
 
 pub fn record(value: anytype) void {
     if (record_branches_only and !@hasField(@TypeOf(value), "branch")) return;
@@ -491,6 +510,27 @@ pub const Multiverse = struct {
             " hazards: overshoots={d} throttles={d} late_steps={d}",
             .{ state.overshoots, state.throttles, state.late_steps },
         ) catch {};
+        var recorded_count: usize = 0;
+        var recorded_bytes: usize = 0;
+        var recorded_all = true;
+        for (vm.events.properties[0..vm.events.property_count]) |*property| {
+            if (property.hits == 0) continue;
+            const size = property.name().len + 128;
+            if (recorded_bytes + size > recorded_bytes_max) {
+                recorded_all = false;
+                continue;
+            }
+            recorded_bytes += size;
+            recorded_buffer[recorded_count] = .{
+                .message = property.name(),
+                .hash = property.message_hash,
+                .kind = property.kind,
+                .hits = property.hits,
+                .trues = property.trues,
+                .failure = property.first_failure,
+            };
+            recorded_count += 1;
+        }
         var failing_names: [64][]const u8 = undefined;
         var failing_count: u32 = 0;
         for (vm.events.properties[0..vm.events.property_count]) |*property| {
@@ -512,6 +552,8 @@ pub const Multiverse = struct {
             .events_hash = &hex(events_hash),
             .guest_hash = &hex(guest_hash),
             .failing = failing_names[0..failing_count],
+            .properties = recorded_buffer[0..recorded_count],
+            .properties_all = recorded_all,
             .path = branch.path,
             .extends = branch.extends,
             .generation = branch.generation,
@@ -546,6 +588,23 @@ pub const Multiverse = struct {
         };
         _ = std.os.linux.write(2, line.buffered().ptr, line.buffered().len);
         assert(multiverse.failing_branches <= multiverse.branches);
+    }
+
+    /// A timeline recorded before a resume, counted as one that ran here (Recorded).
+    pub fn recorded_merge(multiverse: *Multiverse, recorded: *const Recorded, branch: u32) !void {
+        const size = @min(recorded.message.len, Events.message_size_max);
+        if (size == 0 or recorded.trues > recorded.hits) return error.BadRecord;
+        var property = Events.Property{
+            .kind = recorded.kind,
+            .message = undefined,
+            .message_size = @intCast(size),
+            .message_hash = recorded.hash,
+            .hits = recorded.hits,
+            .trues = recorded.trues,
+            .first_failure = recorded.failure,
+        };
+        @memcpy(property.message[0..size], recorded.message[0..size]);
+        try multiverse.merge(&property, branch);
     }
 
     fn aggregate_find(multiverse: *Multiverse, property: *const Events.Property) !*Aggregate {
