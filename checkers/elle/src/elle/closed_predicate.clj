@@ -2,9 +2,16 @@
 ; Elle is copyright 2019--2020 Jepsen, LLC and Peter Alvaro, under the Eclipse Public License
 ; 2.0 (src/elle/LICENSE); this copy's change is under the same license.
 ; Elle 0.2.8's elle/closed_predicate.clj (github.com/jepsen-io/elle, EPL-2.0), loaded ahead of
-; Elle's jar (deps.edn's :paths come first), with one fix: ww-graph matched `:write` where every
-; other function, and the histories, spell a write `:w`, so a write got no write-write edge and
-; serializable passed a read skew through writes. Elle's own closed-predicate tests pass with it.
+; Elle's jar (deps.edn's :paths come first), with these fixes:
+; - ww-graph matched `:write` where every other function, and the histories, spell a write `:w`,
+;   so a write got no write-write edge and serializable passed a read skew through writes;
+; - versions-after's unborn branch was an `if` closed before its `loop`, its value discarded, so a
+;   predicate anti-dependency through a key the init created was missed (snapshot isolation
+;   passed a G-single); and version< (which the RW explainer uses) was true whenever its first
+;   version existed and couldn't order :elle/unborn, so the paren fix alone threw "Explainer".
+;   Now :elle/unborn precedes every version and version< is false when b never follows a.
+; Elle's closed-predicate tests pass, except failure-to-observe-test, which now also reports the
+; G-single-realtime that version-set's own comment predicts for that history.
 (ns elle.closed-predicate
   "A test for predicate safety. Uses a closed-universe assumption to
   infer the version set selected for transactions based not only on what the
@@ -278,16 +285,16 @@
    (if (identical? :elle/unborn target-version)
      (if (identical? :elle/unborn (first versions))
        (subvec versions 1)
-       versions))
-   ; Some non-unborn version
-   (loop [i 0]
-     ; Stop when there are no versions that could follow
-     (when (< i (dec (count versions)))
-       (if (= (nth versions i) target-version)
-         ; Found it
-         (subvec versions (inc i))
-         ; Keep looking
-         (recur (inc i)))))))
+       versions)
+     ; Some non-unborn version
+     (loop [i 0]
+       ; Stop when there are no versions that could follow
+       (when (< i (dec (count versions)))
+         (if (= (nth versions i) target-version)
+           ; Found it
+           (subvec versions (inc i))
+           ; Keep looking
+           (recur (inc i))))))))
 
 (defn version<
   "Takes an all-versions map of keys to vectors of versions, a key, and two
@@ -295,15 +302,22 @@
   ([all-versions k a b]
    (version< (get all-versions k) a b))
   ([versions a b]
-   (loopr [found-a? false]
-          [v versions]
-          (if found-a?
-            (if (= v b)
-              true
-              (recur found-a?))
-            (if (= v a)
-              (recur true)
-              (recur found-a?))))))
+   (if (identical? :elle/unborn a)
+     ; Every version follows :elle/unborn (see versions-after), whether or not
+     ; the unborn version is in this key's order.
+     (and (not (identical? :elle/unborn b))
+          (boolean (some #(= b %) versions)))
+     (loopr [found-a? false]
+            [v versions]
+            (if found-a?
+              (if (= v b)
+                true
+                (recur found-a?))
+              (if (= v a)
+                (recur true)
+                (recur found-a?)))
+            ; b never followed a
+            false))))
 
 (defn resolve-version
   "Both unborn and dead versions are returned by the database as `nil`.

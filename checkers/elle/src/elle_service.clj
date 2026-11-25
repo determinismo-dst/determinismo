@@ -30,6 +30,7 @@
             [clojure.walk :as walk]
             [bifurcan-clj.core :as bifurcan]
             [elle.closed-predicate :as closed-predicate]
+            [elle.consistency-model :as cm]
             [elle.core :as elle]
             [elle.graph :as graph]
             [elle.list-append :as list-append]
@@ -156,19 +157,45 @@
              :when (and (= :r f) (sequential? v) (not= (count v) (count (distinct v))))]
          {:op o :key k :values (vec (keep (fn [[x n]] (when (< 1 n) x)) (frequencies v)))})))
 
-(defn- deduplicated [operations]
-  (map (fn [o]
-         (update o :value
-                 (fn [mops]
-                   (mapv (fn [[f k v :as mop]]
-                           (if (and (= :r f) (sequential? v)) [f k (vec (distinct v))] mop))
-                         mops))))
-       operations))
+(defn- deduplicated
+  "The operations without the reads that hold a value twice: each dropped from its completion and
+  from its invocation (the same position), so Elle judges what is left. Deduplicated in place, a
+  read like [1 1 2] became [1 2] and tied with another read of equal length, which Elle orders by
+  hash, hiding a G0-realtime it finds without the read (a Lean replica of Elle, its D17)."
+  [operations]
+  (let [ops (vec operations)
+        dup? (fn [[f _ v]] (and (= :r f) (sequential? v) (not= (count v) (count (distinct v)))))
+        ;; position -> the mop positions to drop, for each completion and its invocation
+        drops (loop [i 0, open {}, drops {}]
+                (if (= i (count ops))
+                  drops
+                  (let [o (nth ops i), p (:process o)]
+                    (if (= :invoke (:type o))
+                      (recur (inc i) (assoc open p i) drops)
+                      (let [js (when (and (= :ok (:type o)) (sequential? (:value o)))
+                                 (set (keep-indexed (fn [j mop] (when (dup? mop) j)) (:value o))))]
+                        (recur (inc i) (dissoc open p)
+                               (if (seq js)
+                                 (cond-> (assoc drops i js)
+                                   (contains? open p) (assoc (get open p) js))
+                                 drops)))))))]
+    (map-indexed (fn [i o]
+                   (if-let [js (get drops i)]
+                     (update o :value #(vec (keep-indexed (fn [j mop] (when-not (js j) mop)) %)))
+                     o))
+                 ops)))
 
 (def per-key "strict-serializable-per-key")
 
-(defn- keys-of [op]
-  (into #{} (map second) (:value op)))
+(defn- keys-of
+  "The keys an operation touches: an init's are its map's keys; a predicate read reads every key
+  (::all). Taking each micro-operation's second element had made a predicate read's key its
+  predicate, and an init's keys its values (a Lean replica of Elle, its D19)."
+  [op]
+  (let [v (:value op)]
+    (if (map? v)
+      (set (keys v))
+      (into #{} (map (fn [[f k]] (if (= :rp f) ::all k))) v))))
 
 (defn- realtime-per-key-graph
   "elle.core/realtime-graph, between operations touching a key in common only: each key keeps
@@ -179,8 +206,12 @@
   (let [step (fn [[pending g] op]
                (case (:type op)
                  :invoke (if-let [done (history/completion h op)]
-                           [pending (reduce #(graph/link-all-to %1 (get pending %2) done rels/realtime)
-                                            g (keys-of op))]
+                           (let [ks (keys-of op)
+                                 ;; every key's for a predicate read; a key's and the predicate
+                                 ;; reads' otherwise
+                                 sources (if (contains? ks ::all) (keys pending) (conj (vec ks) ::all))]
+                             [pending (reduce #(graph/link-all-to %1 (get pending %2) done rels/realtime)
+                                              g sources)])
                            [pending g])
                  :ok (let [^ISet implied (graph/in g op)
                            kept (fn [ops] (into #{op} (remove #(and implied (.contains implied %))) ops))]
@@ -224,7 +255,10 @@
                  (-> result
                      (assoc :valid? false)
                      (update :anomaly-types #(distinct (conj (vec %) :duplicate-elements)))
-                     (assoc-in [:anomalies :duplicate-elements] twice))
+                     (assoc-in [:anomalies :duplicate-elements] twice)
+                     ;; what the anomalies rule out, the duplicates among them (PL-1): Elle's
+                     ;; boundary was the deduplicated history's (a Lean replica of Elle, its D16)
+                     (as-> r (assoc r :not (:not (cm/friendly-boundary (set (:anomaly-types r)))))))
                  result)
         valid (:valid? result)
         formed (window (:anomalies result))

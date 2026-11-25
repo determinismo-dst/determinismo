@@ -41,3 +41,81 @@
 (deftest closed-predicate-consistent-reads-pass
   (let [answer (service/check consistent-read "closed-predicate" "serializable" false)]
     (is (true? (:valid answer)) (pr-str answer))))
+
+;; Fixes from a Lean replica of Elle's round 2 (each history its minimal one).
+
+(defn- op [process type f mops] {"process" process "type" type "f" f "value" mops})
+
+(defn- answer [model consistency & ops]
+  (service/check (apply history ops) model consistency false))
+
+;; D10: closed-predicate's versions-after dropped its unborn branch: snapshot isolation passed a
+;; G-single through a predicate read missing key 1, which the init created and T1 deleted.
+(deftest closed-predicate-predicate-read-of-an-init-key
+  (let [a (answer "closed-predicate" "snapshot-isolation"
+                  (op 0 "invoke" "init" [["init" 0 0] ["init" 1 0]])
+                  (op 0 "ok" "init" [["init" 0 0] ["init" 1 0]])
+                  (op 1 "invoke" "txn" [["delete" 1 nil]]) (op 1 "ok" "txn" [["delete" 1 nil]])
+                  (op 2 "invoke" "txn" [["rp" ["=" 0] nil] ["r" 1 nil]])
+                  (op 2 "ok" "txn" [["rp" ["=" 0] []] ["r" 1 nil]]))]
+    (is (false? (:valid a)) (pr-str a))))
+
+;; D3: the process order skipped :info operations: process 0 read its own later (indeterminate)
+;; append, and strong session read committed passed it.
+(deftest process-order-reaches-info-operations
+  (let [a (answer "list-append" "strong-session-read-committed"
+                  (op 0 "invoke" "txn" [["r" 0 nil]]) (op 0 "ok" "txn" [["r" 0 [1]]])
+                  (op 0 "invoke" "txn" [["append" 0 1]]) (op 0 "info" "txn" [["append" 0 1]]))]
+    (is (false? (:valid a)) (pr-str a))))
+
+;; D3's other side (D5): with the :info append aborted, the read [2 1] is an aborted read, which
+;; read uncommitted allows; real time into the :info completion made it fail.
+(deftest read-uncommitted-allows-an-aborted-info-read
+  (let [a (answer "list-append" "strong-read-uncommitted"
+                  (op 0 "invoke" "txn" [["append" 0 1]]) (op 0 "ok" "txn" [["append" 0 1]])
+                  (op 0 "invoke" "txn" [["append" 0 2]]) (op 0 "info" "txn" [["append" 0 2]])
+                  (op 1 "invoke" "txn" [["r" 0 nil]]) (op 1 "ok" "txn" [["r" 0 [2 1]]]))]
+    (is (true? (:valid a)) (pr-str a))))
+
+;; D13: rw-register didn't index :info writes: process 0 read its own later indeterminate write,
+;; and strict serializability passed it.
+(deftest rw-register-indexes-info-writes
+  (let [a (answer "rw-register" "strict-serializable"
+                  (op 0 "invoke" "txn" [["r" 0 nil]]) (op 0 "ok" "txn" [["r" 0 1]])
+                  (op 0 "invoke" "txn" [["w" 0 1]]) (op 0 "info" "txn" [["w" 0 1]]))]
+    (is (false? (:valid a)) (pr-str a))))
+
+;; D16: after duplicates, `not` was the deduplicated history's boundary ([] when Elle found it
+;; valid); duplicate elements rule out read uncommitted.
+(deftest duplicates-name-what-they-rule-out
+  (let [a (answer "list-append" "serializable"
+                  (op 0 "invoke" "txn" [["r" 0 nil]]) (op 0 "ok" "txn" [["r" 0 []]])
+                  (op 1 "invoke" "txn" [["append" 1 1] ["r" 1 nil]])
+                  (op 1 "ok" "txn" [["append" 1 1] ["r" 1 [1 1]]]))]
+    (is (false? (:valid a)) (pr-str a))
+    (is (= ["read-uncommitted"] (vec (:not a))) (pr-str a))))
+
+;; D17: deduplicated in place, the read [1 1 2] became [1 2] and tied with [2 1]; Elle's hash
+;; order then hid the G0-realtime it finds without the duplicated read.
+(deftest duplicates-hide-no-other-anomaly
+  (let [a (answer "list-append" "strict-serializable"
+                  (op 2 "invoke" "txn" [["append" 1 1] ["r" 1 nil]])
+                  (op 2 "ok" "txn" [["append" 1 1] ["r" 1 [2 1]]])
+                  (op 1 "invoke" "txn" [["append" 0 1] ["append" 0 2]])
+                  (op 0 "invoke" "txn" [["append" 1 2] ["r" 1 nil]])
+                  (op 0 "ok" "txn" [["append" 1 2] ["r" 1 [1 1 2]]])
+                  (op 1 "ok" "txn" [["append" 0 1] ["append" 0 2]])
+                  (op 1 "invoke" "txn" [["r" 0 nil]]) (op 1 "ok" "txn" [["r" 0 []]]))]
+    (is (some #{"G0-realtime"} (:anomaly_types a)) (pr-str a))
+    (is (some #{"duplicate-elements"} (:anomaly_types a)) (pr-str a))))
+
+;; D19: per key, a predicate read's "key" was its predicate, so real time never ordered it after
+;; T1's write; Elle's strict serializability finds the stale predicate read (G-single-realtime).
+(deftest per-key-predicate-reads-read-every-key
+  (let [a (answer "closed-predicate" "strict-serializable-per-key"
+                  (op 0 "invoke" "init" [["init" 0 0] ["init" 1 0]])
+                  (op 0 "ok" "init" [["init" 0 0] ["init" 1 0]])
+                  (op 1 "invoke" "txn" [["w" 0 1]]) (op 1 "ok" "txn" [["w" 0 1]])
+                  (op 2 "invoke" "txn" [["rp" ["=" 0] nil]])
+                  (op 2 "ok" "txn" [["rp" ["=" 0] [[0 0] [1 0]]]]))]
+    (is (false? (:valid a)) (pr-str a))))

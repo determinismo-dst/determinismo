@@ -62,11 +62,23 @@ and Elle 0.2.8's `elle.txn` loads unilog while declaring it for its dev profile 
 
 ## Elle, patched
 
-`src/elle/closed_predicate.clj` is Elle 0.2.8's namespace with one fix, loaded ahead of Elle's
-jar (`:paths` come first): its `ww-graph` matched writes spelled `:write`, while the histories,
-Elle's own generator and every other function spell them `:w`, so a write got no write-write
-edge and serializable passed a read skew through writes. Elle's closed-predicate tests pass
-with it. The service keeps its version: rebuild and restart it by hand on each host
+`src/elle/` holds Elle 0.2.8 namespaces with fixes, loaded ahead of Elle's jar (`:paths` come
+first), each under Elle's license (EPL-2.0, `src/elle/LICENSE`). All were found by a Lean replica
+of Elle and reproduced on Elle; Elle's own test suite passes with them, except
+`failure-to-observe-test`, which now also reports the G-single-realtime its history holds.
+- `closed_predicate.clj`: writes (`[:w k v]`) get write-write edges (`ww-graph` matched
+  `:write`); `versions-after` keeps its unborn branch and `version<` orders `:elle/unborn` first,
+  so a predicate anti-dependency on a key the init created is found and explained.
+- `core.clj`, `txn.clj`: for models that prohibit G1a, the process order reaches a process's
+  `:info` operation; for models that allow it, real time has no edges into `:info` completions
+  (cycles that vanish when the operation aborted).
+- `rw_register.clj`: `:info` writes are indexed (as a write an `:ok` read saw, for models that
+  prohibit G1a), and a transaction order through an `:info` write keeps its neighbours' edge.
+
+The service itself, likewise: a read holding a value twice is dropped (not deduplicated) before
+Elle judges the rest, `not` covers the duplicates too, and per key a predicate read reads every key.
+
+The service keeps its version: rebuild and restart it by hand on each host
 (`podman build -t determinismo-elle -f checkers/elle/Dockerfile .`, `podman rm -f
 determinismo-elle`, `podman run -d --name determinismo-elle --network host determinismo-elle`)
 with no check running.
