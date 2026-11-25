@@ -399,6 +399,10 @@ const Composer = struct {
     /// Every running command killed, with whatever it started (its process group: commands
     /// lead their own), as Antithesis does when an eventually command begins.
     fn kill_all(composer: *Composer) void {
+        // What ended on its own first, judged by its own status: a start that died of SIGKILL
+        // before the kill (the OOM killer, a kill from outside) was reaped below as the
+        // composer's kill and never judged (CE2's remainder, the Lean replica of determinismo).
+        while (composer.running_count > 0 and composer.reap(false, false)) {}
         for (composer.running[0..composer.running_count]) |entry| {
             _ = linux.kill(-entry.pid, .KILL);
             _ = linux.kill(entry.pid, .KILL); // Before it made its group, if it had not yet.
