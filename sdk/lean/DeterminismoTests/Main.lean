@@ -124,6 +124,48 @@ def decisions : List Check :=
     { name := "a weighted draw stays in range",
       ok := (List.range 200).all fun i => (drawWeighted (mkStdGen i) [1, 0, 5]).1 ∈ [0, 2] } ]
 
+/-- An uneven tree: a's second option ends the timeline, its first opens three more: 4 timelines. -/
+def unevenRun (source : Source) : Ended :=
+  let body : EStateM Stop Tiny Unit := do
+    let a ← decide (σ := Tiny) "a" 2
+    if a == 0 then
+      let _ ← decide (σ := Tiny) "c" 3
+      pure ()
+  match body.run { decisions := { source } } with
+  | .ok _ t => { taken := t.decisions.taken, violation := none }
+  | .error _ t => { taken := t.decisions.taken, violation := none }
+
+def censusChecks : List Check :=
+  let whole := census tinyRun
+  let half := census tinyRun (maxRuns := 5)
+  let rest := censusStep tinyRun {} 100 half
+  let capped := census tinyRun { perName := [("c", 2)] }
+  [ { name := "a census runs every timeline and counts the one bad path",
+      ok := whole.runs == 12 && whole.clean == 11 && whole.next.isNone
+        && (match whole.byProperty.toList with
+            | [p] => p.property == "tiny" && p.count == 1 && p.first.values == #[1, 0, 2]
+            | _ => false) },
+    { name := "a census resumed from its segment's next counts the same",
+      ok := half.runs == 5 && half.next.isSome && rest.runs == 12 && rest.clean == 11
+        && rest.violations == 1 && rest.next.isNone },
+    { name := "a path line round-trips", ok := pathOfLine (pathLine #[1, 0, 2]) == some #[1, 0, 2] && pathOfLine "" == some #[] },
+    { name := "a depth cap branches only the first decisions: 2 timelines, then 4",
+      ok := (census tinyClean { depth := some 1 }).runs == 2 && (census tinyClean { depth := some 2 }).runs == 4 },
+    { name := "a per-name cap: c's first two options, 8 timelines, the bad path (c = 2) left out",
+      ok := capped.runs == 8 && capped.violations == 0 },
+    { name := "deepening counts each timeline once, shallowest first: 1, 1, 2, 8",
+      ok := (deepen tinyClean 3).toList.map (·.counted) == [1, 1, 2, 8] },
+    { name := "deepening finds the bad path at depth 3, not before",
+      ok := (deepen tinyRun 3).toList.map (·.violations) == [0, 0, 0, 1] },
+    { name := "Knuth's estimate of a uniform tree is exact: 12",
+      ok := (size tinyClean).mean == 12.0 && (size tinyClean).max == 12 },
+    { name := "Knuth's estimate within a depth cap: 4", ok := (size tinyClean { depth := some 2 }).mean == 4.0 },
+    { name := "Knuth's estimate of an uneven tree (4 timelines) is near 4",
+      ok := let z := size unevenRun (probes := 400); z.mean > 3.5 && z.mean < 4.5 && z.max == 6 },
+    { name := "random draws keep within a per-name cap",
+      ok := (List.range 50).all fun i =>
+        (tinyRun { gen := mkStdGen (mixSeed i), bounds := { perName := [("c", 1)] } }).taken[2]!.value == 0 } ]
+
 def locks : List Check :=
   let complete (r : Exhausted) := match r with | .complete _ => true | _ => false
   let deadlock (r : Exhausted) := match r with | .found c => c.property == "deadlock" | _ => false
@@ -174,7 +216,7 @@ def describe (c : Counterexample) : String :=
 
 def main : IO UInt32 := do
   let mut failed := 0
-  for c in decisions ++ disk ++ history ++ locks do
+  for c in decisions ++ censusChecks ++ disk ++ history ++ locks do
     IO.println s!"{if c.ok then "ok  " else "FAIL"} {c.name}"
     if !c.ok then failed := failed + 1
   -- The toy register, end to end.

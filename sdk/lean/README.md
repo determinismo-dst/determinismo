@@ -14,6 +14,7 @@ determinismo tape repeats a timeline of the real system.
 | `Determinismo.Locks` | a mutex and a reader-writer lock (writer priority optional, as folly's `SharedMutex`), taken with a `try` in a step (`none`: the step blocks) |
 | `Determinismo.History` | linearizability of a client history against a sequential model (unanswered operations may take effect later or never; failed ones never) |
 | `Determinismo.Search` | `explore` (timelines from seeds), `exhaust` (every timeline within bounds, depth first), `shrink`, `tape` (a counterexample as determinismo's named decisions) |
+| `Determinismo.Census` | `census` (every timeline within bounds, counted: per property its count and first counterexample), resumable from its `next` (`censusStep`; `pathLine`/`pathOfLine` across processes), `censusIO` (segments under a wall-clock budget, progress after each), `deepen` (iterative deepening: shallow counterexamples first, each timeline counted once), `size` (Knuth's estimate from uniform probes); `Bounds` (a depth cap, per-name option caps) for all of them and for random draws |
 
 A node's code (`NodeM`): `send`, `readFile`, `append`, `replace`, `truncate`, `sync` (false on a
 failed sync), `now`, `wallclock`, `choose` (its own randomness, a decision), `reply`, `fail`,

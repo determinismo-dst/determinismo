@@ -21,6 +21,25 @@ structure Taken where
   value : Nat
   deriving Repr, BEq, Inhabited
 
+/-- The part of the decision tree a search walks (a census's, a sizing's): decisions past
+`depth` take their first option, and a decision named in `perName` its first k options at most.
+Replayed values are never bounded: a tape repeats whatever it holds. -/
+structure Bounds where
+  /-- Decisions branched on: those at positions before it (none: every one). -/
+  depth : Option Nat := none
+  /-- At most this many options of each decision with this name (at least one). -/
+  perName : List (String × Nat) := []
+  deriving Inhabited
+
+/-- How many of a decision's `options` the bounds leave it, at `position` in its timeline. -/
+def Bounds.options (b : Bounds) (position : Nat) (name : String) (options : Nat) : Nat :=
+  let byDepth := match b.depth with
+    | some d => if position < d then options else min options 1
+    | none => options
+  match b.perName.lookup name with
+  | some k => min byDepth (max k 1)
+  | none => byDepth
+
 /-- Where decisions' values come from. -/
 structure Source where
   /-- Taken first, in order (a value at or past its decision's options wraps). -/
@@ -28,6 +47,11 @@ structure Source where
   /-- Past `given`: drawn from this generator, else the first option (0). -/
   random : Bool := true
   gen : StdGen := mkStdGen 0
+  /-- Random draws uniform over the options the bounds leave, weights ignored (Knuth's estimate
+  needs each draw's probability). -/
+  uniform : Bool := false
+  /-- Random draws only among the options these leave (the default: all). -/
+  bounds : Bounds := {}
 
 /-- A seed mixed over 64 bits (splitmix64's finalizer). `mkStdGen` of consecutive small seeds
 gives the same first draw: over seeds 0 to 2,999, option 1 of 2 and option 2 of 3 every time, so
@@ -95,7 +119,10 @@ def Decisions.next (d : Decisions) (name : String) (weights : List Nat) : Except
     let (value, source) :=
       if h : position < d.source.given.size then (d.source.given[position] % options, d.source)
       else if d.source.random then
-        let (v, gen) := drawWeighted d.source.gen weights
+        let allowed := weights.take (d.source.bounds.options position name options)
+        let (v, gen) :=
+          if d.source.uniform then drawUniform d.source.gen allowed.length
+          else drawWeighted d.source.gen allowed
         (v, { d.source with gen := gen })
       else (0, d.source)
     .ok (value, { d with source := source, taken := d.taken.push { name, options, value } })
