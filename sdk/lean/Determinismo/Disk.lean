@@ -88,7 +88,18 @@ structure File (R : Type) where
   disk : List R := []
   cache : List R := []
   pending : List (Write R) := []
+  /-- Records that read corrupt (a latent sector error: the checksum fails) until written again;
+  a power loss doesn't heal them. -/
+  corrupt : List Nat := []
   deriving Repr
+
+/-- Whether a write puts new records at position `i` of a file of `len` records. -/
+def Write.covers {R : Type} (w : Write R) (len : Nat) (i : Nat) : Bool :=
+  match w with
+  | .append _ => i ≥ len
+  | .replace _ => true
+  | .truncate n => i ≥ n
+  | .at offset records => (offset ≤ i && i < offset + records.length) || i ≥ len
 
 namespace File
 
@@ -100,7 +111,8 @@ def applyAll (writes : List (Write R)) (content : List R) : List R :=
 
 /-- A write: seen at once, on the disk at the next sync. -/
 def write (f : File R) (w : Write R) : File R :=
-  { f with cache := w.apply f.cache, pending := f.pending ++ [w] }
+  { f with cache := w.apply f.cache, pending := f.pending ++ [w],
+           corrupt := f.corrupt.filter (fun i => !w.covers f.cache.length i) }
 
 /-- A sync that succeeded: every pending write on the disk. -/
 def syncOk (f : File R) : File R :=
@@ -130,7 +142,7 @@ def crash (f : File R) (kept : Nat) (torn : Nat) : File R :=
   let disk := match f.pending.drop kept with
     | next :: _ => if torn > 0 then next.torn torn whole else whole
     | [] => whole
-  { disk := disk, cache := disk, pending := [] }
+  { f with disk := disk, cache := disk, pending := [] }
 
 /-- A power loss as `crash`, the next pending write torn by sectors (`Write.tornSectors`). -/
 def crashSectors (f : File R) (kept : Nat) (perSector : Nat) (reached : List Bool) : File R :=
@@ -189,6 +201,26 @@ theorem crash_synced (f : File R) (h : f.pending = []) (kept torn : Nat) :
     (f.crash kept torn).disk = f.disk := by
   simp [crash, h, applyAll]
 
+/-- A latent sector error: record `i` reads corrupt until it is written again. -/
+def corruptAt (f : File R) (i : Nat) : File R :=
+  { f with corrupt := if f.corrupt.contains i then f.corrupt else i :: f.corrupt }
+
+/-- Record `i` as a read sees it: none when it reads corrupt or is past the end. -/
+def readAt (f : File R) (i : Nat) : Option R :=
+  if f.corrupt.contains i then none else f.cache[i]?
+
+/-- Every record as a read sees it. -/
+def readAll (f : File R) : List (Option R) := (List.range f.cache.length).map f.readAt
+
+/-- A sync where the pending write number `index`, written in place, landed at `actual` instead
+(a misdirected write: the right data in the wrong sector, within the file): the disk keeps the
+old records at the intended place and has the data at `actual`. Reads still see the cache, until
+an eviction or a power loss shows the disk. -/
+def syncMisdirected (f : File R) (index : Nat) (actual : Nat) : File R :=
+  let writes := f.pending.zipIdx.map fun (w, k) =>
+    if k == index then (match w with | .at _ records => Write.at actual records | other => other) else w
+  { f with disk := applyAll writes f.disk, pending := [] }
+
 end File
 
 /-- A node's files by name (a missing one is empty). -/
@@ -205,6 +237,19 @@ def set (fs : Files R) (name : String) (f : File R) : Files R :=
   (name, f) :: fs.filter (·.1 != name)
 
 end Files
+
+/-- Faults a storage model allows, counted per named zone (a WAL's headers, its prepares, the
+superblock, the grid): at most `perZone` in each, as TigerBeetle's fault model ("One read/write
+fault is permitted per area", src/testing/storage.zig) and its ClusterFaultAtlas give them out. -/
+structure FaultBudget where
+  perZone : Nat := 1
+  used : List (String × Nat) := []
+  deriving Repr
+
+/-- One more fault in `zone`, or none when the zone's budget is spent. -/
+def FaultBudget.take (b : FaultBudget) (zone : String) : Option FaultBudget :=
+  let n := (b.used.lookup zone).getD 0
+  if n < b.perZone then some { b with used := (zone, n + 1) :: b.used.filter (·.1 != zone) } else none
 
 /-- Files with a directory: names point at files (inodes); what reads see (`names`) and what the
 disk holds (`namesDisk`) differ until the directory is synced. -/

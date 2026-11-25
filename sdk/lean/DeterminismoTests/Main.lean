@@ -82,6 +82,19 @@ def disk : List Check :=
     { name := "a write in place torn by sectors keeps any of them: the first and third of three",
       ok := let g : File Nat := ((({} : File Nat).write (.append [1, 2, 3, 4, 5, 6])).syncOk).write (.at 0 [7, 8, 9, 10, 11, 12])
         (g.crashSectors 0 2 [true, false, true]).cache == [7, 8, 3, 4, 11, 12] },
+    { name := "a latent sector error reads corrupt, others read fine, and a power loss doesn't heal it",
+      ok := let g := (((({} : File Nat).write (.append [1, 2, 3])).syncOk).corruptAt 1)
+        g.readAll == [some 1, none, some 3] && (g.crash 0 0).readAt 1 == none },
+    { name := "writing a corrupt record again heals it",
+      ok := let g := (((({} : File Nat).write (.append [1, 2, 3])).syncOk).corruptAt 1).write (.at 1 [9])
+        g.readAll == [some 1, some 9, some 3] },
+    { name := "a misdirected write: the data at the wrong place, the intended place stale after a power loss",
+      ok := let g := ((({} : File Nat).write (.append [1, 2, 3, 4])).syncOk).write (.at 0 [9])
+        g.readAt 0 == some 9 && ((g.syncMisdirected 0 2).crash 0 0).cache == [1, 2, 9, 4] },
+    { name := "a fault budget of one per zone: a second fault in the zone refused, another zone's allowed",
+      ok := match ({} : FaultBudget).take "wal" with
+        | some b => (b.take "wal").isNone && (b.take "superblock").isSome
+        | none => false },
     { name := "an append torn by sectors keeps its leading sectors",
       ok := ((({} : File Nat).write (.append [4, 5, 6, 7, 8])).crashSectors 0 2 [true, true, false]).cache == [4, 5, 6, 7] } ]
 
