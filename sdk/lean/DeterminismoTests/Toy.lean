@@ -12,6 +12,9 @@ the variant:
   acknowledged write;
 - `ignoreSyncError`: syncs, answers whatever the sync said: a failed sync's write is read back
   from the cache, then lost at a power loss;
+- `haltNoCopy`: syncs, answers only when the sync succeeded, halts when it failed, but starts again
+  from what it reads without writing it again: after a failed sync the cache holds an entry the
+  disk never got, the restart serves it, and an eviction (no power loss needed) takes it back;
 - `correct`: syncs, answers only when the sync succeeded, halts when it failed; and a start appends
   a copy of what it reads and syncs it before serving, since after a failed sync the cache can hold
   what never reached the disk (the highest sequence number wins, so a torn copy changes nothing).
@@ -26,7 +29,7 @@ namespace DeterminismoTests.Toy
 open Determinismo
 
 inductive Variant where
-  | ackBeforeSync | ignoreSyncError | correct
+  | ackBeforeSync | ignoreSyncError | haltNoCopy | correct
   deriving BEq, Repr
 
 inductive Op where
@@ -82,7 +85,7 @@ def serve (variant : Variant) (st : State) (request : Nat) : Op → NodeM sys St
       let _ ← Node.sync (s := sys) "wal"
       Node.reply (s := sys) request .done
       pure st'
-    | .correct =>
+    | .correct | .haltNoCopy =>
       if ← Node.sync (s := sys) "wal" then
         Node.reply (s := sys) request .done
         pure st'

@@ -1,6 +1,7 @@
 import Determinismo
 import DeterminismoTests.Toy
 import DeterminismoTests.Locks
+import DeterminismoTests.Boot
 
 /-! The library's tests: `lake exe determinismo-lean-tests` (exit 1 when one fails). -/
 
@@ -27,8 +28,25 @@ def tinyRun (source : Source) : Ended :=
   | .ok _ t => { taken := t.decisions.taken, violation := none }
   | .error (.violation p d) t => { taken := t.decisions.taken, violation := some (p, d) }
   | .error .limit t => { taken := t.decisions.taken, violation := none }
+  | .error (.nodeDown _) t => { taken := t.decisions.taken, violation := none }
 
 def tinyClean (source : Source) : Ended := { tinyRun source with violation := none }
+
+/-- The tiny program with its first decision in an unrecorded setup phase. -/
+def tinyUnrecorded (source : Source) : Ended :=
+  let body : EStateM Stop Tiny Unit := do
+    let _ ← unrecorded (σ := Tiny) 3 (decide (σ := Tiny) "a" 2)
+    let _ ← decide (σ := Tiny) "b" 2
+    let _ ← decide (σ := Tiny) "c" 3
+  match body.run { decisions := { source } } with
+  | .ok _ t => { taken := t.decisions.taken, violation := none }
+  | .error _ t => { taken := t.decisions.taken, violation := none }
+
+/-- Code that decides without knowing its world. -/
+def generic {m : Type → Type} [Monad m] [MonadDecide m] : m Nat := do
+  let x ← MonadDecide.decideIn "generic.first" [1, 1, 1]
+  let y ← MonadDecide.decideIn "generic.second" [1, 1]
+  pure (10 * x + y)
 
 structure Check where
   name : String
@@ -48,7 +66,15 @@ def disk : List Check :=
     { name := "a failed sync's writes are never written again",
       ok := ((f2.syncFailed [false, false]).syncOk).disk == [1, 2] },
     { name := "a rewrite torn at a power loss keeps part of the new content",
-      ok := ((f1.write (.replace [7, 8, 9])).crash 0 2).cache == [7, 8] } ]
+      ok := ((f1.write (.replace [7, 8, 9])).crash 0 2).cache == [7, 8] },
+    { name := "an eviction after a failed sync drops what never reached the disk",
+      ok := ((f2.syncFailed [false, true]).evict).cache == [1, 2, 4, 5, 6] },
+    { name := "an eviction keeps the writes still pending",
+      ok := (f2.evict).cache == f2.cache },
+    { name := "writeback in any order: the second pending write without the first",
+      ok := (f2.crashAny [false, true]).cache == [1, 2, 4, 5, 6] },
+    { name := "a write cut short keeps its first records",
+      ok := ((Write.append [4, 5, 6]).cutShort 2).apply [1] == [1, 4, 5] } ]
 
 def history : List Check :=
   let w (id : Nat) (v : Nat) (i r : Nat) (out : Option (Outcome Toy.Res)) : OpRec Toy.Op Toy.Res :=
@@ -75,6 +101,26 @@ def decisions : List Check :=
       ok := match exhaust tinyClean 100 with | .complete n => n == 12 | _ => false },
     { name := "the exhaustive search finds the one bad path",
       ok := match exhaust tinyRun 100 with | .found c => c.values == #[1, 0, 2] | _ => false },
+    { name := "an unrecorded phase leaves the search what follows it: 6 timelines",
+      ok := match exhaust tinyUnrecorded 100 with | .complete n => n == 6 | _ => false },
+    { name := "an unrecorded phase repeats from its seed and records nothing",
+      ok := (tinyUnrecorded (Source.path #[1, 2])).taken.map (·.name) == #["b", "c"]
+        && (tinyUnrecorded (Source.path #[1, 2])).taken.map (·.value) == #[1, 2] },
+    { name := "generic code decides from a world's monad",
+      ok := match (generic (m := EStateM Stop Tiny)).run { decisions := { source := Source.path #[2, 1] } } with
+        | .ok v _ => v == 21 | _ => false },
+    { name := "generic code decides from a node-like reader, and over decisions alone",
+      ok := (match ((generic (m := ReaderT Nat (EStateM Stop Tiny))).run 7).run { decisions := { source := Source.path #[1, 0] } } with
+          | .ok v _ => v == 10 | _ => false)
+        && (match (generic (m := EStateM Stop Decisions)).run { source := Source.path #[2, 0] } with
+          | .ok v d => v == 20 && d.taken.size == 2 | _ => false) },
+    { name := "a timeline's first decision varies across seeds (2 options: each 40-60% of 1,000 seeds)",
+      ok := let ones := ((List.range 1000).filter fun i => (tinyRun (Source.seeded i)).taken[0]!.value == 1).length
+        400 ≤ ones && ones ≤ 600 },
+    { name := "a timeline's first decision varies across seeds (3 options: each 25-42% of 1,000 seeds)",
+      ok := let firsts := (List.range 1000).map fun i =>
+          (Decisions.next { source := Source.seeded i } "x" [1, 1, 1]).toOption.map (·.1) |>.getD 9
+        (List.range 3).all fun v => let k := (firsts.filter (· == v)).length; 250 ≤ k && k ≤ 420 },
     { name := "a weighted draw stays in range",
       ok := (List.range 200).all fun i => (drawWeighted (mkStdGen i) [1, 0, 5]).1 ∈ [0, 2] } ]
 
@@ -96,10 +142,32 @@ def toyConfig (syncErrors : Bool) : Config :=
   { nodes := 3, steps := 40, recovery := 40, clientOps := 6,
     faults := { syncErrors, skew := false } }
 
+/-- Kills and evictions, failed syncs, no power loss at all. -/
+def noPowerLoss : Config :=
+  { nodes := 3, steps := 40, recovery := 40, clientOps := 6,
+    faults := { syncErrors := true, skew := false, crash := false, crashPoints := false, swarm := false } }
+
 def small (syncErrors : Bool) : Config :=
   { nodes := 1, steps := 5, recovery := 3, clientOps := 2,
     faults := { syncErrors, skew := false, partition := false, drop := false, duplicate := false,
-                kill := false, swarm := false } }
+                kill := false, swarm := false, crashPoints := false, evict := false } }
+
+/-- A smaller world with crash points at every disk operation and evictions. -/
+def smallCrashPoints : Config :=
+  { nodes := 1, steps := 3, recovery := 3, clientOps := 2,
+    faults := { syncErrors := false, skew := false, partition := false, drop := false, duplicate := false,
+                kill := false, swarm := false, crashPointOneIn := 2 } }
+
+/-- The toy register judged only by how many started nodes are down at once. -/
+def toyBound : Properties Toy.sys where
+  invariant c :=
+    let d := ((List.range c.nodes.size).filter fun n => (c.node n).starts > 0 && !c.up n).length
+    if d > c.config.nodesDownMax then some s!"{d} nodes down at once" else none
+
+/-- Kills and frequent crash points, at most one node down. -/
+def toyDown : Config :=
+  { nodes := 3, steps := 40, recovery := 20, clientOps := 6, nodesDownMax := 1,
+    faults := { skew := false, swarm := false, crashPointOneIn := 3 } }
 
 def describe (c : Counterexample) : String :=
   s!"{c.property} after {c.runs} timelines, {c.taken.size} decisions: {c.detail}"
@@ -126,11 +194,40 @@ def main : IO UInt32 := do
       IO.println s!"       shrunk to {short.taken.size} decisions; its story:"
       for line in Toy.runLog variant (toyConfig syncErrors) (Source.path short.values) do
         IO.println s!"         {line}"
+  -- A failed sync's entry served after a restart, then evicted: no power loss needed.
+  for (name, variant, evict, expectFound) in [
+      ("halting without writing the log again is found by kills and eviction alone", Toy.Variant.haltNoCopy, true, true),
+      ("without eviction, kills alone never expose it (the entry stays in the cache)", Toy.Variant.haltNoCopy, false, false),
+      ("the correct register: nothing found by kills and eviction", Toy.Variant.correct, true, false) ] do
+    let config := { noPowerLoss with faults := { noPowerLoss.faults with evict } }
+    let found := explore (Toy.run variant config) 3000
+    let ok := found.isSome == expectFound
+    IO.println s!"{if ok then "ok  " else "FAIL"} {name}: {match found with | some c => describe c | none => "none in 3000 timelines"}"
+    if !ok then failed := failed + 1
+  -- Crash points and nodesDownMax: a node's own start is eligible, nodes not yet booted are not
+  -- down, and crash points never take more than nodesDownMax down.
+  let seen (name : String) (seek : String) : IO Bool := do
+    let found := explore (Boot.run false (some seek) Boot.config) 3000
+    let ok := match found with | some c => c.detail.startsWith "seen" | none => false
+    IO.println s!"{if ok then "ok  " else "FAIL"} {name}: {match found with | some c => describe c | none => "none in 3000 timelines"}"
+    pure ok
+  unless ← seen "a crash point fires in a node's first boot, the others not yet booted"
+      "node 1 lost power during its first start" do failed := failed + 1
+  unless ← seen "a crash point fires inside a restart" "lost power during its start" do failed := failed + 1
+  for (name, found) in [
+      ("crash points in starts never take more than nodesDownMax down", explore (Boot.run true none Boot.config) 3000),
+      ("crash points in a node's code never take more than nodesDownMax down",
+        explore (fun src => let r := runCluster (Toy.behavior .correct) toyBound toyDown src
+                            { taken := r.taken, violation := r.violation }) 3000) ] do
+    IO.println s!"{if found.isNone then "ok  " else "FAIL"} {name}: {match found with | some c => describe c | none => "none in 3000 timelines"}"
+    if found.isSome then failed := failed + 1
   -- Exhaustive, on a small world.
   for (name, variant, syncErrors, expectFound) in [
       ("exhaustive: acknowledging before the sync is found", Toy.Variant.ackBeforeSync, false, true),
-      ("exhaustive: the correct register, every timeline", Toy.Variant.correct, true, false) ] do
-    let result := exhaust (Toy.run variant (small syncErrors)) 500000
+      ("exhaustive: the correct register, every timeline", Toy.Variant.correct, true, false),
+      ("exhaustive, crash points and evictions: the correct register, every timeline", Toy.Variant.correct, false, false) ] do
+    let config := if name.startsWith "exhaustive, crash points" then smallCrashPoints else small syncErrors
+    let result := exhaust (Toy.run variant config) 500000
     let (ok, said) := match result with
       | .found c => (expectFound, s!"found after {c.runs} timelines: {c.detail}")
       | .complete n => (!expectFound, s!"complete: {n} timelines, none broke")

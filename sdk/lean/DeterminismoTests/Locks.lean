@@ -47,5 +47,6 @@ def run (scripts : Array (List Act)) (writerPriority : Bool := true) (source : S
   | .ok _ => { taken := p.decisions.taken, violation := none }
   | .error (.violation property detail) => { taken := p.decisions.taken, violation := some (property, detail) }
   | .error .limit => { taken := p.decisions.taken, violation := none }
+  | .error (.nodeDown _) => { taken := p.decisions.taken, violation := none }
 
 end DeterminismoTests.Locks

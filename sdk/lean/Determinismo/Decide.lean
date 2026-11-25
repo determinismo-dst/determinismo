@@ -29,8 +29,18 @@ structure Source where
   random : Bool := true
   gen : StdGen := mkStdGen 0
 
+/-- A seed mixed over 64 bits (splitmix64's finalizer). `mkStdGen` of consecutive small seeds
+gives the same first draw: over seeds 0 to 2,999, option 1 of 2 and option 2 of 3 every time, so
+every explored timeline took the same first decision until the seed was mixed. -/
+def mixSeed (seed : Nat) : Nat :=
+  let m := 2 ^ 64
+  let z := (seed + 0x9E3779B97F4A7C15) % m
+  let z := ((z ^^^ (z >>> 30)) * 0xBF58476D1CE4E5B9) % m
+  let z := ((z ^^^ (z >>> 27)) * 0x94D049BB133111EB) % m
+  z ^^^ (z >>> 31)
+
 /-- A source drawing every decision at random from `seed`. -/
-def Source.seeded (seed : Nat) : Source := { gen := mkStdGen seed }
+def Source.seeded (seed : Nat) : Source := { gen := mkStdGen (mixSeed seed) }
 
 /-- A source replaying `values`, then taking the first option of every decision after them. -/
 def Source.path (values : Array Nat) : Source := { given := values, random := false }
@@ -48,6 +58,9 @@ inductive Stop where
   | violation (property : String) (detail : String)
   /-- Its decision limit was reached: an end, not a failure. -/
   | limit
+  /-- A node lost power inside its own code (a crash point at a disk operation): its event ends
+  there, the node is down, the timeline goes on (`Cluster` catches it). -/
+  | nodeDown (node : Nat)
   deriving Repr, BEq, Inhabited
 
 /-- A world's state that carries its decisions. -/
@@ -110,8 +123,40 @@ def pick {α : Type} (name : String) (items : List α) : EStateM Stop σ (Option
   | [] => pure none
   | first :: _ => pure (some (items.getD (← decide name items.length) first))
 
+/-- `x` with decisions that are not the timeline's: drawn from `seed`, never recorded, the
+timeline's own decisions untouched (a setup to reach a state, so a search explores only what
+comes after it). The same seed repeats the same phase. -/
+def unrecorded {α : Type} (seed : Nat) (x : EStateM Stop σ α) : EStateM Stop σ α := do
+  let saved := Chaotic.decisions (← get)
+  modify fun s => Chaotic.setDecisions s { source := Source.seeded seed, limit := saved.limit }
+  try
+    let r ← x
+    modify fun s => Chaotic.setDecisions s saved
+    pure r
+  catch e =>
+    modify fun s => Chaotic.setDecisions s saved
+    throw e
+
 /-- A property broken: the timeline stops here. -/
 def violate {α : Type} (property : String) (detail : String) : EStateM Stop σ α :=
   throw (.violation property detail)
+
+/-- Code that decides without knowing its world (a pure module: a tree's map order, an
+allocator's choice): written over any `m` with this class, run from a world's monad
+(`EStateM Stop σ` for a `Chaotic σ`, a node's `NodeM`) or alone over `Decisions`. -/
+class MonadDecide (m : Type → Type) where
+  /-- A decision among `weights.length` options, drawn by weight when random. -/
+  decideIn : String → List Nat → m Nat
+
+instance {σ : Type} [Chaotic σ] : MonadDecide (EStateM Stop σ) where
+  decideIn name weights := decideWeighted (σ := σ) name weights
+
+instance {m : Type → Type} {ρ : Type} [MonadDecide m] : MonadDecide (ReaderT ρ m) where
+  decideIn name weights := fun _ => MonadDecide.decideIn name weights
+
+/-- Decisions alone: a world for code that only decides. -/
+instance : Chaotic Decisions where
+  decisions d := d
+  setDecisions _ d := d
 
 end Determinismo

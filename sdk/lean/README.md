@@ -7,9 +7,9 @@ determinismo tape repeats a timeline of the real system.
 
 | Module | What it gives |
 |---|---|
-| `Determinismo.Decide` | decisions (`decide`, `decideWeighted`, `decideRare`, `pick`), their sources (a seed, a path), `violate` |
-| `Determinismo.Disk` | a file's disk, cache and pending writes; syncs, failed syncs (EIO: never retried, read back until a power loss), power losses (a prefix of the pending writes, one torn); theorems |
-| `Determinismo.Cluster` | nodes running a system's code (`Behavior`: start from the disk, receive, tick, request) in a world of lost, duplicated, reordered and partitioned messages (one way too), power losses, process kills, halts, failed syncs, clock skew, swarm testing; client histories; `invariant` and `final` properties |
+| `Determinismo.Decide` | decisions (`decide`, `decideWeighted`, `decideRare`, `pick`), their sources (a seed, mixed; a path), `violate`; `unrecorded` (a setup phase whose decisions are not the timeline's: a search explores what follows it); `MonadDecide` (code that decides without knowing its world: a pure module run from a node's code or over `Decisions` alone) |
+| `Determinismo.Disk` | a file's disk, cache and pending writes; syncs, failed syncs (EIO: never retried, read back until a power loss or an eviction), power losses (a prefix of the pending writes, one torn; or any subset), eviction under memory pressure, writes cut short; theorems |
+| `Determinismo.Cluster` | nodes running a system's code (`Behavior`: start from the disk, receive, tick, request) in a world of lost, duplicated, reordered and partitioned messages (one way too), power losses (also inside a node's code: crash points at each write, before it, cut short or applied before the call returned, and at each sync, before or after it), process kills, halts, failed syncs, page-cache eviction, clock skew, swarm testing; client histories; `invariant` and `final` properties |
 | `Determinismo.Threads` | a process's threads, each step atomic, the next thread a decision (`thread.next`): every interleaving within bounds; deadlocks; the story (`Process.note`) |
 | `Determinismo.Locks` | a mutex and a reader-writer lock (writer priority optional, as folly's `SharedMutex`), taken with a `try` in a step (`none`: the step blocks) |
 | `Determinismo.History` | linearizability of a client history against a sequential model (unanswered operations may take effect later or never; failed ones never) |
@@ -28,7 +28,12 @@ real system by determinismo; a property that holds in every timeline within boun
     lake build
     lake exe determinismo-lean-tests
 
-The tests: decisions replayed and enumerated, the disk's fault semantics, linearizability, locks
+The tests: decisions replayed and enumerated (a timeline's first decision spread across seeds, an
+unrecorded phase, code deciding without knowing its world), the disk's fault semantics,
+linearizability, crash points under `nodesDownMax` (inside a first boot and a restart, never past
+the bound) and eviction
+(a register that halts on a failed sync but starts again without writing its log again is found by
+kills and eviction alone, and by nothing without eviction), locks
 (opposite orders deadlock, a release in a thread's last step frees its waiter, a reader taking a
 writer-priority lock again behind a waiting writer deadlocks), and a register on a write-ahead log
 in three variants: acknowledging before its sync (found), ignoring

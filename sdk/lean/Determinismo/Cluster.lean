@@ -81,6 +81,19 @@ structure Faults where
   /-- Node clocks skewed, up to `skewMax` ticks either way. -/
   skew : Bool := false
   skewMax : Nat := 5
+  /-- Power losses inside a node's code, at its disk operations: before a write, with the write
+  cut short, or applied before the call returned; before a sync, or after it before it
+  returned. One operation in `crashPointOneIn` when drawn, and only while fewer than
+  `nodesDownMax` other nodes are down (`Cluster.downBesides`): a node's own start is eligible,
+  nodes not yet booted are not down. -/
+  crashPoints : Bool := true
+  crashPointOneIn : Nat := 40
+  /-- Memory pressure: a node's clean pages leave its cache (a failed sync's never-written pages
+  with them). -/
+  evict : Bool := true
+  /-- At a power loss each pending write reached the disk or not, in any order (a filesystem
+  that orders nothing); else a prefix of them, one torn (ordered appends). -/
+  anyOrderWriteback : Bool := false
   /-- Per timeline, each kind drawn on or off. -/
   swarm : Bool := true
   deriving Repr
@@ -173,6 +186,11 @@ def upNodes (c : Cluster s) : List NodeId := (List.range c.nodes.size).filter c.
 
 def downNodes (c : Cluster s) : List NodeId := (List.range c.nodes.size).filter (!c.up ·)
 
+/-- The nodes other than `n` that booted and are down now: what bounds a crash point in `n`'s
+code (`nodesDownMax`), `n`'s own start included. -/
+def downBesides (c : Cluster s) (n : NodeId) : List NodeId :=
+  (List.range c.nodes.size).filter fun m => m != n && (c.node m).starts > 0 && !c.up m
+
 def deliverable (c : Cluster s) : List (Envelope s.Msg) :=
   let open_ := c.net.filter fun e => !c.blocked.contains (e.src, e.dst)
   if c.config.fifo then
@@ -210,8 +228,28 @@ def setFile (name : String) (f : File s.Rec) : NodeM s Unit := do
   let n ← read
   modify fun c => c.setNode n fun nd => { nd with files := nd.files.set name f }
 
+/-- A crash point here, drawn: none, or where in the operation the power goes (its phases). -/
+def crashPoint (phases : Nat) : NodeM s (Option Nat) := do
+  let c ← get
+  if !c.faults.crashPoints || c.recovering then return none
+  -- At most `nodesDownMax` down once the power goes here: the node itself counts as up (its own
+  -- start too), and nodes not yet booted are not down.
+  if (c.downBesides (← read)).length ≥ c.config.nodesDownMax then return none
+  if !(← decideRare (σ := Cluster s) "disk.crash.point" 1 c.faults.crashPointOneIn) then return none
+  return some (← decide (σ := Cluster s) "disk.crash.phase" phases)
+
 def write (name : String) (w : Write s.Rec) : NodeM s Unit := do
-  setFile name ((← file name).write w)
+  match ← crashPoint (s := s) 3 with
+  | none => setFile name ((← file name).write w)
+  | some phase =>
+    let n ← read
+    -- 0: before the write; 1: cut short partway; 2: applied, before the call returned.
+    if phase == 1 && w.size > 1 then
+      let kept ← decide (σ := Cluster s) "disk.crash.cut" w.size
+      setFile name ((← file name).write (w.cutShort kept))
+    else if phase == 2 then setFile name ((← file name).write w)
+    note (s := s) s!"node {n}: power lost at its write of {name} ({["before it", "partway", "after it"].getD phase ""})"
+    throw (.nodeDown n)
 
 def append (name : String) (records : List s.Rec) : NodeM s Unit := write name (.append records)
 
@@ -224,6 +262,12 @@ not, never retried. -/
 def sync (name : String) : NodeM s Bool := do
   let f ← file name
   if f.pending.isEmpty then return true
+  if let some phase ← crashPoint (s := s) 2 then
+    let n ← read
+    -- 0: before the sync; 1: after it, before the call returned (the data is on the disk).
+    if phase == 1 then setFile name f.syncOk
+    note (s := s) s!"node {n}: power lost at its sync of {name} ({if phase == 0 then "before it" else "after it"})"
+    throw (.nodeDown n)
   let c ← get
   let failed ← if c.faults.syncErrors && !c.recovering then
       decideRare (σ := Cluster s) "disk.sync.error" 1 8 else pure false
@@ -281,7 +325,37 @@ namespace World
 
 variable {s : Sys}
 
-def runAt {α : Type} (n : NodeId) (x : NodeM s α) : ClusterM s α := x.run n
+/-- A power loss's effect on node `n`: down, each file keeping what `Disk` says, by decisions. -/
+def powerLossFiles (n : NodeId) : ClusterM s Unit := do
+  let c ← get
+  let mut files : Files s.Rec := []
+  for (name, f) in (c.node n).files do
+    if c.faults.anyOrderWriteback then
+      let mut reached := []
+      for _ in f.pending do
+        reached := reached ++ [(← decide (σ := Cluster s) "disk.crash.reached" 2) == 1]
+      files := files ++ [(name, f.crashAny reached)]
+    else
+      let kept ← decide (σ := Cluster s) "disk.crash.kept" (f.pending.length + 1)
+      let torn ← match f.pending.drop kept with
+        | next :: _ =>
+          if c.faults.torn && next.size > 1 then decide (σ := Cluster s) "disk.crash.torn" next.size
+          else pure 0
+        | [] => pure 0
+      files := files ++ [(name, f.crash kept torn)]
+  modify fun c => c.setNode n fun nd => { nd with state := none, halted := false, files := files }
+  note s!"node {n} lost power"
+
+/-- A node's code at node `n`; none when the power went inside it (a crash point): the node is
+then down, its files as a power loss leaves them. -/
+def runAt {α : Type} (n : NodeId) (x : NodeM s α) : ClusterM s (Option α) := do
+  try
+    let r ← x.run n
+    pure (some r)
+  catch e =>
+    match e with
+    | .nodeDown m => do powerLossFiles m; pure none
+    | other => throw other
 
 /-- A node's memory after an event's code: down when the code halted. -/
 def settle (n : NodeId) (state : s.State) : ClusterM s Unit :=
@@ -290,24 +364,15 @@ def settle (n : NodeId) (state : s.State) : ClusterM s Unit :=
 
 def startNode (b : Behavior s) (n : NodeId) : ClusterM s Unit := do
   modify fun c => c.setNode n fun nd => { nd with starts := nd.starts + 1 }
-  let state ← runAt n b.start
-  settle n state
-  note s!"node {n} started"
+  match ← runAt n b.start with
+  | some state =>
+    settle n state
+    note s!"node {n} started"
+  | none =>
+    note s!"node {n} lost power during its {if ((← get).node n).starts == 1 then "first " else ""}start"
 
-/-- A power loss: each file keeps what `Disk` says, by decisions. -/
-def powerLoss (n : NodeId) : ClusterM s Unit := do
-  let c ← get
-  let mut files : Files s.Rec := []
-  for (name, f) in (c.node n).files do
-    let kept ← decide (σ := Cluster s) "disk.crash.kept" (f.pending.length + 1)
-    let torn ← match f.pending.drop kept with
-      | next :: _ =>
-        if c.faults.torn && next.size > 1 then decide (σ := Cluster s) "disk.crash.torn" next.size
-        else pure 0
-      | [] => pure 0
-    files := files ++ [(name, f.crash kept torn)]
-  modify fun c => c.setNode n fun nd => { nd with state := none, files := files }
-  note s!"node {n} lost power"
+/-- A power loss: the node down, each file keeping what `Disk` says, by decisions. -/
+def powerLoss (n : NodeId) : ClusterM s Unit := powerLossFiles n
 
 def kill (n : NodeId) : ClusterM s Unit := do
   modify fun c => c.setNode n fun nd => { nd with state := none }
@@ -335,15 +400,13 @@ def deliver (b : Behavior s) (e : Envelope s.Msg) (keepCopy : Bool) : ClusterM s
   match (c.node e.dst).state with
   | none => pure () -- Its node is down: lost.
   | some state =>
-    let state' ← runAt e.dst (b.receive state e)
-    settle e.dst state'
+    if let some state' ← runAt e.dst (b.receive state e) then settle e.dst state'
 
 def tickNode (b : Behavior s) (n : NodeId) : ClusterM s Unit := do
   match ((← get).node n).state with
   | none => pure ()
   | some state =>
-    let state' ← runAt n (b.tick state)
-    settle n state'
+    if let some state' ← runAt n (b.tick state) then settle n state'
 
 def clientRequest (b : Behavior s) (n : NodeId) : ClusterM s Unit := do
   let op ← b.operation
@@ -354,11 +417,10 @@ def clientRequest (b : Behavior s) (n : NodeId) : ClusterM s Unit := do
   match (c.node n).state with
   | none => pure ()
   | some state =>
-    let state' ← runAt n (b.request state id op)
-    settle n state'
+    if let some state' ← runAt n (b.request state id op) then settle n state'
 
 inductive Event where
-  | deliver | duplicate | drop | tick | client | crash | kill | start | partition | heal | skew
+  | deliver | duplicate | drop | tick | client | crash | kill | start | partition | heal | skew | evict
   deriving Repr, BEq
 
 /-- The events possible now, each with its weight. -/
@@ -379,7 +441,8 @@ def possible (c : Cluster s) : List (Event × Nat) :=
     (.start, if down.isEmpty then 0 else if c.recovering then 4 else 2),
     (.partition, if faulty && f.partition && c.blocked.isEmpty then 1 else 0),
     (.heal, if !c.blocked.isEmpty then (if c.recovering then 8 else 1) else 0),
-    (.skew, if faulty && f.skew then 1 else 0) ].filter (·.2 > 0)
+    (.skew, if faulty && f.skew then 1 else 0),
+    (.evict, if faulty && f.evict && !up.isEmpty then 1 else 0) ].filter (·.2 > 0)
 
 /-- One event, drawn. False when nothing can happen. -/
 def event (b : Behavior s) : ClusterM s Bool := do
@@ -419,6 +482,10 @@ def event (b : Behavior s) : ClusterM s Bool := do
       let skew : Int := Int.ofNat v - Int.ofNat m
       modify fun c => c.setNode n fun nd => { nd with skew := skew }
       note s!"node {n}'s clock skewed {skew}"
+  | .evict =>
+    if let some n ← pick (σ := Cluster s) "fault.evict" c.upNodes then
+      modify fun c => c.setNode n fun nd => { nd with files := nd.files.map fun (name, f) => (name, f.evict) }
+      note s!"node {n}'s page cache evicted"
   modify fun c => { c with step := c.step + 1 }
   return true
 
@@ -434,7 +501,8 @@ def swarm (f : Faults) : ClusterM s Faults := do
     crash := ← on "crash" f.crash, kill := ← on "kill" f.kill,
     partition := ← on "partition" f.partition, drop := ← on "drop" f.drop,
     duplicate := ← on "duplicate" f.duplicate, syncErrors := ← on "sync_errors" f.syncErrors,
-    skew := ← on "skew" f.skew }
+    skew := ← on "skew" f.skew, crashPoints := ← on "crash_points" f.crashPoints,
+    evict := ← on "evict" f.evict }
 
 /-- A whole timeline: boot, faults, recovery, judgment. -/
 def timeline (b : Behavior s) (p : Properties s) : ClusterM s Unit := do
@@ -468,5 +536,6 @@ def runCluster {s : Sys} (b : Behavior s) (p : Properties s) (config : Config) (
   | .ok _ c => { taken := c.decisions.taken, violation := none, cluster := c }
   | .error (.violation property detail) c => { taken := c.decisions.taken, violation := some (property, detail), cluster := c }
   | .error .limit c => { taken := c.decisions.taken, violation := none, cluster := c }
+  | .error (.nodeDown _) c => { taken := c.decisions.taken, violation := none, cluster := c }
 
 end Determinismo
