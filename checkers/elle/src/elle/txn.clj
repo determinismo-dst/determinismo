@@ -7,6 +7,10 @@
 ;   real time without edges into :info completions (those cycles vanish when it aborted).
 ; Found by a Lean replica of Elle; checked over every interpretation of the replica's histories
 ; (no new false positive), on Elle itself, and with Elle's test suite.
+; - Round 3's D20 fix (determinismo-workloads' workloads/elle/lean REPORT-3.md/fix-d20): a cycle with two or more anti-dependencies, one an
+;   item anti-dependency, is G2-item (or G-nonadjacent-item) whatever its predicate edges, as
+;   Adya defines G2-item, and the item searches take predicate anti-dependencies beside an item
+;   one: repeatable read passed such cycles as G2.
 (ns elle.txn
   "Functions for cycle analysis over transactional workloads."
   (:require [bifurcan-clj [core :as b]
@@ -522,14 +526,17 @@
                                   "G-single"
                                   "G-single-item")
 
+                                ; Round 3's D20 fix: Adya's G2-item is a
+                                ; cycle with one or more item
+                                ; anti-dependencies, whatever else it holds
                                 (< 1 (+ rw rwp))
                                 (if rw-adj?
-                                  (if predicate?
-                                    "G2"
-                                    "G2-item")
-                                  (if predicate?
-                                    "G-nonadjacent"
-                                    "G-nonadjacent-item"))
+                                  (if (< 0 rw)
+                                    "G2-item"
+                                    "G2")
+                                  (if (< 0 rw)
+                                    "G-nonadjacent-item"
+                                    "G-nonadjacent"))
 
                                 (< 0 (+ wr wrp)) "G1c"
                                 (< 0 (+ ww wwp)) "G0"
@@ -592,9 +599,11 @@
                 :single-rels (rels/union rw rwp)
                 :type        :G-single}
     ; G-nonadjacent-item: like G-nonadjacent, but no predicate rw edges.
+    ; Round 3's D20 fix: predicate anti-dependencies too, beside an item one
     :G-nonadjacent-item {:rels             (rels/union ww wwp wr wrp)
-                         :nonadjacent-rels rw
-                         :multiple-rels    rw
+                         :nonadjacent-rels (rels/union rw rwp)
+                         :multiple-rels    (rels/union rw rwp)
+                         :required-rels    #{rw}
                          :type             :G-nonadjacent-item}
     ; G-nonadjacent is the more general form of G-single: it has multiple
     ; nonadjacent rw edges.
@@ -606,9 +615,11 @@
     ; G2-item, likewise, starts with an anti-dep edge, but allows more, and
     ; insists on being G2, rather than G-single. Not bulletproof, but G-single
     ; is worse, so I'm OK with it.
-    :G2-item   {:rels          (rels/union ww wwp wr wrp rw)
+    ; Round 3's D20 fix: predicate anti-dependencies too, beside an item one
+    :G2-item   {:rels          (rels/union ww wwp wr wrp rw rwp)
                 ; A single rw rel is trivially G-Single
-                :multiple-rels rw
+                :multiple-rels (rels/union rw rwp)
+                :required-rels #{rw}
                 :type         :G2-item}
     ; G2 is identical, except we want a cycle explained as G2
     ; specifically--it'll have at least one :predicate? edge.
@@ -828,7 +839,11 @@
                                cycle-types
                                (cm/anomalies-prohibited-by possible-models))]
     ;(info :impossible-anomalies impossible-anomalies)
-    impossible-anomalies))
+    ; Round 3's D20 fix: PL-2.99's cycle-exists subgraph has no predicate
+    ; anti-dependencies, while a G2-item (or G-nonadjacent-item) cycle may hold
+    ; some beside an item one: its absence rules neither out.
+    (set (remove #(re-find #"^G(2|-nonadjacent)-item" (name %))
+                 impossible-anomalies))))
 
 (defn merge-cycle-exists+cycle-cases
   "Takes a vector of cycle-exists cases and a vector of cycle cases. Eliminates

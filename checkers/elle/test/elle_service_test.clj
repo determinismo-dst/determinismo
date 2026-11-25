@@ -119,3 +119,38 @@
                   (op 2 "invoke" "txn" [["rp" ["=" 0] nil]])
                   (op 2 "ok" "txn" [["rp" ["=" 0] [[0 0] [1 0]]]]))]
     (is (false? (:valid a)) (pr-str a))))
+
+;; D23 (round 3 of the Lean replica): D3's fix took real time out of :info completions for models
+;; allowing G1a, and lost this strong read uncommitted violation: the :info transaction can't have
+;; committed ([3 4] and [2] aren't on one trace), so 2 precedes 1 (T1 -ww-> T0), with real time
+;; T0 -> T1. Elle 0.2.8 caught it through the :info operation; D5's fix catches it without.
+(deftest strong-read-uncommitted-without-the-info-edge
+  (let [a (answer "list-append" "strong-read-uncommitted"
+                  (op 0 "invoke" "txn" [["r" 0 nil] ["append" 0 1]]) (op 0 "ok" "txn" [["r" 0 [2]] ["append" 0 1]])
+                  (op 0 "invoke" "txn" [["r" 0 nil] ["append" 0 2]]) (op 0 "ok" "txn" [["r" 0 [3 4]] ["append" 0 2]])
+                  (op 0 "invoke" "txn" [["append" 0 3] ["append" 0 4]]) (op 0 "info" "txn" [["append" 0 3] ["append" 0 4]]))]
+    (is (false? (:valid a)) (pr-str a))))
+
+;; D1: an append nobody read became an anti-dependency: snapshot isolation passed a G-single
+;; present in every interpretation (both orders of key 1's appends).
+(deftest snapshot-isolation-sees-g-single-through-unread-appends
+  (let [a (answer "list-append" "snapshot-isolation"
+                  (op 0 "invoke" "txn" [["r" 0 nil] ["append" 1 1]])
+                  (op 1 "invoke" "txn" [["r" 1 nil] ["append" 1 2] ["append" 0 1]])
+                  (op 0 "ok" "txn" [["r" 0 []] ["append" 1 1]])
+                  (op 1 "ok" "txn" [["r" 1 []] ["append" 1 2] ["append" 0 1]]))]
+    (is (false? (:valid a)) (pr-str a))))
+
+;; D7: rw-register dropped the self-edge of a transaction reading its own later write.
+(deftest rw-register-future-read
+  (let [a (answer "rw-register" "strict-serializable"
+                  (op 0 "invoke" "txn" [["r" 0 nil] ["w" 0 1]]) (op 0 "ok" "txn" [["r" 0 1] ["w" 0 1]]))]
+    (is (false? (:valid a)) (pr-str a))))
+
+;; D8: list-append threw on a garbage read (an element nobody appended) instead of reporting it.
+(deftest list-append-garbage-read
+  (let [a (try (answer "list-append" "strict-serializable"
+                       (op 0 "invoke" "txn" [["r" 0 nil]]) (op 0 "ok" "txn" [["r" 0 [7]]]))
+               (catch Throwable e {:threw (str (class e) ": " (.getMessage e))}))]
+    (is (false? (:valid a)) (pr-str a))))
+

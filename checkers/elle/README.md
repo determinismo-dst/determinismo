@@ -68,8 +68,12 @@ and Elle 0.2.8's `elle.txn` loads unilog while declaring it for its dev profile 
 `src/elle/` holds Elle 0.2.8 namespaces with fixes, loaded ahead of Elle's jar (`:paths` come
 first), each under Elle's license (EPL-2.0, `src/elle/LICENSE`). All were found by a Lean replica
 of Elle ([determinismo-workloads' workloads/elle/lean](https://github.com/determinismo-dst/determinismo-workloads/tree/main/workloads/elle/lean),
-its findings in UNREPORTED.md) and reproduced on Elle; Elle's own test suite passes with them, except
-`failure-to-observe-test`, which now also reports the G-single-realtime its history holds.
+its findings in UNREPORTED.md) and reproduced on Elle. Elle's own suite with them: 103 tests, its
+failures only the expected outputs they change. `failure-to-observe-test` (now also the
+G-single-realtime its history holds), `lost-update-test` (gains G-single-item, D1),
+`g1c-multi-key-delete-test` (D21), `all-anomalies-test` and rw-register's `checker-test` (the new
+`:fuzzy-read`, D6), `anomalies-prohibited-by-test` (the new `:garbage-read`, D8); list-append's
+`checker-test` can't write its output file here, as on Elle as written.
 - `closed_predicate.clj`: writes (`[:w k v]`) get write-write edges (`ww-graph` matched
   `:write`); `versions-after` keeps its unborn branch and `version<` orders `:elle/unborn` first,
   so a predicate anti-dependency on a key the init created is found and explained.
@@ -79,12 +83,27 @@ its findings in UNREPORTED.md) and reproduced on Elle; Elle's own test suite pas
 - `rw_register.clj`: `:info` writes are indexed (as a write an `:ok` read saw, for models that
   prohibit G1a), and a transaction order through an `:info` write keeps its neighbours' edge.
 
+Round 3's (2026-11-25), the fixes its replica checked safe:
+- `list_append.clj` (new here): a G-single through appends nobody read is found (D1); for models
+  allowing G1a, `:info` appends aren't indexed as writes and failed ones are stepped over (D5 with
+  D4), which also restores strong read uncommitted verdicts the D3 fix above lost (D23); a read of
+  an element nobody appended is a `:garbage-read`, not a crash (D8).
+- `rw_register.clj`: unread writes the same (D1); every external read counts, two values read
+  for one key are a `:fuzzy-read` (D6); a read of the transaction's own later write is a
+  `:future-read` (D7).
+- `closed_predicate.clj`: a predicate read's rows are item reads (D21); explainers read only `:ok`
+  operations' reads (D22). `txn.clj`: cycles mixing item and predicate anti-dependencies are
+  G2-item or G-nonadjacent-item (D20).
+- `consistency_model.clj` (new here): `:fuzzy-read` and `:garbage-read` proscribed where Adya's
+  levels do.
+
+Not taken: D12 (deterministic version order, but one verdict lost in 40,000), D2 (two models at
+once: the service never sends two), D15 (jepsen.history, safe only compiled ahead of time).
+
 The service itself, likewise: a read holding a value twice is dropped (not deduplicated) before
 Elle judges the rest, `not` covers the duplicates too, and per key a predicate read reads every key.
 
-The service keeps its version: rebuild and restart it by hand on each host
-(`podman build -t determinismo-elle -f checkers/elle/Dockerfile .`, `podman rm -f
-determinismo-elle`, `podman run -d --name determinismo-elle --network host determinismo-elle`)
-with no check running.
+The service keeps its version: a deploy rebuilds and restarts it when checkers/elle changed
+(infra/host/elle-image.sh, which update.sh runs, with no check going).
 
 The service's tests: `clojure -M:test` here.

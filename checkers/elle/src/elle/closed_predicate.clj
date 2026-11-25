@@ -12,6 +12,12 @@
 ;   Now :elle/unborn precedes every version and version< is false when b never follows a.
 ; Elle's closed-predicate tests pass, except failure-to-observe-test, which now also reports the
 ; G-single-realtime that version-set's own comment predicts for that history.
+; - Round 3's D21 fix (determinismo-workloads' workloads/elle/lean REPORT-3.md/fix-d21): an :ok predicate read's rows are item reads too (the
+;   namespace docstring assumes they appear as such), so a stale :true read is an item
+;   anti-dependency: strict serializability passed it.
+; - Round 3's D22 fix (determinismo-workloads' workloads/elle/lean REPORT-3.md/fix-d22): the explainers' item paths read an :ok operation's
+;   reads only: an :info operation's unknown read (its invocation's nil) was explained as a read
+;   of :elle/dead, so a G-single became a G1c and consistent view passed it.
 (ns elle.closed-predicate
   "A test for predicate safety. Uses a closed-universe assumption to
   infer the version set selected for transactions based not only on what the
@@ -441,6 +447,19 @@
                   (assoc! vsets mop (version-set all-versions mop))))
          (persistent! vsets)))
 
+(defn item-mops
+  "Round 3's D21 fix: an op's micro-ops, then each of its predicate reads' rows
+  as an item read [:r k v] (a predicate read reads the versions it returns)."
+  [op]
+  (let [mops (:value op)]
+    (if (sequential? mops)
+      (into (vec mops)
+            (for [[f _ rows] mops
+                  :when (and (= :rp f) (map? rows))
+                  [k v] rows]
+              [:r k v]))
+      mops)))
+
 (defrecord RWExplainer [all-versions vsets]
   elle/DataExplainer
   (explain-pair-data [_ a b]
@@ -448,7 +467,8 @@
       ; First, try to find a kv link. Loop over kv reads in a, looking
       ; for cases where b overwrote a's read.
       (or (loopr []
-                 [[f k v :as mop] (filter (comp #{:r} first) (:value a))]
+                 ; Round 3's D22 fix: an :ok op's reads only
+                 [[f k v :as mop] (when (h/ok? a) (filter (comp #{:r} first) (item-mops a)))]
                  (let [v (resolve-version all-versions k v)]
                    ; Was there a value following this read?
                    (if-let [v' (version-after all-versions k v)]
@@ -519,7 +539,7 @@
   {:graph
    (loopr [g (b/linear (g/op-digraph))]
           [op          (h/oks history)
-           [f :as mop] (:value op)]
+           [f :as mop] (item-mops op)]
           (recur
             (condp identical? f
               ; KV read
@@ -569,7 +589,8 @@
     ; Try for an item dependency
     (let [writes (ext-writes-op a)]
       (or (loopr []
-                 [[f k v :as mop] (:value b)]
+                 ; Round 3's D22 fix: an :ok op's reads only
+                 [[f k v :as mop] (when (h/ok? b) (item-mops b))]
                  (if-not (identical? f :r)
                    (recur)
                    (let [v (resolve-version all-versions k v)]
@@ -612,7 +633,7 @@
   {:graph
    (loopr [g                (b/linear (g/op-digraph))]
           [op               (h/oks history)
-           [f k v :as mop]  (:value op)]
+           [f k v :as mop]  (item-mops op)]
           (recur
             (condp identical? f
               ; Item read

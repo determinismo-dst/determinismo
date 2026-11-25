@@ -8,6 +8,19 @@
 ;   order through an :info write no longer hides a ww edge.
 ; Found by a Lean replica of Elle; checked over every interpretation of the replica's histories
 ; (no new false positive), on Elle itself, and with Elle's test suite.
+; Round 3's D1 fix, register form (determinismo-workloads' workloads/elle/lean REPORT-3.md/fix-d1): a reader of version v1 that also writes the
+; key gets, in a second cycle search, a ww step (not rw) to the writer of a version v2 after v1 when
+; v2 and its own write are unordered in the version graph: ww where its write came first, a
+; G-single through the reader otherwise; a G0 or G1c through such a step is reported as
+; G-single-item. Snapshot isolation and consistent view passed such G-singles.
+; Round 3's D6 fix (determinismo-workloads' workloads/elle/lean REPORT-3.md/fix-d6): wr and rw edges come from every external read (a read
+; of a key the transaction hasn't written yet), not only each key's first: a G1c through a second
+; read was missed. And an :ok transaction reading one key twice with two values (a fuzzy read) is
+; reported as :fuzzy-read, a G-single-item in every interpretation, which repeatable read and
+; consistent view prohibit (consistency_model.clj); it was reported only as :internal.
+; Round 3's D7 fix (determinismo-workloads' workloads/elle/lean REPORT-3.md/fix-d7): a transaction reading a value it writes itself later
+; (values are unique, so its own future write) is reported as :future-read, as list-append does
+; (the lattice takes it as G1c). wr-graph's self-edge for it was dropped with singleton SCCs.
 (ns elle.rw-register
   "A test which looks for cycles in write/read transactionss over registers.
   Writes are assumed to be unique, but this is the only constraint.
@@ -116,6 +129,53 @@
   consistent with that transaction's previous write to k."
   [history]
   (ct/ok-keep op-internal-case history))
+
+(defn op-future-read-case
+  "Round 3's D7 fix: given an op, returns a map describing a read of a value
+  the same transaction writes later (with unique values, its own future
+  write), or nil."
+  [op]
+  (let [mops (vec (:value op))]
+    (first
+      (for [i (range (count mops))
+            :let [[f k v :as mop] (nth mops i)]
+            :when (and (= :r f) (some? v))
+            j (range (inc i) (count mops))
+            :let [[f' k' v'] (nth mops j)]
+            :when (and (= :w f') (= k k') (= v v'))]
+        {:op op, :mop mop}))))
+
+(defn future-read-cases
+  "Round 3's D7 fix: ok operations reading their own future writes."
+  [history]
+  (ct/ok-keep op-future-read-case history))
+
+(defn all-ext-reads
+  "Round 3's D6 fix: every [k v] read of a key the transaction hasn't written
+  yet, in order (txn/ext-reads keeps each key's first)."
+  [txn]
+  (loop [mops (seq txn), written #{}, reads []]
+    (if-let [[f k v] (first mops)]
+      (case f
+        :w (recur (next mops) (conj written k) reads)
+        :r (recur (next mops) written (if (written k) reads (conj reads [k v])))
+        (recur (next mops) written reads))
+      reads)))
+
+(defn op-fuzzy-read-case
+  "Round 3's D6 fix: an op whose external reads of one key returned two
+  values (a non-repeatable read), or nil."
+  [op]
+  (let [by-key (group-by first (all-ext-reads (:value op)))]
+    (first (for [[k reads] by-key
+                 :let [vs (distinct (map second reads))]
+                 :when (< 1 (count vs))]
+             {:op op, :key k, :values (vec vs)}))))
+
+(defn fuzzy-read-cases
+  "Round 3's D6 fix: ok operations with fuzzy reads."
+  [history]
+  (ct/ok-keep op-fuzzy-read-case history))
 
 (defn g1a-cases
   "G1a, or aborted read, is an anomaly where a transaction reads data from an
@@ -256,7 +316,8 @@
               (let [txn (:value op)
                     writes (txn/ext-writes txn)
                     ; For reads, we only know their values when the op is OK.
-                    reads  (when (h/ok? op) (txn/ext-reads txn))]
+                    ; Round 3's D6 fix: every external read
+                    reads  (when (h/ok? op) (all-ext-reads txn))]
                 (->> (concat writes reads)
                      ; OK, now iterate over kv maps, building up our version
                      ; graph.
@@ -764,6 +825,40 @@
        :sources   sources
        :graphs    graphs})))
 
+(defn unread-pairs
+  "Round 3's D1 fix (register form): a set of [reader writer k]: an edge
+  v1 -> v2 of k's version graph gives the reader of v1 an rw edge to v2's
+  writer; the reader also writes k (its final write v3), and v2 and v3 are
+  unordered in that graph. Where the reader's write came first, the reader
+  precedes the writer by ww; otherwise the version after v1 came before the
+  reader's own, a G-single through the reader."
+  [history version-graphs read-fn]
+  (let [er    (ext-index read-fn history)
+        ew    (ext-write-index history)
+        reach (fn [vg v] (set (g/bfs #(g/out vg %) [v])))]
+    (set (for [[k vg] version-graphs
+               ^IEdge e (bg/edges vg)
+               :let [v1 (.from e), v2 (.to e)]
+               r (get-in er [k v1])
+               w (get-in ew [k v2])
+               :when (not= r w)
+               :let [v3 (get (txn/ext-writes (:value r)) k ::none)]
+               :when (and (not= ::none v3) (not= v3 v2)
+                          (not (contains? (reach vg v3) v2))
+                          (not (contains? (reach vg v2) v3)))]
+           [r w k]))))
+
+(defrecord UnreadExplainer [pairs]
+  elle/DataExplainer
+  (explain-pair-data [_ a b]
+    (first (for [[r w k] pairs :when (and (= a r) (= b w))]
+             {:type :ww, :key k, :unread? true})))
+
+  (render-explanation [_ {:keys [key]} a-name b-name]
+    (str a-name " read a version of " (pr-str key) " and wrote it, as " b-name
+         " did, in an order we can't tell: " a-name " came first, or the version"
+         " after the one it read came before its own")))
+
 (defn version-graphs->transaction-graph
   "Takes a history and a map of keys to version graphs, and infers a graph of
   dependencies between operations in that history by using the (likely partial)
@@ -780,7 +875,10 @@
   ([history version-graphs]
    (version-graphs->transaction-graph history version-graphs false))
   ([history version-graphs g1a?]
-  (let [ext-read-index  (ext-index txn/ext-reads  history)
+   (version-graphs->transaction-graph history version-graphs g1a? #{}))
+  ([history version-graphs g1a? unread]
+  (let [; Round 3's D6 fix: every external read
+        ext-read-index  (ext-index all-ext-reads history)
         ; Round 2's D13 fix: :info writers too
         ext-write-index (ext-write-index history)
         ; ... and ww edges out of an :info writer whose write an :ok read saw,
@@ -803,7 +901,11 @@
                  all-vals  (set (concat v1-reads v1-writes v2-writes))]
              (recur (-> g
                         (g/link-all-to-all v1-writes v2-writes ww)
-                        (g/link-all-to-all v1-reads v2-writes rw)
+                        ; Round 3's D1 fix: no rw edge for an unread pair
+                        ((fn [g] (reduce (fn [g [r w]]
+                                           (if (unread [r w k]) g (g/link g r w rw)))
+                                         g
+                                         (for [r v1-reads, w v2-writes] [r w]))))
                         (g/remove-self-edges all-vals))))
            (b/forked g)))))
 
@@ -822,8 +924,8 @@
       (keep (fn [[k a-value]]
               (when-let [version-graph (get version-graphs k)]
                 (when-let [b-value (get b-kvs k)]
-                  (when (.contains ^ISet (g/out version-graph a-value)
-                                   b-value)
+                  (when (some-> ^ISet (g/out version-graph a-value)
+                                (.contains b-value))
                     {:key     k
                      :value   a-value
                      :value'  b-value}))))
@@ -845,12 +947,17 @@
          b-name " set it to " (pr-str value')
          ", which came later in the version order")))
 
-(defrecord RWExplainer [version-graphs]
+(defrecord RWExplainer [version-graphs unread]
   elle/DataExplainer
   (explain-pair-data [_ a b]
     (when-let [{:keys [key value value'] :as e}
-               (explain-op-deps version-graphs
-                                txn/ext-reads a txn/ext-writes b)]
+               ; Round 3's D1 fix: each external read alone, an unread pair's
+               ; key skipped
+               (first (keep (fn [r]
+                              (when-let [e (explain-op-deps version-graphs (constantly [r])
+                                                            a txn/ext-writes b)]
+                                (when-not (contains? unread [a b (:key e)]) e)))
+                            (seq (all-ext-reads (:value a)))))]
       (assoc e
              :type :rw
              :a-mop-index (index-of (:value a) [:r key value])
@@ -873,27 +980,34 @@
     :wfr-keys?           Assumes writes follow reads in a txn
 
   In addition, we infer a dependency edge from nil to every non-nil value."
-  [opts history]
+  ([opts history]
+   (ww+rw-graph opts history false))
+  ([opts history unread?]
   (let [{:keys [anomalies sources graphs]} (version-graphs opts history)
         ; Round 2's D13 fix
         graphs (step-over-info history graphs)
+        ; Round 3's D1 fix: in the second search, unread pairs are ww steps
+        unread (if unread? (unread-pairs history graphs all-ext-reads) #{})
         tg  (version-graphs->transaction-graph
               history graphs
-              (contains? (ct/prohibited-anomaly-types opts) :G1a))]
+              (contains? (ct/prohibited-anomaly-types opts) :G1a)
+              unread)
+        tg  (b/forked (reduce (fn [g [r w _]] (g/link g r w ww)) (b/linear tg) unread))]
     ; We might have found anomalies when computing the version graph
     {:anomalies anomalies
      :graph     tg
      :explainer (elle/->CombinedExplainer [(WWExplainer. graphs)
-                                           (RWExplainer. graphs)])}))
+                                           (RWExplainer. graphs unread)
+                                           (UnreadExplainer. unread)])})))
 
 (defrecord WRExplainer []
   elle/DataExplainer
   (explain-pair-data [_ a b]
     (let [writes (txn/ext-writes (:value a))
-          reads  (txn/ext-reads  (:value b))]
+          ; Round 3's D6 fix: every external read
+          reads  (set (all-ext-reads (:value b)))]
       (reduce (fn [_ [k v]]
-                (when (and (contains? reads k)
-                           (= v (get reads k)))
+                (when (contains? reads [k v])
                   (reduced
                     {:type  :wr
                      :key   k
@@ -914,7 +1028,8 @@
   [history]
   (let [; Round 2's D13 fix: :info writers too
         ext-writes (ext-write-index history)
-        ext-reads  (ext-index txn/ext-reads  history)]
+        ; Round 3's D6 fix: every external read
+        ext-reads  (ext-index all-ext-reads history)]
     ; Take all reads and relate them to prior writes.
     {:graph
      (b/forked
@@ -976,13 +1091,40 @@
   The graph we return combines all this information.
 
   TODO: maybe use writes-follow-reads(?) to infer more versions from wr deps?"
-  [opts history]
+  ([opts history]
+   (graph opts history false))
+  ([opts history unread?]
   (let [; Build our combined analyzers
-        analyzers (into [wr-graph (partial ww+rw-graph opts)]
+        analyzers (into [wr-graph #(ww+rw-graph opts % unread?)]
                         (ct/additional-graphs opts))
         analyzer (apply elle/combine analyzers)]
     ; And go!
-    (analyzer history)))
+    (analyzer history))))
+
+(defn unread-cycles
+  "Round 3's D1 fix (register form): the cycles of the graph where each unread
+  pair is a ww step: a G0 or G1c through an unread step is reported as
+  G-single-item (with its variant); any other class stands (a G-single implies
+  G-nonadjacent and G2)."
+  [opts history]
+  (let [history (h/client-ops history)
+        graphs  (step-over-info history (:graphs (version-graphs opts history)))]
+    (when (seq (unread-pairs history graphs all-ext-reads))
+      (let [found (:anomalies (ct/cycles opts #(graph opts % true) history))]
+        (->> (for [[t cs] found
+                   :when (and (sequential? cs) (ct/cycle-types t))
+                   c cs
+                   :let [n (name t)
+                         v (re-find #"-(process|realtime)$" n)
+                         base (if v (subs n 0 (- (count n) (count (first v)))) n)
+                         t' (if (and (#{"G0" "G1c"} base)
+                                     (some :unread? (:steps c)))
+                              (keyword (str "G-single-item" (first v)))
+                              t)]
+                   ; any other class stands: a G-single implies G-nonadjacent and G2
+                   :when true]
+               [t' (assoc c :type t')])
+             (reduce (fn [m [t c]] (update m t (fnil conj []) c)) {}))))))
 
 (defn check
   "Full checker for write-read registers. Options are:
@@ -1047,17 +1189,26 @@
          g1a          (h/task history g1a [] (g1a-cases history))
          g1b          (h/task history g1b [] (g1b-cases history))
          internal     (h/task history internal [] (internal-cases history))
+         ; Round 3's D6 fix
+         fuzzy-read   (h/task history fuzzy-read [] (fuzzy-read-cases history))
+         ; Round 3's D7 fix
+         future-read  (h/task history future-read [] (future-read-cases history))
          lost-update  (h/task history lost-update []
                               (ct/lost-update-cases #{:w} history))
          cycles       (:anomalies (ct/cycles! opts (partial graph opts)
                                               history))
+         ; Round 3's D1 fix: the G-singles through unread pairs
+         cycles       (merge-with (fn [a b] (vec (distinct (concat a b))))
+                                  cycles (unread-cycles opts history))
          _            @type-sanity ; Will throw if problems
          ; Build up anomaly map
          anomalies (cond-> cycles
                      @internal     (assoc :internal @internal)
                      @g1a          (assoc :G1a @g1a)
                      @g1b          (assoc :G1b @g1b)
-                     @lost-update  (assoc :lost-update @lost-update))]
+                     @lost-update  (assoc :lost-update @lost-update)
+                     @fuzzy-read   (assoc :fuzzy-read @fuzzy-read)
+                     @future-read  (assoc :future-read @future-read))]
      (ct/result-map opts anomalies))))
 
 (defn gen
