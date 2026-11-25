@@ -162,6 +162,8 @@ pub fn main(init: std.process.Init) !void {
             .flood = flood_scenario,
             .startup_coverage = startup_coverage_scenario,
             .ending = ending_scenario,
+            .ending_signal = ending_signal_scenario,
+            .ending_fail = ending_fail_scenario,
             .sinks = sinks_scenario,
             .aim = aim_scenario,
             .slow = slow_scenario,
@@ -682,6 +684,59 @@ fn process_alive(pid: linux.pid_t) bool {
 
 fn ending_finally(_: *System.Context) !void {
     sdk.reachable("a finally command ran", .{});
+}
+
+/// A finally command runs only when every command ran to completion, the length's own kills
+/// forgiven: a driver that died by a signal before the length killed the rest is no
+/// completion. The length's forgiveness once wiped every earlier interruption with its own
+/// (CE1, the blind Lean replica of the platform). Half the timelines have their first start
+/// die by SIGKILL at once; the others' starts sleep past a short --timeline.
+fn ending_signal_scenario(s: *System.Scenario) void {
+    s.parallel_driver("signaled", signaled_driver);
+    s.finally("after_signal", ending_signal_finally);
+}
+
+const signaled_first_path = "/tmp/det-selftest-signaled-first";
+const signaled_path = "/tmp/det-selftest-signaled";
+
+fn signaled_driver(_: *System.Context) !void {
+    const flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true };
+    const first = linux.open(signaled_first_path, flags, 0o644);
+    if (linux.errno(first) == .SUCCESS) {
+        _ = linux.close(@intCast(first));
+        if (sdk.random_below(2) == 0) {
+            const marked = linux.open(signaled_path, flags, 0o644);
+            if (linux.errno(marked) == .SUCCESS) _ = linux.close(@intCast(marked));
+            sdk.event("signaled_self", .{});
+            _ = linux.kill(linux.getpid(), .KILL);
+        }
+    }
+    const long = linux.timespec{ .sec = 30, .nsec = 0 };
+    _ = linux.nanosleep(&long, null);
+}
+
+fn ending_signal_finally(_: *System.Context) !void {
+    sdk.reachable("a finally command ran after the length killed the rest", .{});
+    const marked = linux.access(signaled_path, linux.F_OK) == 0;
+    sdk.always(!marked, "a finally runs only after every command ran to completion", .{});
+}
+
+/// A command that exits on its own is judged by its status, though it is reaped while the
+/// composer kills the rest: with no minimum drive (--min-drive 0) nothing reaped the starts
+/// below the parallelism before the eventually command's kill, which reported every one as
+/// killed and its failure as none (CE2, the blind Lean replica of the platform).
+fn ending_fail_scenario(s: *System.Scenario) void {
+    s.parallel_driver("fails", fails);
+    s.eventually("after_fail", ending_fail_eventually);
+}
+
+fn fails(_: *System.Context) !void {
+    sdk.event("fails_start", .{});
+    return error.Failed;
+}
+
+fn ending_fail_eventually(_: *System.Context) !void {
+    sdk.reachable("an eventually command ran after failing drivers", .{});
 }
 
 fn clock_jitter_scenario(s: *System.Scenario) void {

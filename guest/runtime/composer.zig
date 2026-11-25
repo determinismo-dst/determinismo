@@ -328,8 +328,13 @@ const Composer = struct {
                 if (entry.pid != pid) continue;
                 const bits: u32 = @bitCast(status);
                 const signaled = bits & 0x7f != 0 or (bits >> 8) & 0xff >= 128;
-                if (signaled or killed) composer.interrupted += 1;
-                report_exit(entry.command, bits, killed);
+                // Killed by the composer only when its SIGKILL ended it: a command reaped while
+                // the rest are killed may have exited on its own before (with --min-drive 0
+                // nothing reaped the starts below the parallelism first), and its status is
+                // judged as any (CE2, the blind Lean replica of the platform).
+                const by_kill = killed and bits & 0x7f == @backingInt(linux.SIG.KILL);
+                if (signaled or by_kill) composer.interrupted += 1;
+                report_exit(entry.command, bits, by_kill);
                 composer.running[index] = composer.running[composer.running_count - 1];
                 composer.running_count -= 1;
                 return true;
@@ -516,7 +521,6 @@ pub fn main(init: std.process.Init) !void {
     // (and the faults stop); a finally one waits for them to end on their own, and runs only
     // if every command ran to completion; or neither.
     const ending = ending_pick(&composer);
-    var bounded = false;
     if (ending == .eventually) {
         min_drive(&composer, drive_start_ns, scenario.min_drive_ms);
         composer.kill_all();
@@ -527,15 +531,16 @@ pub fn main(init: std.process.Init) !void {
         composer.wait_until(end_ns + length_grace_ns);
         if (composer.running_count > 0) {
             sdk.event("length_reached", .{ .running = composer.running_count });
+            // Only the length's own kills are forgiven: a command that died before them (a
+            // signal, a node's restart) still keeps the finally from running (CE1, the blind
+            // Lean replica of the platform: the forgiveness wiped every interruption).
+            const interrupted = composer.interrupted;
             composer.kill_all();
-            bounded = true;
+            composer.interrupted = interrupted;
         }
     } else composer.wait_all();
     composer.faults_stop();
     sdk.event("faults_phase", .{ .state = "stop" });
-    // Drivers ended by the length, by design: a finally (the checks) runs as an eventually
-    // command would, not skipped as after commands that failed to end.
-    if (bounded) composer.interrupted = 0;
     run_ending(&composer, ending, scenario.ending_ms_max orelse ending_ms_max_default);
     checks_stream(&system);
     sdk.event("composer_done", .{ .commands_started = composer.started_count });
