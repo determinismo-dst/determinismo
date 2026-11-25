@@ -1,50 +1,17 @@
 ;; SPDX-License-Identifier: MIT
-;; The visualization's process: jank's nREPL server on a thread of its own (its port in
-;; .nrepl-port, as `jank repl` writes it), the window's frames on the main thread, where macOS
-;; wants them. A REPL connected to it uses determinismo.api and determinismo.debug as anywhere,
-;; and the window follows: each evaluation is told to it with its value.
+;; The visualization's process: the window of cards (jankifier/cards: jank's nREPL server on a
+;; thread of its own, its port in .nrepl-port, the window's frames on the main thread) with
+;; determinismo's cards and the moment lab's. A REPL connected to it uses determinismo.api,
+;; determinismo.debug, determinismo.lab and determinismo.lean as anywhere, and the window follows.
 ;;   ./viz.sh                                     the window
 ;;   ./viz.sh --hidden --record <video.mp4>       its frames to a video, nothing shown
 (ns determinismo.viz.main
-  (:require [clojure.string :as str]
-            [jank.nrepl.server.core :as nrepl]
-            [jank.nrepl.server.handler :as handler]
-            [determinismo.viz :as viz]))
-
-(defn- after [flag args]
-  (second (drop-while (fn [arg] (not= arg flag)) args)))
-
-(defn- editor's?
-  "What an editor evaluates for itself on connecting, and the window's own calls: not a
-  person's work."
-  [code]
-  (or (str/includes? code "cider") (str/includes? code "clojure.main/repl-requires")
-      (str/includes? code "clojure.stacktrace")
-      (str/includes? code "determinismo.viz/")
-      (str/starts-with? code "(in-ns ") (str/starts-with? code "(ns ")))
-
-(defn- tell-evaluations!
-  "nREPL's eval as it was, its value (*1) or its error then told to the window."
-  []
-  (let [evaluate (get-method handler/handle-message :eval)]
-    (defmethod handler/handle-message :eval [message]
-      (let [answer (evaluate message)
-            parts (if (map? answer) [answer] (remove nil? answer))
-            error (some :ex parts)
-            code (str/trim (get message "code" ""))]
-        (when-not (editor's? code)
-          (try
-            (viz/evaluated! code (when-not error *1) error)
-            (catch :default e
-              (println "determinismo.viz:" e))))
-        answer))))
+  (:require [cards.main :as main]
+            [determinismo.viz :as viz]
+            [determinismo.viz.lab]))
 
 (defn -main [& args]
-  (deref (nrepl/background-main))
-  (tell-evaluations!)
   (viz/listen!)
-  (viz/open! {:hidden (some (fn [arg] (= arg "--hidden")) args)
-              :record (after "--record" args)})
-  (viz/loop!)
-  ;; Gone at once, nothing torn down under a REPL thread still compiling (detviz::quit).
-  (cpp/detviz.quit))
+  ;; The viz's own calls (a card by hand, a script asking it) make no card of their own.
+  (main/quiet! "determinismo.viz/")
+  (main/run! (assoc (main/options args) :title "determinismo")))

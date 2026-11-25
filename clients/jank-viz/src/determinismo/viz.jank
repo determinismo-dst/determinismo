@@ -1,62 +1,78 @@
 ;; SPDX-License-Identifier: MIT
-;; determinismo's data drawn with Dear ImGui, following a jank REPL: a printer for what the
-;; REPL does. On top, the run's multiverse (its timelines, where they branch, their faults and
-;; failures, the moment a session is at). Below, a card for each evaluation, shown by what it
-;; was: a session opened (its timeline, its moment, how it was found, the faults around it),
-;; registers and memory with what they were before beside what they are now, the instructions
-;; at an address before and after a poke, a command's output, a query's events and maps as EDN,
-;; SQL's rows as a table, numbers as bars with what changed since the last ones, anything else
-;; as it prints; none for nil. Nothing to call for it: the REPL's
-;; evaluations (jank's nREPL server, in this process) and the client's calls
-;; (determinismo.tap) are told here. The drawing is plain jank over a few native primitives
-;; (include/detviz.hpp), changed from the REPL like anything else.
+;; determinismo's cards, for the window of cards that follows a jank REPL (jankifier/cards: the
+;; window, its feed of cards, handlers, pinned cards and the drawing primitives). What is
+;; determinismo's is here: pinned on top, the run's multiverse (its timelines, where they branch,
+;; their faults and failures, the moment a session is at) and a game's screen; in the feed, a card
+;; for each evaluation shown by what the client did during it: a session opened (its timeline, its
+;; moment, how it was found, the faults around it), registers and memory with what they were
+;; before beside what they are now, the instructions at an address before and after a poke, a
+;; crash's stack, a command's output, a query's events and nested values as EDN, SQL's rows, a few
+;; numbers as bars with what changed since the last ones. Anything else is the cards' own (text, a
+;; flat map, a table, numbers, a matrix). Nothing to call for it: the REPL's evaluations are told to
+;; the cards, and the client's calls (determinismo.tap) here. The moment lab's cards are
+;; determinismo.viz.lab's.
 (ns determinismo.viz
-  (:include "detviz.hpp")
   (:require [clojure.string :as str]
+            [cards.core :as c]
             [determinismo.api :as api]
             [determinismo.http :as http]
             [determinismo.json :as json]
             [determinismo.tap :as tap]))
 
-;; serve's palette.
-(def paper 0xfdf6d8)
-(def card 0xfffbe6)
-(def ink 0x1c1b18)
-(def muted 0x7a7466)
-(def rule 0xcfc49a)
-(def red 0xb3261e)
-(def green 0x2e7d32)
-(def blue 0x1a4f8b)
-(def orange 0xb86b00)
-(def purple 0x6a1b9a)
+;; serve's palette, the cards' own.
+(def paper c/paper)
+(def card c/card)
+(def ink c/ink)
+(def muted c/muted)
+(def rule c/rule)
+(def red c/red)
+(def green c/green)
+(def blue c/blue)
+(def orange c/orange)
+(def purple c/purple)
 
 ;; A game's crates on a screen (a session's frames), each its id's last digit's colour.
 (def ^:private digit-of (zipmap (map str (range 10)) (range 10)))
 (def ^:private crate-colors [0xb3261e 0x1a4f8b 0x2e7d32 0xb86b00 0x6a1b9a 0x00838f 0xad1457 0x4e342e 0x283593 0x558b2f])
 
-;; Text sizes (detviz.hpp): mono small, normal, large; serif normal, large.
-(def small 0)
-(def mono 1)
-(def big 2)
-(def serif 3)
-(def title 4)
+;; Text sizes: mono small, normal, large; serif normal, large.
+(def small c/small)
+(def mono c/mono)
+(def big c/big)
+(def serif c/serif)
+(def title c/title)
 
-(def state
+(defonce state
   (atom {:run nil :info nil :timelines [] :marks [] :visits [] :looked #{} :cursor nil
-         :session nil :cards [] :live false}))
+         :session nil :live false}))
 
 ;; What the client did during the evaluation under way (the REPL's thread), for its card.
-(def ^:private told (atom []))
+(defonce ^:private told (atom []))
+;; The cards made so far (their data): what a value was, for its next card's before.
+(defonce ^:private shown (atom []))
+;; An agent's lines as they come (determinismo.quint's), drawn by its card live.
+(defonce ^:private agent-lines (atom []))
+;; Keys whose maps another namespace's handlers draw (determinismo.viz.lab's results): no card of
+;; this file's for them.
+(defonce owned-keys (atom #{:det/card}))
 
-;; Native primitives, by name.
-(defn- text! [x y color size what] (cpp/detviz.text x y color size what))
-(defn- text-width [size what] (cpp/detviz.text_width size what))
-(defn- line! [x1 y1 x2 y2 color thickness] (cpp/detviz.line x1 y1 x2 y2 color thickness))
-(defn- curve! [x1 y1 x2 y2 color thickness] (cpp/detviz.curve x1 y1 x2 y2 color thickness))
-(defn- rect! [x1 y1 x2 y2 color alpha rounding] (cpp/detviz.rect x1 y1 x2 y2 color alpha rounding))
-(defn- frame! [x1 y1 x2 y2 color thickness] (cpp/detviz.frame x1 y1 x2 y2 color thickness))
-(defn- circle! [x y radius color alpha] (cpp/detviz.circle x y radius color alpha))
-(defn- ring! [x y radius color thickness] (cpp/detviz.ring x y radius color thickness))
+(defn- owned? [value]
+  (and (map? value) (some (fn [k] (contains? value k)) @owned-keys)))
+
+(def ^{:dynamic true :doc "True on a thread acting for the window itself (a button's): what the
+  client does there makes no evaluation's card."} *own* false)
+
+;; The cards' primitives, by the names this file draws with.
+(def ^:private text! c/text!)
+(def ^:private text-width c/text-width)
+(def ^:private line! c/line!)
+(def ^:private curve! c/curve!)
+(def ^:private rect! c/rect!)
+(def ^:private frame! c/frame!)
+(def ^:private circle! c/circle!)
+(def ^:private ring! c/ring!)
+(def ^:private clip c/clip)
+
 
 ;; Times are doubles wherever they are added or multiplied: jank 0.1's integer + and * wrap at
 ;; 32 bits when both operands fit in them ((* 3000 1000000) is -1294967296), and a moment in
@@ -88,25 +104,12 @@
         (apply str "0x" out)
         (recur (quot n 16) (conj out (nth hex-digits (mod n 16))))))))
 
-(defn- clip
-  "`what` cut to `width` points at size `size`."
-  [size width what]
-  (let [what (str what)]
-    (if (<= (text-width size what) width)
-      what
-      (loop [n (count what)]
-        (let [cut (str (subs what 0 n) "…")]
-          (if (or (<= n 1) (<= (text-width size cut) width))
-            cut
-            (recur (- n (max 1 (quot n 8))))))))))
-
 (defn- instructions
   "The x86-64 instructions `bytes` are (llvm-mc), a line each; none without the tool."
   [bytes]
-  (let [said (str (cpp/detviz.run (cpp/cast cpp/std.string
-                                            (str "printf '" (str/join " " (map (fn [b] (str "0x" (hex2 b))) bytes))
-                                                 "' | /opt/homebrew/opt/llvm/bin/llvm-mc --disassemble -triple=x86_64 2>/dev/null"))))]
-    (->> (str/split-lines said)
+  (let [[_ said] (http/run ["sh" "-c" (str "printf '" (str/join " " (map (fn [b] (str "0x" (hex2 b))) bytes))
+                                           "' | /opt/homebrew/opt/llvm/bin/llvm-mc --disassemble -triple=x86_64 2>/dev/null")])]
+    (->> (str/split-lines (str said))
          (map str/trim)
          (remove (fn [line] (or (str/blank? line) (str/starts-with? line "."))))
          (mapv (fn [line] (str/replace line "\t" " "))))))
@@ -157,6 +160,7 @@
           timelines (fetch (str "/runs/" run "/timelines"))
           marks (distinct (concat (marks-of run nil)
                                   (mapcat (fn [index] (marks-of run index)) (:looked @state))))]
+      (swap! c/state assoc :title (str "Run " run (when-let [scenario (get-in info [:request :scenario])] (str " · " scenario))))
       (swap! state (fn [s]
                      (assoc s
                             :info info
@@ -168,7 +172,10 @@
                             :live (= "running" (:state info)))))))
   nil)
 
+(declare pin-map!)
+
 (defn- switch-run! [run]
+  (pin-map!)
   (when (not= run (:run @state))
     (swap! state assoc :run run :timelines [] :marks [] :visits [] :looked #{} :cursor nil :session nil :ghosts [] :planned nil)))
 
@@ -217,6 +224,10 @@
 ;; examples/jank-game and examples/flecs-game draw it), from the last one before its moment, then
 ;; as it comes while the session is open (serve's /sessions/<id>/latest), drawn under the map.
 
+(declare pin-screen!)
+
+(defonce ^:private screen-pinned (atom false))
+
 (defn- screen-frame-of
   "A `frame` event as the screen shows it: its board, counts and moment; nil without a board."
   [event]
@@ -234,17 +245,26 @@
                                       {:condition "event=frame" :branch branch
                                        :up_to_vtime (/ at-ns 1000000000.0) :limit 5000})))]
       (when-let [frame (screen-frame-of before)]
-        (swap! state (fn [s] (if (= id (:id (:session s))) (assoc s :screen frame) s))))
+        (swap! state (fn [s] (if (= id (:id (:session s))) (assoc s :screen frame) s)))
+        (pin-screen!))
       (loop []
         (when (= id (:id (:session @state)))
           (let [said (try (api/request :get (str "/sessions/" id "/latest?event=frame")) (catch :default _ nil))]
             (when (and (string? said) (not (str/blank? said)))
               (when-let [frame (screen-frame-of (json/read-json said))]
-                (swap! state (fn [s] (if (= id (:id (:session s))) (assoc s :screen frame) s))))))
+                (swap! state (fn [s] (if (= id (:id (:session s))) (assoc s :screen frame) s)))
+                (pin-screen!))))
           (http/sleep-ms 100)
           (recur))))))
 
 (def ^:private found-marks-max 400)
+
+(defn- tell!
+  "A call of the client's, for the card of the evaluation under way (none for the window's own
+  actions: a button's)."
+  [said]
+  (when-not *own*
+    (swap! told conj said)))
 
 (defn- heard
   "What the client did: the map's state after it, and its part of the evaluation's card."
@@ -261,7 +281,7 @@
                                       :visits (conj (:visits s) {:timeline (:branch data) :at-ns at}))))
           ;; Its screen (after the state names it: the follower stops once it no longer does).
           (screen-follow! (:run data) (:branch data) at (:session data))
-          (swap! told conj [kind session])))
+          (tell! [kind session])))
 
     ;; A plan: the timeline it would be, a ghost row where it would leave, until it is opened.
     (= kind :session/plan)
@@ -271,29 +291,33 @@
                                                     :start_ns (* 1000000.0 (:at_vtime_ms data))
                                                     :vtime_ns (* 1000000.0 (:at_vtime_ms data))
                                                     :from_ns (* 1000000.0 (:from_vtime_ms data))}))))
-        (swap! told conj [kind data]))
+        (tell! [kind data]))
 
     (= kind :session/close)
     (do (swap! state assoc :cursor nil :session nil :screen nil)
+        (when @screen-pinned
+          (reset! screen-pinned false)
+          (c/unpin! "screen"))
         (refresh!)
-        (swap! told conj [kind data]))
+        (tell! [kind data]))
 
     ;; A run planned: the map shows its imagined first timelines, setups only, until it starts.
     (= kind :run/plan)
-    (do (swap! state assoc :run nil :info nil :marks [] :visits [] :looked #{} :cursor nil :session nil
+    (do (pin-map!)
+        (swap! state assoc :run nil :info nil :marks [] :visits [] :looked #{} :cursor nil :session nil
                :ghosts [] :planned data
                :timelines (mapv (fn [setup] {:index (:index setup) :ghost true :setup true :start_ns 0 :vtime_ns 0})
                                 (:setups data)))
-        (swap! told conj [kind data]))
+        (tell! [kind data]))
 
     (= kind :run/start)
     (do (show-run! (:run data))
         (follow! (:run data))
-        (swap! told conj [kind data]))
+        (tell! [kind data]))
 
     (= kind :run/done)
     (do (show-run! (:run data))
-        (swap! told conj [kind data]))
+        (tell! [kind data]))
 
     (= kind :replay)
     (do (look! (:run data) (:branch (:request data)))
@@ -302,7 +326,7 @@
                              :until (:until request) :rewind-ms (:rewind_ms request)})]
           (swap! state (fn [s] (assoc s :looked (conj (:looked s) (:branch request))
                                       :visits (conj (:visits s) {:timeline (:branch request) :at-ns at}))))
-          (swap! told conj [kind (assoc data :at-ns at)])))
+          (tell! [kind (assoc data :at-ns at)])))
 
     (= kind :query)
     (do (look! (:run data) (:branch (:request data)))
@@ -324,7 +348,7 @@
                                                             (when-let [at (or (:vtime_ns event) (:first_vtime_ns event))]
                                                               {:timeline (:branch event) :at-ns at :kind :found}))
                                                           (take found-marks-max (:events data))))))))
-        (swap! told conj [kind data]))
+        (tell! [kind data]))
 
     ;; Its flag at once: the session's events reach serve's store when it ends.
     (= kind :checkpoint)
@@ -332,11 +356,11 @@
                                                                    {:timeline (:timeline data) :kind :checkpoint
                                                                     :at-ns (:vtime_ns (:checkpoint data))
                                                                     :what (:name (:checkpoint data))}))))))
-        (swap! told conj [kind data]))
+        (tell! [kind data]))
 
     (or (= kind :sql) (= kind :properties))
     (do (show-run! (:run data))
-        (swap! told conj [kind data]))
+        (tell! [kind data]))
 
     ;; A timeline checked against a Quint spec: where the spec's invariant was lost, or the
     ;; event the spec refuses, a ring on the timeline's row beside its own first failure.
@@ -347,26 +371,22 @@
                                                                    {:timeline (:timeline data) :kind :quint
                                                                     :at-ns (:vtime_ns event)
                                                                     :what (or (:invariant data) (:action event))})))))))
-        (swap! told conj [kind data]))
+        (tell! [kind data]))
 
     (= kind :quint-kinds)
     (do (look! (:run data) (:timeline data))
-        (swap! told conj [kind data]))
+        (tell! [kind data]))
 
     ;; An agent at work: each thing it runs and each answer of its checks, on one card as it
     ;; comes (the evaluation ends when the agent does).
     (= kind :quint-agent)
-    (swap! state (fn [s]
-                   (let [cards (:cards s)
-                         newest (last cards)]
-                     (if (:agent newest)
-                       (assoc s :cards (conj (vec (butlast cards))
-                                             (assoc newest :lines (vec (take-last 12 (conj (:lines newest) (str (:line data))))))))
-                       (assoc s :cards (conj (vec cards) {:code "the agent" :view :lines :agent true
-                                                         :lines [(str (:line data))]}))))))
+    (let [first-line (empty? @agent-lines)]
+      (swap! agent-lines (fn [lines] (vec (take-last 12 (conj lines (str (:line data)))))))
+      (when first-line
+        (c/show "the agent" {:det/card true :view :agent})))
 
     :else
-    (swap! told conj [kind data]))
+    (tell! [kind data]))
   nil)
 
 ;; A card: an evaluation's code, how it is shown (:view), and what that view shows.
@@ -459,25 +479,30 @@
     {:at (if (str/starts-with? at "/") (str/join "/" (take-last 2 parts)) at) :own own}))
 
 (defn- shaped
-  "A value's view: numbers as bars, rows as a table, a flat map as its keys and values, a
-  nested one as EDN, text as lines, a number or a word as it prints; none for nil."
+  "A value's view among determinismo's: a crash's stack, registers, a few numbers as bars with
+  what changed, a nested value as EDN. nil for what the cards' own kinds draw (text, a flat map,
+  rows as a table, many numbers, a matrix)."
   [value]
   (cond
     (nil? value) nil
+    (not (coll? value)) nil
+    (owned? value) nil
+    (:cards/view (meta value)) nil
+    (and (vector? value) (contains? #{:col :row :text :space :draw} (first value))) nil
     ;; A crash's stack (the crash_stack event's details): where it crashed.
     (and (map? value) (vector? (:frames value)) (contains? value :rip))
     {:view :stack :process (:process value) :signal (:signal value) :fault (:fault_address value)
      :frames (mapv frame-of (take 10 (:frames value)))}
     (and (map? value) (contains? value :rip)) {:view :registers :registers value}
-    (and (vector? value) (seq value) (every? number? value)) {:view :numbers :numbers value}
+    (and (vector? value) (seq value) (<= (count value) 32) (every? number? value)) {:view :numbers :numbers value}
+    (and (sequential? value) (seq value) (every? number? value)) nil
+    (and (sequential? value) (seq value) (every? sequential? value) (every? (fn [row] (every? number? row)) value)) nil
     (and (sequential? value) (seq value) (every? map? value)
-         (every? (fn [row] (every? plain? (vals row))) value)) {:view :table :rows (mapv brief-row (take 8 value))
-                                                                :count (count value)}
-    (and (map? value) (seq value) (every? plain? (vals value)))
-    {:view :table :rows (mapv (fn [[k v]] {:key (if (keyword? k) (name k) (str k)) :value (brief v)}) value)}
+         (every? (fn [row] (every? plain? (vals row))) value)) nil
+    (and (map? value) (seq value) (every? plain? (vals value))) nil
+    (and (map? value) (contains? value :det/card)) nil
     (and (sequential? value) (seq value) (every? string? value)) {:view :lines :lines (mapv brief (take-last 8 value))}
-    (and (string? value) (str/includes? value "\n")) {:view :lines :lines (mapv brief (take-last 8 (str/split-lines value)))}
-    (plain? value) {:view :value :said (brief value)}
+    (empty? value) nil
     :else {:view :edn :lines (pretty-lines value 16)}))
 
 ;; A run's draws (determinismo.api's draw-split and draw-sets): a row a label, its values side
@@ -604,10 +629,12 @@
                       replay (str "timeline #" (:branch (:request replay)) (when (:at-ns replay) (str " at " (seconds (:at-ns replay)))))
                       now (str "session " (:id now) (when (:timeline now) (str " · timeline #" (:timeline now))))
                       :else nil)
-        cards (:cards s)
+        cards @shown
         view
         (cond
        error {:view :error :said error}
+       ;; A result another namespace's handlers draw (the lab's): theirs, whatever it did.
+       (owned? value) nil
        ;; Before the sessions and looks they make on the way (regs, mem, where, a session per
        ;; look): the moment found, the calls named.
        momented (let [found (:found momented)]
@@ -708,68 +735,7 @@
                  (assoc view :was (:numbers (previous-of cards :numbers)))
                  view)))]
     (when view
-      (merge {:code code :context context} view))))
-
-(defn evaluated!
-  "An evaluation ended: its card, last in the feed."
-  [code value error]
-  (let [happened @told
-        value (if (var? value) (deref value) value)]
-    (reset! told [])
-    (when-not (or (str/blank? code) (and (fn? value) (empty? happened)))
-      (swap! state (fn [s]
-                     (if-let [made (card-of s code value error happened)]
-                       (assoc s :cards (vec (take-last 400 (conj (:cards s) made))))
-                       s))))
-    nil))
-
-(defn show
-  "A value on a card of its own (the REPL's results go there by themselves)."
-  ([value] (show "value" value))
-  ([said value]
-   (swap! state (fn [s] (assoc s :cards (conj (:cards s) (merge {:code said} (or (shaped value) {:view :note :said (pr-str value)}))))))
-   value))
-
-(defn clear!
-  "No cards."
-  []
-  (swap! state assoc :cards [])
-  nil)
-
-(defn listen!
-  "The client's calls shown from now on."
-  []
-  (tap/listen! (fn [kind data] (heard kind data))))
-
-;; Drawing. Points from the window's top left.
-
-(defn- box!
-  "A panel: its title over a rule; where its content starts (y)."
-  [x y width height what]
-  (rect! x y (+ x width) (+ y height) card 1.0 6.0)
-  (frame! x y (+ x width) (+ y height) rule 1.0)
-  (text! (+ x 14) (+ y 10) ink serif what)
-  (line! (+ x 14) (+ y 34) (- (+ x width) 14) (+ y 34) rule 1.0)
-  (+ y 44))
-
-(defn- draw-header [s width]
-  (let [info (:info s)
-        request (:request info)
-        run (:run s)
-        planned (:planned s)
-        said (cond run (str "Run " run (when (:scenario request) (str " · " (:scenario request))))
-                   planned (str "A run planned" (when (:scenario planned) (str " · " (:scenario planned))))
-                   :else "determinismo")]
-    (text! 32 22 ink title said)
-    (when info
-      (let [now (str (:state info))]
-        (text! (+ 44 (text-width title said)) 34 (if (= now "failed") red (if (= now "running") blue green)) small (str/upper-case now)))
-      (text! 32 60 muted small
-             (clip small (- width 64)
-                   (str (last (str/split (str (or (:program_asked request) (:compose request) "")) #"/"))
-                        (when (:profile request) (str " · profile " (:profile request)))
-                        (when (some? (:seed request)) (str " · seed " (:seed request)))))))
-    (line! 32 84 (- width 32) 84 ink 1.5)))
+      (merge {:det/card true :code code :context context} view))))
 
 (defn- rows-of
   "The timelines with a row: the explored ones, and of the sessions' those the REPL is at or
@@ -786,7 +752,9 @@
                    (if (or (nil? t) (contains? found index))
                      (recur found (rest left))
                      (recur (conj found index) (concat (rest left) (when (some? (:extends t)) [(:extends t)])))))))]
-    (vec (sort-by :index (filter (fn [t] (or (nil? (:extends t)) (contains? kept (:index t)))) timelines)))))
+    ;; Compact (the lab's): only those, the run's own timelines left out.
+    (vec (sort-by :index (filter (fn [t] (or (and (nil? (:extends t)) (not (:compact s))) (contains? kept (:index t))))
+                                 timelines)))))
 
 (defn- view-of
   "The stretch of virtual time the map shows: every timeline; with moments looked at or found
@@ -841,12 +809,57 @@
       (when (and (= index (:timeline visit)) (:at-ns visit))
         (line! (at-x (:at-ns visit)) (- ty 7) (at-x (:at-ns visit)) (+ ty 7) ink 1.0)))))
 
+(defn- map-shape
+  "The map's rows: the timelines drawn, how tall a row is, those drawn again large below."
+  [s0]
+  (let [ghosts (:ghosts s0)
+        s (assoc s0 :timelines (vec (concat (:timelines s0) ghosts)) :looked (into (set (:looked s0)) (map :index ghosts)))
+        timelines (rows-of s)
+        n (count timelines)
+        row (cond (<= n 6) 30.0 (<= n 12) 20.0 (<= n 30) 11.0 :else (/ 300.0 n))
+        large (>= row 11.0)
+        by-index (into {} (map (fn [t] [(:index t) t]) timelines))
+        focus (if large [] (vec (take 3 (filter (fn [index] (contains? by-index index)) (sort (:looked s))))))
+        dense (max 40.0 (* row (max 1 n)))]
+    {:s s :timelines timelines :n n :row row :large large :by-index by-index :focus focus :dense dense
+     :height (+ dense (* 34 (count focus)))}))
+
+(defn- map-height
+  "The multiverse card's body height."
+  [s]
+  (+ (:height (map-shape s)) 58))
+
+(defn- map-title [s]
+  (let [all (count (:timelines s))
+        sessions (count (filter :extends (:timelines s)))]
+    (str "Multiverse · " all (if (= all 1) " timeline" " timelines")
+         (when (pos? sessions) (str ", " sessions " from sessions"))
+         (when (:live s) " · exploring"))))
+
+(defn- draw-status
+  "The run's state and what it runs, a line."
+  [s x y width]
+  (let [info (:info s)
+        request (:request info)
+        planned (:planned s)
+        now (str/upper-case (str (or (:state info) (when planned "planned") "")))]
+    (text! x y (if (= now "FAILED") red (if (= now "RUNNING") blue green)) small now)
+    (text! (+ x 16 (text-width small now)) y muted small
+           (clip small (- width 30 (text-width small now))
+                 (str (last (str/split (str (or (:program_asked request) (:compose request) (:program planned) "")) #"/"))
+                      (when (:scenario request) (str " · " (:scenario request)))
+                      (when (:profile request) (str " · profile " (:profile request)))
+                      (when (some? (:seed request)) (str " · seed " (:seed request)))
+                      (when (:compact s) " · the lab's timelines only"))))))
+
 (defn- draw-map
   "The multiverse: a row a timeline, where each left the one before it, faults, crashes and
   failures on them, the moments looked at, the session's. Many timelines are thin rows, and
-  those the REPL looked at are drawn again below them, large. Returns where it ends (y)."
-  [s0 x y width]
-  (let [ghosts (:ghosts s0)
+  those the REPL looked at are drawn again below them, large. Its first line, the run's state."
+  [s0 x y0 width]
+  (draw-status s0 x y0 width)
+  (let [y (- y0 22)
+        ghosts (:ghosts s0)
         s (assoc s0 :timelines (vec (concat (:timelines s0) ghosts)) :looked (into (set (:looked s0)) (map :index ghosts)))
         timelines (rows-of s)
         n (count timelines)
@@ -865,10 +878,6 @@
         focus-rows (into {} (map-indexed (fn [i index] [index (+ y 46 dense 17 (* 34 i))]) focus))
         all (count (:timelines s0))
         sessions (count (filter :extends (:timelines s0)))]
-    (box! x y width (+ height 78)
-          (str "Multiverse · " all (if (= all 1) " timeline" " timelines")
-               (when (pos? sessions) (str ", " sessions " from sessions"))
-               (when (:live s) " · exploring")))
     (doseq [t timelines]
       (let [ty (get rows (:index t))
             start (or (:start_ns t) 0)
@@ -917,14 +926,15 @@
       (when-let [ty (or (get focus-rows (:timeline cursor)) (get rows (:timeline cursor)))]
         (when (:at-ns cursor)
           (let [cx (at-x (:at-ns cursor))
-                pulse (+ 7.0 (* 2.5 (cpp/sin (* 4.0 (cpp/detviz.seconds)))))]
+                ;; A ring that breathes: a triangle wave, 0.64 a second.
+                phase (let [t (* 0.64 (c/seconds))] (- t (long t)))
+                pulse (+ 7.0 (* 2.5 (- (* 4.0 (abs (- phase 0.5))) 1.0)))]
             (line! cx (+ y 42) cx (+ y 50 height) ink 1.0)
             (circle! cx ty 4.5 ink 1.0)
             (ring! cx ty pulse ink 1.5)
             (text! (+ cx 8) (+ y 36) ink small (seconds (:at-ns cursor)))))))
     (text! left (+ y 56 height) muted small (seconds from))
-    (text! (- right (text-width small (seconds to))) (+ y 56 height) muted small (seconds to))
-    (+ y height 78 14)))
+    (text! (- right (text-width small (seconds to))) (+ y 56 height) muted small (seconds to))))
 
 ;; Each card's body: its height, and its drawing at (x, y).
 
@@ -1424,27 +1434,48 @@
                                                 changes))
                            "the spec's first state")))))))))
 
-(defn- draw-card
-  "One card at (x, y): its code, where it was, its body. Returns its height."
-  [c x y width dim]
-  (let [height (+ 52 (body-height c))
-        inner (- width 28)
-        view (:view c)
-        context (:context c)
-        bx (+ x 14)
-        by (+ y 42)]
-    (rect! x y (+ x width) (+ y height) card (if dim 0.5 1.0) 6.0)
-    (frame! x y (+ x width) (+ y height) (if dim rule ink) 1.0)
-    (text! (+ x 14) (+ y 9) (if dim muted ink) mono
-           (clip mono (- inner (if context (+ 16 (text-width small context)) 0)) (str/replace (str (:code c)) #"\s+" " ")))
-    (when context
-      (text! (- (+ x width) 14 (text-width small context)) (+ y 11) blue small context))
-    (line! (+ x 14) (+ y 32) (- (+ x width) 14) (+ y 32) rule 1.0)
+(defn- draw-screen
+  "The session's screen: its frame's board as a grid, a cell a metre, each crate a block in its
+  colour with its id's last digit; under it the counts and when."
+  [s x y width]
+  (let [screen (:screen s)
+        lines (str/split-lines (:board screen))
+        rows (vec (take-while (fn [line] (re-matches #"[.0-9]+" line)) lines))
+        cell 15.0
+        n (count rows)
+        side (* cell (max 1 (count (first rows))))
+        top y
+        left (+ x (/ (- width side) 2.0))]
+    (rect! left top (+ left side) (+ top (* cell n)) paper 1.0 2.0)
+    (doseq [[r row] (map-indexed vector rows)
+            [c ch] (map-indexed vector row)]
+      (let [cx (+ left (* cell c))
+            cy (+ top (* cell r))]
+        (if (= (str ch) ".")
+          (rect! (+ cx 6.5) (+ cy 6.5) (+ cx 8.5) (+ cy 8.5) rule 1.0 0.0)
+          (let [digit (get digit-of (str ch) 0)]
+            (rect! (+ cx 1) (+ cy 1) (+ cx cell -1) (+ cy cell -1) (nth crate-colors digit) 0.9 2.0)
+            (text! (+ cx 4) (+ cy 0) paper small (str ch))))))
+    (text! left (+ top (* cell n) 8) muted small (str "crates " (:crates screen) "   score " (:score screen)))))
+
+;; A card's body by its view, as a handler of the cards draws it: every card of determinismo's is
+;; a map with :det/card.
+
+(defn- card-height [c]
+  (if (= :agent (:view c))
+    (* 20 (max 1 (min 8 (count @agent-lines))))
+    (body-height c)))
+
+(defn- draw-body
+  "A card's body at (x, y), `inner` wide."
+  [c bx by inner]
+  (let [view (:view c)]
     (cond
       (= view :session) (draw-session c bx by inner)
       (= view :registers) (draw-registers c bx by inner)
       (= view :memory) (draw-memory c bx by inner)
       (= view :lines) (draw-lines c bx by inner)
+      (= view :agent) (draw-lines {:lines @agent-lines} bx by inner)
       (= view :table) (draw-table c bx by inner)
       (= view :edn) (draw-edn (:lines c) bx by inner)
       (= view :stack) (draw-stack c bx by inner)
@@ -1464,119 +1495,103 @@
                               (text! (+ bx 52 (text-width big (str (:virtual c)))) by ink big (str (:physical c))))
       (= view :error) (text! bx by red mono (clip mono inner (:said c)))
       (= view :note) (text! bx by ink mono (clip mono inner (:said c)))
-      :else (text! bx by ink big (clip big inner (:said c))))
-    height))
+      :else (text! bx by ink big (clip big inner (:said c))))))
 
-;; The feed's roll: how far its cards are shifted up (what does not fit goes under the map),
-;; eased toward where the newest card is whole. The render thread's alone.
-(def ^:private roll (atom {:shift 0.0 :at 0.0 :total 0}))
+(c/handle! {:id :determinismo
+            :attr :det/card
+            :height (fn [c width] (card-height c))
+            :draw (fn [c x y width] (draw-body c x y width))})
 
-(defn- draw-feed
-  "The cards in their order from `y`, the newest last and whole: once they pass the bottom all
-  of them are shifted up under the map, the shift eased, so that they roll and do not jump."
-  [s x y width bottom]
-  (let [cards (:cards s)
-        heights (mapv (fn [c] (+ 52 (body-height c) 12)) cards)
-        total (apply + 0 heights)
-        target (max 0.0 (- total (- bottom y)))
-        now (cpp/detviz.seconds)
-        was @roll
-        dt (max 0.0 (min 0.1 (- now (:at was))))
-        left (- target (:shift was))
-        ;; Fewer cards (cleared): where they are at once. More: a part of what is left each frame.
-        shift (if (or (< total (:total was)) (< (if (neg? left) (- left) left) 0.5))
-                target
-                (+ (:shift was) (* left (min 1.0 (* 7.0 dt)))))
-        newest (dec (count cards))
-        top (- y 6)]
-    (reset! roll {:shift shift :at now :total total})
-    (cpp/detviz.clip_begin x top (+ x width 2) bottom)
-    (loop [i 0 at (- y shift)]
-      (when (< i (count cards))
-        (let [height (nth heights i)]
-          (when (and (> (+ at height) top) (< at bottom))
-            (draw-card (nth cards i) x at width (not= i newest)))
-          (recur (inc i) (+ at height)))))
-    ;; What rolls under the map fades into the paper there.
-    (when (> shift 0.5)
-      (rect! x top (+ x width 2) (+ top 6) paper 0.85 0.0)
-      (rect! x (+ top 6) (+ x width 2) (+ top 12) paper 0.55 0.0)
-      (rect! x (+ top 12) (+ x width 2) (+ top 18) paper 0.25 0.0))
-    (cpp/detviz.clip_end)))
+;; An evaluation's card: what the client did during it, told before the card is made
+;; (on-evaluation!), turns its value into one of determinismo's cards; a value the client had no
+;; part in keeps the cards' own kinds unless it is one of determinismo's (registers, a stack).
 
-(defn- draw-screen
-  "The session's screen: its frame's board as a grid, a cell a metre, each crate a block in its
-  colour with its id's last digit; under it the counts and when. Returns where it ends (y)."
-  [s x y width]
-  (let [screen (:screen s)
-        lines (str/split-lines (:board screen))
-        rows (vec (take-while (fn [line] (re-matches #"[.0-9]+" line)) lines))
-        cell 15.0
-        n (count rows)
-        side (* cell (max 1 (count (first rows))))
-        height (+ 44 (* cell n) 34)
-        top (box! x y width height (str "Screen · timeline #" (:timeline (:session s))
-                                       (when (:at-ns screen) (str " at " (seconds (:at-ns screen))))))
-        left (+ x (/ (- width side) 2.0))]
-    (rect! left top (+ left side) (+ top (* cell n)) paper 1.0 2.0)
-    (doseq [[r row] (map-indexed vector rows)
-            [c ch] (map-indexed vector row)]
-      (let [cx (+ left (* cell c))
-            cy (+ top (* cell r))]
-        (if (= (str ch) ".")
-          (rect! (+ cx 6.5) (+ cy 6.5) (+ cx 8.5) (+ cy 8.5) rule 1.0 0.0)
-          (let [digit (get digit-of (str ch) 0)]
-            (rect! (+ cx 1) (+ cy 1) (+ cx cell -1) (+ cy cell -1) (nth crate-colors digit) 0.9 2.0)
-            (text! (+ cx 4) (+ cy 0) paper small (str ch))))))
-    (text! left (+ top (* cell n) 8) muted small (str "crates " (:crates screen) "   score " (:score screen)))
-    (+ y height 14)))
+(defonce ^:private pending (atom nil))
 
-(defn draw
-  "One frame of `s`."
-  [s]
-  (let [width (cpp/detviz.width)
-        height (cpp/detviz.height)]
-    (draw-header s width)
-    (let [map-end (if (:run s) (draw-map s 32 100 (- width 64)) 100)
-          top (if (:screen s) (draw-screen s 32 map-end (- width 64)) map-end)]
-      (if (empty? (:cards s))
-        (text! 32 (+ top 8) muted serif "Evaluate something in the REPL: it is shown here.")
-        (draw-feed s 32 top (- width 64) (- height 20))))))
+(defn- one-line [text]
+  (str/replace (str text) #"\s+" " "))
 
-(defn frames
-  "Frames drawn so far."
+(defn- remember!
+  "A card made, for what the next one says was before (`previous-of`)."
+  [made]
+  (swap! shown (fn [cards] (vec (take-last 60 (conj cards made))))))
+
+(c/defview! :det/evaluation
+  {:shape (fn [value]
+            (let [p @pending]
+              (when (and p (identical? value (:value p)))
+                (reset! pending nil)
+                (when-let [made (card-of @state (:code p) value nil (:happened p))]
+                  (remember! made)
+                  (when-let [shown-card (c/shaped made)]
+                    (if (:context made)
+                      (assoc shown-card :title (str (one-line (:code p)) "   ·   " (:context made)))
+                      shown-card))))))})
+
+(defn- evaluated
+  "An evaluation ended (on the REPL's thread, before its card is made): what the client did
+  during it, kept for its card."
+  [code value error]
+  (reset! pending {:code code :value value :happened @told})
+  (reset! told []))
+
+(defn show
+  "A value on a card of its own, as an evaluation's would be (the REPL's results go there by
+  themselves). Returns the value."
+  ([value] (show "value" value))
+  ([said value]
+   (let [made (card-of @state said value nil [])]
+     (when made (remember! made))
+     (c/show said (or made value)))
+   value))
+
+(defn clear!
+  "No cards in the feed (the pinned ones stay)."
   []
-  (cpp/detviz.frames))
+  (c/clear!))
 
-(defn snapshot!
-  "The next frame written to `path` (a PPM image): a recording's only."
-  [path]
-  (cpp/detviz.snapshot path))
+;; Pinned on top: the multiverse, from the first run shown; a game's screen while a session
+;; shows one.
 
-(defn open!
-  "The window. `hidden` and `record` (a video's path) for a recording."
-  [{:keys [width height hidden record]}]
-  (cpp/detviz.open (or width 960) (or height 1080) (boolean hidden) (or record "")))
+(defonce ^:private map-pinned (atom false))
 
-(defonce ^{:doc "The last error a frame's drawing threw (its message is drawn in red too)."} draw-error (atom nil))
+(defn- multiverse-card [s]
+  (if (or (:run s) (:planned s))
+    (with-meta [:draw (map-height s) (fn [x y width] (draw-map @state x y width))]
+      {:cards/title (map-title s)})
+    [:text {:color :muted} "No run shown yet."]))
 
-(defn- frame-failed!
-  "A frame's drawing threw: what it said, kept and drawn in red."
-  [said]
-  (reset! draw-error said)
-  (text! 32 110 red mono (str "draw: " said)))
+(defn- pin-map! []
+  (when (compare-and-set! map-pinned false true)
+    (c/pin! "multiverse" state (fn [s] (multiverse-card s)))))
 
-(defn loop!
-  "Frames until the window closes: on the main thread."
+(defn- screen-height [s]
+  (let [rows (take-while (fn [line] (re-matches #"[.0-9]+" line)) (str/split-lines (str (:board (:screen s)))))]
+    (+ (* 15.0 (count rows)) 30)))
+
+(defn- screen-card [s]
+  (if (:screen s)
+    (with-meta [:draw (screen-height s) (fn [x y width] (when (:screen @state) (draw-screen @state x y width)))]
+      {:cards/title (str "Screen · timeline #" (:timeline (:session s))
+                         (when (:at-ns (:screen s)) (str " at " (seconds (:at-ns (:screen s))))))})
+    [:text {:color :muted} "No frame yet."]))
+
+(defn- pin-screen! []
+  (when (compare-and-set! screen-pinned false true)
+    (c/pin! "screen" state (fn [s] (screen-card s)))))
+
+(defn compact!
+  "The multiverse drawn with the timelines looked at alone (the lab's), or every one."
+  [on?]
+  (swap! state assoc :compact (boolean on?))
+  nil)
+
+(defonce ^:private listening (atom false))
+
+(defn listen!
+  "The client's calls and the REPL's evaluations shown from now on (once)."
   []
-  (while (cpp/detviz.alive)
-    (cpp/detviz.frame_begin paper)
-    ;; jank binds nil in (catch :default e) (2026-11-18): a thrown value is caught by its
-    ;; type, a native error (a comparison with nil) as std::exception with its what().
-    (try
-      (draw @state)
-      (catch jank.runtime.object_ref e (frame-failed! (or (ex-message e) (str e))))
-      (catch cpp/std.exception e (frame-failed! (str (cpp/.what e))))
-      (catch :default _ (frame-failed! "an error jank does not say")))
-    (cpp/detviz.frame_end))
-  (cpp/detviz.close))
+  (when (compare-and-set! listening false true)
+    (tap/listen! (fn [kind data] (heard kind data)))
+    (c/on-evaluation! (fn [code value error] (evaluated code value error))))
+  nil)

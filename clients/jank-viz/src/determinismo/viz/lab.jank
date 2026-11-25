@@ -1,0 +1,779 @@
+;; SPDX-License-Identifier: MIT
+;; The moment lab's cards (determinismo.lab, determinismo.lean): pinned while a lab is on a
+;; session, refreshed after every step.
+;;
+;; - The moment: the world at the session's moment, the nodes as boxes coloured by their state
+;;   (up, paused, down, halted) with badges (clock, disk, CPU, every fault on them with the time it
+;;   has left), the runner (where the test commands run) above them, and between every two a
+;;   line a direction, coloured by what the faults on do to it (cut, jammed, clogged, slowed,
+;;   degraded). Beside it, what can be done there: click a node or a link's handle for its faults
+;;   as ImGui buttons and sliders, each one `det-faults inject` step of the session's timeline;
+;;   time on by 100 ms, 1 s or 10 s, or until an event query; a checkpoint; a fault tried as a
+;;   comparison (determinismo.lab/compare!). Beside that, what happened since the last action:
+;;   the notable events, the nodes' output, failed properties in red, the test commands' last
+;;   outcomes.
+;; - What a fault changed (a comparison's diff), until dismissed.
+;; - A Lean counterexample's tape being driven: its steps, the next one, what each did.
+;;
+;; The lab's results evaluated at the REPL (lab/fault!, lab/advance!, lab/world, lab/compare!,
+;; lean/load!, lean/next!) get cards of their own in the feed, by handlers on their keys.
+(ns determinismo.viz.lab
+  (:require [clojure.string :as str]
+            [cards.core :as c]
+            [determinismo.lab :as lab]
+            [determinismo.lean :as lean]
+            [determinismo.tap :as tap]
+            [determinismo.viz :as viz]))
+
+(cpp/raw "
+#include <cmath>
+#include <string>
+#include \"imgui.h\"
+#include <jank/runtime/core.hpp>
+#include <jank/runtime/core/math.hpp>
+#include <jank/runtime/core/to_string.hpp>
+#include <jank/runtime/core/truthy.hpp>
+
+// ImGui's widgets with jank values for their labels and numbers.
+namespace detlab
+{
+  inline std::string said(jank::runtime::object_ref const o)
+  {
+    auto const s(jank::runtime::to_string(o));
+    return std::string(s.data(), s.size());
+  }
+
+  inline int whole(jank::runtime::object_ref const o)
+  {
+    return static_cast<int>(jank::runtime::to_real(o));
+  }
+
+  inline bool button(jank::runtime::object_ref const label)
+  {
+    return ImGui::Button(said(label).c_str());
+  }
+
+  inline bool small_button(jank::runtime::object_ref const label)
+  {
+    return ImGui::SmallButton(said(label).c_str());
+  }
+
+  inline bool radio(jank::runtime::object_ref const label, int *value, jank::runtime::object_ref const mine)
+  {
+    return ImGui::RadioButton(said(label).c_str(), value, whole(mine));
+  }
+
+  inline bool checkbox(jank::runtime::object_ref const label, bool *value)
+  {
+    return ImGui::Checkbox(said(label).c_str(), value);
+  }
+
+  inline bool slider(jank::runtime::object_ref const label, int *value, jank::runtime::object_ref const lo,
+                     jank::runtime::object_ref const hi, jank::runtime::object_ref const width)
+  {
+    ImGui::SetNextItemWidth(static_cast<float>(jank::runtime::to_real(width)));
+    return ImGui::SliderInt(said(label).c_str(), value, whole(lo), whole(hi));
+  }
+
+  inline double cosine(jank::runtime::object_ref const a)
+  {
+    return std::cos(jank::runtime::to_real(a));
+  }
+
+  inline double sine(jank::runtime::object_ref const a)
+  {
+    return std::sin(jank::runtime::to_real(a));
+  }
+
+  inline double root(jank::runtime::object_ref const a)
+  {
+    return std::sqrt(jank::runtime::to_real(a));
+  }
+
+  inline void same_line()
+  {
+    ImGui::SameLine();
+  }
+
+  inline void disabled(jank::runtime::object_ref const on)
+  {
+    ImGui::BeginDisabled(jank::runtime::truthy(on));
+  }
+
+  inline void enabled()
+  {
+    ImGui::EndDisabled();
+  }
+}
+")
+
+(def ^:private small c/small)
+(def ^:private mono c/mono)
+(def ^:private big c/big)
+(def ^:private serif c/serif)
+
+(def ^:private halted-color 0x4e4a40)
+(def ^:private state-colors {:up c/green :paused c/blue :down c/red :halted halted-color})
+(def ^:private link-colors {:cut c/red :jammed 0x7f1d1d :clogged c/purple :slowed c/orange :degraded 0xc77700 :ok c/rule})
+(def ^:private badge-colors {:clock c/blue :disk c/purple :cpu c/orange :fault c/red})
+
+;; The window's own state: what is selected, the widgets' values (native, for ImGui), what the
+;; last action said.
+
+(defonce ui (atom {:selected nil :status nil :query "event=node_start"}))
+
+(defonce ^:private duration (cpp/box (cpp/new cpp/int 3000)))
+(defonce ^:private skew (cpp/box (cpp/new cpp/int 500)))
+(defonce ^:private skew-back (cpp/box (cpp/new cpp/bool false)))
+(defonce ^:private cpu (cpp/box (cpp/new cpp/int 10)))
+(defonce ^:private failure (cpp/box (cpp/new cpp/int 2)))
+(defonce ^:private flavor (cpp/box (cpp/new cpp/int 0)))
+(defonce ^:private disruption (cpp/box (cpp/new cpp/int 0)))
+(defonce ^:private comparing (cpp/box (cpp/new cpp/bool false)))
+(defonce ^:private compare-ms (cpp/box (cpp/new cpp/int 3000)))
+
+(defn- int-of [box] (long (cpp/* (cpp/unbox (:* int) box))))
+(defn- bool-of [box] (boolean (cpp/* (cpp/unbox (:* bool) box))))
+
+(def ^:private failures ["errors" "write_errors" "lost_writes" "corrupt_reads" "slow"])
+(def ^:private flavors ["delay_loss" "duplicate" "corrupt" "reorder" "congestion" "burst_loss"])
+(def ^:private disruptions ["stopped" "slowed" "jammed"])
+
+;; Acting from a button: on a thread of its own (a step takes seconds), the window's own (no
+;; evaluation's card), one at a time.
+
+(defn- act!
+  "`f` run for the button `what`, its result or its error said in the controls."
+  [what f]
+  (when-not (or (:busy @lab/state) (:working (:status @ui)))
+    (swap! ui assoc :status {:working what})
+    (future
+      (binding [viz/*own* true]
+        (try
+          (let [result (f)]
+            (swap! ui assoc :status {:done what :result result}))
+          (catch jank.runtime.object_ref e
+            (swap! ui assoc :status {:error (or (ex-message e) (str e)) :what what}))
+          (catch cpp/std.exception e
+            (swap! ui assoc :status {:error (str (cpp/.what e)) :what what})))))
+    nil))
+
+(defn- fault-button!
+  "A fault: applied now, or tried as a comparison when the box says so."
+  [spec]
+  (let [s (:session @lab/state)]
+    (if (bool-of comparing)
+      (act! (str "compare " (lab/fault-said spec)) (fn [] (lab/compare! s spec {:ms (int-of compare-ms)})))
+      (act! (lab/fault-said spec) (fn [] (lab/fault! s spec))))))
+
+;; The world's layout: the runner above, the nodes on an ellipse under it.
+
+(def ^:private box-w 128.0)
+(def ^:private box-h 54.0)
+
+(defn- places
+  "Each endpoint's box centre in the world's drawing at (x, y), `width` by `height`."
+  [names x y width height]
+  (let [n (count names)
+        cx (+ x (/ width 2.0))
+        cy (+ y 96.0 (/ (- height 150.0) 2.0))
+        rx (max 80.0 (- (/ width 2.0) 90.0))
+        ry (max 60.0 (- (/ (- height 150.0) 2.0) 24.0))]
+    (into {"runner" [cx (+ y 34.0)]}
+          (map-indexed (fn [i name]
+                         (let [angle (+ (* -0.5 3.14159265) (/ (* 2.0 3.14159265 (+ i 0.5)) (max 1 n)))]
+                           [name [(+ cx (* rx (cpp/detlab.cosine angle))) (+ cy (* ry (cpp/detlab.sine angle)))]]))
+                       names))))
+
+(defn- edge-point
+  "Where the line from a box's centre toward (tx, ty) leaves the box."
+  [[x y] [tx ty] half-w half-h]
+  (let [dx (- tx x)
+        dy (- ty y)
+        sx (if (zero? dx) 1.0e9 (/ half-w (abs dx)))
+        sy (if (zero? dy) 1.0e9 (/ half-h (abs dy)))
+        t (min sx sy 1.0)]
+    [(+ x (* dx t)) (+ y (* dy t))]))
+
+(defn- arrow!
+  "An arrowhead at (x, y) pointing along (dx, dy)."
+  [x y dx dy color]
+  (let [length (max 0.001 (cpp/detlab.root (+ (* dx dx) (* dy dy))))
+        ux (/ dx length)
+        uy (/ dy length)]
+    (c/triangle! (+ x (* 9.0 ux)) (+ y (* 9.0 uy))
+                 (- x (* 6.0 ux) (* 6.0 uy)) (+ (- y (* 6.0 uy)) (* 6.0 ux))
+                 (+ (- x (* 6.0 ux)) (* 6.0 uy)) (- y (* 6.0 uy) (* 6.0 ux))
+                 color 1.0)))
+
+(defn- dashed! [x1 y1 x2 y2 color thickness]
+  (let [dx (- x2 x1)
+        dy (- y2 y1)
+        length (cpp/detlab.root (+ (* dx dx) (* dy dy)))
+        pieces (max 1 (long (/ length 12.0)))]
+    (doseq [i (range pieces)]
+      (when (even? i)
+        (let [a (/ (* 1.0 i) pieces)
+              b (/ (* 1.0 (inc i)) pieces)]
+          (c/line! (+ x1 (* dx a)) (+ y1 (* dy a)) (+ x1 (* dx b)) (+ y1 (* dy b)) color thickness))))))
+
+(defn- direction!
+  "One direction of a link, offset to its side of the line: its colour, dashed when the packets
+  still pass (slowed, degraded), an arrow when it is not ok."
+  [from to state offset]
+  (let [[x1 y1] from
+        [x2 y2] to
+        dx (- x2 x1)
+        dy (- y2 y1)
+        length (max 0.001 (cpp/detlab.root (+ (* dx dx) (* dy dy))))
+        ox (* offset (/ (- dy) length))
+        oy (* offset (/ dx length))
+        color (get link-colors state c/rule)
+        thick (if (= state :ok) 1.5 3.0)
+        ax1 (+ x1 ox) ay1 (+ y1 oy) ax2 (+ x2 ox) ay2 (+ y2 oy)]
+    (if (contains? #{:slowed :degraded :jammed} state)
+      (dashed! ax1 ay1 ax2 ay2 color thick)
+      (c/line! ax1 ay1 ax2 ay2 color thick))
+    (when (not= state :ok)
+      (arrow! (+ ax1 (* 0.62 dx)) (+ ay1 (* 0.62 dy)) dx dy color))))
+
+(defn- worst-of [link]
+  (first (filter (fn [s] (or (= s (:ab link)) (= s (:ba link)))) lab/link-states)))
+
+(defn- link-said [link]
+  (let [ab (:ab link) ba (:ba link)]
+    (cond (and (= ab :ok) (= ba :ok)) "healthy"
+          (= ab ba) (str (name ab) " both ways")
+          :else (str (:a link) " → " (:b link) " " (name ab) ", " (:b link) " → " (:a link) " " (name ba)))))
+
+(defn- draw-node!
+  "A node's box at its place: its state's colour, its name, state and pid; its badges under it.
+  Selected: framed. Returns whether it was clicked."
+  [node [px py] selected interactive]
+  (let [x1 (- px (/ box-w 2.0)) y1 (- py (/ box-h 2.0))
+        x2 (+ px (/ box-w 2.0)) y2 (+ py (/ box-h 2.0))
+        color (get state-colors (:state node) halted-color)
+        hover (and interactive (c/inside? x1 y1 x2 y2))]
+    (c/rect! x1 y1 x2 y2 color (if hover 1.0 0.88) 7.0)
+    (when selected
+      (c/frame! (- x1 3) (- y1 3) (+ x2 3) (+ y2 3) c/ink 2.5))
+    (c/text! (+ x1 10) (+ y1 7) c/paper big (c/clip big (- box-w 16) (:name node)))
+    (c/text! (+ x1 10) (+ y1 33) c/paper small
+             (str (name (:state node)) (when (:pid node) (str " · pid " (:pid node)))))
+    (doseq [[i badge] (map-indexed vector (take 4 (:badges node)))]
+      (let [by (+ y2 6 (* 16 i))
+            color (get badge-colors (:kind badge) c/red)]
+        (c/circle! (+ x1 5) (+ by 7) 3.5 color 1.0)
+        (c/text! (+ x1 13) by color small (c/clip small (+ box-w 70) (str (:said badge) " · " (:left badge))))))
+    (when (> (count (:badges node)) 4)
+      (c/text! (+ x1 13) (+ y2 6 64) c/muted small (str "and " (- (count (:badges node)) 4) " more")))
+    (and interactive (c/clicked? x1 y1 x2 y2))))
+
+(defn- draw-runner! [[px py]]
+  (let [x1 (- px 60) y1 (- py 16) x2 (+ px 60) y2 (+ py 16)]
+    (c/rect! x1 y1 x2 y2 c/card 1.0 14.0)
+    (c/frame! x1 y1 x2 y2 c/muted 1.0)
+    (c/text! (+ x1 14) (+ y1 8) c/muted small "runner (tests)")))
+
+(defn- legend! [x y]
+  (loop [items [[:ok "ok"] [:cut "cut"] [:jammed "jammed"] [:clogged "clogged"] [:slowed "slowed"] [:degraded "degraded"]]
+         at x]
+    (when (seq items)
+      (let [[state said] (first items)]
+        (if (contains? #{:slowed :degraded :jammed} state)
+          (dashed! at (+ y 7) (+ at 22) (+ y 7) (get link-colors state) 3.0)
+          (c/line! at (+ y 7) (+ at 22) (+ y 7) (get link-colors state) (if (= state :ok) 1.5 3.0)))
+        (c/text! (+ at 27) y c/muted small said)
+        (recur (rest items) (+ at 40 (c/text-width small said)))))))
+
+(defn world-height [w] 430.0)
+
+(defn draw-world!
+  "The world `w` (determinismo.lab/view's) at (x, y), `width` wide: the runner, the nodes and
+  every link, the moment's line above. `interactive`: nodes and links answer clicks (they select)."
+  [w x y width interactive]
+  (let [height (world-height w)
+        names (mapv :name (:nodes w))
+        at (places names x y width height)
+        selected (:selected @ui)
+        faults (count (:faults w))]
+    (c/text! x y c/ink mono
+             (c/clip mono width
+                     (str "at " (lab/at-said (:at-ns w))
+                          (if (:injector w) " · injector running" (when (false? (:injector w)) " · injector stopped"))
+                          (when (:quiet w) (str " · quiet " (lab/secs (:quiet w)) " left"))
+                          (when (and (:clock-ns w) (not (zero? (:clock-ns w)))) (str " · clock skipped " (lab/secs (:clock-ns w))))
+                          " · " faults (if (= 1 faults) " fault on" " faults on"))))
+    ;; Links first, under the boxes: each direction a line of its own.
+    (doseq [link (:links w)]
+      (let [pa (get at (:a link))
+            pb (get at (:b link))
+            runner (= "runner" (:a link))]
+        (when (and pa pb)
+          (let [from (edge-point pa pb (if runner 60.0 (/ box-w 2.0)) (if runner 16.0 (/ box-h 2.0)))
+                to (edge-point pb pa (/ box-w 2.0) (/ box-h 2.0))
+                quiet (and runner (= :ok (:ab link)) (= :ok (:ba link)))]
+            (if quiet
+              (c/line! (first from) (second from) (first to) (second to) c/rule 1.0)
+              (do (direction! from to (:ab link) 3.5)
+                  (direction! to from (:ba link) 3.5)))
+            ;; A handle to select it, mid-line.
+            (let [mx (/ (+ (first from) (first to)) 2.0)
+                  my (/ (+ (second from) (second to)) 2.0)
+                  worst (worst-of link)
+                  chosen (= selected {:link [(:a link) (:b link)]})
+                  hover (and interactive (c/inside? (- mx 9) (- my 9) (+ mx 9) (+ my 9)))]
+              (c/circle! mx my (if (or hover chosen) 8.0 6.0) (get link-colors worst c/rule) 1.0)
+              (c/ring! mx my (if (or hover chosen) 8.0 6.0) c/ink (if chosen 2.5 1.0))
+              (when (and interactive (c/clicked? (- mx 9) (- my 9) (+ mx 9) (+ my 9)))
+                (swap! ui assoc :selected {:link [(:a link) (:b link)]})))))))
+    (draw-runner! (get at "runner"))
+    (doseq [node (:nodes w)]
+      (when (draw-node! node (get at (:name node)) (= selected {:node (:name node)}) interactive)
+        (swap! ui assoc :selected {:node (:name node)})))
+    (legend! x (+ y height -18))))
+
+;; The controls: ImGui's widgets for the selection, time, checkpoints and comparisons.
+
+(defn- row! [x y] (c/cursor! x y))
+
+(defn- button! [label] (boolean (cpp/detlab.button label)))
+
+(defn- small-button! [label] (boolean (cpp/detlab.small_button label)))
+
+(defn- same-line! [] (cpp/detlab.same_line))
+
+(defn- slider! [label box lo hi width]
+  (cpp/detlab.slider label (cpp/unbox (:* int) box) lo hi width))
+
+(defn- checkbox! [label box]
+  (cpp/detlab.checkbox label (cpp/unbox (:* bool) box)))
+
+(defn- disabled! [on] (cpp/detlab.disabled (boolean on)))
+
+(defn- enabled! [] (cpp/detlab.enabled))
+
+(defn- radios!
+  "A radio button for each of `options` (the values `from` on), side by side."
+  [box options from]
+  (doseq [[i option] (map-indexed vector options)]
+    (when (pos? i) (same-line!))
+    (cpp/detlab.radio (str option "##" (+ from i)) (cpp/unbox (:* int) box) (+ from i))))
+
+(defn- duration-ms [] (int-of duration))
+
+(defn- node-controls! [node x y width]
+  (let [d (duration-ms)
+        run (fn [spec] (fault-button! (assoc spec :node node :duration_ms d)))]
+    (row! x y)
+    (when (button! "Pause##n") (run {:kind "pause"}))
+    (same-line!)
+    (when (button! "Kill##n") (run {:kind "restart"}))
+    (same-line!)
+    (when (button! "Power loss##n") (run {:kind "crash"}))
+    (same-line!)
+    (when (button! "Stop##n") (run {:kind "stop"}))
+    (row! x (+ y 30))
+    (when (button! "Isolate##n") (run {:kind "isolate"}))
+    (same-line!)
+    (when (button! "Clog in##n") (run {:kind "clog" :direction "inbound"}))
+    (same-line!)
+    (when (button! "Clog out##n") (run {:kind "clog" :direction "outbound"}))
+    (same-line!)
+    (when (button! "Clog both##n") (run {:kind "clog" :direction "both"}))
+    (row! x (+ y 64))
+    (slider! "##cpu" cpu 5 50 (min 160.0 (- width 150)))
+    (same-line!)
+    (when (button! "Throttle CPU %##n") (run {:kind "throttle" :cpu_percent (int-of cpu)}))
+    (row! x (+ y 94))
+    (slider! "##skew" skew 1 10000 (min 160.0 (- width 220)))
+    (same-line!)
+    (checkbox! "back##skew" skew-back)
+    (same-line!)
+    (when (button! "Skew clock ms##n")
+      (run {:kind "clock_skew" :skip_ms (int-of skew) :forward (not (bool-of skew-back))}))
+    (row! x (+ y 124))
+    (radios! failure (subvec failures 0 3) 0)
+    (row! x (+ y 150))
+    (radios! failure (subvec failures 3 5) 3)
+    (same-line!)
+    (when (button! "Disk fault##n") (run {:kind "disk" :failure (nth failures (int-of failure))}))))
+
+(defn- link-controls! [[a b] x y width]
+  (let [d (duration-ms)
+        nodes (fn [name] (if (= name "runner") "runner" name))
+        form (nth disruptions (int-of disruption))
+        run (fn [spec] (fault-button! (assoc spec :duration_ms d)))]
+    (row! x y)
+    (radios! disruption disruptions 0)
+    (row! x (+ y 28))
+    (when (button! "Partition both ways##l")
+      (run {:kind "partition_groups" :groups [[(nodes a)] [(nodes b)]] :direction "both" :disruption form}))
+    (row! x (+ y 58))
+    (when (button! (str "One way " a " → " b "##l"))
+      (run {:kind "partition_groups" :groups [[(nodes a)] [(nodes b)]] :direction "outbound" :disruption form}))
+    (same-line!)
+    (when (button! (str "One way " b " → " a "##l"))
+      (run {:kind "partition_groups" :groups [[(nodes b)] [(nodes a)]] :direction "outbound" :disruption form}))
+    (when-not (= a "runner")
+      (row! x (+ y 92))
+      (radios! flavor (subvec flavors 0 3) 0)
+      (row! x (+ y 118))
+      (radios! flavor (subvec flavors 3 6) 3)
+      (row! x (+ y 146))
+      (when (button! (str "Degrade " a " → " b "##l"))
+        (run {:kind "degrade" :node a :peer b :flavor (nth flavors (int-of flavor))}))
+      (same-line!)
+      (when (button! (str "Degrade " b " → " a "##l"))
+        (run {:kind "degrade" :node b :peer a :flavor (nth flavors (int-of flavor))})))))
+
+(defn controls-height [] 470.0)
+
+(defn- draw-controls!
+  "What can be done at the moment, as ImGui's widgets, at (x, y), `width` wide."
+  [lab x y width]
+  (let [s (:session lab)
+        status (:status @ui)
+        busy (or (:busy lab) (:working status))
+        selected (:selected @ui)
+        w (lab/view lab)
+        state-of (fn [name] (some (fn [n] (when (= name (:name n)) (:state n))) (:nodes w)))]
+    (c/text! x y c/ink c/mono-bold
+             (cond (:node selected) (str (:node selected) " · " (name (or (state-of (:node selected)) :up)))
+                   (:link selected) (let [[a b] (:link selected)
+                                          link (some (fn [l] (when (and (= a (:a l)) (= b (:b l))) l)) (:links w))]
+                                      (str a " — " b " · " (if link (link-said link) "")))
+                   :else "Click a node or a link's handle"))
+    (disabled! busy)
+    (row! x (+ y 30))
+    (slider! "fault ms##all" duration 100 20000 (min 240.0 (- width 90)))
+    (cond (:node selected) (node-controls! (:node selected) x (+ y 60) width)
+          (:link selected) (link-controls! (:link selected) x (+ y 60) width)
+          :else nil)
+    (row! x (+ y 240))
+    (when (button! "Restore the network") (fault-button! {:kind "restore"}))
+    (same-line!)
+    (checkbox! "try as a comparison" comparing)
+    (when (bool-of comparing)
+      (row! x (+ y 270))
+      (slider! "ms after##cmp" compare-ms 500 10000 (min 200.0 (- width 120))))
+    (c/text! x (+ y 304) c/muted small "the timeline on")
+    (row! x (+ y 322))
+    (when (button! "+100 ms") (act! "advance 100 ms" (fn [] (lab/advance! s 100))))
+    (same-line!)
+    (when (button! "+1 s") (act! "advance 1 s" (fn [] (lab/advance! s 1000))))
+    (same-line!)
+    (when (button! "+10 s") (act! "advance 10 s" (fn [] (lab/advance! s 10000))))
+    (same-line!)
+    (when (button! "Checkpoint")
+      (act! "checkpoint" (fn [] (lab/checkpoint! s (str "lab-" (:timeline lab) "-" (inc (count (:checkpoints lab))))))))
+    (row! x (+ y 354))
+    (when (button! "Until") (let [q (:query @ui)] (act! (str "until " q) (fn [] (lab/until! s q)))))
+    (c/text! (+ x 62) (+ y 358) c/ink mono (c/clip mono (- width 62) (str (:query @ui))))
+    (row! x (+ y 384))
+    (doseq [[i [label q]] (map-indexed vector [["a fault" "event=fault"] ["a node starts" "event=node_start"]
+                                               ["a property fails" "assert.condition=false"]])]
+      (when (pos? i) (same-line!))
+      (when (small-button! (str label "##q"))
+        (swap! ui assoc :query q)))
+    (enabled!)
+    (let [line (cond (:working status) [c/blue (str "working: " (:working status))]
+                     (:busy lab) [c/blue (str "working: " (:busy lab))]
+                     (:error status) [c/red (str (:what status) ": " (:error status))]
+                     (:done status) (let [r (:result status)]
+                                      (cond (:refused r) [c/red (str (:done status) ": " (:refused r))]
+                                            (:applied r) [c/green (str (:done status) ": applied")]
+                                            :else [c/muted (str "done: " (:done status))]))
+                     :else [c/muted "each action is a step of the session's timeline"])]
+      (doseq [[i text] (map-indexed vector (c/wrap-words small width (second line) 3))]
+        (c/text! x (+ y 416 (* 16 i)) (first line) small text)))))
+
+;; What happened since the last action, and the test commands' outcomes.
+
+(defn- event-said
+  "An event as a line: its name and what of its details says most."
+  [e]
+  (let [event (:event e)
+        details (:details event)
+        a (or (:assert event) (:antithesis_assert event))]
+    (cond
+      a (str (if (false? (:condition a)) "FAILED " "") (:message a))
+      (= "fault" (:event event)) (str "fault " (lab/fault-said details))
+      :else (str (:event event)
+                 (when (map? details)
+                   (let [said (str/join " " (keep (fn [k] (when-let [v (get details k)] (str (name k) "=" v)))
+                                                  [:node :kind :command :status :name :err :point :process]))]
+                     (when (seq said) (str " " said))))))))
+
+(defn- since-lines
+  "The lines of the since column: [colour text] each."
+  [lab]
+  (let [events (:since lab)
+        from (:mark-ns lab)
+        w (lab/view lab)
+        counts (->> (:since-counts lab)
+                    (remove (fn [[k _]] (contains? #{"fault" "output"} k)))
+                    (sort-by (fn [[_ n]] (- n)))
+                    (take 4)
+                    (map (fn [[k n]] (str n " " k))))]
+    (vec (concat
+          [[c/ink (str (or (:what (last (:actions lab))) "opened") " · "
+                       (lab/at-said (or from 0)) " → " (lab/at-said (:at-ns lab)))]]
+          (for [f (:failing w)]
+            [c/red (str "failing: " (:message f) " (" (:count f) ", first at " (lab/at-said (:first-ns f)) ")")])
+          (for [e (take-last 12 events)]
+            [(if (lab/failed-assertion e) c/red (if (= "fault" (get-in e [:event :event])) c/orange c/ink))
+             (str "+" (lab/secs (- (:vtime_ns e) (or from 0))) "  " (event-said e))])
+          (when (> (count events) 12) [[c/muted (str "… " (- (count events) 12) " earlier")]])
+          (for [o (take-last 4 (:output lab))]
+            [c/muted (str (get-in o [:event :output :source]) ": " (get-in o [:event :output :text]))])
+          (when (seq counts) [[c/muted (str "also " (str/join ", " counts))]])
+          [[c/muted "test commands, the last:"]]
+          (for [h (take-last 6 (:history w))]
+            [(if (= 0 (:status h)) c/green c/red)
+             (str (:command h) " " (if (= 0 (:status h)) "ok" (str "failed " (:status h)))
+                  (when (:to-ns h) (str " at " (lab/at-said (:to-ns h)))))])
+          (for [n (take-last 3 (:notes w))] [c/muted (str (lab/at-said (:at-ns n)) " " (:what n))])))))
+
+(defn- draw-since! [lab x y width height]
+  (let [lines (since-lines lab)
+        most (long (/ height 17))]
+    (doseq [[i [color text]] (map-indexed vector (take most lines))]
+      (c/text! x (+ y (* 17 i)) color small (c/clip small width text)))))
+
+;; The moment card: the world, the controls, what happened since; three columns side by side
+;; in a wide window, the third under the first two in a narrow one.
+
+(defonce ^:private viewed (atom [nil nil]))
+
+(defn- view-of
+  "The lab's view, made again only when the lab changed (drawn every frame)."
+  [lab]
+  (let [[was made] @viewed]
+    (if (identical? was lab)
+      made
+      (let [made (lab/view lab)]
+        (reset! viewed [lab made])
+        made))))
+
+(defn- wide? [] (>= (c/window-width) 1300.0))
+
+(defn- moment-height []
+  (if (wide?) 470.0 (+ 470.0 300.0)))
+
+(defn- draw-moment! [x y width]
+  (when-let [lab @lab/state]
+    (let [w (view-of lab)]
+      (if (wide?)
+        (let [world-w (* 0.46 width)
+              controls-w (* 0.27 width)
+              since-x (+ x world-w controls-w 36)]
+          (draw-world! w x y world-w true)
+          (draw-controls! lab (+ x world-w 18) y (- controls-w 18))
+          (draw-since! lab since-x y (- (+ x width) since-x) 460.0))
+        (let [world-w (* 0.56 width)]
+          (draw-world! w x y world-w true)
+          (draw-controls! lab (+ x world-w 18) y (- width world-w 18))
+          (draw-since! lab x (+ y 480) width 280.0))))))
+
+(defn- moment-card [lab]
+  (if (and lab (not (:closed lab)))
+    (with-meta [:draw (moment-height) (fn [x y width] (draw-moment! x y width))]
+      {:cards/title (str "The moment · session " (:session lab) " · timeline #" (:timeline lab)
+                         " (from #" (:branch lab) " at " (lab/at-said (:opened-ns lab)) ")")})
+    [:text {:color :muted} (if lab (str "Session " (:session lab) " ended.") "No lab.")]))
+
+(declare unpin!)
+
+;; A comparison's diff: what a fault changed.
+
+(defn- diff-lines [d]
+  (let [failing (:failing d)
+        without (get-in d [:history :without])
+        with (get-in d [:history :with])
+        nodes-without (get-in d [:nodes :without])
+        nodes-with (get-in d [:nodes :with])
+        changed-nodes (filter (fn [[n state]] (not= state (get nodes-without n))) nodes-with)]
+    (vec (concat
+          [[c/muted (str "from " (lab/at-said (:from-ns d)) " (checkpoint " (:checkpoint d) "), " (lab/secs (* 1.0e6 (:ms d)))
+                         " each · without: timeline #" (get-in d [:timelines :without])
+                         " · with: timeline #" (get-in d [:timelines :with]))]]
+          (when (:refused d) [[c/red (str "the fault was refused: " (:refused d))]])
+          (when-let [control (:control d)]
+            [(if (:same control)
+               [c/green (str "control: a second future without the fault is the same one (" (:events control)
+                             " events, timeline #" (:timeline control) "): what differs is the fault's")]
+               [c/orange (str "control: a second future without the fault parts from the first too"
+                              (when-let [p (:parted control)] (str " (at event " (:index p) ")"))
+                              ": differences below may be noise")])])
+          (if (or (seq (:new failing)) (seq (:gone failing)) (seq (:both failing)))
+            (concat (for [m (:new failing)] [c/red (str "+ fails with the fault: " m)])
+                    (for [m (:gone failing)] [c/green (str "- fails only without it: " m)])
+                    (for [m (:both failing)] [c/muted (str "  fails in both: " m)]))
+            [[c/ink "no property fails in either future"]])
+          [[(if (> (:failed with) (:failed without)) c/red c/ink)
+            (str "test commands: without " (:ok without) " ok, " (:failed without) " failed · with "
+                 (:ok with) " ok, " (:failed with) " failed"
+                 (when (seq (:failures with)) (str " (" (str/join ", " (:failures with)) ")")))]]
+          (if (seq changed-nodes)
+            (for [[n state] changed-nodes] [c/orange (str n ": " (name (or (get nodes-without n) :up)) " without, " (name state) " with")])
+            [[c/muted "the nodes end alike"]])
+          (when-let [p (:parted d)]
+            [[c/ink (str "the futures part at event " (:index p) (when (:at-ns p) (str " (" (lab/at-said (:at-ns p)) ")")))]
+             [c/muted (str "  without: " (or (:without p) "nothing more"))]
+             [c/muted (str "  with:    " (or (:with p) "nothing more"))]])
+          [[c/muted (str "events: without " (get-in d [:counts :without]) ", with " (get-in d [:counts :with]) "; by name, the most changed:")]]
+          (for [row (take 6 (:events d))]
+            [(if (> (:with row) (:without row)) c/orange c/blue)
+             (str "  " (:name row) ": " (:without row) " → " (:with row))])))))
+
+(defn- draw-diff! [d x y width]
+  (doseq [[i [color text]] (map-indexed vector (diff-lines d))]
+    (c/text! x (+ y (* 18 i)) color (if (zero? i) small mono) (c/clip (if (zero? i) small mono) width text))))
+
+(defn- diff-height [d] (* 18.0 (count (diff-lines d))))
+
+(defn- diff-card [lab]
+  (let [d (:diff lab)]
+    (if d
+      (with-meta [:col
+                  [:draw (diff-height d) (fn [x y width] (draw-diff! d x y width))]
+                  [:draw 30 (fn [x y width]
+                              (c/cursor! x y)
+                              (when (small-button! "dismiss##diff")
+                                ;; Unpinned off the frame being drawn.
+                                (future (swap! lab/state dissoc :diff)
+                                        (unpin! "diff"))))]]
+        {:cards/title (str "What " (:said d) " changed")})
+      [:text {:color :muted} "No comparison."])))
+
+;; A tape being driven.
+
+(defn- tape-lines [t]
+  (let [p (:plan t)
+        steps (:steps p)
+        at (:at t)
+        results (:results t)
+        shown (take 10 (drop (max 0 (- at 3)) (map-indexed vector steps)))]
+    (vec (concat
+          [[c/muted (str (count steps) " faults to drive of " (:decisions p) " decisions"
+                         (when (:story p) ", the story naming the nodes")
+                         "; " (count (:skipped p)) " skipped one by one, "
+                         (reduce + 0 (vals (:counted p))) " counted (not faults)")]]
+          (for [[i step] shown]
+            (let [result (some (fn [r] (when (= i (:lean/step r)) r)) results)]
+              [(cond (= i (:running t)) c/blue
+                     result (if (get-in result [:fault :refused]) c/red c/green)
+                     (= i at) c/ink
+                     :else c/muted)
+               (str (cond (= i (:running t)) "… " (= i at) "▶ " result (if (get-in result [:fault :refused]) "✗ " "✓ ") :else "  ")
+                    "#" (:index step) " " (:model step) "  →  " (lab/fault-said (:inject step))
+                    (when-not (:certain step) " (the tape's guess)")
+                    (when-let [r (get-in result [:fault :refused])] (str ": " r)))]))
+          (when (< (+ (max 0 (- at 3)) 10) (count steps)) [[c/muted (str "… " (- (count steps) (+ (max 0 (- at 3)) 10)) " more")]])
+          (for [[why n] (take 3 (sort-by (fn [[_ n]] (- n)) (frequencies (map :why (:skipped p)))))]
+            [c/muted (str "skipped " n ": " why)])
+          (for [dis (take 2 (:disagree p))]
+            [c/orange (str "#" (:index dis) ": the tape's guess node " (:tape dis) ", the story's " (:story dis))])))))
+
+(defn- tape-card [t]
+  (if (:plan t)
+    (let [lines (tape-lines t)]
+      (with-meta [:col
+                  [:draw (* 18.0 (count lines))
+                   (fn [x y width]
+                     (doseq [[i [color text]] (map-indexed vector (tape-lines @lean/state))]
+                       (c/text! x (+ y (* 18 i)) color (if (zero? i) small mono) (c/clip (if (zero? i) small mono) width text))))]
+                  [:draw 30 (fn [x y width]
+                              (let [s (:session @lab/state)
+                                    t @lean/state
+                                    left (- (count (get-in t [:plan :steps])) (:at t))]
+                                (c/cursor! x y)
+                                (disabled! (or (zero? left) (:busy @lab/state) (:working (:status @ui))))
+                                (when (button! "Next step##tape") (act! "the tape's next step" (fn [] (lean/next! s))))
+                                (same-line!)
+                                (when (button! "The rest##tape") (act! "the tape's steps" (fn [] (lean/drive! s))))
+                                (enabled!)))]]
+        {:cards/title (str "Tape · " (last (str/split (str (:tape t)) #"/")))}))
+    [:text {:color :muted} "No tape."]))
+
+;; Pinned while there is something to show.
+
+(defonce ^:private pinned (atom #{}))
+
+(defn- pin-once! [what source view]
+  (when-not (contains? @pinned what)
+    (swap! pinned conj what)
+    (c/pin! what source view)))
+
+(defn- unpin! [what]
+  (when (contains? @pinned what)
+    (swap! pinned disj what)
+    (c/unpin! what)))
+
+(defn- heard [kind data]
+  (cond
+    (= kind :lab/attach) (do (viz/compact! true)
+                             (pin-once! "moment" lab/state (fn [lab] (moment-card lab))))
+    (= kind :lab/compare) (pin-once! "diff" lab/state (fn [lab] (diff-card lab)))
+    (= kind :lean/plan) (pin-once! "tape" lean/state (fn [t] (tape-card t)))
+    (= kind :session/close) (when (and @lab/state (= (:session data) (:session @lab/state)) (not (:busy @lab/state)))
+                              nil)
+    :else nil))
+
+(defn done!
+  "The lab's cards unpinned (the multiverse whole again)."
+  []
+  (doseq [what ["moment" "diff" "tape"]] (unpin! what))
+  (viz/compact! false))
+
+;; The lab's results as cards of the feed, by their keys.
+
+(swap! viz/owned-keys into #{:lab/act :lab/diff :lab/world :lean/plan :lean/step})
+
+(c/handle! {:attr :lab/world
+            :height (fn [w width] (+ 10 (world-height w)))
+            :draw (fn [w x y width] (draw-world! w x y (min width 760.0) false))})
+
+(defn- act-lines [r]
+  (vec (concat
+        [[(cond (:refused r) c/red (:applied r) c/green :else c/ink)
+          (str (:lab/act r)
+               (cond (:refused r) (str ": " (:refused r))
+                     (:applied r) ": applied"
+                     (contains? r :matched) (if (:matched r) (str ": met " (get-in r [:matched :event])) ": not met")
+                     :else ""))]
+         [c/muted (str "session " (:session r) " · timeline #" (:timeline r) " · "
+                       (lab/at-said (or (:from-ns r) 0)) " → " (lab/at-said (or (:at-ns r) 0)))]]
+        (for [m (:failing r)] [c/red (str "failing: " m)])
+        (for [e (take 8 (:events r))]
+          [(if (lab/failed-assertion e) c/red c/ink) (str "+" (lab/secs (- (:vtime_ns e) (or (:from-ns r) 0))) "  " (event-said e))])
+        (when (> (count (:events r)) 8) [[c/muted (str "… " (- (count (:events r)) 8) " more")]]))))
+
+(c/handle! {:attr :lab/act
+            :height (fn [r width] (* 18.0 (count (act-lines r))))
+            :draw (fn [r x y width]
+                    (doseq [[i [color text]] (map-indexed vector (act-lines r))]
+                      (c/text! x (+ y (* 18 i)) color mono (c/clip mono width text))))})
+
+(c/handle! {:attr :lab/diff
+            :height (fn [d width] (diff-height d))
+            :draw (fn [d x y width] (draw-diff! d x y width))})
+
+(c/handle! {:attr :lean/plan
+            :height (fn [p width] (* 18.0 (count (tape-lines {:plan p :at 0 :results []}))))
+            :draw (fn [p x y width]
+                    (doseq [[i [color text]] (map-indexed vector (tape-lines {:plan p :at 0 :results []}))]
+                      (c/text! x (+ y (* 18 i)) color mono (c/clip mono width text))))})
+
+(c/handle! {:attr :lean/step
+            :height (fn [r width] 40)
+            :draw (fn [r x y width]
+                    (let [step (:step r)
+                          refused (get-in r [:fault :refused])]
+                      (c/text! x y (if refused c/red c/green) mono
+                               (c/clip mono width (str "#" (:index step) " " (:model step) "  →  " (lab/fault-said (:inject step)))))
+                      (c/text! x (+ y 20) c/muted small
+                               (str (if refused (str "refused: " refused) "applied") ", then on to " (lab/at-said (or (:at-ns r) 0))))))})
+
+(defonce ^:private listening (do (tap/listen! (fn [kind data] (heard kind data))) true))
