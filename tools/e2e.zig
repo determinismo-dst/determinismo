@@ -1002,7 +1002,7 @@ fn check_debugging(context: *Context) !void {
     var recorded: [1]Branch = undefined;
     expect(context, parse_branches(base, &recorded) == 1, "debugging: recorded one timeline", .{});
     const tape = try std.fs.path.join(context.arena, &.{ tapes, "branch-0.jsonl" });
-    const symbols = try explore(context, &.{ "--program", program, "--scenario", "bank", "--timeline", "30s", "--tape", tape, "--at-vtime-ms", "3000", "--exec", "grep ' jiffies$' /proc/kallsyms" });
+    const symbols = try explore(context, &.{ "--program", program, "--scenario", "bank", "--timeline", "30s", "--clock-start-max", "0", "--tape", tape, "--at-vtime-ms", "3000", "--exec", "grep ' jiffies$' /proc/kallsyms" });
     const at = std.mem.indexOf(u8, symbols, " D jiffies") orelse std.mem.indexOf(u8, symbols, " d jiffies") orelse {
         const shown = if (std.mem.indexOf(u8, symbols, "exec_output")) |i| symbols[i..@min(symbols.len, i + 200)] else symbols[symbols.len -| 400..];
         expect(context, false, "debugging: the guest kernel's jiffies found in /proc/kallsyms ({s})", .{shown});
@@ -1014,7 +1014,7 @@ fn check_debugging(context: *Context) !void {
     const watch = try std.fmt.allocPrint(context.arena, "0x{x}:8", .{physical});
     const poke = try std.fmt.allocPrint(context.arena, "0x{x}=00000000", .{physical});
     const poked = try std.fmt.allocPrint(context.arena, "[determinismo] poke: 0x{x}", .{physical});
-    const look: []const []const u8 = &.{ "--program", program, "--scenario", "bank", "--timeline", "30s", "--tape", tape, "--at-vtime-ms", "3000", "--exec", "true" };
+    const look: []const []const u8 = &.{ "--program", program, "--scenario", "bank", "--timeline", "30s", "--clock-start-max", "0", "--tape", tape, "--at-vtime-ms", "3000", "--exec", "true" };
     const plain = try explore(context, look);
     const watched = try explore(context, try std.mem.concat(context.arena, []const u8, &.{ look, &.{ "--watch", watch } }));
     var plain_branch: [1]Branch = undefined;
@@ -1028,7 +1028,7 @@ fn check_debugging(context: *Context) !void {
     const script = try std.fs.path.join(context.arena, &.{ context.scratch, "debugging-steps.txt" });
     const steps = try std.fmt.allocPrint(context.arena, "det:regs\ndet:translate current 0x{x}\ndet:mem 0x{x} 8\ndet:poke 0x{x}=00000000\ndet:mem 0x{x} 8\n", .{ virtual, physical, physical, physical });
     try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = script, .data = steps });
-    const stepped = try explore(context, &.{ "--program", program, "--scenario", "bank", "--timeline", "30s", "--tape", tape, "--at-vtime-ms", "3000", "--exec-script", script });
+    const stepped = try explore(context, &.{ "--program", program, "--scenario", "bank", "--timeline", "30s", "--clock-start-max", "0", "--tape", tape, "--at-vtime-ms", "3000", "--exec-script", script });
     const zeros = try std.fmt.allocPrint(context.arena, "\"address\":\"0x{x}\",\"size\":8,\"hex\":\"0000000000000000\"", .{physical});
     expect_all(context, &.{
         .{ "det:regs printed the vCPU's registers", std.mem.indexOf(u8, stepped, "[determinismo] regs: {\"vtime_ns\":3000") != null },
@@ -1039,7 +1039,7 @@ fn check_debugging(context: *Context) !void {
     }, "debugging: the debugger's steps at a moment", .{});
     // Breakpoints and steps: stopped on the kernel's schedule (its first instruction), on 1000
     // branches, and the history to 5 s the plain replay's.
-    const scheduler = try explore(context, &.{ "--program", program, "--scenario", "bank", "--timeline", "30s", "--tape", tape, "--at-vtime-ms", "3000", "--exec", "grep ' T schedule$' /proc/kallsyms" });
+    const scheduler = try explore(context, &.{ "--program", program, "--scenario", "bank", "--timeline", "30s", "--clock-start-max", "0", "--tape", tape, "--at-vtime-ms", "3000", "--exec", "grep ' T schedule$' /proc/kallsyms" });
     // In the command's output, not its echo (the grep itself names " T schedule").
     const output_at = std.mem.indexOf(u8, scheduler, "\"exec_output\"") orelse 0;
     const schedule_at = std.mem.indexOfPos(u8, scheduler, output_at, " T schedule") orelse {
@@ -1052,8 +1052,8 @@ fn check_debugging(context: *Context) !void {
     try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = stops, .data = try std.fmt.allocPrint(context.arena, "det:break 0x{x}\ndet:continue 1000\ndet:regs\ndet:step 1000\ndet:regs\ndet:break off\ndet:at 5000000000\ntrue\n", .{schedule}) });
     const plain_to = try std.fs.path.join(context.arena, &.{ context.scratch, "debugging-plain.txt" });
     try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = plain_to, .data = "det:at 5000000000\ntrue\n" });
-    const stopped = try explore(context, &.{ "--program", program, "--scenario", "bank", "--timeline", "30s", "--tape", tape, "--at-vtime-ms", "3000", "--exec-script", stops });
-    const unstopped = try explore(context, &.{ "--program", program, "--scenario", "bank", "--timeline", "30s", "--tape", tape, "--at-vtime-ms", "3000", "--exec-script", plain_to });
+    const stopped = try explore(context, &.{ "--program", program, "--scenario", "bank", "--timeline", "30s", "--clock-start-max", "0", "--tape", tape, "--at-vtime-ms", "3000", "--exec-script", stops });
+    const unstopped = try explore(context, &.{ "--program", program, "--scenario", "bank", "--timeline", "30s", "--clock-start-max", "0", "--tape", tape, "--at-vtime-ms", "3000", "--exec-script", plain_to });
     var stopped_branch: [1]Branch = undefined;
     var unstopped_branch: [1]Branch = undefined;
     const rip = try std.fmt.allocPrint(context.arena, "\"rip\":\"0x{x}\",\"cr3\"", .{schedule});
@@ -1068,7 +1068,7 @@ fn check_debugging(context: *Context) !void {
     // plain replay's.
     const watches = try std.fs.path.join(context.arena, &.{ context.scratch, "debugging-watches.txt" });
     try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = watches, .data = try std.fmt.allocPrint(context.arena, "det:watch 0x{x} 8\ndet:continue 1000\ndet:continue 1000\ndet:mem 0x{x} 8\ndet:watch off\ndet:at 5000000000\ntrue\n", .{ virtual, physical }) });
-    const watched_steps = try explore(context, &.{ "--program", program, "--scenario", "bank", "--timeline", "30s", "--tape", tape, "--at-vtime-ms", "3000", "--exec-script", watches });
+    const watched_steps = try explore(context, &.{ "--program", program, "--scenario", "bank", "--timeline", "30s", "--clock-start-max", "0", "--tape", tape, "--at-vtime-ms", "3000", "--exec-script", watches });
     const hit_prefix = try std.fmt.allocPrint(context.arena, "\"watch\":\"0x{x}\",\"size\":8,\"hex\":\"", .{virtual});
     var values: [2]u64 = .{ 0, 0 };
     var hexes: [2][]const u8 = .{ "", "" };
@@ -1099,10 +1099,10 @@ fn check_debugging(context: *Context) !void {
     // no call once the initramfs grew, 2026-11-18, and det:continue's first stop was 26 ms on.)
     const collects = try std.fs.path.join(context.arena, &.{ context.scratch, "debugging-collects.txt" });
     try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = collects, .data = try std.fmt.allocPrint(context.arena, "det:watch 0x{x} 8\ndet:collect 20\ndet:watch off\ndet:break 0x{x}\ndet:collect 100\ndet:break off\ndet:at 5000000000\ntrue\n", .{ virtual, schedule }) });
-    const collected = try explore(context, &.{ "--program", program, "--scenario", "bank", "--timeline", "30s", "--tape", tape, "--at-vtime-ms", "3000", "--exec-script", collects });
+    const collected = try explore(context, &.{ "--program", program, "--scenario", "bank", "--timeline", "30s", "--clock-start-max", "0", "--tape", tape, "--at-vtime-ms", "3000", "--exec-script", collects });
     const collect_stops = try std.fs.path.join(context.arena, &.{ context.scratch, "debugging-collect-stops.txt" });
     try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = collect_stops, .data = try std.fmt.allocPrint(context.arena, "det:watch 0x{x} 8\ndet:collect 20\ndet:watch off\ndet:break 0x{x}\ndet:continue 1000\ndet:break off\ndet:at 5000000000\ntrue\n", .{ virtual, schedule }) });
-    const stopped_call = try explore(context, &.{ "--program", program, "--scenario", "bank", "--timeline", "30s", "--tape", tape, "--at-vtime-ms", "3000", "--exec-script", collect_stops });
+    const stopped_call = try explore(context, &.{ "--program", program, "--scenario", "bank", "--timeline", "30s", "--clock-start-max", "0", "--tape", tape, "--at-vtime-ms", "3000", "--exec-script", collect_stops });
     const write_prefix = try std.fmt.allocPrint(context.arena, "\"watch\":\"0x{x}\",\"size\":8,\"hex\":\"", .{virtual});
     var writes: u32 = 0;
     var increasing = true;
@@ -1145,7 +1145,7 @@ fn check_debugging(context: *Context) !void {
     var fork_branch: [1]Branch = undefined;
     const one = parse_branches(forked, &fork_branch) == 1;
     const fork_tape = try std.fs.path.join(context.arena, &.{ forks, "branch-0.jsonl" });
-    const again = try explore(context, &.{ "--program", program, "--scenario", "bank", "--timeline", "30s", "--tape", fork_tape });
+    const again = try explore(context, &.{ "--program", program, "--scenario", "bank", "--timeline", "30s", "--clock-start-max", "0", "--tape", fork_tape });
     var again_branch: [1]Branch = undefined;
     expect_all(context, &.{
         .{ "the fork wrote the poke", std.mem.indexOf(u8, forked, poked) != null },
@@ -5139,11 +5139,37 @@ fn check_profile(context: *Context) !void {
 }
 
 /// Rewind: 5 ms of virtual time before the first violation, where it has not happened yet.
+/// A timeline of seed 3's first 16 that loses money at least `room_ms` past the setup snapshot,
+/// for a moment that far before its violation (each candidate's violation found by --until): which
+/// timeline fails first, and when, moves with every decision added before it (the clock start's
+/// two, 2026-11-25: the first failing one broke 29 ms past the snapshot).
+fn bank_violating_branch_with_room(context: *Context, system: []const []const u8, violation: []const u8, room_ms: u64) ![]const u8 {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "bank-test" });
+    const report = try explore(context, &.{ "--program", program, "--scenario", "bank", "--seed", "3", "--branches", "16" });
+    var lines = std.mem.tokenizeScalar(u8, report, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "[branch ")) continue;
+        if (std.mem.indexOf(u8, line, "FAIL \"total balance is conserved\"") == null) continue;
+        const end = std.mem.indexOfScalar(u8, line, ']') orelse continue;
+        const index = try context.arena.dupe(u8, std.mem.trim(u8, line["[branch ".len..end], " "));
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(context.arena, system);
+        try argv.appendSlice(context.arena, &.{ "--branch", index, "--until", violation, "--exec", "true" });
+        const found = try explore(context, argv.items);
+        const last = std.mem.lastIndexOf(u8, found, "at moment vtime=") orelse continue;
+        const holds_ns: u64 = @trunc(number_after(found[last..], "at moment vtime=") orelse 0);
+        const snapshot_ms = snapshot_vtime_ms(found) orelse continue;
+        if (holds_ns >= (snapshot_ms + room_ms) * std.time.ns_per_ms) return index;
+    }
+    expect(context, false, "bank: one of seed 3's first 16 timelines loses money {d} ms past the setup", .{room_ms});
+    return error.NoViolatingBranch;
+}
+
 fn check_rewind(context: *Context, system: []const []const u8, violation: []const u8) !void {
     var extra: std.ArrayList([]const u8) = .empty;
     try extra.appendSlice(context.arena, system);
     try extra.appendSlice(context.arena, &.{
-        "--branch", try bank_violating_branch(context), "--until", violation, "--rewind-ms", "50", "--exec", "echo rewound",
+        "--branch", try bank_violating_branch_with_room(context, system, violation, 60), "--until", violation, "--rewind-ms", "50", "--exec", "echo rewound",
     });
     const report = try explore(context, extra.items);
     const holds: u64 = @trunc(number_after(report, "the condition holds at ") orelse 0);
