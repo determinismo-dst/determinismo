@@ -154,3 +154,18 @@
                (catch Throwable e {:threw (str (class e) ": " (.getMessage e))}))]
     (is (false? (:valid a)) (pr-str a))))
 
+
+;; D12 (round 4 of the Lean replica's refinement): among reads of equal length, list-append's
+;; version order followed Clojure's hash-set order, so two histories that differ only in key 0's
+;; values 1 and 2 swapped got different verdicts (Elle 0.2.8: invalid, G0, and valid). Ordered by
+;; elements no failed operation appended, then where each was first read, a renaming changes none.
+(deftest list-append-verdict-survives-renaming-values
+  (let [pair (fn [x y] (answer "list-append" "read-uncommitted"
+                               (op 0 "invoke" "txn" [["append" 0 x] ["append" 1 4]]) (op 0 "ok" "txn" [["append" 0 x] ["append" 1 4]])
+                               (op 1 "invoke" "txn" [["append" 0 y] ["append" 1 3]]) (op 1 "ok" "txn" [["append" 0 y] ["append" 1 3]])
+                               (op 2 "invoke" "txn" [["r" 0 nil]]) (op 2 "ok" "txn" [["r" 0 [x]]])
+                               (op 3 "invoke" "txn" [["r" 0 nil]]) (op 3 "ok" "txn" [["r" 0 [y]]])
+                               (op 4 "invoke" "txn" [["r" 1 nil]]) (op 4 "ok" "txn" [["r" 1 [3 4]]])))
+        a (pair 1 2)
+        b (pair 2 1)]
+    (is (= (:valid a) (:valid b)) (pr-str [a b]))))

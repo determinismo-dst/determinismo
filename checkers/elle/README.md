@@ -71,7 +71,7 @@ of Elle ([determinismo-workloads' workloads/elle/lean](https://github.com/determ
 its findings in UNREPORTED.md) and reproduced on Elle.
 
 Elle's own suite with them (103 tests): list-append's `checker-test` can't write its output file
-here, as on Elle as written; six tests expect what Elle 0.2.8 answers, and our answers differ:
+here, as on Elle as written; seven tests expect what Elle 0.2.8 answers, and our answers differ:
 - `failure-to-observe-test`: also G-single-realtime, so `not` strong snapshot isolation. The
   transaction's predicate read misses key 5, which the init had created (value 3) and completed
   before the transaction began: an anti-dependency into the init, and real time out of it.
@@ -88,6 +88,10 @@ here, as on Elle as written; six tests expect what Elle 0.2.8 answers, and our a
 - rw-register's `checker-test`: `not` also consistent view and repeatable read. The transaction
   reads `:x` as 1, then as 2, with no write of its own between: a fuzzy read (Adya's P2), which
   both prohibit; 0.2.8 judged only the first read of a key (D6).
+- list-append's `sim-prefix-test`: the same verdict, anomaly types and G0 cycle, but key 8's
+  incompatible-order example is another pair of its three mutually incompatible reads of length
+  5 (`[1 2 3 4 5]` and `[1 2 3 4 6]`, where 0.2.8 names `[1 2 3 4 8]` and `[1 2 3 4 5]`): reads
+  of equal length are ordered by where each was first read, not by hash order (D12).
 - `all-anomalies-test`, `anomalies-prohibited-by-test`: the anomaly catalog gains `:fuzzy-read`
   (D6) and `:garbage-read` (a read of an element nobody appended, where 0.2.8's list-append
   threw; D8), and read committed's prohibited set `:garbage-read`.
@@ -105,7 +109,11 @@ Round 3's (2026-11-25), the fixes its replica checked safe:
 - `list_append.clj` (new here): a G-single through appends nobody read is found (D1); for models
   allowing G1a, `:info` appends aren't indexed as writes and failed ones are stepped over (D5 with
   D4), which also restores strong read uncommitted verdicts the D3 fix above lost (D23); a read of
-  an element nobody appended is a `:garbage-read`, not a crash (D8).
+  an element nobody appended is a `:garbage-read`, not a crash (D8); among reads of equal
+  length the version order ranks a read by its elements no failed operation appended, then by
+  where it was first read, not by Clojure's hash-set order, so renaming values changes no verdict
+  (D12, round 4's refinement: proved for the version order; renaming flipped 250 to 505 verdicts
+  in 40,000 histories before, none with it; no verdict lost).
 - `rw_register.clj`: unread writes the same (D1); every external read counts, two values read
   for one key are a `:fuzzy-read` (D6); a read of the transaction's own later write is a
   `:future-read` (D7).
@@ -115,8 +123,9 @@ Round 3's (2026-11-25), the fixes its replica checked safe:
 - `consistency_model.clj` (new here): `:fuzzy-read` and `:garbage-read` proscribed where Adya's
   levels do.
 
-Not taken: D12 (deterministic version order, but one verdict lost in 40,000), D2 (two models at
-once: the service never sends two), D15 (jepsen.history, safe only compiled ahead of time).
+Not taken: round 3's D12 (deterministic version order, but one verdict lost in 40,000; its
+refinement above is taken), D2 (two models at once: the service never sends two), D15
+(jepsen.history, safe only compiled ahead of time).
 
 The service itself, likewise: a read holding a value twice is dropped (not deduplicated) before
 Elle judges the rest, `not` covers the duplicates too, and per key a predicate read reads every key.

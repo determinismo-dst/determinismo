@@ -2,7 +2,11 @@
 ; Elle is copyright 2019--2020 Jepsen, LLC and Peter Alvaro, under the Eclipse Public License
 ; 2.0; this copy's changes are under the same license.
 ; Elle 0.2.8's elle/list_append.clj (github.com/jepsen-io/elle), with round 3's fixes from a
-; Lean replica of Elle (determinismo-workloads' workloads/elle/lean, REPORT-3.md):
+; Lean replica of Elle (determinismo-workloads' workloads/elle/lean, REPORT-3.md, REPORT-4.md):
+; - D12 (round 4's refinement, REPORT-4.md): sorted-values orders reads of equal length by
+;   their count of elements no failed operation appended, then by where each was first read, so
+;   a verdict no longer follows Clojure's hash-set order (renaming values changed 250 to 505
+;   verdicts in 40,000 histories; with it none).
 ; - D8: dirty-update-cases passes over an element no operation appended (it asserted), and a
 ;   read holding one is reported as :garbage-read (proscribed by PL-1 in consistency_model.clj).
 ; - D4: ww-mop-dep steps over an element no indexed operation appended (a failed one's, a
@@ -284,14 +288,42 @@
                  [k #{[v]}])))
        (into {})))
 
+(defn first-read-indices
+  "Round 4's D12 refinement: a map of keys to maps of each non-empty read value
+  to where it was first read: [operation index, micro-op position]."
+  [history]
+  (reduce (fn [m op]
+            (reduce (fn [m [j [f k v]]]
+                      (if (and (= :r f) v (not= [] v)
+                               (not (contains? (get m k) v)))
+                        (assoc-in m [k v] [(:index op) j])
+                        m))
+                    m
+                    (map-indexed vector (:value op))))
+          {}
+          history))
+
+(defn failed-appends
+  "Round 4's D12 refinement: the [k e] pairs failed operations appended."
+  [history]
+  (into #{} (for [op history :when (h/fail? op)
+                  [f k v] (:value op) :when (= :append f)]
+              [k v])))
+
 (defn sorted-values
   "Takes a history where operation values are transactions, and every micro-op
   in a transaction is an append or a read. Computes a map of keys to all
   distinct observed values for that key, ordered by length.
 
   As a special case, if we have a key which only has a single append, we don't
-  need a read: we can infer the sorted values it took on were simply [], [x]."
-  [history]
+  need a read: we can infer the sorted values it took on were simply [], [x].
+
+  Round 4's D12 refinement: values of equal length are ordered by their count
+  of elements no failed operation appended (`failed`, a set of [k e]), then by
+  where each was first read."
+  ([history]
+   (sorted-values history (failed-appends history)))
+  ([history failed]
   (let [fold
         (loopf {:name :sorted-values}
                ; Reducer
@@ -324,12 +356,19 @@
                               (bs/union values1 values2))))
                 ; Transform back to Clojure
                 (datafy states1)))]
-    (->> (h/fold history fold)
-         ; If we can't infer anything from reads, see if we can use a single
-         ; append operation to infer a value.
-         (merge (values-from-single-appends history))
-         ; And sort
-         (util/map-vals (comp vec (partial sort-by count))))))
+    (let [firsts (first-read-indices history)]
+      (->> (h/fold history fold)
+           ; If we can't infer anything from reads, see if we can use a single
+           ; append operation to infer a value.
+           (merge (values-from-single-appends history))
+           ; And sort, by length, then by elements no failed op appended, then
+           ; by where each was first read
+           (reduce-kv (fn [m k vs]
+                        (assoc m k (vec (sort-by (juxt count
+                                                       (fn [v] (count (remove #(failed [k %]) v)))
+                                                       #(get-in firsts [k %] [-1 -1]))
+                                                 vs))))
+                      {}))))))
 
 (defn incompatible-orders
   "Takes a map of keys to sorted observed values and verifies that for each key
@@ -647,6 +686,8 @@
   ([history]
    (preprocess history true))
   ([history g1a?]
+   (preprocess history g1a? (failed-appends history)))
+  ([history g1a? failed]
   (let [; Make sure there are only appends and reads
         vmt (h/task history verify-mop-types-task []
                     (verify-mop-types history))
@@ -680,7 +721,8 @@
                                                         mop))
                                                     (:value op))))
                                      history)
-                               {:have-indices? true, :already-ops? true}))))]
+                               {:have-indices? true, :already-ops? true})))
+                         failed)]
      ; Compute indices
      (let [append-index (h/task history append-index []
                                 (append-index sorted-values))
@@ -939,7 +981,8 @@
   G2)."
   [opts history]
   (let [history+ (h/possible (h/client-ops history))
-        pre      (preprocess history+ (contains? (ct/prohibited-anomaly-types opts) :G1a))
+        pre      (preprocess history+ (contains? (ct/prohibited-anomaly-types opts) :G1a)
+                             (failed-appends history))
         pairs    (unread-pairs pre)]
     (when (seq pairs)
       (let [g (fn [h]
@@ -1129,7 +1172,7 @@
          _ (h/ensure-pair-index history+)
          dups          (h/task history dups [] (duplicates history+))
          sorted-values (h/task history sorted-values+ []
-                               (sorted-values history+))
+                               (sorted-values history+ (failed-appends history)))
          incmp-order   (h/task history incmp-order [sv sorted-values]
                                (incompatible-orders sv))
          _             (h/task history render-incmp-order [sv    sorted-values
