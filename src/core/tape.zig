@@ -215,13 +215,19 @@ pub const Overrides = struct {
         return null;
     }
 
-    /// Compares the replay with the tape's checkpoint at this event count, if there is one.
+    /// Compares the replay with the tape's checkpoint at this event count, if there is one. A
+    /// replay past the next checkpoint's count diverged before it: checkpoints follow guest lines
+    /// only (vm.zig's checkpoint), so the tape's event there was a guest line and the replay's
+    /// was not (a kernel line, a decision). Waiting for that count instead left every later
+    /// checkpoint unchecked (the Lean replica of determinismo's CE13).
     pub fn check(overrides: *Overrides, now: Checkpoint) !void {
         if (overrides.checkpoint_cursor == overrides.checkpoint_count) return;
         const expected = overrides.checkpoints[overrides.checkpoint_cursor];
-        if (expected.events != now.events) return;
+        if (now.events < expected.events) return;
         overrides.checkpoint_cursor += 1;
-        if (expected.branches != now.branches or expected.events_hash != now.events_hash) {
+        if (expected.events != now.events or expected.branches != now.branches or
+            expected.events_hash != now.events_hash)
+        {
             return error.ReplayDiverged;
         }
     }
@@ -974,4 +980,26 @@ test "a tape keeps the machine a strategy decided for its run" {
     const header = try parse(buffer[0..size], scratch, overrides);
     try std.testing.expectEqual(machine.modulation_stretch_ns, header.machine.?.modulation_stretch_ns);
     try std.testing.expectEqualStrings(machine.custom_faults, header.machine.?.custom_faults);
+}
+
+
+test "a replay past a checkpoint's count diverged" {
+    const overrides = try std.testing.allocator.create(Overrides);
+    defer std.testing.allocator.destroy(overrides);
+    overrides.* = .{ .entries = undefined, .count = 0, .cursor = 0 };
+    // The tape's checkpoints at events 64, 128 and 192 (guest lines there).
+    for ([_]u64{ 64, 128, 192 }, 1..) |events, hash| {
+        overrides.checkpoints[overrides.checkpoint_count] = .{ .events = events, .branches = 0, .events_hash = hash };
+        overrides.checkpoint_count += 1;
+    }
+    // The replay's event 64 is a kernel line (no check), its guest lines go on from 65: the
+    // first check, at 128, finds the replay past the tape's 64.
+    try std.testing.expectError(error.ReplayDiverged, overrides.check(.{ .events = 128, .branches = 0, .events_hash = 2 }));
+    // Below the next checkpoint's count: nothing to compare yet.
+    overrides.checkpoint_cursor = 0;
+    try overrides.check(.{ .events = 0, .branches = 0, .events_hash = 0 });
+    try std.testing.expectEqual(@as(u32, 0), overrides.checkpoint_cursor);
+    // At it, the same: compared.
+    try overrides.check(.{ .events = 64, .branches = 0, .events_hash = 1 });
+    try std.testing.expectEqual(@as(u32, 1), overrides.checkpoint_cursor);
 }

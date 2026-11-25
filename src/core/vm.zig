@@ -3687,8 +3687,11 @@ fn decide_random(vm: *VM, value: []u8, source: []const u8) !void {
             std.mem.writeInt(u64, value[0..8], vm.fork_index, .little);
             vm.fork_index = 0;
             if (vm.tape_fd) |fd| tape.write_override(fd, pull, value, fork_reason);
-            try vm.decision_event(pull, source, label, fork_reason);
         }
+        // Its event whether answered or replayed, as egress's: a replay's history is the run's
+        // (without it a replay of a forked timeline was one event short from there: the Lean
+        // replica of determinismo's CE12).
+        try vm.decision_event(pull, source, label, fork_reason);
         return;
     };
     // The machine's egress channel (sdk.egress_channel): a fact, a replay's from its tape.
@@ -3798,8 +3801,9 @@ fn decide_random(vm: *VM, value: []u8, source: []const u8) !void {
             // Its bytes too carry the reason (their kind: tape.Kind, no reason kept for it).
             const reason = serve_reason;
             if (vm.tape_fd) |fd| tape.write_override(fd, pull, value, reason);
-            if (status) try vm.decision_event(pull, source, label, serve_reason);
         }
+        // Its event whether answered or replayed, as egress's (CE12, as the fork's above).
+        if (status) try vm.decision_event(pull, source, label, serve_reason);
         if (status) vm.request_clear(.serve);
         return;
     };
