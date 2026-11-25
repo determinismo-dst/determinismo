@@ -137,6 +137,13 @@ pub const Catalog = struct {
         entry.value_ptr.reached = entry.value_ptr.reached or reached;
     }
 
+    /// Whether a scenario explored reached the assertion as it must be (made true, for a
+    /// `sometimes`).
+    pub fn made_true(catalog: *const Catalog, message: []const u8) bool {
+        const entry = catalog.entries.get(message) orelse return false;
+        return entry.reached;
+    }
+
     /// Prints the assertions no scenario reached; returns how many fail (always, sometimes,
     /// reachable: the kinds that must be reached), when every scenario was explored.
     pub fn judge(catalog: *const Catalog, every_scenario: bool) u32 {
@@ -173,6 +180,8 @@ test Catalog {
     try catalog.note(.sometimes, "reached in two", true);
     try catalog.note(.reachable, "reached nowhere", false);
     try catalog.note(.@"unreachable", "never reached, rightly", false);
+    try std.testing.expect(catalog.made_true("reached in one") and catalog.made_true("reached in two"));
+    try std.testing.expect(!catalog.made_true("reached nowhere") and !catalog.made_true("never noted"));
     // Only what no scenario reached, of the kinds that must be reached, and only when every
     // scenario was explored.
     try std.testing.expectEqual(@as(u32, 1), catalog.judge(true));
@@ -353,6 +362,13 @@ pub const Multiverse = struct {
             return must_hit and aggregate.branches_hit == 0;
         }
 
+        /// A `sometimes` reached here and never true: its verdict spans the scenarios explored,
+        /// another one may make it true (Multiverse.sometimes_unmet, then main.zig).
+        fn unmet_here(aggregate: *const Aggregate) bool {
+            return aggregate.run_failing == null and aggregate.property.kind == .sometimes and
+                aggregate.branches_hit > 0 and aggregate.branches_true == 0;
+        }
+
         fn failing(aggregate: *const Aggregate) bool {
             if (aggregate.run_failing) |verdict| return verdict;
             if (aggregate.unreached_here()) return false;
@@ -366,6 +382,28 @@ pub const Multiverse = struct {
 
     /// Properties that fail across the multiverse: what an exploration's verdict (exit status)
     /// is about.
+    /// A scenario's verdict before the others are known: its failing properties but the
+    /// `sometimes` it reached and never made true, failing only when no scenario explored makes
+    /// them true (sometimes_unmet). Each scenario judging them alone failed a run whose other
+    /// scenario made one true (CE10, the blind Lean replica of the platform).
+    pub fn failing_violations(multiverse: *const Multiverse) u32 {
+        var count: u32 = 0;
+        for (multiverse.aggregates[0..multiverse.aggregate_count]) |*aggregate| {
+            count += @intFromBool(aggregate.failing() and !aggregate.unmet_here());
+        }
+        return count;
+    }
+
+    /// The `sometimes` this scenario reached and never made true, for the catalog's verdict
+    /// across the scenarios explored (Catalog.made_true).
+    pub fn sometimes_unmet(multiverse: *const Multiverse, arena: std.mem.Allocator) ![]const []const u8 {
+        var unmet: std.ArrayList([]const u8) = .empty;
+        for (multiverse.aggregates[0..multiverse.aggregate_count]) |*aggregate| {
+            if (aggregate.unmet_here()) try unmet.append(arena, try arena.dupe(u8, aggregate.property.name()));
+        }
+        return unmet.toOwnedSlice(arena);
+    }
+
     pub fn failing_properties(multiverse: *const Multiverse) u32 {
         var count: u32 = 0;
         for (multiverse.aggregates[0..multiverse.aggregate_count]) |*aggregate| {

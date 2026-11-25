@@ -1103,6 +1103,9 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
     const base_cmdline = arguments.cmdline;
     var failing_scenarios: u32 = 0;
     var catalog = report.Catalog{ .arena = arena };
+    // The `sometimes` each scenario without other failures reached and never made true: it
+    // fails only when no scenario explored made them true, judged once all ran.
+    var unmet: std.ArrayList([]const []const u8) = .empty;
     const scenarios = try scenarios_selected(arena, &arguments, prepared);
     for (scenarios, 0..) |scenario, index| {
         // Several scenarios explored: each its own run (its record, events and tapes, branch
@@ -1138,10 +1141,18 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
             .run => try command_run(context, vm, &options, arguments.from_snapshot),
             .explore => {
                 const multiverse = try command_explore(context, vm, &options, &arguments);
-                failing_scenarios += @intFromBool(multiverse.failing_properties() > 0);
                 try multiverse.catalog_reached(&catalog);
+                if (multiverse.failing_violations() > 0) {
+                    failing_scenarios += 1;
+                } else try unmet.append(arena, try multiverse.sometimes_unmet(arena));
             },
         }
+    }
+    for (unmet.items) |messages| {
+        for (messages) |message| if (!catalog.made_true(message)) {
+            failing_scenarios += 1;
+            break;
+        };
     }
     // Catalogs span scenarios (a test program's, a service serving several): an assertion
     // must be reached in some scenario, judged once all ran.

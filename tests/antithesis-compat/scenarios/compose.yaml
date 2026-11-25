@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: MIT
+# Two test templates, one property: a `sometimes` false in one and true in the other. The
+# catalog spans the templates explored, as an Antithesis run explores them together, so the run
+# passes (each template judged alone failed it: CE10, the blind Lean replica of the platform).
+# Run with:
+#   determinismo explore ... --compose tests/antithesis-compat/scenarios/compose.yaml --scenario all
+services:
+  client:
+    build: ./client
+    command: [/usr/local/bin/ready]
