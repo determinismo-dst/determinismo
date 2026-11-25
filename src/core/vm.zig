@@ -217,6 +217,9 @@ ingress_reply: std.ArrayList(u8) = .empty,
 ingress_reply_at: usize = 0,
 ingress_status: u32 = 0,
 ingress_taped: bool = false,
+/// Ingress answered live in a replay: a session extending the timeline listens from its moment
+/// on (its recorded answers dropped). Otherwise a replay's ingress answers are its tape's.
+ingress_answers_live: bool = false,
 ingress_listen: ?[]const u8 = null,
 ingress_listener: linux.fd_t = -1,
 ingress_listener_pid: linux.pid_t = 0,
@@ -1970,6 +1973,7 @@ fn moment_command_one(vm: *VM) !bool {
     if (std.mem.eql(u8, step, step_extend)) {
         vm.steps_own = true;
         if (vm.ingress_listen != null) if (vm.overrides) |overrides| {
+            vm.ingress_answers_live = true;
             const dropped = overrides.drop_kind(.ingress);
             if (dropped > 0) std.debug.print("[determinismo] extend: {d} recorded ingress answers to come dropped (this session listens)\n", .{dropped});
         };
@@ -3285,6 +3289,29 @@ fn ingress_answer(vm: *VM) !void {
     }
 }
 
+/// An ingress status answer saying nothing came (status ok, no bytes): an idle poll's.
+fn ingress_nothing(value: []u8) void {
+    std.mem.writeInt(u32, value[0..4], @backingInt(EgressStatus.ok), .little);
+    std.mem.writeInt(u32, value[4..8], 0, .little);
+}
+
+fn ingress_is_nothing(value: []const u8) bool {
+    return value.len == 8 and std.mem.readInt(u32, value[0..4], .little) == @backingInt(EgressStatus.ok) and
+        std.mem.readInt(u32, value[4..8], .little) == 0;
+}
+
+test ingress_is_nothing {
+    var value: [8]u8 = undefined;
+    ingress_nothing(&value);
+    try std.testing.expect(ingress_is_nothing(&value));
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0, 0, 0, 0, 0, 0, 0 }, &value); // As taped: "0100000000000000".
+    std.mem.writeInt(u32, value[4..8], 3, .little);
+    try std.testing.expect(!ingress_is_nothing(&value)); // Bytes came.
+    std.mem.writeInt(u32, value[0..4], @backingInt(EgressStatus.end), .little);
+    std.mem.writeInt(u32, value[4..8], 0, .little);
+    try std.testing.expect(!ingress_is_nothing(&value)); // The connection ended: taped.
+}
+
 /// The connection id in a guest's ingress request ({"ingress":{"op":...,"id":N,...}}), 0 for
 /// none (an accept). A session on a timeline with a connection still open (an editor's REPL
 /// connection, taken by the session it extends) numbered its own first connection 1 again:
@@ -3776,7 +3803,16 @@ fn decide_random(vm: *VM, value: []u8, source: []const u8) !void {
         if (status) vm.ingress_next = @max(vm.ingress_next, ingress_id_seen(vm.request_of(.ingress)) +| 1);
         const taped = if (vm.overrides) |overrides| taped: {
             if (!status) break :taped vm.ingress_taped and try vm.override_apply(overrides, pull, value);
-            if (overrides.kind_at(pull) != .ingress) break :taped false;
+            if (overrides.kind_at(pull) != .ingress) {
+                // An idle poll's nothing is never taped (below): a replay answers a status pull
+                // its tape lacks with it, as the run was answered. Never one the tape has an
+                // answer before: the replay passed it, diverged.
+                if (vm.ingress_answers_live) break :taped false;
+                if (overrides.passed(pull)) return error.TapeOutOfOrder;
+                if (value.len != 8) return error.BadGuestRequest;
+                ingress_nothing(value);
+                break :taped true;
+            }
             break :taped try vm.override_apply(overrides, pull, value);
         } else false;
         if (status) vm.ingress_taped = taped;
@@ -3793,9 +3829,12 @@ fn decide_random(vm: *VM, value: []u8, source: []const u8) !void {
                 @memcpy(value, rest[0..value.len]);
                 vm.ingress_reply_at += value.len;
             }
-            // Its bytes too carry the reason (their kind: tape.Kind, no reason kept for it).
+            // Its bytes too carry the reason (their kind: tape.Kind, no reason kept for it). An
+            // idle poll's nothing (84 a virtual second) not: a replay answers it alike, and taped
+            // it outgrew what a replay could read in 13 virtual minutes (CE20, the Lean replica
+            // of determinismo).
             const reason = ingress_reason;
-            if (vm.tape_fd) |fd| try vm.tape_override(fd, pull, value, reason);
+            if (!(status and ingress_is_nothing(value))) if (vm.tape_fd) |fd| try vm.tape_override(fd, pull, value, reason);
         }
         if (status) {
             const answered = std.mem.readInt(u32, value[0..4], .little);

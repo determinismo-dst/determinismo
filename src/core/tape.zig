@@ -289,6 +289,12 @@ pub const Overrides = struct {
         overrides.checkpoint_cursor = overrides.checkpoint_count;
     }
 
+    /// Whether the tape's next override is for a pull before `pull`: one the replay passed
+    /// without taking it (it diverged from the run).
+    pub fn passed(overrides: *const Overrides, pull: u64) bool {
+        return overrides.cursor < overrides.count and overrides.entries[overrides.cursor].pull < pull;
+    }
+
     /// A replay at pull `pull` past where its tape's recorder stopped taping: no answer after
     /// it is on the tape.
     pub fn past_full(overrides: *const Overrides, pull: u64) bool {
