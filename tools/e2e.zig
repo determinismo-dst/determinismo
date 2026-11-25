@@ -3036,8 +3036,10 @@ fn check_ci(context: *Context) !void {
     const junit = try run_kept(context, &.{ "sh", "-c", junit_command });
     // The same job read with a reply cap below its run's output: determinismo-ci read the whole
     // output once the run ended (jank's run 2202: 119 MB past the 64 MB cap, StreamTooLong, the
-    // verdicts never printed), though it uses none of it.
-    const capped_command = try std.mem.replaceOwned(u8, arena, junit_command, "--config ci-junit.json", "--config ci-junit.json --reply-max 262144");
+    // verdicts never printed), though it uses none of it. ci-capped.json is ci-junit.json with
+    // 40 KB more output a timeline (12 of them: past the 256 KB cap; ci-junit's own run stays
+    // under it, so the cap was never reached).
+    const capped_command = try std.mem.replaceOwned(u8, arena, junit_command, "--config ci-junit.json", "--config ci-capped.json --reply-max 262144");
     const capped = try run_kept(context, &.{ "sh", "-c", capped_command });
     const capped_judged = std.mem.indexOf(u8, capped.stdout, "3 tests, 1 failing, 1 flaky") != null and
         std.mem.indexOf(u8, capped.stdout, "StreamTooLong") == null and std.mem.indexOf(u8, capped.stderr, "StreamTooLong") == null;
