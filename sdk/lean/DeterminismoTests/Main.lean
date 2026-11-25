@@ -250,6 +250,16 @@ def connections : List Check :=
       ok := (List.range 100).all fun i =>
         (Conn.runFull (Conn.config true (clientNodes := some [0])) (Source.seeded i)).cluster.history.all (·.node == 0) } ]
 
+def edn : List Check :=
+  let op := Edn.map [(.kw "type", .kw "ok"), (.kw "f", .kw "txn"), (.kw "process", .int 0),
+    (.kw "value", .vec [.vec [.kw "append", .int 1, .int 2], .vec [.kw "r", .int 1, .vec [.int 2]]])]
+  [ { name := "an Elle operation renders as EDN",
+      ok := op.render == "{:type :ok, :f :txn, :process 0, :value [[:append 1 2] [:r 1 [2]]]}" },
+    { name := "strings escaped, sets, lists, symbols, tags, nil and negatives",
+      ok := (Edn.vec [.str "a\"b\\c\n", .set [.int 1], .list [.sym "inc", .int (-1)], .nil, .bool false,
+              .tagged "inst" (.str "2026-11-25T00:00:00Z")]).render
+            == "[\"a\\\"b\\\\c\\n\" #{1} (inc -1) nil false #inst \"2026-11-25T00:00:00Z\"]" } ]
+
 def censusChecks : List Check :=
   let whole := census tinyRun
   let half := census tinyRun (maxRuns := 5)
@@ -331,7 +341,7 @@ def describe (c : Counterexample) : String :=
 
 def main : IO UInt32 := do
   let mut failed := 0
-  for c in decisions ++ connections ++ sync ++ combinatorics ++ censusChecks ++ shrinkChecks ++ disk ++ fileSystem ++ history ++ locks do
+  for c in decisions ++ edn ++ connections ++ sync ++ combinatorics ++ censusChecks ++ shrinkChecks ++ disk ++ fileSystem ++ history ++ locks do
     IO.println s!"{if c.ok then "ok  " else "FAIL"} {c.name}"
     if !c.ok then failed := failed + 1
   -- The toy register, end to end.

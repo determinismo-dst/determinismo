@@ -4,5 +4,6 @@ import Determinismo.Cluster
 import Determinismo.History
 import Determinismo.Search
 import Determinismo.Census
+import Determinismo.Edn
 import Determinismo.Threads
 import Determinismo.Locks
