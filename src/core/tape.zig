@@ -587,10 +587,13 @@ fn checkpoint_parse(overrides: *Overrides, value: std.json.Value) !void {
 }
 
 /// Keeps a tape's checkpoint, in order: one in `checkpoint_every`, which doubles (the kept ones
-/// thinned to every other) whenever the array is full. Never a limit on a tape's length.
+/// thinned to every other) whenever the array is full, again until a doubling frees a slot (a
+/// tape's checkpoints can all sit on the doubled interval: those between came after kernel
+/// lines, which take none). Never a limit on a tape's length.
 fn checkpoint_keep(overrides: *Overrides, checkpoint: Checkpoint) void {
     if (!checkpoint_kept(checkpoint, overrides.checkpoint_every)) return;
-    if (overrides.checkpoint_count == checkpoint_count_max) {
+    while (overrides.checkpoint_count == checkpoint_count_max) {
+        assert(overrides.checkpoint_every < 1 << 31);
         overrides.checkpoint_every *= 2;
         var kept: u32 = 0;
         for (overrides.checkpoints[0..overrides.checkpoint_count]) |entry| {
@@ -633,6 +636,26 @@ test "a tape's checkpoints past the array are thinned, never refused" {
     // A replay checks the kept ones and passes over the others.
     for (1..total + 1) |index| try overrides.check(.{ .events = index * checkpoint_interval, .branches = index, .events_hash = index });
     try std.testing.expectEqual(overrides.checkpoint_count, overrides.checkpoint_cursor);
+}
+
+test "a tape whose checkpoints all sit on the doubled interval thins again" {
+    // The Lean replica's CE14: checkpoints at even multiples only (the others came after kernel
+    // lines): one doubling keeps them all, the array stays full.
+    const overrides = try std.testing.allocator.create(Overrides);
+    defer std.testing.allocator.destroy(overrides);
+    overrides.checkpoint_count = 0;
+    overrides.checkpoint_cursor = 0;
+    overrides.checkpoint_every = 1;
+    for (1..checkpoint_count_max + 2) |index| checkpoint_keep(overrides, .{
+        .events = 2 * index * checkpoint_interval,
+        .branches = index,
+        .events_hash = index,
+    });
+    try std.testing.expectEqual(@as(u32, 4), overrides.checkpoint_every);
+    try std.testing.expectEqual(@as(u32, checkpoint_count_max / 2), overrides.checkpoint_count);
+    for (overrides.checkpoints[0..overrides.checkpoint_count]) |entry| {
+        try std.testing.expect(checkpoint_kept(entry, overrides.checkpoint_every));
+    }
 }
 
 pub fn write_checkpoint(fd: linux.fd_t, checkpoint: Checkpoint) void {
