@@ -1,3 +1,6 @@
+; SPDX-License-Identifier: EPL-2.0
+; Elle is copyright 2019--2020 Jepsen, LLC and Peter Alvaro, under the Eclipse Public License
+; 2.0 (src/elle/LICENSE); this copy's change is under the same license.
 ; Elle 0.2.8's elle/closed_predicate.clj (github.com/jepsen-io/elle, EPL-2.0), loaded ahead of
 ; Elle's jar (deps.edn's :paths come first), with one fix: ww-graph matched `:write` where every
 ; other function, and the histories, spell a write `:w`, so a write got no write-write edge and
