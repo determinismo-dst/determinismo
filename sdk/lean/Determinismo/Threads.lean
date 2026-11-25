@@ -10,6 +10,10 @@ thread-pause faults choose it in the real process, so a search reaches every int
 its bounds. A step can also block (a lock held, a queue empty): the thread waits until a step of
 another changes the memory. A process kill (`thread.kill`, when `kills` is on) ends every thread
 at once; what survives is what the program kept in `durable`.
+
+Threads come and go: a step may `spawn` one (it steps from the next decision on), wait for one to
+end (`finished`, a join), ask one to stop (`cancel`, seen at its next `cancelRequested`), or end
+one where it stands (`stop`). `Process.note` writes the process's story, step by step.
 -/
 
 namespace Determinismo
@@ -31,6 +35,8 @@ structure Process (M L : Type) where
   /-- Steps so far. -/
   steps : Nat := 0
   log : Array String := #[]
+  /-- Threads asked to stop (`cancel`): each sees it at its next check (`cancelRequested`). -/
+  cancelled : List Nat := []
 
 instance {M L : Type} : Chaotic (Process M L) where
   decisions p := p.decisions
@@ -41,6 +47,27 @@ abbrev ProcessM (M L : Type) := EStateM Stop (Process M L)
 /-- A line of the process's story (`Process.log`), stamped with its step. -/
 def Process.note {M L : Type} (line : String) : ProcessM M L Unit :=
   modify fun p => { p with log := p.log.push s!"{p.steps}: {line}" }
+
+/-- A new thread with `locals`, stepping from the next interleaving decision on: its index. -/
+def Process.spawn {M L : Type} (locals : L) : ProcessM M L Nat := do
+  let p ← get
+  set { p with threads := p.threads.push (some locals) }
+  pure p.threads.size
+
+/-- Whether thread `t` is over (its last step done, or stopped). A step joining `t` returns
+`.blocked` until it is. -/
+def Process.finished {M L : Type} (p : Process M L) (t : Nat) : Bool := (p.threads.getD t none).isNone
+
+/-- Asks thread `t` to stop: cooperative, as Java's interrupt or a cancellation point, seen when
+`t` next checks `cancelRequested`. -/
+def Process.cancel {M L : Type} (t : Nat) : ProcessM M L Unit :=
+  modify fun p => { p with cancelled := if p.cancelled.contains t then p.cancelled else t :: p.cancelled }
+
+def Process.cancelRequested {M L : Type} (p : Process M L) (t : Nat) : Bool := p.cancelled.contains t
+
+/-- Ends thread `t` where it stands (an asynchronous cancellation: whatever it held stays held). -/
+def Process.stop {M L : Type} (t : Nat) : ProcessM M L Unit :=
+  modify fun p => { p with threads := p.threads.set! t none }
 
 /-- A program: a thread's step on the shared memory (it may decide: a thread's own randomness). -/
 structure Program (M L : Type) where

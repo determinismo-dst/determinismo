@@ -1,3 +1,5 @@
+import Determinismo.Decide
+
 /-!
 # Locks for threads
 
@@ -11,6 +13,10 @@ Not reentrant: a thread taking a lock it holds is refused, as a plain mutex dead
   `announce`d itself keeps new readers out until it has taken and released the lock: a reader
   already holding it that asks again then waits behind the writer, the deadlock such locks are
   known for.
+- `Condvar`: a wait is two steps, `enter` (the thread joins the waiters and releases its mutex)
+  then `tryWake` (blocked until notified and the mutex is free, then holding it again; a
+  spurious wakeup is a decision, `wakeSpuriously`). `notifyOne` wakes a waiter chosen by a
+  decision, `notifyAll` every one; a notify with nobody waiting is lost, as in the real thing.
 -/
 
 namespace Determinismo
@@ -61,5 +67,50 @@ def tryLock (l : RwLock) (t : Nat) : Option RwLock :=
 def unlock (l : RwLock) : RwLock := { l with writer := none }
 
 end RwLock
+
+structure Condvar where
+  /-- Threads waiting, in the order they began to. -/
+  waiting : List Nat := []
+  /-- Threads notified, not yet holding the mutex again. -/
+  notified : List Nat := []
+  deriving Repr, BEq
+
+namespace Condvar
+
+/-- Thread `t` begins to wait (its step also releases the mutex it held). -/
+def enter (c : Condvar) (t : Nat) : Condvar :=
+  if c.waiting.contains t then c else { c with waiting := c.waiting ++ [t] }
+
+/-- Thread `t` wakes if it was notified and `m` is free: both updated, `t` holding `m`. -/
+def tryWake (c : Condvar) (m : Mutex) (t : Nat) : Option (Condvar × Mutex) :=
+  if c.notified.contains t then
+    (m.tryLock t).map fun m' => ({ c with notified := c.notified.erase t }, m')
+  else none
+
+/-- Waiter number `i` (in `waiting`) notified. -/
+def notifyAt (c : Condvar) (i : Nat) : Condvar :=
+  match c.waiting[i]? with
+  | some t => { waiting := c.waiting.erase t, notified := c.notified ++ [t] }
+  | none => c
+
+def notifyAll (c : Condvar) : Condvar := { waiting := [], notified := c.notified ++ c.waiting }
+
+/-- A spurious wakeup of `t`, as if notified (POSIX allows it: a waiter must check again). -/
+def spurious (c : Condvar) (t : Nat) : Condvar :=
+  if c.waiting.contains t then { waiting := c.waiting.erase t, notified := c.notified ++ [t] } else c
+
+end Condvar
+
+variable {σ : Type} [Chaotic σ]
+
+/-- One waiter notified, which one decided (`name`); nobody waiting: the notify is lost. -/
+def notifyOne (name : String) (c : Condvar) : EStateM Stop σ Condvar := do
+  if c.waiting.isEmpty then pure c
+  else pure (c.notifyAt (← decide name c.waiting.length))
+
+/-- Whether waiter `t` wakes spuriously now, `inOf` in `of` when random. -/
+def wakeSpuriously (name : String) (c : Condvar) (t : Nat) (inOf : Nat := 1) (of : Nat := 16) :
+    EStateM Stop σ Condvar := do
+  if c.waiting.contains t && (← decideRare name inOf of) then pure (c.spurious t) else pure c
 
 end Determinismo

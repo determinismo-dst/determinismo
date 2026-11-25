@@ -1,6 +1,7 @@
 import Determinismo
 import DeterminismoTests.Toy
 import DeterminismoTests.Locks
+import DeterminismoTests.Sync
 import DeterminismoTests.Boot
 
 /-! The library's tests: `lake exe determinismo-lean-tests` (exit 1 when one fails). -/
@@ -189,6 +190,26 @@ def combinatorics : List Check :=
         let b := (Decisions.nextOf { source := Source.seeded i } "x" 5 none).toOption.map (·.1)
         a == b } ]
 
+def sync : List Check :=
+  let ex (prog : Program Sync.Mem Nat) (threads : Nat) := exhaust (fun src => (Sync.run prog threads src).1) 100000
+  let ended := (Sync.run (Sync.spawnProgram true true) 1 (Source.path #[])).2
+  [ { name := "notifying without the mutex loses the wakeup between the check and the wait: deadlock",
+      ok := Sync.found (ex (Sync.waitProgram false true false) 2) "deadlock" },
+    { name := "notifying under the mutex: every interleaving ends", ok := Sync.complete (ex (Sync.waitProgram true true false) 2) },
+    { name := "a wait in an if: fine without spurious wakeups",
+      ok := Sync.complete (ex (Sync.waitProgram true false false) 2) },
+    { name := "a wait in an if: a spurious wakeup goes on before ready",
+      ok := Sync.found (ex (Sync.waitProgram true false true) 2) "woke before ready" },
+    { name := "a wait in a loop survives spurious wakeups (16 steps: 3,868 timelines)",
+      ok := match exhaust (fun src => (Sync.run (Sync.waitProgram true true true) 2 src 16).1) 100000 with
+        | .complete n => n == 3868 | _ => false },
+    { name := "reading a spawned worker's count without joining it is found",
+      ok := Sync.found (ex (Sync.spawnProgram false false) 1) "read before the worker ran" },
+    { name := "joined first: the count is always 1", ok := Sync.complete (ex (Sync.spawnProgram true false) 1) },
+    { name := "a worker cancelled then joined: no interleaving deadlocks",
+      ok := Sync.complete (ex (Sync.spawnProgram true true) 1) },
+    { name := "cancelled then joined: both threads end", ok := ended.threads.all (·.isNone) && ended.threads.size == 2 } ]
+
 def censusChecks : List Check :=
   let whole := census tinyRun
   let half := census tinyRun (maxRuns := 5)
@@ -270,7 +291,7 @@ def describe (c : Counterexample) : String :=
 
 def main : IO UInt32 := do
   let mut failed := 0
-  for c in decisions ++ combinatorics ++ censusChecks ++ shrinkChecks ++ disk ++ history ++ locks do
+  for c in decisions ++ sync ++ combinatorics ++ censusChecks ++ shrinkChecks ++ disk ++ history ++ locks do
     IO.println s!"{if c.ok then "ok  " else "FAIL"} {c.name}"
     if !c.ok then failed := failed + 1
   -- The toy register, end to end.
