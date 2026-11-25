@@ -229,7 +229,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "wasm-reach", check_wasm_reach },             .{ "plugins-many", check_plugins_many },             .{ "strategy-follow", check_strategy_follow },
         .{ "steppers", check_steppers },                 .{ "reactive-faults", check_reactive_faults },       .{ "injectors", check_injectors },
         .{ "labels", check_labels },                     .{ "wasm-upload", check_wasm_upload },               .{ "timeline-clocks", check_timeline_clocks },
-        .{ "egress", check_egress },                     .{ "ingress", check_ingress },                       .{ "ingress-session", check_ingress_session },
+        .{ "egress", check_egress },                     .{ "fork-replay", check_fork_replay },                     .{ "ingress", check_ingress },                       .{ "ingress-session", check_ingress_session },
         .{ "moments", check_moments },                   .{ "properties", check_builtin_properties },         .{ "entropy", check_kernel_entropy },
         .{ "quiet", check_quiet_period },                .{ "clock_jitter", check_clock_jitter },             .{ "query", check_query },
         .{ "progress", check_progress_while_quiet },     .{ "network", check_network_faults },                .{ "fault-exclusions", check_fault_exclusions },
@@ -408,6 +408,30 @@ fn moment_ns(output: []const u8) ?u64 {
 /// scenario reaches a server on this host through the allowlist and is refused one port over;
 /// then the timeline replayed from its tape with the server stopped: the same answer (from the
 /// tape: nothing connects), the same history.
+/// A timeline with an sdk.fork pull replays from its tape with the run's history: the replayed
+/// pull emits its decision event as the recorded one did (the Lean replica of determinismo's
+/// CE12: one event short from there, so every later checkpoint differed).
+fn check_fork_replay(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "det-selftest" });
+    const tapes = try std.fs.path.join(arena, &.{ context.scratch, "fork-replay-tapes" });
+    const explored = try explore(context, &.{
+        "--program", program, "--scenario", "fork_pull", "--seed", "5", "--branches", "1", "--tape-dir", tapes,
+    });
+    var branches: [1]Branch = undefined;
+    const ran = parse_branches(explored, &branches) == 1;
+    const tape = if (ran) try std.fmt.allocPrint(arena, "{s}/branch-{d}.jsonl", .{ tapes, branches[0].index }) else "";
+    const replay = if (ran) try explore(context, &.{ "--program", program, "--scenario", "fork_pull", "--tape", tape }) else "";
+    var replayed: [1]Branch = undefined;
+    const replayed_one = ran and parse_branches(replay, &replayed) == 1;
+    expect_all(context, &.{
+        .{ "the timeline ran", ran },
+        .{ "the replay ran it again", replayed_one },
+        .{ "the replay never diverged from its tape", ran and std.mem.indexOf(u8, replay, "replay diverged") == null },
+        .{ "the replay's history is the run's", replayed_one and std.mem.eql(u8, replayed[0].events_hash, branches[0].events_hash) },
+    }, "fork-replay: a timeline with an sdk.fork pull, replayed from its tape", .{});
+}
+
 fn check_egress(context: *Context) !void {
     const arena = context.arena;
     const program = try std.fs.path.join(arena, &.{ context.bin, "det-selftest" });

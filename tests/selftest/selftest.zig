@@ -147,6 +147,7 @@ pub fn main(init: std.process.Init) !void {
             .hang = hang,
             .hang_sometimes = hang_sometimes,
             .egress = egress_scenario,
+            .fork_pull = fork_pull_scenario,
             .ingress = ingress_scenario,
             .stress = stress,
             .quiet = quiet_scenario,
@@ -2131,6 +2132,20 @@ fn ingress_write(fd: linux.fd_t, bytes: []const u8) void {
 /// egress.txt, its body read (retried through the boundary's faults); then a CONNECT to
 /// 127.0.0.1:7898 (not allowed): refused. Replayed
 /// from its tape with the server gone, the same bytes (tools/e2e.zig: egress).
+/// fork_pull: sdk.fork outside a session (nothing cloned: it answers 0), then 200 events past
+/// several checkpoints, so that a replay from the tape compares them (tools/e2e.zig:
+/// fork-replay; the Lean replica of determinismo's CE12: a replayed fork pull emitted no
+/// decision event, one event short from there).
+fn fork_pull_scenario(s: *System.Scenario) void {
+    s.singleton_driver("fork-pull", fork_pull_driver);
+}
+
+fn fork_pull_driver(_: *System.Context) !void {
+    const index = sdk.fork(2);
+    sdk.always(index == 0, "outside a session a fork clones nothing", .{ .index = index });
+    for (0..200) |step| sdk.event("fork_pull_step", .{ .step = step });
+}
+
 fn egress_scenario(s: *System.Scenario) void {
     s.singleton_driver("egress", egress_driver);
 }
