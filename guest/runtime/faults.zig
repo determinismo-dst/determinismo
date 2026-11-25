@@ -2242,12 +2242,12 @@ fn node_end(system: *const schema.System, slot: *?NodeFault) void {
     defer doing_set("wait", null, "");
     switch (fault.applied.kind) {
         .pause => nodes.freeze(name, .thawed) catch {},
-        .sync_stall => durable_disarm(name),
+        .sync_stall => durable_disarm(name, .stall),
         .durable_crash => {
             const index = node_index_of(system, name) orelse return;
             durable_lock_take();
             durable_active[index] = false;
-            durable_disarm(name);
+            durable_disarm(name, .crash_before);
             const crashed = durable_crashed[index];
             durable_crashed[index] = false;
             durable_lock.unlock();
@@ -3253,12 +3253,20 @@ fn durable_arm(applied: *const Applied) !void {
     if (linux.errno(armed) != .SUCCESS) return error.ArmFailed;
 }
 
-fn durable_disarm(name: []const u8) void {
+/// The node's crash arm disarmed (its crash asked for), a sync_stall's left as it is.
+fn durable_disarm_crash(name: []const u8) void {
+    durable_disarm(name, .crash_before);
+}
+
+/// The node's arm of that kind disarmed (a sync_stall's, `.stall`; a durable_crash's, either
+/// crash mode), its other kind's left armed: one arm a node made the first fault to end disarm
+/// both (CE35, the Lean replica of determinismo).
+fn durable_disarm(name: []const u8, mode: DurabilityMode) void {
     if (module_device < 0) return;
     var arm: DurabilityArm = .{
         .cgroup = node_cgroup(name) catch return,
         .one_in = 0,
-        .mode = .stall,
+        .mode = mode,
         .stall_ms_min = 0,
         .stall_ms_max = 0,
         .node = @splat(0),
@@ -3314,7 +3322,7 @@ fn durable_listen() void {
             .when = if (request.mode == .crash_after) "after_sync" else "before_sync",
         });
         // Disarmed once the freeze is asked for: the parked process goes on into it.
-        nodes.crash_with(node[0], durable_disarm, durable_partial[node[1]]) catch |err| {
+        nodes.crash_with(node[0], durable_disarm_crash, durable_partial[node[1]]) catch |err| {
             sdk.event("fault_failed", .{ .node = node[0], .err = @errorName(err) });
             continue;
         };

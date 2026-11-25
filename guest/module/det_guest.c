@@ -246,7 +246,7 @@ static ssize_t det_read(struct file *f, char __user *buf, size_t n, loff_t *off)
  * decides, the overlay's own call never, so each sync is one decision.
  */
 
-#define DET_DURABILITY_NODES 32
+#define DET_DURABILITY_NODES 64 /* Two arms a node: its stall's and its crash's. */
 #define DET_DURABILITY_PARKED 16
 #define DET_STALL 0
 #define DET_CRASH_BEFORE 1
@@ -284,13 +284,24 @@ static u32 det_request_count;
 static DECLARE_WAIT_QUEUE_HEAD(det_durability_requests);
 static DECLARE_WAIT_QUEUE_HEAD(det_durability_released);
 
-/* Under det_durability_lock: the armed node of `cgroup`, or NULL. */
-static struct det_durability_arm *det_armed_of(u64 cgroup)
+/*
+ * A node's arms by kind: a sync_stall's (DET_STALL) and a durable_crash's (either crash mode),
+ * each its own. One arm a node made the later fault replace the earlier and the first to end
+ * disarm both (CE35, the Lean replica of determinismo).
+ */
+static bool det_stall_kind(u32 mode)
+{
+	return mode == DET_STALL;
+}
+
+/* Under det_durability_lock: the armed node of `cgroup` of the kind, or NULL. */
+static struct det_durability_arm *det_armed_of(u64 cgroup, bool stall)
 {
 	int i;
 
 	for (i = 0; i < DET_DURABILITY_NODES; i++)
-		if (det_armed[i].one_in && det_armed[i].cgroup == cgroup)
+		if (det_armed[i].one_in && det_armed[i].cgroup == cgroup &&
+		    det_stall_kind(det_armed[i].mode) == stall)
 			return &det_armed[i];
 	return NULL;
 }
@@ -299,7 +310,7 @@ static struct det_durability_arm *det_armed_of(u64 cgroup)
  * The arm of the current task's node (one_in 0 when none): its cgroup's, or an ancestor's (a
  * node's processes may sit in cgroups of their own under it, as a container runtime's do).
  */
-static struct det_durability_arm det_arm_current(void)
+static struct det_durability_arm det_arm_current(bool stall)
 {
 	struct det_durability_arm arm = { .one_in = 0 }, *found = NULL;
 	struct cgroup *cgroup;
@@ -308,7 +319,7 @@ static struct det_durability_arm det_arm_current(void)
 	spin_lock_irqsave(&det_durability_lock, flags);
 	rcu_read_lock();
 	for (cgroup = task_dfl_cgroup(current); cgroup && !found; cgroup = cgroup_parent(cgroup))
-		found = det_armed_of(cgroup_ino(cgroup));
+		found = det_armed_of(cgroup_ino(cgroup), stall);
 	rcu_read_unlock();
 	if (found)
 		arm = *found;
@@ -400,7 +411,11 @@ static void det_park(u64 cgroup, u32 mode)
 
 extern int (*det_durability_point)(struct file *file, bool after);
 
-/* The kernel's durability point (0008): each mode decides at its own side of the sync. */
+/*
+ * The kernel's durability point (0008): each mode decides at its own side of the sync, a node's
+ * crash first, then (before the sync, not crashed) its stall: one pull each, a node with one arm
+ * as before.
+ */
 static int det_durability(struct file *file, bool after)
 {
 	struct det_durability_arm arm;
@@ -410,13 +425,21 @@ static int det_durability(struct file *file, bool after)
 		return 0;
 	if (file_inode(file)->i_sb->s_magic == OVERLAYFS_SUPER_MAGIC)
 		return 0;
-	arm = det_arm_current();
-	if (!arm.one_in || after != (arm.mode == DET_CRASH_AFTER))
+	arm = det_arm_current(false);
+	if (arm.one_in && after == (arm.mode == DET_CRASH_AFTER)) {
+		pull = det_pull();
+		if ((u32)pull % arm.one_in == 0)
+			goto crash;
+	}
+	if (after)
+		return 0;
+	arm = det_arm_current(true);
+	if (!arm.one_in)
 		return 0;
 	pull = det_pull();
 	if ((u32)pull % arm.one_in != 0)
 		return 0;
-	if (arm.mode == DET_STALL) {
+	{
 		u32 span = arm.stall_ms_max - min(arm.stall_ms_min, arm.stall_ms_max) + 1;
 		u32 ms = arm.stall_ms_min + (u32)(pull >> 32) % span;
 
@@ -424,6 +447,7 @@ static int det_durability(struct file *file, bool after)
 		schedule_timeout_killable(msecs_to_jiffies(ms));
 		return 0;
 	}
+crash:
 	if (arm.mode == DET_CRASH_AFTER) {
 		det_park(arm.cgroup, DET_CRASH_AFTER); /* Synced; frozen before it acts on it. */
 		return 0;
@@ -465,8 +489,9 @@ static long det_durability_ioctl(unsigned int cmd, unsigned long arg)
 	arm.node[sizeof(arm.node) - 1] = 0;
 	spin_lock_irqsave(&det_durability_lock, flags);
 	for (i = 0; i < DET_DURABILITY_NODES; i++) {
-		if (det_armed[i].one_in && det_armed[i].cgroup == arm.cgroup)
-			det_armed[i].one_in = 0; /* Replaced (or disarmed). */
+		if (det_armed[i].one_in && det_armed[i].cgroup == arm.cgroup &&
+		    det_stall_kind(det_armed[i].mode) == det_stall_kind(arm.mode))
+			det_armed[i].one_in = 0; /* Replaced (or disarmed): its kind's alone. */
 		if (!det_armed[i].one_in && free < 0)
 			free = i;
 	}
@@ -475,8 +500,8 @@ static long det_durability_ioctl(unsigned int cmd, unsigned long arg)
 	for (i = 0; i < DET_DURABILITY_NODES; i++)
 		count += det_armed[i].one_in != 0;
 	atomic_set(&det_armed_count, count);
-	if (!arm.one_in) {
-		/* Disarmed: its parked tasks go on (into the freeze, when a crash comes). */
+	if (!arm.one_in && !det_stall_kind(arm.mode)) {
+		/* A crash disarmed: its parked tasks go on (into the freeze, when a crash comes). */
 		for (i = 0; i < DET_DURABILITY_PARKED; i++)
 			if (det_parked[i].task && det_parked[i].cgroup == arm.cgroup)
 				WRITE_ONCE(det_parked[i].released, true);
@@ -492,7 +517,7 @@ static long det_durability_ioctl(unsigned int cmd, unsigned long arg)
 		}
 	}
 	spin_unlock_irqrestore(&det_durability_lock, flags);
-	if (!arm.one_in)
+	if (!arm.one_in && !det_stall_kind(arm.mode))
 		wake_up_all(&det_durability_released);
 	return arm.one_in && free < 0 ? -ENOSPC : 0;
 }
