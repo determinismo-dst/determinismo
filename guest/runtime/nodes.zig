@@ -1974,7 +1974,9 @@ pub const DiskFailure = enum {
     /// Writes fail; reads work.
     write_errors,
     /// Writes are acknowledged and never stored (a lying disk or controller cache): a crash
-    /// after loses them although they were synced.
+    /// after loses them although they were synced, and so does the kernel dropping a written
+    /// page from its cache before any crash (memory pressure): a read then returns what the disk
+    /// held, as a lying disk's would (CE36, the Lean replica of determinismo).
     lost_writes,
     /// Reads return one byte of each request changed (bit rot). What is stored is intact but where
     /// the node writes part of a page it did not hold: the kernel reads the page to merge the
