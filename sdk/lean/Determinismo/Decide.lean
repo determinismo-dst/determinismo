@@ -108,10 +108,10 @@ def drawWeighted (gen : StdGen) (weights : List Nat) : Nat × StdGen :=
       | w :: rest => if r < acc + w then index else pick rest (index + 1) (acc + w)
     (pick weights 0 0, gen')
 
-/-- The next value of a decision with `weights.length` options (`weights` shape random draws
-only: a replayed or searched path takes any option). One option: 0, not recorded. -/
-def Decisions.next (d : Decisions) (name : String) (weights : List Nat) : Except Stop (Nat × Decisions) :=
-  let options := weights.length
+/-- The next value of a decision with `options` options, by `weights` when random (none:
+uniform, no list built). One option: 0, not recorded. -/
+def Decisions.nextOf (d : Decisions) (name : String) (options : Nat) (weights : Option (List Nat)) :
+    Except Stop (Nat × Decisions) :=
   if options ≤ 1 then .ok (0, d)
   else if d.taken.size ≥ d.limit then .error .limit
   else
@@ -119,13 +119,19 @@ def Decisions.next (d : Decisions) (name : String) (weights : List Nat) : Except
     let (value, source) :=
       if h : position < d.source.given.size then (d.source.given[position] % options, d.source)
       else if d.source.random then
-        let allowed := weights.take (d.source.bounds.options position name options)
-        let (v, gen) :=
-          if d.source.uniform then drawUniform d.source.gen allowed.length
-          else drawWeighted d.source.gen allowed
+        let allowed := d.source.bounds.options position name options
+        let (v, gen) := match weights with
+          | some ws => if d.source.uniform then drawUniform d.source.gen allowed
+                       else drawWeighted d.source.gen (ws.take allowed)
+          | none => drawUniform d.source.gen allowed
         (v, { d.source with gen := gen })
       else (0, d.source)
     .ok (value, { d with source := source, taken := d.taken.push { name, options, value } })
+
+/-- The next value of a decision with `weights.length` options (`weights` shape random draws
+only: a replayed or searched path takes any option). One option: 0, not recorded. -/
+def Decisions.next (d : Decisions) (name : String) (weights : List Nat) : Except Stop (Nat × Decisions) :=
+  d.nextOf name weights.length (some weights)
 
 variable {σ : Type} [Chaotic σ]
 
@@ -136,9 +142,13 @@ def decideWeighted (name : String) (weights : List Nat) : EStateM Stop σ Nat :=
   | .ok (value, d) => set (Chaotic.setDecisions s d); pure value
   | .error stop => throw stop
 
-/-- A decision among `options` options, uniform when random. -/
-def decide (name : String) (options : Nat) : EStateM Stop σ Nat :=
-  decideWeighted name (List.replicate options 1)
+/-- A decision among `options` options, uniform when random (the same draws as equal weights,
+without building their list). -/
+def decide (name : String) (options : Nat) : EStateM Stop σ Nat := do
+  let s ← get
+  match (Chaotic.decisions s).nextOf name options none with
+  | .ok (value, d) => set (Chaotic.setDecisions s d); pure value
+  | .error stop => throw stop
 
 /-- A yes or no, yes `inOf` times in `of` when random (a rare fault: 1 in 8). -/
 def decideRare (name : String) (inOf : Nat) (of : Nat) : EStateM Stop σ Bool := do
@@ -149,6 +159,32 @@ def pick {α : Type} (name : String) (items : List α) : EStateM Stop σ (Option
   match items with
   | [] => pure none
   | first :: _ => pure (some (items.getD (← decide name items.length) first))
+
+/-- An order of 0 to n - 1 by decisions (Fisher-Yates: the i-th of n - i options), each of the n!
+orders on exactly one path: a search walks every order once. -/
+def permutation (name : String) (n : Nat) : EStateM Stop σ (Array Nat) := do
+  let mut order := (List.range n).toArray
+  for i in List.range n do
+    let j := i + (← decide name (n - i))
+    order := (order.swapIfInBounds i j)
+  pure order
+
+/-- The items kept by a yes or no each (2^n paths, one per subset). -/
+def subset {α : Type} (name : String) (items : List α) : EStateM Stop σ (List α) := do
+  let mut kept := []
+  for item in items do
+    if (← decide name 2) == 1 then kept := item :: kept
+  pure kept.reverse
+
+/-- `total` split into `parts` counts (each from 0), one path per composition. -/
+def composition (name : String) (total parts : Nat) : EStateM Stop σ (Array Nat) := do
+  let mut left := total
+  let mut counts := #[]
+  for _ in List.range (parts - 1) do
+    let x ← decide name (left + 1)
+    counts := counts.push x
+    left := left - x
+  pure (if parts == 0 then #[] else counts.push left)
 
 /-- `x` with decisions that are not the timeline's: drawn from `seed`, never recorded, the
 timeline's own decisions untouched (a setup to reach a state, so a search explores only what

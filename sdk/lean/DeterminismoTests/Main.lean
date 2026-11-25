@@ -156,6 +156,39 @@ def shrinkChecks : List Check :=
     { name := "shrinking drops decisions from the middle: 1 1 1 2 to 1 2",
       ok := (shrink stepsRun c).values == #[1, 2] } ]
 
+/-- One of the combinatorial draws, its result recorded as the timeline's detail (never a violation). -/
+def drawRun (draw : EStateM Stop Tiny String) (source : Source) : Ended × String :=
+  match draw.run { decisions := { source } } with
+  | .ok r t => ({ taken := t.decisions.taken, violation := none }, r)
+  | .error _ t => ({ taken := t.decisions.taken, violation := none }, "")
+
+/-- Every result of a draw over the whole space, by a census. -/
+def everyResult (draw : EStateM Stop Tiny String) : List String := Id.run do
+  let mut out := []
+  let mut path : Option (Array Nat) := some #[]
+  for _ in List.range 1000 do
+    match path with
+    | none => break
+    | some p =>
+      let (o, r) := drawRun draw (Source.path p)
+      out := r :: out
+      path := nextPathWithin {} o.taken
+  return out.reverse
+
+def combinatorics : List Check :=
+  let perms := everyResult (do pure (toString (← permutation (σ := Tiny) "order" 3)))
+  let subsets := everyResult (do pure (toString (← subset (σ := Tiny) "keep" ["a", "b", "c"])))
+  let comps := everyResult (do pure (toString (← composition (σ := Tiny) "split" 3 2)))
+  [ { name := "permutations of 3: 6 paths, each order once", ok := perms.length == 6 && perms.eraseDups.length == 6 },
+    { name := "subsets of 3: 8 paths, each subset once", ok := subsets.length == 8 && subsets.eraseDups.length == 8 },
+    { name := "compositions of 3 into 2: 4 paths, each once",
+      ok := comps.length == 4 && comps.eraseDups.length == 4 },
+    { name := "a uniform decide draws what equal weights drew",
+      ok := (List.range 200).all fun i =>
+        let a := (Decisions.next { source := Source.seeded i } "x" [1, 1, 1, 1, 1]).toOption.map (·.1)
+        let b := (Decisions.nextOf { source := Source.seeded i } "x" 5 none).toOption.map (·.1)
+        a == b } ]
+
 def censusChecks : List Check :=
   let whole := census tinyRun
   let half := census tinyRun (maxRuns := 5)
@@ -237,7 +270,7 @@ def describe (c : Counterexample) : String :=
 
 def main : IO UInt32 := do
   let mut failed := 0
-  for c in decisions ++ censusChecks ++ shrinkChecks ++ disk ++ history ++ locks do
+  for c in decisions ++ combinatorics ++ censusChecks ++ shrinkChecks ++ disk ++ history ++ locks do
     IO.println s!"{if c.ok then "ok  " else "FAIL"} {c.name}"
     if !c.ok then failed := failed + 1
   -- The toy register, end to end.
