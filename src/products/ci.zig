@@ -256,7 +256,6 @@ fn run(arena: std.mem.Allocator, io: std.Io, argv: []const [:0]const u8) !u8 {
     if (said.stopped_why.len > 0) std.debug.print("determinismo-ci: serve stopped run {d}: {s}\n", .{ started.id, said.stopped_why });
     if (said.uncovered.len > 0) std.debug.print("determinismo-ci: run {d}: {s}\n", .{ started.id, said.uncovered });
     // Each shard's verdict: its property's failing timelines among its own.
-    const ShardRow = struct { shard: u32 = 0, failing: u32 = 0, timelines: u32 = 0 };
     const rows = try client.json([]const ShardRow, "POST", try std.fmt.allocPrint(arena, "/runs/{d}/sql", .{started.id}), try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(.{ .sql = shard_sql }, .{})}));
     var verdict: []const u8 = "pass";
     for (1..shard_count + 1) |number| {
@@ -266,10 +265,10 @@ fn run(arena: std.mem.Allocator, io: std.Io, argv: []const [:0]const u8) !u8 {
         var count: u32 = 0;
         var at = number - 1;
         while (at < setup.tests.len) : (at += shard_count) count += 1;
-        const shard_verdict = if (row.timelines < config.timelines) "error" else if (row.failing == 0) "pass" else if (row.failing >= row.timelines) "fail" else "flaky";
-        if (verdict_rank(shard_verdict) > verdict_rank(verdict)) verdict = shard_verdict;
+        const judged = shard_verdict(row, config.timelines);
+        if (verdict_rank(judged.verdict) > verdict_rank(verdict)) verdict = judged.verdict;
         std.debug.print("  shard {d}: {s:<6} {d} tests, failing in {d} of {d} timelines\n", .{
-            number, shard_verdict, count, row.failing, config.timelines,
+            number, judged.verdict, count, judged.failing, config.timelines,
         });
     }
     // Each test's verdict from the timelines' JUnit reports; the job's the worse of the two
@@ -282,6 +281,29 @@ fn run(arena: std.mem.Allocator, io: std.Io, argv: []const [:0]const u8) !u8 {
     if (std.mem.eql(u8, verdict, "pass")) return 0;
     if (std.mem.eql(u8, verdict, "flaky")) return if (flaky_passes) 0 else 2;
     return 1;
+}
+
+/// A shard's row from shard_sql: of its timelines that stated its property, those it failed in.
+const ShardRow = struct { shard: u32 = 0, failing: u32 = 0, timelines: u32 = 0 };
+
+/// A shard's verdict from its row and the timelines it ran in.
+fn shard_verdict(row: ShardRow, timelines: u32) struct { verdict: []const u8, failing: u32 } {
+    const verdict = if (row.timelines < timelines) "error" else if (row.failing == 0) "pass" else if (row.failing >= row.timelines) "fail" else "flaky";
+    return .{ .verdict = verdict, .failing = row.failing };
+}
+
+test "a shard whose tests hang in one timeline of three is flaky, failing in that one" {
+    // CE27 (the Lean replica of determinismo): a timeline whose tests hung past its limit (or
+    // whose runner died) states nothing, and the job said "error", "failing in 0 of 3", exit 1
+    // even with --flaky-passes; docs/CI.md knows fail, flaky and pass.
+    const judged = shard_verdict(.{ .shard = 1, .failing = 0, .timelines = 2 }, 3);
+    try std.testing.expectEqualStrings("flaky", judged.verdict);
+    try std.testing.expectEqual(@as(u32, 1), judged.failing);
+    const all = shard_verdict(.{ .shard = 1, .failing = 0, .timelines = 0 }, 3); // Every one hung.
+    try std.testing.expectEqualStrings("fail", all.verdict);
+    try std.testing.expectEqual(@as(u32, 3), all.failing);
+    try std.testing.expectEqualStrings("pass", shard_verdict(.{ .shard = 1, .failing = 0, .timelines = 3 }, 3).verdict);
+    try std.testing.expectEqualStrings("flaky", shard_verdict(.{ .shard = 1, .failing = 1, .timelines = 3 }, 3).verdict);
 }
 
 /// Each shard's verdict from serve's store: its property's failing timelines among its own, the
