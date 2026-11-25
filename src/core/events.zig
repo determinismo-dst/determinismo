@@ -518,6 +518,7 @@ const platform_events = std.StaticStringMap(void).initComptime(.{
     .{"check_chunk"},
     .{"check_input"},
     .{"check_kept"},
+    .{"clock_start"},
     .{"command_exit"},
     .{"command_left_out"},
     .{"command_start"},
