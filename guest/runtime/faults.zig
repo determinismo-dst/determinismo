@@ -2117,6 +2117,32 @@ test nodes_down {
     try std.testing.expectEqual(2, nodes_down(&.{ false, false, true }, &until, 0, now_ns));
 }
 
+/// The nodes an outage would add to: outside it, under a fault that took them down or back from
+/// one less than their recovery ago (nodes_down's rule).
+fn outage_down_already(active: []const bool, recovering_until_ns: []const u64, in_outage: []const bool, now_ns: u64) u32 {
+    assert(active.len == recovering_until_ns.len and active.len == in_outage.len);
+    var down: u32 = 0;
+    for (active, recovering_until_ns, in_outage) |faulted, until_ns, inside| {
+        if (inside) continue;
+        down += @intFromBool(faulted or until_ns > now_ns);
+    }
+    return down;
+}
+
+test outage_down_already {
+    // Five nodes: n0 restarted and back 0.2 s ago with 15 s to recover, the outage on n1 and n2.
+    const recovery_ns = 15 * std.time.ns_per_s;
+    const now_ns = 32_660 * std.time.ns_per_ms;
+    const until = [_]u64{ 32_430 * std.time.ns_per_ms + recovery_ns, 0, 0, 0, 0 };
+    const outage = [_]bool{ false, true, true, false, false };
+    // n0 still recovering counts: the outage's two make three, past a cap of two.
+    try std.testing.expectEqual(@as(u32, 1), outage_down_already(&.{ false, false, false, false, false }, &until, &outage, now_ns));
+    // Its recovery over: none.
+    try std.testing.expectEqual(@as(u32, 0), outage_down_already(&.{ false, false, false, false, false }, &until, &outage, now_ns + recovery_ns));
+    // n3 under a fault now: two; a node inside the outage is the outage's own count.
+    try std.testing.expectEqual(@as(u32, 2), outage_down_already(&.{ false, true, false, true, false }, &until, &outage, now_ns));
+}
+
 fn takes_down(kind: Kind) bool {
     return switch (kind) {
         .restart, .crash, .stop, .wipe, .durable_crash, .outage => true,
@@ -3066,12 +3092,21 @@ fn outage_start(system: *const schema.System, applied: *const Applied) void {
         sdk.event("fault_skipped", .{ .kind = "outage", .err = "FewerThanTwoNodes" });
         return;
     }
-    // The scenario's cap on nodes down at once counts those already down too.
+    // The scenario's cap on nodes down at once counts those already down too, and those back from
+    // a fault less than their recovery ago, as node_start's does (nodes_down): counting only
+    // active faults, an outage of two beside a node still recovering made three down under a cap
+    // of two (the Lean replica of determinismo's CE7).
     if (nodes_down_max > 0) {
-        var down_already: u32 = 0;
-        for (nodes_faulted[0..count_nodes]) |faulted| {
-            if (faulted[@backingInt(Layer.process)]) |fault| down_already += @intFromBool(takes_down(fault.applied.kind));
+        var active: [schema.nodes_max]bool = @splat(false);
+        for (nodes_faulted[0..count_nodes], 0..) |faulted, index| {
+            if (faulted[@backingInt(Layer.process)]) |fault| active[index] = takes_down(fault.applied.kind);
         }
+        const down_already = outage_down_already(
+            active[0..count_nodes],
+            down_recovering_until_ns[0..count_nodes],
+            taken.outage[1..][0..count_nodes],
+            monotonic_ns(),
+        );
         if (down_already + count > nodes_down_max) {
             sdk.event("fault_skipped", .{ .kind = "outage", .err = "NodesDownMax" });
             return;
