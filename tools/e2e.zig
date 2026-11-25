@@ -642,6 +642,9 @@ fn check_ingress(context: *Context) !void {
 /// run (its next number: 1), so its events answer queries and its replay, with nobody
 /// connecting, delivers the same connection from its tape; a second session asking for the
 /// address the first holds is refused.
+/// src/core/tape.zig's ingress_reason: the reason an ingress answer is taped with.
+const tape_ingress_reason = "an ingress answer to the guest (sdk.ingress)";
+
 fn check_ingress_session(context: *Context) !void {
     const arena = context.arena;
     const address = "127.0.0.1:7893";
@@ -703,8 +706,15 @@ fn check_ingress_session(context: *Context) !void {
     const timelines = curl(context, &.{url ++ "/runs/1/timelines"}) catch "";
     const replay_body = try std.fmt.allocPrint(arena, "{{\"branch\":{d},\"until\":\"event=ingress_close\",\"exec\":\":\"}}", .{timeline});
     const replayed = curl(context, &.{ "-X", "POST", "-d", replay_body, url ++ "/runs/1/replay" }) catch "";
+    // Its tape holds what came, never an idle poll's nothing (status ok, no bytes), which a
+    // replay answers alike: taped 84 times a virtual second, a session's tape outgrew what a
+    // replay could read in 13 virtual minutes (CE20, the Lean replica of determinismo).
+    const session_tape = std.Io.Dir.cwd().readFileAlloc(context.io, try std.fmt.allocPrint(arena, "{s}/runs/1/tapes/branch-{d}.jsonl", .{ data, timeline }), arena, .limited(1 << 26)) catch "";
+    const idle_taped = std.mem.count(u8, session_tape, "\"hex\":\"0100000000000000\",\"reason\":\"" ++ tape_ingress_reason);
     expect_all(context, &.{
         .{ "a session opened with ingress", session > 0 },
+        .{ "its tape read", session_tape.len > 0 },
+        .{ "no idle poll's nothing on its tape", idle_taped == 0 },
         .{ "it is the run's next timeline: 1", timeline == 1 },
         .{ "a second session on the address it holds is refused (409)", std.mem.eql(u8, second, "409") },
         .{ "a client here reaches the node's port through the session's listener", std.mem.eql(u8, answer, "through the session\n") },
@@ -712,7 +722,7 @@ fn check_ingress_session(context: *Context) !void {
         .{ "a query finds the connection in the session's timeline", std.mem.indexOf(u8, queried, "\"event\":\"ingress_open\"") != null },
         .{ "the timeline's replay delivers the connection from its tape", std.mem.indexOf(u8, replayed, "ingress_open") != null and std.mem.indexOf(u8, replayed, "ingress_close") != null },
         .{ "the replay listens on nothing", std.mem.indexOf(u8, replayed, "ingress: listening") == null },
-    }, "ingress session {d}, timeline {d}: answered {s}, replay {d} bytes", .{ session, timeline, std.mem.trim(u8, answer, "\n"), replayed.len });
+    }, "ingress session {d}, timeline {d}: answered {s}, replay {d} bytes, {d} idle polls taped", .{ session, timeline, std.mem.trim(u8, answer, "\n"), replayed.len, idle_taped });
 }
 
 /// A session's checkpoint through serve, as a person resumes a REPL after a crash: a session on
