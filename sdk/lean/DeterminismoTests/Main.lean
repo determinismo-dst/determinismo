@@ -135,6 +135,27 @@ def unevenRun (source : Source) : Ended :=
   | .ok _ t => { taken := t.decisions.taken, violation := none }
   | .error _ t => { taken := t.decisions.taken, violation := none }
 
+/-- Steps until a 0; a 2 after a 1 breaks "order". -/
+def stepsRun (source : Source) : Ended :=
+  let body : EStateM Stop Tiny Unit := do
+    let mut seenOne := false
+    for _ in List.range 10 do
+      let step ← decide (σ := Tiny) "step" 3
+      if step == 0 then return
+      if step == 2 && seenOne then violate (σ := Tiny) "order" s!"a 2 after a 1"
+      if step == 1 then seenOne := true
+  match body.run { decisions := { source } } with
+  | .ok _ t => { taken := t.decisions.taken, violation := none }
+  | .error (.violation p d) t => { taken := t.decisions.taken, violation := some (p, d) }
+  | .error _ t => { taken := t.decisions.taken, violation := none }
+
+def shrinkChecks : List Check :=
+  let o := stepsRun (Source.path #[1, 1, 1, 2])
+  let c : Counterexample := { taken := o.taken, property := "order", detail := "a 2 after a 1", runs := 1 }
+  [ { name := "the counterexample to shrink breaks the property", ok := o.violation.isSome && o.taken.size == 4 },
+    { name := "shrinking drops decisions from the middle: 1 1 1 2 to 1 2",
+      ok := (shrink stepsRun c).values == #[1, 2] } ]
+
 def censusChecks : List Check :=
   let whole := census tinyRun
   let half := census tinyRun (maxRuns := 5)
@@ -216,7 +237,7 @@ def describe (c : Counterexample) : String :=
 
 def main : IO UInt32 := do
   let mut failed := 0
-  for c in decisions ++ censusChecks ++ disk ++ history ++ locks do
+  for c in decisions ++ censusChecks ++ shrinkChecks ++ disk ++ history ++ locks do
     IO.println s!"{if c.ok then "ok  " else "FAIL"} {c.name}"
     if !c.ok then failed := failed + 1
   -- The toy register, end to end.
