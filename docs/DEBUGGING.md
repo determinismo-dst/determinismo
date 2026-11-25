@@ -198,7 +198,13 @@ takes them for shell commands.
 From Clojure, babashka or jank (one `.cljc` source, no dependencies): clients/clojure,
 `determinismo.debug`'s `open`, `regs`, `translate`, `mem`, `poke`, `break`, `continue`,
 `step-branches`, `sh`, `checkpoint`, `resume` (a session at a session's last checkpoint of a
-name) and `close`, each answered as data.
+name) and `close`, each answered as data. `determinismo.lab` builds a moment lab on them: the
+world at a session's moment derived from the timeline's events and `det-nodes list` (nodes up,
+paused, down or halted, each link's directions, the faults on with the time they have left),
+faults injected there as `det-faults inject` steps, the timeline on by `det:wait` or `det:until`,
+and a fault tried against the same moment without it (two sessions resumed from a checkpoint);
+clients/jank-viz draws it and acts from its buttons. `det:continue` needs a breakpoint or a
+watchpoint: without one, the step answers `error: NoBreakpoint` and the session ends.
 
 Planned: an interactive debugger (a GDB stub at a moment, pokes and watches from serve's panel).
 
