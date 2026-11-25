@@ -2676,6 +2676,10 @@ fn check_ending(context: *Context) !void {
     const report = try explore(context, &.{
         "--program", program, "--scenario", "ending", "--seed", "1", "--branches", "8", "--events-dir", events,
     });
+    // Ended timelines' events are compressed (branch-<n>.jsonl.zst): read as text, plain beside
+    // them. Without it every count here was 0 since they were (found 2026-11-25, the check out
+    // of the batch).
+    try events_plain(context, events);
     // Per timeline (by the assertions' evaluations, not their catalog's declarations): eventually
     // ones killed the sleepers still running (fewer finished than started: with one driver at a
     // time, the earlier ones finish) once they drove the drawn minimum (30 s sleepers: all still
@@ -2714,6 +2718,7 @@ fn check_ending(context: *Context) !void {
         "--program",    program,     "--scenario",  "ending", "--seed", "1", "--branches", "4",
         "--events-dir", none_events, "--min-drive", "0",
     });
+    try events_plain(context, none_events);
     const drawn = try run_kept(context, &.{ "grep", "-rlF", "\"event\":\"min_drive\"", none_events });
     // A timeline length bounds the driver phase even while every slot is held: sleepers of 30 s,
     // 2 s of starts, no minimum drive. A start that waited for a slot without a deadline held
@@ -2723,6 +2728,7 @@ fn check_ending(context: *Context) !void {
         "--program",    program,      "--scenario",  "ending", "--seed",     "1",  "--branches", "4",
         "--events-dir", timed_events, "--min-drive", "0",      "--timeline", "2s",
     });
+    try events_plain(context, timed_events);
     const timed_script = try std.fmt.allocPrint(arena,
         \\cd {s}; e=0; long=0
         \\for t in branch-*.jsonl; do
@@ -9067,6 +9073,7 @@ fn check_ending_killed(context: *Context) !void {
         "--program",    program,       "--scenario",  "ending_signal", "--seed",     "1",  "--branches", "8",
         "--events-dir", signal_events, "--min-drive", "0",             "--timeline", "2s",
     });
+    try events_plain(context, signal_events);
     const signal_script = try std.fmt.allocPrint(arena,
         \\cd {s}; ran=0; skipped=0; wrong=0; signaled=0
         \\for t in branch-*.jsonl; do
@@ -9087,6 +9094,7 @@ fn check_ending_killed(context: *Context) !void {
         "--program",    program,     "--scenario",  "ending_fail", "--seed", "1", "--branches", "4",
         "--events-dir", fail_events, "--min-drive", "0",
     });
+    try events_plain(context, fail_events);
     const fail_script = try std.fmt.allocPrint(arena,
         \\cd {s}; cat branch-*.jsonl | grep -c '"command":"fails","killed":true'; cat branch-*.jsonl | grep -c '"command":"fails","status":1'
     , .{fail_events});
