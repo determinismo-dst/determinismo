@@ -13,6 +13,12 @@ sync. What a fault leaves:
   written again (Linux marks the pages clean); reads still see them until a power loss.
 
 The records are the system's own (a WAL's entries, a snapshot, a hard state).
+
+A write in place (`at`, pwrite) a power loss can tear by sectors: any of its sectors reached the
+disk, the others kept their old records (`crashSectors`). A `FileSystem` adds directories: a
+name created, renamed or removed is seen at once and durable only after the directory's own sync
+(`syncDir`), as fsync of the parent directory makes it on Linux: a file written, synced and
+renamed over the old one is the old one again after a power loss that came before that sync.
 -/
 
 namespace Determinismo
@@ -25,6 +31,9 @@ inductive Write (R : Type) where
   | replace (records : List R)
   /-- Cut to its first `length` records. -/
   | truncate (length : Nat)
+  /-- Records written in place from position `offset` (pwrite), the file extended past its end
+  (an offset past the end writes at the end: no holes). -/
+  | at (offset : Nat) (records : List R)
   deriving Repr, BEq
 
 namespace Write
@@ -35,12 +44,15 @@ def apply : Write R → List R → List R
   | .append records, content => content ++ records
   | .replace records, _ => records
   | .truncate length, content => content.take length
+  | .at offset records, content =>
+    content.take offset ++ records ++ content.drop (offset + records.length)
 
 /-- How many records of it can reach a disk on their own (a torn write keeps fewer). -/
 def size : Write R → Nat
   | .append records => records.length
   | .replace records => records.length
   | .truncate _ => 0
+  | .at _ records => records.length
 
 /-- The same write applied only partly, its first `kept` records: a write a power loss cut short
 while the kernel was copying it (the write call never returned). -/
@@ -48,6 +60,7 @@ def cutShort (kept : Nat) : Write R → Write R
   | .append records => .append (records.take kept)
   | .replace records => .replace (records.take kept)
   | .truncate length => .truncate length
+  | .at offset records => .at offset (records.take kept)
 
 /-- Its first `kept` records on the disk, the rest lost: an append cut short, or a rewrite whose
 truncation reached the disk with part of the new content. -/
@@ -55,6 +68,18 @@ def torn (kept : Nat) : Write R → List R → List R
   | .append records, content => content ++ records.take kept
   | .replace records, _ => records.take kept
   | .truncate length, content => content.take length
+  | .at offset records, content => (Write.at offset (records.take kept)).apply content
+
+/-- An in-place write torn by sectors of `perSector` records: the sectors whose Bool is true
+(missing Bools: false) reached the disk, the others kept the old records. Other writes tear by
+prefix (`torn`), as many records as the leading sectors reached. -/
+def tornSectors (perSector : Nat) (reached : List Bool) : Write R → List R → List R
+  | .at offset records, content =>
+    let per := max perSector 1
+    let indexed := records.zipIdx
+    indexed.foldl (fun c (r, i) =>
+      if reached.getD (i / per) false then (Write.at (offset + i) [r]).apply c else c) content
+  | w, content => w.torn ((reached.takeWhile id).length * max perSector 1) content
 
 end Write
 
@@ -104,6 +129,14 @@ def crash (f : File R) (kept : Nat) (torn : Nat) : File R :=
   let whole := applyAll (f.pending.take kept) f.disk
   let disk := match f.pending.drop kept with
     | next :: _ => if torn > 0 then next.torn torn whole else whole
+    | [] => whole
+  { disk := disk, cache := disk, pending := [] }
+
+/-- A power loss as `crash`, the next pending write torn by sectors (`Write.tornSectors`). -/
+def crashSectors (f : File R) (kept : Nat) (perSector : Nat) (reached : List Bool) : File R :=
+  let whole := applyAll (f.pending.take kept) f.disk
+  let disk := match f.pending.drop kept with
+    | next :: _ => next.tornSectors perSector reached whole
     | [] => whole
   { disk := disk, cache := disk, pending := [] }
 
@@ -172,5 +205,72 @@ def set (fs : Files R) (name : String) (f : File R) : Files R :=
   (name, f) :: fs.filter (·.1 != name)
 
 end Files
+
+/-- Files with a directory: names point at files (inodes); what reads see (`names`) and what the
+disk holds (`namesDisk`) differ until the directory is synced. -/
+structure FileSystem (R : Type) where
+  inodes : List (Nat × File R) := []
+  names : List (String × Nat) := []
+  namesDisk : List (String × Nat) := []
+  nextInode : Nat := 0
+  deriving Repr
+
+namespace FileSystem
+
+variable {R : Type}
+
+def inode (fs : FileSystem R) (name : String) : Option Nat := fs.names.lookup name
+
+/-- The file a name points at, as reads see it (a missing name: none). -/
+def file? (fs : FileSystem R) (name : String) : Option (File R) :=
+  (fs.inode name).bind fun i => fs.inodes.lookup i
+
+def read (fs : FileSystem R) (name : String) : Option (List R) := (fs.file? name).map (·.cache)
+
+def setInode (fs : FileSystem R) (i : Nat) (f : File R) : FileSystem R :=
+  { fs with inodes := (i, f) :: fs.inodes.filter (·.1 != i) }
+
+/-- A new empty file under `name` (an existing name keeps its file). -/
+def create (fs : FileSystem R) (name : String) : FileSystem R :=
+  if (fs.inode name).isSome then fs
+  else { fs.setInode fs.nextInode {} with
+         names := (name, fs.nextInode) :: fs.names, nextInode := fs.nextInode + 1 }
+
+/-- A write to the file under `name` (created if missing). -/
+def write (fs : FileSystem R) (name : String) (w : Write R) : FileSystem R :=
+  let fs := fs.create name
+  match fs.inode name with
+  | some i => fs.setInode i (((fs.inodes.lookup i).getD {}).write w)
+  | none => fs
+
+/-- fsync of the file under `name`: its data, not its name. -/
+def sync (fs : FileSystem R) (name : String) : FileSystem R :=
+  match fs.inode name with
+  | some i => fs.setInode i (((fs.inodes.lookup i).getD {}).syncOk)
+  | none => fs
+
+/-- `src` renamed to `dst` (replacing it), atomically as reads see it; on the disk at `syncDir`. -/
+def rename (fs : FileSystem R) (src dst : String) : FileSystem R :=
+  match fs.inode src with
+  | some i => { fs with names := (dst, i) :: fs.names.filter (fun (n, _) => n != src && n != dst) }
+  | none => fs
+
+def unlink (fs : FileSystem R) (name : String) : FileSystem R :=
+  { fs with names := fs.names.filter (·.1 != name) }
+
+/-- fsync of the directory: its names as they are now reach the disk. -/
+def syncDir (fs : FileSystem R) : FileSystem R := { fs with namesDisk := fs.names }
+
+/-- A power loss: the names on the disk, each file's pending writes lost past a prefix of `kept`
+(the same count for each file, `File.crash`). -/
+def crash (fs : FileSystem R) (kept : Nat := 0) (torn : Nat := 0) : FileSystem R :=
+  { fs with names := fs.namesDisk, inodes := fs.inodes.map fun (i, f) => (i, f.crash kept torn) }
+
+/-- With the directory synced, a power loss keeps every name. -/
+theorem crash_names_after_syncDir (fs : FileSystem R) (kept torn : Nat) :
+    ((fs.syncDir).crash kept torn).names = fs.names := by
+  simp [syncDir, crash]
+
+end FileSystem
 
 end Determinismo

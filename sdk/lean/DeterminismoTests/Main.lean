@@ -75,7 +75,25 @@ def disk : List Check :=
     { name := "writeback in any order: the second pending write without the first",
       ok := (f2.crashAny [false, true]).cache == [1, 2, 4, 5, 6] },
     { name := "a write cut short keeps its first records",
-      ok := ((Write.append [4, 5, 6]).cutShort 2).apply [1] == [1, 4, 5] } ]
+      ok := ((Write.append [4, 5, 6]).cutShort 2).apply [1] == [1, 4, 5] },
+    { name := "a write in place overwrites from its offset; past the end it appends",
+      ok := (Write.at 1 [7, 8]).apply [1, 2, 3, 4] == [1, 7, 8, 4] && (Write.at 5 [9]).apply [1, 2] == [1, 2, 9] },
+    { name := "a write in place torn by sectors keeps any of them: the first and third of three",
+      ok := let g : File Nat := ((({} : File Nat).write (.append [1, 2, 3, 4, 5, 6])).syncOk).write (.at 0 [7, 8, 9, 10, 11, 12])
+        (g.crashSectors 0 2 [true, false, true]).cache == [7, 8, 3, 4, 11, 12] },
+    { name := "an append torn by sectors keeps its leading sectors",
+      ok := ((({} : File Nat).write (.append [4, 5, 6, 7, 8])).crashSectors 0 2 [true, true, false]).cache == [4, 5, 6, 7] } ]
+
+def fileSystem : List Check :=
+  let base : FileSystem Nat := (((({} : FileSystem Nat).write "data" (.append [1])).sync "data").syncDir)
+  let renamed := ((base.write "tmp" (.append [2])).sync "tmp").rename "tmp" "data"
+  [ { name := "a rename is seen at once", ok := renamed.read "data" == some [2] && renamed.read "tmp" == none },
+    { name := "written, synced, renamed, no directory sync: the old file after a power loss",
+      ok := (renamed.crash).read "data" == some [1] },
+    { name := "the directory synced after the rename: the new file survives",
+      ok := (renamed.syncDir.crash).read "data" == some [2] },
+    { name := "a file synced but never its directory: gone after a power loss",
+      ok := let fs := ((({} : FileSystem Nat).write "new" (.append [5])).sync "new"); fs.crash.read "new" == none } ]
 
 def history : List Check :=
   let w (id : Nat) (v : Nat) (i r : Nat) (out : Option (Outcome Toy.Res)) : OpRec Toy.Op Toy.Res :=
@@ -291,7 +309,7 @@ def describe (c : Counterexample) : String :=
 
 def main : IO UInt32 := do
   let mut failed := 0
-  for c in decisions ++ sync ++ combinatorics ++ censusChecks ++ shrinkChecks ++ disk ++ history ++ locks do
+  for c in decisions ++ sync ++ combinatorics ++ censusChecks ++ shrinkChecks ++ disk ++ fileSystem ++ history ++ locks do
     IO.println s!"{if c.ok then "ok  " else "FAIL"} {c.name}"
     if !c.ok then failed := failed + 1
   -- The toy register, end to end.
