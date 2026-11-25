@@ -517,6 +517,11 @@ pub const Faults = struct {
     /// and lost to such a disk is no system's fault (ParticleDB's smoke run 332). Its other
     /// failures leave what is stored intact, so durability stays judgeable under them: a
     /// corrupted read taken for the end of a log (Jepsen's ParticleDB #108, #112) loses commits.
+    /// One exception, as a real disk's: pages the node partially writes during corrupt_reads
+    /// without holding them are read to merge the write, that read corrupted, and their
+    /// write-back stores the changed byte. Every read it corrupts is an event
+    /// (`disk_corrupt_read`: node, file, sectors, byte), so a durability judge excludes those
+    /// pages, or flags a loss inside one: a loss outside every such read is the system's (CE31).
     disk_lost_writes: bool = true,
     /// A restart (restart, crash, wipe, stop) may give it a new address (Antithesis's
     /// "Restarted nodes may change IP addresses upon rejoining the network"): every hosts file

@@ -1976,7 +1976,12 @@ pub const DiskFailure = enum {
     /// Writes are acknowledged and never stored (a lying disk or controller cache): a crash
     /// after loses them although they were synced.
     lost_writes,
-    /// Reads return one byte of each request changed (bit rot); what is stored is intact.
+    /// Reads return one byte of each request changed (bit rot). What is stored is intact but where
+    /// the node writes part of a page it did not hold: the kernel reads the page to merge the
+    /// write, that read is corrupted, and the write-back stores its changed byte, as a real
+    /// disk's would. Every read it corrupts is named (`disk_corrupt_read`: node, file, sectors,
+    /// the byte; disk_reads_trace), so a durability judge excludes those pages, or flags a loss
+    /// inside one, without guessing (CE31, the Lean replica of determinismo).
     corrupt_reads,
     /// Every request waits (a slow or overloaded disk).
     slow,
@@ -2045,8 +2050,12 @@ pub fn disk_fail(name: []const u8, fault: DiskFault) !void {
     var failed_buffer: [path_size_max]u8 = undefined;
     try file_write(try disk_failed_path(&failed_buffer, &paths), "1");
     var name_buffer: [mapper_name_size]u8 = undefined;
+    const mapper = try mapper_name(&name_buffer, name);
     const table: MapperTarget = if (aimed.len > 0) .{ .segments = record[aimed_prefix.len..] } else target;
-    try mapper_table(try mapper_name(&name_buffer, name), table);
+    // Its reads named from before the table fails them (a read just before is named too: never
+    // one missed).
+    if (fault.failure == .corrupt_reads) disk_reads_trace_start(name, &paths, mapper, fault.file, aimed, @max(fault.corrupt_byte, 1));
+    try mapper_table(mapper, table);
     sdk.event("node_disk_fail", .{ .node = name, .failure = fault.failure, .file = fault.file, .extents = aimed.len });
 }
 
@@ -2142,6 +2151,176 @@ const disk_record_size = 16 << 10;
 /// A file's blocks on the node's disk, in 512-byte sectors.
 const Extent = struct { start: u64, count: u64 };
 
+// The reads a corrupt_reads fault corrupts, named ---------------------------------------------
+// dm-flakey changes byte `corrupt_byte` of every read bio while the fault lasts and says nothing;
+// the block layer's block_bio_queue tracepoint says each bio queued on the node's device-mapper
+// device (its sectors), so each read is an event: what a durability judge needs to tell a byte
+// the fault stored (a read-modify-write's) from a byte the system lost (CE31).
+
+const disk_reads_events_max = 4096;
+
+fn disk_reads_tracer_path(buffer: *[path_size_max]u8, paths: *const Paths) ![:0]const u8 {
+    return print_z(buffer, "{s}/disk-reads-tracer", .{paths.directory});
+}
+
+fn disk_reads_instance(buffer: *[path_size_max]u8, mapper: []const u8) ![:0]const u8 {
+    return print_z(buffer, "/sys/kernel/tracing/instances/det-reads-{s}", .{mapper});
+}
+
+/// The tracer started (a process of its own, its pid beside the node's state), or said failed.
+fn disk_reads_trace_start(name: []const u8, paths: *const Paths, mapper: []const u8, file: []const u8, aimed: []const Extent, corrupt_byte: u32) void {
+    var device_buffer: [path_size_max]u8 = undefined;
+    const device = print_z(&device_buffer, "/dev/mapper/{s}", .{mapper}) catch return;
+    var stat: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, device, 0, .{ .TYPE = true }, &stat)) != .SUCCESS) {
+        sdk.event("disk_reads_trace_failed", .{ .node = name, .why = "statx" });
+        return;
+    }
+    const major = stat.rdev_major;
+    const minor = stat.rdev_minor;
+    _ = linux.mount("none", "/sys/kernel/tracing", "tracefs", 0, 0); // Mounted already, or now.
+    var instance_buffer: [path_size_max]u8 = undefined;
+    const instance = disk_reads_instance(&instance_buffer, mapper) catch return;
+    _ = linux.mkdir(instance, 0o700);
+    var path_buffer: [path_size_max]u8 = undefined;
+    var filter_buffer: [64]u8 = undefined;
+    // The kernel's dev_t (MKDEV: major << 20 | minor), this device's bios alone.
+    const filter = std.fmt.bufPrint(&filter_buffer, "dev == {d}\n", .{(@as(u64, major) << 20) | minor}) catch return;
+    const armed = blk: {
+        file_write(print_z(&path_buffer, "{s}/events/block/block_bio_queue/filter", .{instance}) catch break :blk false, filter) catch {};
+        file_write(print_z(&path_buffer, "{s}/events/block/block_bio_queue/enable", .{instance}) catch break :blk false, "1\n") catch break :blk false;
+        file_write(print_z(&path_buffer, "{s}/tracing_on", .{instance}) catch break :blk false, "1\n") catch break :blk false;
+        break :blk true;
+    };
+    if (!armed) {
+        sdk.event("disk_reads_trace_failed", .{ .node = name, .why = "tracefs" });
+        return;
+    }
+    const pipe = print_z(&path_buffer, "{s}/trace_pipe", .{instance}) catch return;
+    // Opened here, before the table fails reads: none queued after it is missed.
+    const fd = linux.open(pipe, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) {
+        sdk.event("disk_reads_trace_failed", .{ .node = name, .why = "trace_pipe" });
+        return;
+    }
+    // Detached (a fork of a fork): the injector that started it may not be the one that heals.
+    const child = linux.fork();
+    if (linux.errno(child) != .SUCCESS) {
+        _ = linux.close(@intCast(fd));
+        return;
+    }
+    if (child != 0) {
+        _ = linux.close(@intCast(fd));
+        var status: i32 = 0;
+        _ = linux.waitpid(@intCast(child), &status, 0);
+        return;
+    }
+    const reader = linux.fork();
+    if (reader != 0) linux.exit(0);
+    var pid_buffer: [32]u8 = undefined;
+    var tracer_buffer: [path_size_max]u8 = undefined;
+    const pid_text = std.fmt.bufPrint(&pid_buffer, "{d}", .{linux.getpid()}) catch linux.exit(1);
+    file_write(disk_reads_tracer_path(&tracer_buffer, paths) catch linux.exit(1), pid_text) catch linux.exit(1);
+    disk_reads_read(@intCast(fd), name, file, aimed, corrupt_byte, major, minor);
+    linux.exit(0);
+}
+
+/// The tracer's loop: each read bio queued on the device (inside the aimed extents, for a fault
+/// aimed at a file) an event, at most disk_reads_events_max a fault.
+fn disk_reads_read(fd: linux.fd_t, name: []const u8, file: []const u8, aimed: []const Extent, corrupt_byte: u32, major: u32, minor: u32) void {
+    var kept_extents: [fiemap_extents_max]Extent = undefined;
+    const extents = kept_extents[0..aimed.len];
+    @memcpy(extents, aimed);
+    var buffer: [16384]u8 = undefined;
+    var kept: usize = 0;
+    var events: u32 = 0;
+    while (true) {
+        const size = linux.read(fd, buffer[kept..].ptr, buffer.len - kept);
+        if (linux.errno(size) != .SUCCESS or size == 0) return;
+        kept += size;
+        var from: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, buffer[0..kept], from, '\n')) |end| : (from = end + 1) {
+            const read = bio_read_line(buffer[from..end]) orelse continue;
+            if (read.major != major or read.minor != minor) continue;
+            if (extents.len > 0 and !extents_overlap(extents, read.sector, read.sectors)) continue;
+            if (events == disk_reads_events_max) {
+                sdk.event("disk_corrupt_reads_capped", .{ .node = name, .file = file, .events = events });
+                events += 1;
+            }
+            if (events > disk_reads_events_max) continue;
+            sdk.event("disk_corrupt_read", .{
+                .node = name,
+                .file = file,
+                .sector = read.sector,
+                .sectors = read.sectors,
+                .byte = read.sector * 512 + corrupt_byte - 1, // The device's byte the fault changed.
+            });
+            events += 1;
+        }
+        std.mem.copyForwards(u8, buffer[0 .. kept - from], buffer[from..kept]);
+        kept -= from;
+        if (kept == buffer.len) kept = 0; // A line longer than the buffer: dropped.
+    }
+}
+
+fn extents_overlap(extents: []const Extent, sector: u64, sectors: u64) bool {
+    for (extents) |extent| {
+        if (sector < extent.start + extent.count and extent.start < sector + sectors) return true;
+    }
+    return false;
+}
+
+const BioRead = struct { major: u32, minor: u32, sector: u64, sectors: u64 };
+
+/// A block_bio_queue line's read ("... block_bio_queue: 252,0 R 2048 + 8 [comm]": its device,
+/// its kind of request, a read's R first, its first sector and its count), else null.
+fn bio_read_line(line: []const u8) ?BioRead {
+    const marker = "block_bio_queue: ";
+    const at = std.mem.indexOf(u8, line, marker) orelse return null;
+    var words = std.mem.tokenizeScalar(u8, line[at + marker.len ..], ' ');
+    const device = words.next() orelse return null;
+    const rwbs = words.next() orelse return null;
+    if (rwbs.len == 0 or rwbs[0] != 'R') return null;
+    const sector_text = words.next() orelse return null;
+    if (!std.mem.eql(u8, words.next() orelse return null, "+")) return null;
+    const count_text = words.next() orelse return null;
+    const comma = std.mem.indexOfScalar(u8, device, ',') orelse return null;
+    return .{
+        .major = std.fmt.parseInt(u32, device[0..comma], 10) catch return null,
+        .minor = std.fmt.parseInt(u32, device[comma + 1 ..], 10) catch return null,
+        .sector = std.fmt.parseInt(u64, sector_text, 10) catch return null,
+        .sectors = std.fmt.parseInt(u64, count_text, 10) catch return null,
+    };
+}
+
+test bio_read_line {
+    const read = bio_read_line("  kworker/u8:2-123  [000] ..... 12.345678: block_bio_queue: 252,0 R 2048 + 8 [det-selftest-no]").?;
+    try std.testing.expectEqual(BioRead{ .major = 252, .minor = 0, .sector = 2048, .sectors = 8 }, read);
+    try std.testing.expect(bio_read_line("  x-1 [000] ..... 1.0: block_bio_queue: 252,0 RA 64 + 32 [x]") != null); // Readahead.
+    try std.testing.expect(bio_read_line("  x-1 [000] ..... 1.0: block_bio_queue: 252,0 WS 64 + 8 [x]") == null); // A write.
+    try std.testing.expect(bio_read_line("  x-1 [000] ..... 1.0: block_rq_issue: 252,0 R 4096 () 64 + 8 [x]") == null);
+    try std.testing.expect(extents_overlap(&.{.{ .start = 100, .count = 8 }}, 104, 8));
+    try std.testing.expect(!extents_overlap(&.{.{ .start = 100, .count = 8 }}, 108, 8));
+}
+
+/// The tracer stopped (its pid read and killed, its instance removed). None running: nothing.
+fn disk_reads_trace_stop(paths: *const Paths) void {
+    var tracer_buffer: [path_size_max]u8 = undefined;
+    const tracer = disk_reads_tracer_path(&tracer_buffer, paths) catch return;
+    var text_buffer: [32]u8 = undefined;
+    const text = read_small(tracer, &text_buffer) orelse return;
+    defer _ = linux.unlink(tracer);
+    const pid = std.fmt.parseInt(linux.pid_t, std.mem.trim(u8, text, " \n"), 10) catch return;
+    _ = linux.kill(pid, .KILL);
+    var name_buffer: [mapper_name_size]u8 = undefined;
+    const mapper = mapper_name(&name_buffer, std.fs.path.basename(paths.directory)) catch return;
+    var instance_buffer: [path_size_max]u8 = undefined;
+    const instance = disk_reads_instance(&instance_buffer, mapper) catch return;
+    var path_buffer: [path_size_max]u8 = undefined;
+    file_write(print_z(&path_buffer, "{s}/events/block/block_bio_queue/enable", .{instance}) catch return, "0\n") catch {};
+    _ = linux.rmdir(instance);
+}
+
 /// The extents of `file` (a path from the node's root) in its writable layer, as the disk holds
 /// them (FIEMAP without FIEMAP_FLAG_SYNC: asking writes nothing back), adjacent ones joined. Data
 /// never written back has no place on the disk yet (delalloc): left out.
@@ -2231,6 +2410,7 @@ pub fn disk_heal(name: []const u8) !bool {
     var name_buffer: [mapper_name_size]u8 = undefined;
     const mapper = try mapper_name(&name_buffer, name);
     try mapper_table(mapper, try disk_baseline_target(&parameters_buffer, loop));
+    disk_reads_trace_stop(&paths); // After the table heals: a read just before it is named too.
     sdk.event("node_disk_heal", .{ .node = name });
     if (pid_read(name) != null and layer_writable(&paths)) return false;
     try kill(name);
