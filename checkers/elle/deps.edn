@@ -8,4 +8,7 @@
         ;; only (as Elle does, without its jackson-core).
         spootnik/unilog {:mvn/version "0.7.32"
                          :exclusions [com.fasterxml.jackson.core/jackson-core]}
-        org.clojure/data.json {:mvn/version "2.5.1"}}}
+        org.clojure/data.json {:mvn/version "2.5.1"}}
+ ;; The service's tests: clojure -M:test
+ :aliases {:test {:extra-paths ["test"]
+                  :main-opts ["-e" "(require 'clojure.test 'elle-service-test) (System/exit (if (clojure.test/successful? (clojure.test/run-tests 'elle-service-test)) 0 1))"]}}}

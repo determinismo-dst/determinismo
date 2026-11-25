@@ -59,3 +59,16 @@ rhizome (Elle's Graphviz renderer) sets Swing up as it loads, which fails on a h
 `src/rhizome/viz.clj` stands in for it (Elle draws only into a `:directory`, never given here);
 and Elle 0.2.8's `elle.txn` loads unilog while declaring it for its dev profile only, so
 `deps.edn` adds it.
+
+## Elle, patched
+
+`src/elle/closed_predicate.clj` is Elle 0.2.8's namespace with one fix, loaded ahead of Elle's
+jar (`:paths` come first): its `ww-graph` matched writes spelled `:write`, while the histories,
+Elle's own generator and every other function spell them `:w`, so a write got no write-write
+edge and serializable passed a read skew through writes. Elle's closed-predicate tests pass
+with it. The service keeps its version: rebuild and restart it by hand on each host
+(`podman build -t determinismo-elle -f checkers/elle/Dockerfile .`, `podman rm -f
+determinismo-elle`, `podman run -d --name determinismo-elle --network host determinismo-elle`)
+with no check running.
+
+The service's tests: `clojure -M:test` here.
