@@ -7623,51 +7623,56 @@ fn check_interleave(context: *Context) !void {
 /// expectation, held at three of four and failed at one: next d7030d4's batch).
 fn check_raft_558(context: *Context) !void {
     const program = try std.fs.path.join(context.arena, &.{ context.bin, "etcd-raft-joint-test" });
-    const timelines = 4;
-    const events = try std.fmt.allocPrint(context.arena, "{s}/raft-558", .{context.scratch});
-    const report = try explore(context, &.{
-        "--program",    program, "--profile",  "holds", "--scenario",   "joint_crash",
-        "--seed",       "1",     "--branches", "4",     "--memory-mib", "3072",
-        "--events-dir", events,
-    });
-    var branches: [timelines]Branch = undefined;
-    const count = parse_branches(report, &branches);
     const property = "replicas agree on the entries they applied";
-    // Each timeline's walk: held at the write, and crashed there or let go (the joint_crash event).
-    const queried = try run_kept(context, &.{ context.determinismo, "query", events, "event=joint_crash" });
-    const Walk = struct { details: struct { crash: bool = false, held: bool = false } = .{} };
-    var crashed: [branches_max]bool = @splat(false);
-    var lines = std.mem.splitScalar(u8, queried.stdout, '\n');
-    while (lines.next()) |line| {
-        if (!std.mem.startsWith(u8, line, "branch ")) continue;
-        var words = std.mem.tokenizeScalar(u8, line, ' ');
-        _ = words.next();
-        const index = std.fmt.parseInt(u32, words.next() orelse continue, 10) catch continue;
-        const json_start = std.mem.indexOfScalar(u8, line, '{') orelse continue;
-        const json_end = std.mem.lastIndexOf(u8, line, "}  (") orelse continue;
-        const walk = std.json.parseFromSliceLeaky(Walk, context.arena, line[json_start .. json_end + 1], .{
-            .ignore_unknown_fields = true,
-        }) catch continue;
-        if (index < crashed.len) crashed[index] = walk.details.crash and walk.details.held;
+    // The walk's own decision fixed (--decide joint.crash), never left to where the draws before
+    // it land: one of 4 timelines crashing at the held write was seed 1's luck until the wall
+    // clock's start added two draws (2026-11-25, none crashed). Crashed at the held write, every
+    // timeline diverges; let go (the walk's control), none.
+    const Outcome = struct { count: u32, crashed: u32, diverged: u32, two_leaders: u64 };
+    var outcomes: [2]Outcome = undefined;
+    for ([_][]const u8{ "crash", "no crash" }, &outcomes, 0..) |choice, *outcome, round| {
+        const events = try std.fmt.allocPrint(context.arena, "{s}/raft-558-{d}", .{ context.scratch, round });
+        const decide = try std.fmt.allocPrint(context.arena, "joint.crash={s}", .{choice});
+        const report = try explore(context, &.{
+            "--program",    program, "--profile",  "holds", "--scenario",   "joint_crash",
+            "--seed",       "1",     "--branches", "2",     "--memory-mib", "3072",
+            "--events-dir", events,  "--decide",   decide,
+        });
+        var branches: [2]Branch = undefined;
+        const count = parse_branches(report, &branches);
+        // Each timeline's walk: held at the write, and crashed there or let go (joint_crash).
+        const queried = try run_kept(context, &.{ context.determinismo, "query", events, "event=joint_crash" });
+        const Walk = struct { details: struct { crash: bool = false, held: bool = false } = .{} };
+        var crashed: [branches_max]bool = @splat(false);
+        var lines = std.mem.splitScalar(u8, queried.stdout, '\n');
+        while (lines.next()) |line| {
+            if (!std.mem.startsWith(u8, line, "branch ")) continue;
+            var words = std.mem.tokenizeScalar(u8, line, ' ');
+            _ = words.next();
+            const index = std.fmt.parseInt(u32, words.next() orelse continue, 10) catch continue;
+            const json_start = std.mem.indexOfScalar(u8, line, '{') orelse continue;
+            const json_end = std.mem.lastIndexOf(u8, line, "}  (") orelse continue;
+            const walk = std.json.parseFromSliceLeaky(Walk, context.arena, line[json_start .. json_end + 1], .{
+                .ignore_unknown_fields = true,
+            }) catch continue;
+            if (index < crashed.len) crashed[index] = walk.details.crash and walk.details.held;
+        }
+        outcome.* = .{ .count = count, .crashed = 0, .diverged = 0, .two_leaders = failing_in(report, "at most one leader per term") orelse 0 };
+        for (branches[0..count]) |branch| {
+            if (branch.index < crashed.len and crashed[branch.index]) outcome.crashed += 1;
+            if (branch_failing_property(report, branch.index, property)) outcome.diverged += 1;
+        }
     }
-    var crashed_count: u32 = 0;
-    var crashed_diverged: u32 = 0;
-    var others_diverged: u32 = 0;
-    for (branches[0..count]) |branch| {
-        const diverged = branch_failing_property(report, branch.index, property);
-        if (branch.index < crashed.len and crashed[branch.index]) {
-            crashed_count += 1;
-            if (diverged) crashed_diverged += 1;
-        } else if (diverged) others_diverged += 1;
-    }
+    const crash = outcomes[0];
+    const control = outcomes[1];
     // Reported, not required: the stale leader's term may differ from the other side's.
-    const two_leaders = failing_in(report, "at most one leader per term") orelse 0;
     expect_all(context, &.{
-        .{ "every timeline explored", count == timelines },
-        .{ "a timeline crashed at the held write", crashed_count > 0 },
-        .{ "the issue's divergence in every timeline crashed there", crashed_diverged == crashed_count },
-        .{ "none in the walk's control (the held write let go)", others_diverged == 0 },
-    }, "raft-558: {d} of {d} timelines crashed at the held write, {d} of them failing \"{s}\", {d} of the others; {d} failing \"at most one leader per term\"", .{ crashed_count, count, crashed_diverged, property, others_diverged, two_leaders });
+        .{ "every timeline explored", crash.count == 2 and control.count == 2 },
+        .{ "crash decided: every timeline crashed at the held write", crash.crashed == crash.count },
+        .{ "the issue's divergence in every timeline crashed there", crash.diverged == crash.count },
+        .{ "no crash decided: none crashed there", control.crashed == 0 },
+        .{ "none in the walk's control (the held write let go)", control.diverged == 0 },
+    }, "raft-558: crash decided, {d} of {d} timelines crashed at the held write, {d} failing \"{s}\"; let go, {d} of {d} failing; {d} failing \"at most one leader per term\"", .{ crash.crashed, crash.count, crash.diverged, property, control.diverged, control.count, crash.two_leaders + control.two_leaders });
 }
 
 /// Whether the report's line of timeline `index` names `property` among its failures.
