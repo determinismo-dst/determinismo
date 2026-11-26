@@ -5957,6 +5957,42 @@ test "the archive returns first to a cell whose returns paid, among equally rare
     try std.testing.expect(returns.len >= 2);
 }
 
+test "a generation never returns twice to one moment" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var state: TreeState = .{
+        .base = 1,
+        .total = 64,
+        .size = 16,
+        .children = 4,
+        .pipeline = 1,
+        .jobs = 1,
+        .holding = false,
+        .registry = undefined,
+        .change = null,
+        .hunks_reached = &.{},
+        .candidates = &.{},
+        .tape_buffer = undefined,
+        .io = undefined,
+        .archive = true,
+        .prefer_sometimes = true,
+        .setup = undefined,
+    };
+    // #0 made a sometimes true at 5 ms: the frontier returns just after it, and the behavior's
+    // new cell has that one place.
+    const moment = 5 * std.time.ns_per_ms;
+    var cell: Cell = .{ .places = undefined, .label = "sometimes \"zero\"", .visits = 0, .paid = 0 };
+    cell.places[0] = .{ .branch = 0, .vtime_ns = moment };
+    try state.cells.put(arena, 9, cell);
+    const frontier = [_]TreeReturn{.{ .branch = 0, .vtime_ns = moment, .why = "Just after #0 first made a sometimes true." }};
+    var random: std.Random.DefaultPrng = .init(3);
+    const returns = try archive_returns(arena, &state, state.size, &frontier, &random);
+    for (returns, 0..) |a, i| for (returns[i + 1 ..]) |b| {
+        try std.testing.expect(!(a.branch == b.branch and a.vtime_ns == b.vtime_ns));
+    };
+}
+
 test "a plugin's returns are kept whole and the archive fills around them, never to a cell it took" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
@@ -7272,6 +7308,11 @@ fn archive_returns(
         for (returns[0..taken]) |chosen| if (chosen.cell == cell_ranked.hash) continue :next;
         const cell = state.cells.getPtr(cell_ranked.hash).?;
         const place = cell.place();
+        // Never a moment this generation returns to already (the frontier's, a plugin's): two
+        // returns there gave it 8 timelines from one moment and 2 moments where 3 were planned,
+        // its second node replayed from the parent's start (CE26, the blind Lean replica of the
+        // platform: a new behavior's cell ranks first while its visits are not counted yet).
+        for (list.items) |planned| if (planned.branch == place.branch and planned.vtime_ns == place.vtime_ns) continue :next;
         cell.visits += 1;
         try list.append(arena, .{
             .branch = place.branch,
