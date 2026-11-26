@@ -2112,6 +2112,35 @@ const Resumed = struct {
     /// catalog as the skipped timelines' declarations.
     declared: std.ArrayList(report.Recorded) = .empty,
 
+    /// A record line (its run line checked by resume_read), in the record's order.
+    fn note(resumed: *Resumed, arena: std.mem.Allocator, line: *const RecordLine) !void {
+        if (line.generation) |judged| {
+            if (judged.number == resumed.generations.items.len) {
+                try resumed.generations.append(arena, judged.branches);
+            }
+        }
+        if (line.fresh) |fresh| try resumed.fresh.append(arena, fresh);
+        if (line.catalog) |judged| {
+            resumed.catalog_failing = judged.failing;
+            resumed.catalog_seen = true;
+        }
+        if (line.declared) |declared| try resumed.declared.append(arena, declared);
+        if (line.branch) |branch| {
+            // A timeline extending one of the run's (a session's): not the explorer's to resume.
+            if (branch.extends != null) return;
+            // Recorded after the catalog's verdict: that verdict judged fewer timelines (a drained
+            // run's end, then a resume's own timelines): stale until a later end judges again
+            // (CE61, the blind Lean replica of the platform).
+            resumed.catalog_seen = false;
+            try resumed.done.put(arena, branch.index, {});
+            if (branch.properties) |properties| {
+                for (properties) |property| try resumed.recorded.append(arena, .{ .index = branch.index, .property = property });
+                if (!branch.properties_all) resumed.recorded_partial += 1;
+            } else resumed.recorded_partial += 1;
+        }
+        if (line.planned) |planned| try resumed.plan_note(arena, planned);
+    }
+
     fn plan_note(resumed: *Resumed, arena: std.mem.Allocator, planned: PlannedLine) !void {
         const key: ReturnKey = .{ .generation = planned.generation, .branch = planned.branch, .vtime_ns = planned.vtime_ns };
         try resumed.planned.put(arena, key, try arena.dupe(u32, planned.indices));
@@ -2171,6 +2200,31 @@ test "a resume's catalog has the skipped timelines' declarations, unreached unle
     var catalog = report.Catalog{ .arena = arena };
     try multiverse.catalog_reached(&catalog);
     try std.testing.expectEqual(@as(u32, 1), catalog.judge(true));
+}
+
+test "a catalog verdict a later timeline follows is stale (CE61)" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const texts = [_][]const u8{
+        // A drained run's end: two timelines, its catalog judged then (one failing).
+        "{\"branch\":{\"index\":0}}",
+        "{\"branch\":{\"index\":1}}",
+        "{\"catalog\":{\"failing\":1}}",
+        // A resume's timelines, interrupted before its own end: no verdict for them.
+        "{\"branch\":{\"index\":2}}",
+    };
+    var resumed: Resumed = .{};
+    for (texts) |text| {
+        const line = try std.json.parseFromSliceLeaky(RecordLine, arena, text, .{ .ignore_unknown_fields = true });
+        try resumed.note(arena, &line);
+    }
+    try std.testing.expect(!resumed.catalog_seen);
+    // A later end's verdict judges them all.
+    const judged = try std.json.parseFromSliceLeaky(RecordLine, arena, "{\"catalog\":{\"failing\":0}}", .{});
+    try resumed.note(arena, &judged);
+    try std.testing.expect(resumed.catalog_seen);
+    try std.testing.expectEqual(@as(u32, 0), resumed.catalog_failing);
 }
 
 test "a complete run resumed again fails for its catalog too" {
@@ -2310,27 +2364,7 @@ fn resume_read(context: Context, arguments: *const Arguments, inputs: u64) !*con
                 return error.RecordOfAnotherRun;
             }
         }
-        if (line.generation) |judged| {
-            if (judged.number == resumed.generations.items.len) {
-                try resumed.generations.append(context.arena, judged.branches);
-            }
-        }
-        if (line.fresh) |fresh| try resumed.fresh.append(context.arena, fresh);
-        if (line.catalog) |judged| {
-            resumed.catalog_failing = judged.failing;
-            resumed.catalog_seen = true;
-        }
-        if (line.declared) |declared| try resumed.declared.append(context.arena, declared);
-        if (line.branch) |branch| {
-            // A timeline extending one of the run's (a session's): not the explorer's to resume.
-            if (branch.extends != null) continue;
-            try resumed.done.put(context.arena, branch.index, {});
-            if (branch.properties) |properties| {
-                for (properties) |property| try resumed.recorded.append(context.arena, .{ .index = branch.index, .property = property });
-                if (!branch.properties_all) resumed.recorded_partial += 1;
-            } else resumed.recorded_partial += 1;
-        }
-        if (line.planned) |planned| try resumed.plan_note(context.arena, planned);
+        try resumed.note(context.arena, &line);
     }
     if (!run_seen) {
         say("[determinismo] {s} has no run to continue\n", .{path});
