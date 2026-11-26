@@ -700,6 +700,32 @@ fn run_update(server: *Server, id: u32) !void {
 /// hunt, a calibration, a trial, explore.
 const coverage_gate_timelines = 4;
 
+/// Whether the run's setup reported coverage (events/setup.jsonl, not in its store while it
+/// runs): the coverage bits are in the setup's snapshot, so timelines repeating the setup's
+/// paths report none, and the gate stopped instrumented runs as uninstrumented (CE30, the blind
+/// Lean replica of the platform). Read in pieces, a setup's file of any size.
+fn setup_covered(server: *Server, id: u32) bool {
+    const directory = run_directory(server, id) catch return false;
+    const path = std.fs.path.joinZ(server.arena, &.{ directory, "events", "setup.jsonl" }) catch return false;
+    const opened = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(opened) != .SUCCESS) return false;
+    const fd: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(fd);
+    const needle = "\"event\":\"coverage\"";
+    var buffer: [64 * 1024]u8 = undefined;
+    var kept: usize = 0; // The last piece's tail, for a needle across two reads.
+    var offset: u64 = 0;
+    while (true) {
+        const read = linux.pread(fd, buffer[kept..].ptr, buffer.len - kept, @intCast(offset));
+        if (linux.errno(read) != .SUCCESS or read == 0) return false;
+        offset += read;
+        const filled = kept + read;
+        if (std.mem.indexOf(u8, buffer[0..filled], needle) != null) return true;
+        kept = @min(filled, needle.len - 1);
+        std.mem.copyForwards(u8, buffer[0..kept], buffer[filled - kept .. filled]);
+    }
+}
+
 fn coverage_gate(server: *Server, id: u32, connection: *duckdb.Connection) void {
     const shared = server.shared;
     const going = run_going(server, id);
@@ -721,11 +747,12 @@ fn coverage_gate(server: *Server, id: u32, connection: *duckdb.Connection) void 
     const Count = struct { count: u64 };
     const covered_sql = "SELECT count(*) AS count FROM (SELECT 1 FROM events WHERE name = 'coverage' LIMIT 1)";
     const covered = (connection.row(Count, server.arena, covered_sql, .{}) catch return) orelse return;
-    if (covered.count > 0) {
+    if (covered.count > 0 or setup_covered(server, id)) {
         shared.coverage_known[id] = true;
         return;
     }
-    const ended = (connection.row(Count, server.arena, "SELECT count(*) AS count FROM timelines", .{}) catch return) orelse return;
+    // The run's own timelines: a session (a timeline extending another) is none of "its first".
+    const ended = (connection.row(Count, server.arena, "SELECT count(*) AS count FROM explored", .{}) catch return) orelse return;
     const remedy = "its system runs without its language's instrumentation (coverage always); build its workload with it, " ++
         "or ask \"coverage\": \"off\" for a self-test\n";
     if (!going) {
@@ -5935,6 +5962,43 @@ test "a run's end is its explorer's exit, then its record's summary" {
     // An explorer that died before its exit: its record's.
     try cwd.deleteFile(io, try std.fs.path.join(arena, &.{ run, "exit" }));
     try std.testing.expectEqual(@as(u32, 0), ended_status(&server, 1));
+}
+
+test "an instrumented run whose first timelines repeat its setup's code is not stopped as uncovered" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const cwd = std.Io.Dir.cwd();
+    const events = try std.fs.path.join(arena, &.{ data, "runs", "1", "events" });
+    try cwd.createDirPath(io, events);
+    try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(arena, &.{ data, "runs", "1", "request.json" }), .data = "{}" });
+    // The setup ran the code; the timelines repeat it and report none of their own.
+    const setup = "{\"seq\":1,\"vtime_ns\":10,\"event\":{\"event\":\"coverage\",\"details\":{\"name\":\"line /src/server.zig:42\"}}}\n";
+    try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(arena, &.{ events, "setup.jsonl" }), .data = setup });
+    var failure: duckdb.Failure = .{};
+    const shared = try std.testing.allocator.create(Shared);
+    defer std.testing.allocator.destroy(shared);
+    const options: Options = .{ .listen = "", .data_directory = data, .machine = &.{}, .self = "" };
+    shared.* = .{ .options = options, .io = io, .database = try duckdb.Database.open(":memory:", .{ .threads = 1 }, &failure) };
+    defer shared.database.close();
+    var connection = try shared.database.connect(&failure);
+    defer connection.close();
+    try connection.exec("CREATE TABLE events (name VARCHAR); CREATE TABLE timelines (branch INTEGER, extends INTEGER); " ++
+        "CREATE VIEW explored AS SELECT * FROM timelines WHERE extends IS NULL; " ++
+        "INSERT INTO timelines VALUES (0, NULL), (1, NULL), (2, NULL), (3, NULL)");
+    // Its explorer, alive (a stop signals it).
+    var explorer = try std.process.spawn(io, .{ .argv = &.{ "sleep", "60" }, .stdout = .ignore, .stderr = .ignore });
+    defer explorer.kill(io);
+    shared.runs[0] = .{ .id = 1, .pid = explorer.id.? };
+    shared.run_count = 1;
+    var server: Server = .{ .shared = shared, .options = options, .io = io, .arena = arena };
+    coverage_gate(&server, 1, &connection);
+    try std.testing.expect(!shared.runs[0].stopped);
+    try std.testing.expect(shared.coverage_known[1]);
 }
 
 test "a resume from the command line that ended before serve looked keeps its own end" {
