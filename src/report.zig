@@ -550,6 +550,22 @@ pub const Multiverse = struct {
             " hazards: overshoots={d} throttles={d} late_steps={d}",
             .{ state.overshoots, state.throttles, state.late_steps },
         ) catch {};
+        // An assertion declared and not reached, new to this run: its declaration a record line
+        // of its own (once a run; a worker's), so a resume's catalog has it. Its timelines' lines
+        // keep reached ones only, and a resumed run lost the declarations of every timeline it
+        // skipped: a catalog assertion never reached then passed (CE45's remainder, the blind
+        // Lean replica of the platform).
+        for (vm.events.properties[0..vm.events.property_count]) |*property| {
+            if (property.hits != 0 or multiverse.aggregate_known(property)) continue;
+            record(.{ .declared = Recorded{
+                .message = property.name(),
+                .hash = property.message_hash,
+                .kind = property.kind,
+                .hits = 0,
+                .trues = 0,
+                .failure = null,
+            } });
+        }
         var recorded_count: usize = 0;
         for (vm.events.properties[0..vm.events.property_count]) |*property| {
             if (property.hits == 0) continue;
@@ -637,6 +653,13 @@ pub const Multiverse = struct {
         };
         @memcpy(property.message[0..size], recorded.message[0..size]);
         try multiverse.merge(&property, branch);
+    }
+
+    fn aggregate_known(multiverse: *const Multiverse, property: *const Events.Property) bool {
+        for (multiverse.aggregates[0..multiverse.aggregate_count]) |*aggregate| {
+            if (aggregate.property.same(property)) return true;
+        }
+        return false;
     }
 
     fn aggregate_find(multiverse: *Multiverse, property: *const Events.Property) !*Aggregate {

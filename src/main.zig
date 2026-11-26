@@ -2104,8 +2104,13 @@ const Resumed = struct {
     /// Recorded timelines whose properties the record lacks (an older record's, or past its
     /// line's room): their verdicts are not counted, and the resume says how many.
     recorded_partial: u32 = 0,
-    /// The catalog's failing assertions as the run last judged them (RecordLine.catalog).
+    /// The catalog's failing assertions as the run last judged them (RecordLine.catalog), when the
+    /// record has its verdict (`catalog_seen`: a run stopped before its end has none).
     catalog_failing: u32 = 0,
+    catalog_seen: bool = false,
+    /// The assertions the run declared and had not reached (RecordLine.declared): in a resume's
+    /// catalog as the skipped timelines' declarations.
+    declared: std.ArrayList(report.Recorded) = .empty,
 
     fn plan_note(resumed: *Resumed, arena: std.mem.Allocator, planned: PlannedLine) !void {
         const key: ReturnKey = .{ .generation = planned.generation, .branch = planned.branch, .vtime_ns = planned.vtime_ns };
@@ -2127,6 +2132,8 @@ const Resumed = struct {
         for (resumed.recorded.items) |*entry| {
             if (resumed.done.contains(entry.index)) try multiverse.recorded_merge(&entry.property, entry.index);
         }
+        // Declarations alone: in the catalog, reached only if some timeline reached them.
+        for (resumed.declared.items) |*declared| try multiverse.recorded_merge(declared, 0);
     }
 };
 const RecordedOf = struct { index: u32, property: report.Recorded };
@@ -2147,6 +2154,23 @@ fn complete_verdict(arena: std.mem.Allocator, resumed: *const Resumed) !struct {
     try resumed.merge_into(multiverse);
     const failing = multiverse.failing_properties();
     return .{ .properties = failing, .status = if (failing > 0 or resumed.catalog_failing > 0) 3 else 0 };
+}
+
+test "a resume's catalog has the skipped timelines' declarations, unreached unless one reached them" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Timeline 0 declared reachable "r" and never reached it; the resumed run's timelines don't
+    // declare it.
+    var resumed: Resumed = .{};
+    try resumed.done.put(arena, 0, {});
+    try resumed.declared.append(arena, .{ .message = "r", .hash = 0, .kind = .reachable, .hits = 0, .trues = 0, .failure = null });
+    const multiverse = try arena.create(report.Multiverse);
+    multiverse.* = .{};
+    try resumed.merge_into(multiverse);
+    var catalog = report.Catalog{ .arena = arena };
+    try multiverse.catalog_reached(&catalog);
+    try std.testing.expectEqual(@as(u32, 1), catalog.judge(true));
 }
 
 test "a complete run resumed again fails for its catalog too" {
@@ -2237,6 +2261,8 @@ const RecordLine = struct {
     generation: ?struct { number: u32, branches: []const u32 } = null,
     fresh: ?Fresh = null,
     planned: ?PlannedLine = null,
+    /// An assertion declared and not reached, the first time the run saw it (report.zig).
+    declared: ?report.Recorded = null,
     /// The run's catalog judged (main's catalog.judge: its assertions no timeline reached), the
     /// last such line the run's verdict.
     catalog: ?struct { failing: u32 = 0 } = null,
@@ -2290,7 +2316,11 @@ fn resume_read(context: Context, arguments: *const Arguments, inputs: u64) !*con
             }
         }
         if (line.fresh) |fresh| try resumed.fresh.append(context.arena, fresh);
-        if (line.catalog) |judged| resumed.catalog_failing = judged.failing;
+        if (line.catalog) |judged| {
+            resumed.catalog_failing = judged.failing;
+            resumed.catalog_seen = true;
+        }
+        if (line.declared) |declared| try resumed.declared.append(context.arena, declared);
         if (line.branch) |branch| {
             // A timeline extending one of the run's (a session's): not the explorer's to resume.
             if (branch.extends != null) continue;
@@ -2328,7 +2358,10 @@ fn resume_read(context: Context, arguments: *const Arguments, inputs: u64) !*con
     const left = for (0..arguments.branches) |index| {
         if (!resumed.done.contains(@intCast(index))) break true;
     } else false;
-    if (!left) {
+    // Complete, its catalog judged in its record: judged from the record. Without that verdict (a
+    // run stopped after its last timeline, before its end) it ends as a run does, its catalog
+    // judged with its scenarios (CE45's remainder).
+    if (!left and resumed.catalog_seen) {
         // Judged from its record, as the run that recorded it would have been (a complete run
         // resumed once exited 0 here whatever its timelines failed: CE29). A catalog's
         // assertions no timeline reached are judged by the runs that ran timelines.
@@ -2449,8 +2482,8 @@ fn persisted_hash(comptime T: type, hasher: *std.hash.Wyhash) void {
 test "what an explorer persists changes only with runs.state_format" {
     // A failure here: the layout changed. Bump runs.state_format and set both below to the new
     // values (a run made before then resumes on its own explorer, never on one that misreads it).
-    try std.testing.expectEqual(@as(u32, 7), runs.state_format);
-    try std.testing.expectEqual(@as(u64, 11856638849795496008), persisted_layout);
+    try std.testing.expectEqual(@as(u32, 8), runs.state_format);
+    try std.testing.expectEqual(@as(u64, 822319605095176114), persisted_layout);
 }
 
 fn summary_write(fd: linux.fd_t, summary: *const Summary) void {
