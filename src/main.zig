@@ -1446,11 +1446,7 @@ fn run_request_write(
         // of the platform). Its injectors kept by content, as its kernel is.
         .timeline_limit = arguments.timeline_limit_text,
         .swarm = arguments.swarm,
-        .injectors = if (arguments.injectors.len == 0) null else injectors: {
-            const kept = try arena.alloc([]const u8, arguments.injectors.len);
-            for (kept, arguments.injectors) |*path, given| path.* = try runs.artifact_keep(arena, io, data, given);
-            break :injectors kept;
-        },
+        .injectors = if (arguments.injectors.len == 0) null else try runs.injectors_keep(arena, io, data, arguments.injectors),
         .trace_errno = arguments.trace_errno, // In the guest's command line: replays need it.
         .generation = arguments.generation_size,
         .horizon = arguments.horizon_text,

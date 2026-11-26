@@ -218,16 +218,44 @@ pub fn artifact_keep(arena: std.mem.Allocator, io: std.Io, data: []const u8, pat
         std.hash.Wyhash.hash(0, bytes), std.fs.path.basename(path),
     });
     const kept = try std.fs.path.join(arena, &.{ directory, name });
+    try keep_once(arena, io, kept, bytes);
+    return kept;
+}
+
+/// A copy kept by content whose file keeps its own name: `<data>/artifacts/<hash>/<name>`, for a
+/// file whose name is part of what a run boots (an injector: see injectors_keep).
+pub fn artifact_keep_named(arena: std.mem.Allocator, io: std.Io, data: []const u8, path: []const u8) ![]const u8 {
+    const cwd = std.Io.Dir.cwd();
+    const bytes = try cwd.readFileAlloc(io, path, arena, .unlimited);
+    const directory = try std.fs.path.join(arena, &.{ data, "artifacts", try std.fmt.allocPrint(arena, "{x:0>16}", .{std.hash.Wyhash.hash(0, bytes)}) });
+    try cwd.createDirPath(io, directory);
+    const kept = try std.fs.path.join(arena, &.{ directory, std.fs.path.basename(path) });
+    try keep_once(arena, io, kept, bytes);
+    return kept;
+}
+
+/// Writes `kept` once, executable. Staged under a name of this thread's: two runs keeping it at
+/// once do not collide, nor two requests to one server (a thread each: the self-test's controller
+/// answered 500 when one renamed the file the other was about to chmod).
+fn keep_once(arena: std.mem.Allocator, io: std.Io, kept: []const u8, bytes: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
     cwd.access(io, kept, .{}) catch {
-        // Staged under a name of this thread's: two runs keeping it at once do not collide, nor
-        // two requests to one server (a thread each: the self-test's controller answered 500
-        // when one renamed the file the other was about to chmod).
         const staging = try std.fmt.allocPrintSentinel(arena, "{s}.staging-{d}-{d}", .{ kept, linux.getpid(), linux.gettid() }, 0);
         try cwd.writeFile(io, .{ .sub_path = staging, .data = bytes });
         // Executable: a test program is run from its kept copy.
         if (linux.errno(linux.fchmodat(linux.AT.FDCWD, staging, 0o755)) != .SUCCESS) return error.ChmodFailed;
         try cwd.rename(staging, cwd, kept, io);
     };
+}
+
+/// A command-line run's injectors kept by content for its analyses (run_request_write), each
+/// under its own name: an injector's name is part of what the run boots (its system disk holds
+/// `/det/injectors/<name>`, and the disk's hash covers the name). Kept as `<hash>-<name>`, every
+/// analysis of a command-line run with an injector booted another disk and was refused (CE60,
+/// the Lean replica of determinismo, round 7).
+pub fn injectors_keep(arena: std.mem.Allocator, io: std.Io, data: []const u8, given: []const []const u8) ![]const []const u8 {
+    const kept = try arena.alloc([]const u8, given.len);
+    for (kept, given) |*path, one| path.* = try artifact_keep_named(arena, io, data, one);
     return kept;
 }
 
@@ -352,6 +380,35 @@ fn write_all(fd: linux.fd_t, bytes: []const u8) void {
         if (linux.errno(result) != .SUCCESS) return; // A terminal gone: the file still gets it.
         written += result;
     }
+}
+
+test "a command-line run's injectors are kept by content under their own names" {
+    // Kept as `<hash>-chaos`, the analysis's --injector built a system disk with
+    // /det/injectors/<hash>-chaos, another disk than the run's: every tape refused
+    // (TapeInputsDiffer; CE60, the Lean replica of determinismo, round 7).
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try absolute(arena, try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{&tmp.sub_path}));
+    const cwd = std.Io.Dir.cwd();
+    const data = try std.fs.path.join(arena, &.{ root, "data" });
+    const chaos = try std.fs.path.join(arena, &.{ root, "chaos" });
+    try cwd.writeFile(io, .{ .sub_path = chaos, .data = "#!/bin/sh\nexit 0\n" });
+    const kept = try injectors_keep(arena, io, data, &.{chaos});
+    try std.testing.expectEqualStrings("chaos", std.fs.path.basename(kept[0]));
+    try std.testing.expectEqualStrings("#!/bin/sh\nexit 0\n", try cwd.readFileAlloc(io, kept[0], arena, .limited(64)));
+    // Another content under the same name: another copy, the first one left as it was.
+    const other = try std.fs.path.join(arena, &.{ root, "other" });
+    try cwd.createDirPath(io, other);
+    const chaos2 = try std.fs.path.join(arena, &.{ other, "chaos" });
+    try cwd.writeFile(io, .{ .sub_path = chaos2, .data = "#!/bin/sh\nexit 1\n" });
+    const kept2 = try injectors_keep(arena, io, data, &.{chaos2});
+    try std.testing.expectEqualStrings("chaos", std.fs.path.basename(kept2[0]));
+    try std.testing.expect(!std.mem.eql(u8, kept[0], kept2[0]));
+    try std.testing.expectEqualStrings("#!/bin/sh\nexit 0\n", try cwd.readFileAlloc(io, kept[0], arena, .limited(64)));
 }
 
 test "an initramfs is kept with its tools whole beside it, by the image's content name" {
