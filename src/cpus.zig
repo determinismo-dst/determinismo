@@ -979,28 +979,59 @@ test "a check waiting for a CPU leaves the others to the rest" {
 /// moves its containers into a scope under user@<uid>.service, whose cpuset caps them: srv4's
 /// isolation confined the whole user slice to the sessions' CPUs, and every image build of a run
 /// serve started (serve on the hunt CPUs) ran on the sessions' instead (2026-11-26). Null when
-/// none of this process's CPUs is in reach (the build runs where the slice lets it).
+/// none of this process's CPUs is in reach (the build runs where the slice lets it), and when the
+/// user manager has no cpuset to read (no isolation, no cpuset controller delegated: whether
+/// podman would take one there is unknown, so none is asked: CE64).
 pub fn podman_cpuset(arena: std.mem.Allocator) !?[]const u8 {
     const uid = linux.getuid();
     var path_buffer: [160]u8 = undefined;
     const path = try std.fmt.bufPrintSentinel(&path_buffer, "/sys/fs/cgroup/user.slice/user-{d}.slice/user@{d}.service/cpuset.cpus.effective", .{ uid, uid }, 0);
-    var reach_buffer: [512]u8 = undefined;
-    const reach: ?[]const u8 = reach: {
-        const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-        if (linux.errno(fd) != .SUCCESS) break :reach null; // No user manager's cpuset: no cap.
-        defer _ = linux.close(@intCast(fd));
-        const size = linux.read(@intCast(fd), &reach_buffer, reach_buffer.len);
-        if (linux.errno(size) != .SUCCESS) break :reach null;
-        break :reach std.mem.trim(u8, reach_buffer[0..size], " \n");
-    };
+    var reach_buffer: [cpus_max * 6]u8 = undefined;
+    const reach = list_file_read(path, &reach_buffer) orelse return null;
     return cpuset_within(arena, given(), reach);
 }
 
-/// `mine`'s CPUs within the kernel CPU list `reach` (all of them without one), as a kernel CPU
-/// list; null when none is.
-fn cpuset_within(arena: std.mem.Allocator, mine: linux.cpu_set_t, reach: ?[]const u8) !?[]const u8 {
+/// A kernel CPU list file, whole (CE64: one 512-byte read cut a long one, as alternate CPUs of
+/// a big host); null when it can't be read.
+fn list_file_read(path: [:0]const u8, buffer: []u8) ?[]const u8 {
+    const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return null;
+    defer _ = linux.close(@intCast(fd));
+    var size: usize = 0;
+    while (size < buffer.len) {
+        const got = linux.read(@intCast(fd), buffer[size..].ptr, buffer.len - size);
+        if (linux.errno(got) != .SUCCESS) return null;
+        if (got == 0) break;
+        size += got;
+    }
+    return std.mem.trim(u8, buffer[0..size], " \n");
+}
+
+test "a CPU list file is read whole (CE64)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [128]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, ".zig-cache/tmp/{s}/cpus", .{&tmp.sub_path}, 0);
+    var list: [2048]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&list);
+    var cpu: usize = 0;
+    while (cpu < 512) : (cpu += 2) try writer.print("{s}{d}", .{ if (cpu == 0) "" else ",", cpu });
+    try writer.writeAll("\n");
+    const fd = linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(fd));
+    _ = linux.write(@intCast(fd), writer.buffered().ptr, writer.buffered().len);
+    _ = linux.close(@intCast(fd));
+    var buffer: [cpus_max * 6]u8 = undefined;
+    const read = list_file_read(path, &buffer).?;
+    try std.testing.expect(read.len > 512);
+    try std.testing.expect(std.mem.endsWith(u8, read, ",510"));
+}
+
+/// `mine`'s CPUs within the kernel CPU list `reach`, as a kernel CPU list; null when none is.
+fn cpuset_within(arena: std.mem.Allocator, mine: linux.cpu_set_t, reach: []const u8) !?[]const u8 {
     var mask = mine;
-    if (reach) |list| {
+    {
+        const list = reach;
         var allowed: linux.cpu_set_t = @splat(0);
         var ranges = std.mem.splitScalar(u8, list, ',');
         while (ranges.next()) |range| {
@@ -1050,11 +1081,19 @@ test "a podman build's CPUs: the process's, as far as the user manager's cpuset 
     try std.testing.expectEqual(@as(?[]const u8, null), try cpuset_within(arena, hunt, "0-8,44-52"));
     // The user manager unconfined: the hunt's own.
     try std.testing.expectEqualStrings("9-43", (try cpuset_within(arena, hunt, "0-52")).?);
-    // No cpuset to read: the process's own, ranges and single CPUs.
+    // Ranges and single CPUs.
     var some: linux.cpu_set_t = @splat(0);
     for ([_]usize{ 0, 2, 3, 4, 7 }) |cpu| set_add(&some, cpu);
-    try std.testing.expectEqualStrings("0,2-4,7", (try cpuset_within(arena, some, null)).?);
+    try std.testing.expectEqualStrings("0,2-4,7", (try cpuset_within(arena, some, "0-63")).?);
     try std.testing.expectEqualStrings("2-3", (try cpuset_within(arena, some, "1-3")).?);
+    // A list past 512 bytes (alternate CPUs of a 512-CPU host): read and taken whole (CE64).
+    var long: std.ArrayList(u8) = .empty;
+    var cpu: usize = 0;
+    while (cpu < 512) : (cpu += 2) try long.print(arena, "{s}{d}", .{ if (cpu == 0) "" else ",", cpu });
+    try std.testing.expect(long.items.len > 512);
+    var high: linux.cpu_set_t = @splat(0);
+    set_add(&high, 510);
+    try std.testing.expectEqualStrings("510", (try cpuset_within(arena, high, long.items)).?);
 }
 
 test "a kernel CPU list's count" {
