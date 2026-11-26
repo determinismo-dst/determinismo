@@ -130,6 +130,19 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, arguments: []const [:0]const u8
             } else |_| {}
         }
     };
+    // Its injectors (a command-line run's kept copies, a serve run's uploads): inputs of its system
+    // disk, which hashes each one's name and content (prepare.zig), so each keeps its name, in
+    // artifacts/injectors/ (another artifact may share a name). Left at the recording host's
+    // paths, a bundle of a run with an injector replayed nowhere else (CE66, the Lean replica of
+    // determinismo, round 8).
+    if (request.object.getPtr("injectors")) |injectors| if (injectors.* == .array) {
+        if (bundle.store == null) try cwd.createDirPath(io, try std.fs.path.join(arena, &.{ out, "artifacts", "injectors" }));
+        for (injectors.array.items) |*entry| if (entry.* == .string) {
+            const name = try std.fs.path.join(arena, &.{ "artifacts", "injectors", std.fs.path.basename(entry.string) });
+            if (!has(&bundle, name)) try bundle_input(arena, io, &bundle, entry.string, name);
+            entry.* = .{ .string = name };
+        };
+    };
     try write(arena, io, &bundle, "request.json", try json_text(arena, request));
 
     // The pinned system: its nodes' images beside it (and what the cache keeps beside each:
@@ -425,6 +438,69 @@ fn sums_write(arena: std.mem.Allocator, io: std.Io, bundle: *const Bundle) !void
     }
     for (bundle.stored.items) |entry| try text.print(arena, "{s}  {s}\n", .{ &entry.sha256, entry.path });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(arena, &.{ bundle.out, "SHA256SUMS" }), .data = text.items });
+}
+
+/// A run bundled with a store, its request naming a kept injector or not: whether every input
+/// the bundle's request names (program, injectors) is the bundle's own (in STORED, relative).
+fn bundle_carries_inputs(with_injector: bool) !bool {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = std.Io.Dir.cwd();
+    const root = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const data = try std.fs.path.join(arena, &.{ root, "data" });
+    const run_directory = try std.fs.path.join(arena, &.{ data, "runs", "5" });
+    const kernel = try std.fs.path.join(arena, &.{ data, "artifacts", "1111111111111111-vmlinuz" });
+    const program = try std.fs.path.join(arena, &.{ data, "artifacts", "2222222222222222-bank" });
+    const injector = try std.fs.path.join(arena, &.{ data, "artifacts", "3333333333333333", "chaos" });
+    const cpuid_path = try std.fs.path.join(arena, &.{ run_directory, "cpuid.txt" });
+    for ([_][]const u8{ kernel, program, injector, cpuid_path }) |path| {
+        try cwd.createDirPath(io, std.fs.path.dirname(path).?);
+        try cwd.writeFile(io, .{ .sub_path = path, .data = std.fs.path.basename(path) });
+    }
+    try cwd.createDirPath(io, try std.fs.path.join(arena, &.{ run_directory, "events" }));
+    try cwd.createDirPath(io, try std.fs.path.join(arena, &.{ run_directory, "tapes" }));
+    try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(arena, &.{ run_directory, "machine.json" }), .data = try std.fmt.allocPrint(arena, "[\"--kernel\",\"{s}\",\"--cpuid\",\"{s}\"]", .{ kernel, cpuid_path }) });
+    const request = if (with_injector)
+        try std.fmt.allocPrint(arena, "{{\"program\":\"{s}\",\"injectors\":[\"{s}\"],\"seed\":7}}", .{ program, injector })
+    else
+        try std.fmt.allocPrint(arena, "{{\"program\":\"{s}\",\"seed\":7}}", .{program});
+    try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(arena, &.{ run_directory, "request.json" }), .data = request });
+    try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(arena, &.{ run_directory, "events", "system.pin.json" }), .data = "{}" });
+    try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(arena, &.{ run_directory, "tapes", "branch-0.jsonl" }), .data = "{\"tape\":2,\"branch\":0}\n" });
+    const out = try std.fs.path.join(arena, &.{ root, "bundle" });
+    const store = try std.fs.path.join(arena, &.{ root, "store" });
+    const out_z = try arena.dupeSentinel(u8, out, 0);
+    const store_z = try arena.dupeSentinel(u8, store, 0);
+    const run_z = try arena.dupeSentinel(u8, run_directory, 0);
+    try std.testing.expectEqual(@as(u8, 0), try run(arena, io, &.{ run_z, "0", out_z, "--store", store_z }));
+    // What its replay reads (verify's run arguments: request.json through system_arguments).
+    const Asked = struct { program: ?[]const u8 = null, injectors: ?[]const []const u8 = null };
+    const asked = try std.json.parseFromSliceLeaky(Asked, arena, try read(arena, io, out, "request.json"), .{ .ignore_unknown_fields = true });
+    const stored = try read(arena, io, out, "STORED");
+    var inputs: std.ArrayList([]const u8) = .empty;
+    try inputs.append(arena, asked.program.?);
+    if (asked.injectors) |list| {
+        try inputs.appendSlice(arena, list);
+        // An injector keeps its name: the system disk hashes each one's name and content.
+        for (list) |path| try std.testing.expectEqualStrings("chaos", std.fs.path.basename(path));
+    }
+    for (inputs.items) |path| {
+        if (std.fs.path.isAbsolute(path) or std.mem.indexOf(u8, stored, path) == null) return false;
+    }
+    return true;
+}
+
+test "a bundle carries every input its request names, a run's injectors too" {
+    // Its request kept the recording host's paths for the injectors (the kept copies,
+    // <data>/artifacts/<hash>/<name>), and nothing put them in the bundle or its store: a bundle
+    // of a run with an injector replayed nowhere else (CE66, the Lean replica of determinismo,
+    // round 8).
+    try std.testing.expect(try bundle_carries_inputs(true));
+    try std.testing.expect(try bundle_carries_inputs(false));
 }
 
 test tapes_max {
