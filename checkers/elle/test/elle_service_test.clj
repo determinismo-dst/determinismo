@@ -5,7 +5,9 @@
   (:require [clojure.data.json :as json]
             [clojure.string :as string]
             [clojure.test :refer [deftest is testing]]
-            [elle-service :as service]))
+            [elle-service :as service]
+            [elle.list-append :as la]
+            [jepsen.history :as h]))
 
 (defn- history [& operations]
   (string/join "\n" (map json/write-str operations)))
@@ -169,3 +171,16 @@
         a (pair 1 2)
         b (pair 2 1)]
     (is (= (:valid a) (:valid b)) (pr-str [a b]))))
+
+;; D2 (the Lean replica of Elle): two models at once, one of them allowing realtime anomalies to be
+;; reported, made Elle add the realtime graph alone; the process-order cycle was then named
+;; G-single-item-realtime, which strong session snapshot isolation allows, and the history passed.
+(deftest two-models-keep-the-process-order
+  (let [history (h/history [{:process 0, :type :invoke, :f :txn, :value [[:append 0 1]]}
+                            {:process 0, :type :ok, :f :txn, :value [[:append 0 1]]}
+                            {:process 0, :type :invoke, :f :txn, :value [[:r 0 nil]]}
+                            {:process 0, :type :ok, :f :txn, :value [[:r 0 []]]}])
+        one (la/check {:consistency-models [:strong-session-snapshot-isolation]} history)
+        two (la/check {:consistency-models [:strong-session-snapshot-isolation :strong-read-uncommitted]} history)]
+    (is (false? (:valid? one)) (pr-str one))
+    (is (false? (:valid? two)) (pr-str (select-keys two [:valid? :anomaly-types])))))
