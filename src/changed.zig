@@ -22,6 +22,9 @@ pub const Change = struct {
     /// first to timelines that came nearer) was measured on two mazes, one a distractor
     /// (tests/changed/mazes.diff, four seeds, 2026-10-28): no gain, so the tree does not.
     closest: []u32,
+    /// The timelines counted (main.zig's change_count): every one that ended, the last ones no
+    /// judgment took too, what "ran in n/N" divides by.
+    counted: u32 = 0,
 
     pub const Approach = struct { hunk: usize, distance: u32 };
 
@@ -63,7 +66,8 @@ pub const Change = struct {
         return null;
     }
 
-    pub fn summarize(change: *const Change, timelines: u32) void {
+    pub fn summarize(change: *const Change) void {
+        const timelines = change.counted;
         var ran: u32 = 0;
         for (change.timelines) |count| ran += @intFromBool(count > 0);
         std.debug.print("[determinismo] changed code: {d} of {d} hunks ran\n", .{

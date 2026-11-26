@@ -4434,7 +4434,9 @@ fn explore_tree(
         "queue for memory\n", .{ state.filler_held, state.queue_held });
     if (branches.arguments.record_path) |record| try behaviors_write(context, &state, record);
     if (state.change) |*target| {
-        target.summarize(state.next_index);
+        // The last timelines no judgment took ran too (CE39).
+        for (batch.summaries.items[0..batch.summaries.count]) |*summary| change_count(target, context.arena, state.hunks_reached, summary);
+        target.summarize();
         report.record(.{ .changed = .{
             .hunks = target.hunks,
             .timelines = target.timelines,
@@ -6394,6 +6396,29 @@ test "a judged timeline's plan has the seed it ran with: its children's chain re
     try std.testing.expectEqual(@as(u64, 0x42), plan[0].seed);
 }
 
+/// A targeted run's count of a timeline that ended: which hunks it ran (once each; its parents'
+/// prefix too), whatever its trace (a timeline the same as an earlier one still ran them), and
+/// how near the hunks none ran its lines come. Every timeline that ended counts, the last ones no
+/// judgment took too: counted at judgments alone, a hunk only they ran read "NEVER RAN", and
+/// "ran in n/N" divided by the timelines planned (CE39, the blind Lean replica of the platform).
+fn change_count(target: *changed.Change, arena: std.mem.Allocator, reached: []bool, summary: *const Summary) void {
+    target.counted += 1;
+    @memset(reached, false);
+    for (summary.behaviors[0..summary.behavior_count]) |behavior| {
+        const hunk = target.hunk_of(arena, behavior.name()) orelse {
+            if (target.approach(arena, behavior.name())) |near| {
+                target.closest[near.hunk] = @min(target.closest[near.hunk], near.distance);
+            }
+            continue;
+        };
+        if (!reached[hunk]) {
+            target.timelines[hunk] += 1;
+            target.first[hunk] = @min(target.first[hunk], summary.index);
+        }
+        reached[hunk] = true;
+    }
+}
+
 fn tree_judge_begin(
     context: Context,
     vm: *VM,
@@ -6447,25 +6472,7 @@ fn tree_judge_begin(
     state.doom_weight = @as(u64, 1) << random.random().uintAtMost(u6, 6);
     state.doom_frontier = random.random().boolean();
     for (done) |summary| {
-        // A targeted run: which hunks each timeline ran (once each; its parents' prefix too),
-        // whatever its trace (a timeline the same as an earlier one still ran them).
-        if (state.change) |*target| {
-            @memset(state.hunks_reached, false);
-            for (summary.behaviors[0..summary.behavior_count]) |behavior| {
-                const hunk = target.hunk_of(arena, behavior.name()) orelse {
-                    // How near the hunks no timeline ran its lines come (the report's).
-                    if (target.approach(arena, behavior.name())) |near| {
-                        target.closest[near.hunk] = @min(target.closest[near.hunk], near.distance);
-                    }
-                    continue;
-                };
-                if (!state.hunks_reached[hunk]) {
-                    target.timelines[hunk] += 1;
-                    target.first[hunk] = @min(target.first[hunk], summary.index);
-                }
-                state.hunks_reached[hunk] = true;
-            }
-        }
+        if (state.change) |*target| change_count(target, arena, state.hunks_reached, summary);
         // Its configuration draws: paid when it found a behavior new to the run or failed.
         var paid = summary.failing_count > 0;
         for (summary.behaviors[0..summary.behavior_count]) |behavior| {
