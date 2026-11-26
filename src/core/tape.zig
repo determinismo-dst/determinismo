@@ -1151,7 +1151,6 @@ test "a tape keeps the machine a strategy decided for its run" {
     try std.testing.expectEqualStrings(machine.custom_faults, header.machine.?.custom_faults);
 }
 
-
 test "a replay past a checkpoint's count diverged" {
     const overrides = try Overrides.create(std.testing.allocator);
     defer overrides.destroy();
