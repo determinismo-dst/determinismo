@@ -11,14 +11,14 @@ pub const Case = struct { name: []const u8, failed: bool, message: []const u8 = 
 pub fn cases(arena: std.mem.Allocator, report: []const u8) ![]const Case {
     var out: std.ArrayList(Case) = .empty;
     var at: usize = 0;
-    while (std.mem.indexOfPos(u8, report, at, "<testcase")) |open| {
+    while (case_index(report, at)) |open| {
         const tag_end = std.mem.indexOfScalarPos(u8, report, open, '>') orelse break;
         const tag = report[open..tag_end];
         const closed = tag.len > 0 and tag[tag.len - 1] == '/';
         var body: []const u8 = "";
         at = tag_end + 1;
         if (!closed) {
-            const close = std.mem.indexOfPos(u8, report, at, "</testcase>") orelse report.len;
+            const close = captured_end(report, at, "</testcase>") orelse report.len;
             body = report[at..close];
             at = close;
         }
@@ -55,6 +55,29 @@ pub fn cases(arena: std.mem.Allocator, report: []const u8) ![]const Case {
     return out.items;
 }
 
+/// The next `<testcase` element at or past `at`: none inside a CDATA section or a comment, which
+/// hold what a test printed (a test of something that writes JUnit XML, or a suite's own output:
+/// go-junit-report writes a package's there). Printed cases were judged as tests of their own,
+/// failing in every timeline (CE49, the Lean replica of determinismo).
+fn case_index(report: []const u8, from: usize) ?usize {
+    var at = from;
+    while (std.mem.indexOfScalarPos(u8, report, at, '<')) |next| {
+        const rest = report[next..];
+        if (std.mem.startsWith(u8, rest, "<![CDATA[")) {
+            at = (std.mem.indexOfPos(u8, report, next, "]]>") orelse return null) + "]]>".len;
+            continue;
+        }
+        if (std.mem.startsWith(u8, rest, "<!--")) {
+            at = (std.mem.indexOfPos(u8, report, next, "-->") orelse return null) + "-->".len;
+            continue;
+        }
+        if (std.mem.startsWith(u8, rest, "<testcase") and (rest.len == "<testcase".len or
+            std.mem.indexOfScalar(u8, " \t\r\n/>", rest["<testcase".len]) != null)) return next;
+        at = next + 1;
+    }
+    return null;
+}
+
 /// Where a case's body opens the element `opening` (`<failure`, `<error`), outside what the
 /// test printed: its `<system-out>` and `<system-err>` and any CDATA section. Surefire, jest-junit
 /// and go-junit-report write a case's output in CDATA, as is, and a passing test that printed an
@@ -86,18 +109,21 @@ fn element_index(body: []const u8, opening: []const u8) ?usize {
     return null;
 }
 
-/// Where a captured element's closing tag is, past `from`: a CDATA section before it is the
+/// Where an element's closing tag is, past `from`: a CDATA section or a comment before it is the
 /// output's, whatever it holds (its own closing tag, printed by a test of something that writes
-/// JUnit XML: CE41, the Lean replica of determinismo).
+/// JUnit XML: CE41; a case's `</testcase>`: CE49, the Lean replica of determinismo).
 fn captured_end(body: []const u8, from: usize, closing: []const u8) ?usize {
     var at = from;
     while (true) {
         const close = std.mem.indexOfPos(u8, body, at, closing) orelse return null;
-        if (std.mem.indexOfPos(u8, body, at, "<![CDATA[")) |cdata| if (cdata < close) {
-            const end = std.mem.indexOfPos(u8, body, cdata, "]]>") orelse return null;
-            at = end + "]]>".len;
+        const cdata = std.mem.indexOfPos(u8, body, at, "<![CDATA[") orelse body.len;
+        const comment = std.mem.indexOfPos(u8, body, at, "<!--") orelse body.len;
+        if (@min(cdata, comment) < close) {
+            const end_marker = if (cdata < comment) "]]>" else "-->";
+            const end = std.mem.indexOfPos(u8, body, @min(cdata, comment), end_marker) orelse return null;
+            at = end + end_marker.len;
             continue;
-        };
+        }
         return close;
     }
 }
