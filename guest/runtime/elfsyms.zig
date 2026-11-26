@@ -8,6 +8,7 @@
 const std = @import("std");
 const gopclntab = @import("gopclntab.zig");
 const cxx = @import("cxx.zig");
+const rust_v0 = @import("rust_v0.zig");
 
 pub const Source = gopclntab.Source;
 
@@ -114,9 +115,10 @@ pub const Symbols = struct {
 
 /// "<function>+0x<offset> <module>", at most `size_max` bytes.
 pub fn name(arena: std.mem.Allocator, found: Symbols.Found, module: []const u8, size_max: usize) ?[]const u8 {
-    // Rust's legacy names first (their last part its hash: C++ would read it as a name), then
-    // C++'s whole signature (cxx.zig), else a nested name's parts, else the symbol as it is.
-    const function = (if (rust_hashed(found.name)) demangled(arena, found.name) else cxx.demangle(arena, found.name) orelse demangled(arena, found.name)) orelse found.name;
+    // Rust's v0 names (rust_v0.zig) and legacy ones first (their last part its hash: C++ would
+    // read it as a name), then C++'s whole signature (cxx.zig), else a nested name's parts, else
+    // the symbol as it is.
+    const function = (if (std.mem.startsWith(u8, found.name, "_R")) rust_v0.demangle(arena, found.name) else if (rust_hashed(found.name)) demangled(arena, found.name) else cxx.demangle(arena, found.name) orelse demangled(arena, found.name)) orelse found.name;
     const text = std.fmt.allocPrint(arena, "{s}+0x{x} {s}", .{ function, found.offset, module }) catch return null;
     return text[0..@min(text.len, size_max)];
 }

@@ -688,6 +688,7 @@ pub fn build(b: *std.Build) void {
         "guest/runtime/where.zig",
         "guest/runtime/gopclntab.zig",
         "guest/runtime/elfsyms.zig",
+        "guest/runtime/rust_v0.zig",
         "guest/runtime/symbol.zig",
         "guest/runtime/hold.zig",
         "guest/runtime/dwarf_types.zig",

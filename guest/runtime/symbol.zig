@@ -11,6 +11,8 @@
 const std = @import("std");
 const linux = std.os.linux;
 const dwarf_types = @import("dwarf_types.zig");
+const rust_v0 = @import("rust_v0.zig");
+const elfsyms = @import("elfsyms.zig");
 const assert = std.debug.assert;
 
 const sht_symtab = 2;
@@ -217,6 +219,9 @@ const Symbol = struct {
 
 /// `name` defined in the ELF file `fd` (its .symtab, else its .dynsym), or null.
 fn symbol_find(arena: std.mem.Allocator, fd: linux.fd_t, name: []const u8) Error!?Symbol {
+    // A Rust path (`<turso_core::io::unix::UnixIO as turso_core::io::IO>::step`) also names a
+    // mangled symbol: its v0 or legacy name read back (rust_v0.zig, elfsyms.zig) matched whole.
+    const by_path = std.mem.indexOf(u8, name, "::") != null;
     var header: [64]u8 = undefined;
     if (!pread_all(fd, &header, 0)) return null;
     if (!std.mem.eql(u8, header[0..4], "\x7fELF") or header[4] != 2 or header[5] != 1) return null;
@@ -263,7 +268,8 @@ fn symbol_find(arena: std.mem.Allocator, fd: linux.fd_t, name: []const u8) Error
                 const name_at = std.mem.readInt(u32, symbol[0..4], .little);
                 const defined_in = std.mem.readInt(u16, symbol[6..8], .little);
                 if (defined_in == 0 or name_at >= strings.len) continue; // Undefined: another module's.
-                if (!std.mem.eql(u8, std.mem.sliceTo(strings[name_at..], 0), name)) continue;
+                const raw = std.mem.sliceTo(strings[name_at..], 0);
+                if (!std.mem.eql(u8, raw, name) and !(by_path and named_as(arena, raw, name))) continue;
                 return .{
                     .value = std.mem.readInt(u64, symbol[8..16], .little),
                     .size = std.mem.readInt(u64, symbol[16..24], .little),
@@ -396,4 +402,26 @@ test "a variable of this process, found by its name where the process sees it" {
     try std.testing.expectEqual(@as(u64, 8), found.type.?.size);
     // Its page is there (it was read above); its frame only a privileged reader sees.
     if (linux.geteuid() == 0) try std.testing.expect(found.physical != null and found.probe != null);
+}
+
+/// Whether a mangled Rust symbol (v0's `_R...`, legacy `_ZN...`) reads as `wanted`.
+fn named_as(arena: std.mem.Allocator, raw: []const u8, wanted: []const u8) bool {
+    const read = if (std.mem.startsWith(u8, raw, "_R"))
+        rust_v0.demangle(arena, raw)
+    else if (std.mem.startsWith(u8, raw, "_ZN"))
+        elfsyms.demangled(arena, raw)
+    else
+        null;
+    return if (read) |text| std.mem.eql(u8, text, wanted) else false;
+}
+
+test "a Rust path names its mangled symbol, v0 or legacy, whole" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const v0 = "_RNvXs0_NtNtCs52BZkLu9GJS_10turso_core2io4unixNtB5_6UnixIONtB7_2IO4step";
+    try std.testing.expect(named_as(arena, v0, "<turso_core::io::unix::UnixIO as turso_core::io::IO>::step"));
+    try std.testing.expect(!named_as(arena, v0, "<turso_core::io::unix::UnixIO as turso_core::io::IO>::ste"));
+    try std.testing.expect(named_as(arena, "_ZN4race4main17h36cc26e430779c6bE", "race::main"));
+    try std.testing.expect(!named_as(arena, "det_pausing_at", "det_pausing_at"));
 }
