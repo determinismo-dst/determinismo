@@ -203,3 +203,22 @@ test "a test case's captured output never fails it" {
     try std.testing.expect(found[3].failed);
     try std.testing.expect(!found[4].failed);
 }
+
+// CE41 (the Lean replica of determinismo): a CDATA section of captured output holding the element's
+// own closing tag.
+test "captured output that prints its own closing tag never fails its test" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const report =
+        \\<testsuite>
+        \\<testcase classname="report.WriterTest" name="writes_an_error" time="0.1"><system-out><![CDATA[expected:
+        \\<system-out>log</system-out><error message="boom"/>
+        \\]]></system-out></testcase>
+        \\<testcase classname="report.WriterTest" name="writes_a_failure" time="0.1"><system-err><![CDATA[</system-err><failure message="no"/>]]></system-err></testcase>
+        \\</testsuite>
+    ;
+    const found = try cases(arena_state.allocator(), report);
+    try std.testing.expectEqual(@as(usize, 2), found.len);
+    try std.testing.expect(!found[0].failed);
+    try std.testing.expect(!found[1].failed);
+}
