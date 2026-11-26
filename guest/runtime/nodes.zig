@@ -1657,6 +1657,15 @@ pub fn wipe(name: []const u8) !void {
     defer start_unlock(lock);
     var paths: Paths = undefined;
     try paths.init(name);
+    // A node that never started (a spare) has nothing to lose, and its first start stays a first
+    // start (no DETERMINISMO_WIPES). Its state directory not made yet, writing its wipe count
+    // failed (OpenFailed): etcd's member driver wipes the spare as it adds it, and its command
+    // failed in half of every etcd hunt's timelines since 2026-11-18 at least (runs 2067, 2068,
+    // 2247, 2248), "test commands exit successfully" with them.
+    if (!exists(paths.directory)) {
+        sdk.event("node_wipe", .{ .node = name, .never_started = true });
+        return;
+    }
     try kill_locked(name);
     if (exists(paths.mounted)) try layer_unmount(&paths);
     var mapper_buffer: [mapper_name_size]u8 = undefined;

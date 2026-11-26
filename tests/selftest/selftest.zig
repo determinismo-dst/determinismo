@@ -1926,7 +1926,13 @@ fn spare_scenario(s: *System.Scenario) void {
 fn spare_start(context: *System.Context) !void {
     const spare = &context.nodes.witness.?;
     sdk.sleep_ms(20 * std.time.ms_per_s);
-    try spare.start();
+    // Started by a wipe before it ever ran, as etcd's member driver brings up the spare it adds
+    // (a wipe starts the node fresh): nothing to lose, and its first start stays a first start.
+    try spare.wipe();
+    var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const wipes = node_environment(arena_state.allocator(), "witness", "DETERMINISMO_WIPES") catch "?";
+    sdk.always(wipes.len == 0, "a spare wiped before its first start starts as a first start", .{ .wipes = wipes });
     var reply: [16]u8 = undefined;
     for (0..200) |_| {
         const answer = request(spare.address, "ping\n", &reply) catch {
