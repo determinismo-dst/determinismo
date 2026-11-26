@@ -14,8 +14,9 @@ const std = @import("std");
 /// 2026-11-19, a timeline's own clock in its summary (SummaryHeader.jitter_seed). 3: 2026-11-25,
 /// each timeline's properties in its record line (report.Recorded), for a resume's verdict. 4:
 /// 2026-11-26, the seed a timeline ran with in its summary (SummaryHeader.seed: CE23). 5:
-/// 2026-11-26, the record's catalog line (RecordLine.catalog: CE45).
-pub const state_format: u32 = 5;
+/// 2026-11-26, the record's catalog line (RecordLine.catalog: CE45). 6: 2026-11-26, each return's
+/// children's numbers (RecordLine.planned: CE32-CE34).
+pub const state_format: u32 = 6;
 const assert = std.debug.assert;
 const linux = std.os.linux;
 

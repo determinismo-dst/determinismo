@@ -5830,13 +5830,14 @@ fn check_resume(context: *Context) !void {
         };
         const whole = try std.fmt.allocPrint(arena, "{s}/resume-{s}-whole.jsonl", .{ context.scratch, branching });
         const parts = try std.fmt.allocPrint(arena, "{s}/resume-{s}-parts.jsonl", .{ context.scratch, branching });
+        const parts_tapes = try std.fmt.allocPrint(arena, "{s}/resume-{s}-parts-tapes", .{ context.scratch, branching });
         _ = try explore(context, &(system ++ [_][]const u8{ "--record", whole }));
         // Killed once a dozen timelines are recorded (its workers go with it).
         var command: std.ArrayList(u8) = .empty;
         try command.print(arena, "exec '{s}' explore", .{context.determinismo});
         for (context.machine) |part| try command.print(arena, " '{s}'", .{part});
         for (system) |part| try command.print(arena, " '{s}'", .{part});
-        try command.print(arena, " --record '{s}' 2> /dev/null", .{parts});
+        try command.print(arena, " --record '{s}' --tape-dir '{s}' 2> /dev/null", .{ parts, parts_tapes });
         var child = try std.process.spawn(context.io, .{
             .argv = &.{ "sh", "-c", command.items },
             .stdout = .ignore,
@@ -5850,7 +5851,16 @@ fn check_resume(context: *Context) !void {
         _ = std.os.linux.kill(child.id.?, .TERM);
         _ = try child.wait(context.io);
         const interrupted = try record_timelines(context, parts);
-        const resumed_report = try explore(context, &(system ++ [_][]const u8{ "--record", parts, "--resume" }));
+        // Each resumed timeline replayed against its record: one numbered under another return's
+        // plan, or started from the setup snapshot inside another's path, parts from it (CE32-CE34).
+        const resumed_report = try explore(context, &(system ++ [_][]const u8{
+            "--record", parts, "--tape-dir", parts_tapes, "--resume", "--verify-replays", "100",
+        }));
+        const replay_property = "timelines replay to their recorded history";
+        const replays_line = for_line(resumed_report, replay_property);
+        const replays_failing = failing_in(resumed_report, replay_property);
+        const replays_hit = if (replays_line) |text| hit_count(text) else 0;
+        const tree_numbered = !std.mem.eql(u8, branching, "tree") or try record_children_planned(context, parts);
         const expected = try record_timelines(context, whole);
         const resumed = try record_timelines(context, parts);
         const once = resumed.len == 48 and for (resumed[1..], resumed[0 .. resumed.len - 1]) |a, b| {
@@ -5880,7 +5890,7 @@ fn check_resume(context: *Context) !void {
         var again: std.ArrayList([]const u8) = .empty;
         try again.appendSlice(arena, &.{ context.determinismo, "explore" });
         try again.appendSlice(arena, context.machine);
-        try again.appendSlice(arena, &(system ++ [_][]const u8{ "--record", parts, "--resume" }));
+        try again.appendSlice(arena, &(system ++ [_][]const u8{ "--record", parts, "--tape-dir", parts_tapes, "--resume" }));
         const complete = try run_kept(context, again.items);
         const complete_status: u8 = switch (complete.term) {
             .exited => |code| code,
@@ -5888,6 +5898,9 @@ fn check_resume(context: *Context) !void {
         };
         expect_all(context, &.{
             .{ "48 timelines recorded, once each", once },
+            .{ "the resumed timelines replayed, none parting from its record", replays_hit > 0 and
+                replays_failing != null and replays_failing.? == 0 },
+            .{ "tree: every timeline is a child of a return the record planned, under its number", tree_numbered },
             .{ "those recorded before the interruption kept as they were", kept },
             .{ "flat: the whole run's timelines", as_whole },
             .{ "the record has failing timelines (the check's premise)", failed.len > 0 },
@@ -5897,6 +5910,36 @@ fn check_resume(context: *Context) !void {
         }, "resume ({s}): killed at {d} timelines, resumed: {d} timelines, once each (the whole " ++
             "run: {d}); {d} properties failing in the record, resumed again: exit {d}", .{ branching, interrupted.len, resumed.len, expected.len, failed.len, complete_status });
     }
+}
+
+/// Whether every timeline of a tree's record that starts at a return is one of the numbers the
+/// record planned for that return (its generation, parent and moment: `planned` lines).
+fn record_children_planned(context: *Context, record: []const u8) !bool {
+    const text = try std.Io.Dir.cwd().readFileAlloc(context.io, record, context.arena, .limited(1 << 28));
+    const Planned = struct { generation: u32, branch: u32, vtime_ns: u64, indices: []const u32 };
+    const Line = struct {
+        planned: ?Planned = null,
+        branch: ?struct { index: u32, generation: u32 = 0, path: []const struct { branch: u32, vtime_ns: u64 } = &.{} } = null,
+    };
+    var planned: std.ArrayList(Planned) = .empty;
+    var children: std.ArrayList(@FieldType(Line, "branch")) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const parsed = std.json.parseFromSliceLeaky(Line, context.arena, line, .{ .ignore_unknown_fields = true }) catch continue;
+        if (parsed.planned) |one| try planned.append(context.arena, one);
+        if (parsed.branch) |one| if (one.path.len > 0) try children.append(context.arena, one);
+    }
+    if (children.items.len == 0) return false;
+    for (children.items) |child_line| {
+        const child = child_line.?;
+        const last = child.path[child.path.len - 1];
+        const found = for (planned.items) |one| {
+            if (one.generation == child.generation and one.branch == last.branch and one.vtime_ns == last.vtime_ns and
+                std.mem.indexOfScalar(u32, one.indices, child.index) != null) break true;
+        } else false;
+        if (!found) return false;
+    }
+    return true;
 }
 
 /// The properties a record's timelines failed (each branch line's "failing"), once each.

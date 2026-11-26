@@ -2094,10 +2094,11 @@ const Resumed = struct {
     summaries: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
     /// The summaries file up to its last whole record (appended to from there).
     summaries_size: u64 = 0,
-    children: std.AutoHashMapUnmanaged(ReturnKey, u32) = .empty,
-    /// Each recorded return's first child (its smallest number): the order the explorer that
-    /// made them numbered them in (recorded_returns).
-    first_child: std.AutoHashMapUnmanaged(ReturnKey, u32) = .empty,
+    /// Each return the interrupted run planned (RecordLine.planned): its children's numbers, in
+    /// order, whether they ran or not. A resumed run gives them those numbers again, whatever order
+    /// its nodes come in (judge_plan_one), and passes over them for any other (index_settle).
+    planned: std.AutoHashMapUnmanaged(ReturnKey, []const u32) = .empty,
+    planned_indices: std.AutoHashMapUnmanaged(u32, void) = .empty,
     generations: std.ArrayList([]const u32) = .empty,
     /// The fresh timelines taken while each generation was judged (queue_take), in order.
     fresh: std.ArrayList(Fresh) = .empty,
@@ -2110,6 +2111,20 @@ const Resumed = struct {
     /// The catalog's failing assertions as the run last judged them (RecordLine.catalog).
     catalog_failing: u32 = 0,
 
+    fn plan_note(resumed: *Resumed, arena: std.mem.Allocator, planned: PlannedLine) !void {
+        const key: ReturnKey = .{ .generation = planned.generation, .branch = planned.branch, .vtime_ns = planned.vtime_ns };
+        try resumed.planned.put(arena, key, try arena.dupe(u32, planned.indices));
+        for (planned.indices) |index| try resumed.planned_indices.put(arena, index, {});
+    }
+
+    /// Whether every timeline the interrupted run planned for a return is recorded: none runs
+    /// again, and no node is made for it.
+    fn return_recorded(resumed: *const Resumed, key: ReturnKey) bool {
+        const indices = resumed.planned.get(key) orelse return false;
+        for (indices) |index| if (!resumed.done.contains(index)) return false;
+        return true;
+    }
+
     /// The recorded timelines' properties in the run's verdict: those still recorded (one whose
     /// summary the interruption cut runs again, and counts then).
     fn merge_into(resumed: *const Resumed, multiverse: *report.Multiverse) !void {
@@ -2120,6 +2135,12 @@ const Resumed = struct {
 };
 const RecordedOf = struct { index: u32, property: report.Recorded };
 const Fresh = struct { generation: u32, index: u32 };
+/// A return's children as numbered (judge_plan_one): its generation, parent and moment, and their
+/// numbers in order. Keyed by the timelines that ran, a resumed tree lost a return none of whose
+/// children had (the rest renumbered: one then judged under another's plan, one started from the
+/// setup snapshot inside another's path), and numbered its returns in the order its nodes came
+/// (CE32-CE34, the blind Lean replica of the platform).
+const PlannedLine = struct { generation: u32, branch: u32, vtime_ns: u64, indices: []const u32 };
 const ReturnKey = struct { generation: u32, branch: u32, vtime_ns: u64 };
 
 /// A complete run's verdict from its record: its timelines' properties merged, and its
@@ -2219,6 +2240,7 @@ const RecordLine = struct {
     } = null,
     generation: ?struct { number: u32, branches: []const u32 } = null,
     fresh: ?Fresh = null,
+    planned: ?PlannedLine = null,
     /// The run's catalog judged (main's catalog.judge: its assertions no timeline reached), the
     /// last such line the run's verdict.
     catalog: ?struct { failing: u32 = 0 } = null,
@@ -2281,15 +2303,8 @@ fn resume_read(context: Context, arguments: *const Arguments, inputs: u64) !*con
                 for (properties) |property| try resumed.recorded.append(context.arena, .{ .index = branch.index, .property = property });
                 if (!branch.properties_all) resumed.recorded_partial += 1;
             } else resumed.recorded_partial += 1;
-            if (branch.path.len > 0) {
-                const last = branch.path[branch.path.len - 1];
-                const key: ReturnKey = .{ .generation = branch.generation, .branch = last.branch, .vtime_ns = last.vtime_ns };
-                const entry = try resumed.children.getOrPut(context.arena, key);
-                entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
-                const first = try resumed.first_child.getOrPut(context.arena, key);
-                if (!first.found_existing or branch.index < first.value_ptr.*) first.value_ptr.* = branch.index;
-            }
         }
+        if (line.planned) |planned| try resumed.plan_note(context.arena, planned);
     }
     if (!run_seen) {
         say("[determinismo] {s} has no run to continue\n", .{path});
@@ -2435,8 +2450,8 @@ fn persisted_hash(comptime T: type, hasher: *std.hash.Wyhash) void {
 test "what an explorer persists changes only with runs.state_format" {
     // A failure here: the layout changed. Bump runs.state_format and set both below to the new
     // values (a run made before then resumes on its own explorer, never on one that misreads it).
-    try std.testing.expectEqual(@as(u32, 5), runs.state_format);
-    try std.testing.expectEqual(@as(u64, 11331929179682600902), persisted_layout);
+    try std.testing.expectEqual(@as(u32, 6), runs.state_format);
+    try std.testing.expectEqual(@as(u64, 10656191066779764107), persisted_layout);
 }
 
 fn summary_write(fd: linux.fd_t, summary: *const Summary) void {
@@ -4737,8 +4752,26 @@ fn queue_take(arena: std.mem.Allocator, state: *TreeState, judging: bool, setup:
 /// is whoever creates its tape first's), those a timeline extending another took meanwhile (a
 /// session's) passed over. Before every number planned; a resumed run passes over the same.
 fn index_settle(state: *TreeState) void {
-    const directory = state.tape_directory orelse return;
-    while (state.next_index < state.total and !tape.claim(directory, state.next_index)) state.next_index += 1;
+    while (state.next_index < state.total) : (state.next_index += 1) {
+        // A number the interrupted run gave a return's child: that return's again (child_indices).
+        if (state.resumed) |resumed| if (resumed.planned_indices.contains(state.next_index)) continue;
+        const directory = state.tape_directory orelse return;
+        if (tape.claim(directory, state.next_index)) return;
+    }
+}
+
+/// A return's children's numbers: those the interrupted run gave them (a resumed run's), else
+/// the next `count` free ones (the run's numbering as it is planned).
+fn child_indices(arena: std.mem.Allocator, state: *TreeState, key: ReturnKey, count: u32) ![]const u32 {
+    if (state.resumed) |resumed| if (resumed.planned.get(key)) |recorded| return recorded;
+    var indices: std.ArrayList(u32) = .empty;
+    for (0..count) |_| {
+        index_settle(state);
+        if (state.next_index >= state.total) break;
+        try indices.append(arena, state.next_index);
+        state.next_index += 1;
+    }
+    return indices.items;
 }
 
 fn queue_fresh(arena: std.mem.Allocator, state: *TreeState, setup: *const Snapshot) !void {
@@ -4886,6 +4919,7 @@ fn rejudge_load(
 test "a resumed run's recorded generations: the earlier ones judged at once, the last left to the run's loop" {
     const arena = std.testing.allocator;
     var state: TreeState = undefined;
+    state.resumed = null;
     state.queue = .empty;
     state.queue_head = 0;
     state.filler_start = 0;
@@ -6457,14 +6491,22 @@ fn judge_plan_ready(arena: std.mem.Allocator, branches: Branches, state: *TreeSt
 
 fn judge_plan_one(arena: std.mem.Allocator, branches: Branches, state: *TreeState, judging: *Judging, making: *NodeMaking) !void {
     const snapshot = making.snapshot orelse return;
-    index_settle(state);
-    if (state.next_index >= state.total) {
-        node_free(snapshot, branches.snapshot); // Not needed after all.
-        return;
-    }
     const parent = making.parent;
     const back = making.back;
     const at = back.vtime_ns;
+    const key: ReturnKey = .{ .generation = judging.generation + 1, .branch = parent.index, .vtime_ns = at };
+    const recorded = if (state.resumed) |resumed| resumed.planned.contains(key) else false;
+    const indices = try child_indices(arena, state, key, back.branches orelse state.children);
+    if (indices.len == 0) {
+        node_free(snapshot, branches.snapshot); // Not needed after all.
+        return;
+    }
+    if (!recorded) report.record(.{ .planned = PlannedLine{
+        .generation = key.generation,
+        .branch = key.branch,
+        .vtime_ns = key.vtime_ns,
+        .indices = indices,
+    } });
     judging.made.all += 1;
     judging.made.held += @intFromBool(making.held);
     judging.made.disk += @intFromBool(making.disk != null);
@@ -6480,12 +6522,10 @@ fn judge_plan_one(arena: std.mem.Allocator, branches: Branches, state: *TreeStat
         .vtime_ns = at,
         .jitter_seed = parent.jitter_seed,
     };
-    for (0..(back.branches orelse state.children)) |_| {
-        index_settle(state);
-        if (state.next_index >= state.total) break;
+    for (indices) |index| {
         try queue_push(arena, state, .{
-            .index = state.next_index,
-            .seed = branch_seed(state.base, state.next_index),
+            .index = index,
+            .seed = branch_seed(state.base, index),
             .snapshot = snapshot,
             .path = path,
             .generation = judging.generation + 1,
@@ -6495,13 +6535,12 @@ fn judge_plan_one(arena: std.mem.Allocator, branches: Branches, state: *TreeStat
             .horizon_ns = if (back.horizon_ns) |horizon|
                 at + horizon
             else if (branches.arguments.horizon_ns) |horizon|
-                at + horizon_drawn(horizon, branch_seed(state.base, state.next_index))
+                at + horizon_drawn(horizon, branch_seed(state.base, index))
             else
                 null,
             .disk_origin = if (making.disk) |on_disk| .{ .branch = on_disk.branch, .vtime_ns = on_disk.held.vtime_ns } else null,
             .jitter_seed = parent.jitter_seed, // Its parent's clock, unless its strategy chooses one.
         });
-        state.next_index += 1;
         returns_planned += 1;
         judging.branches_planned += 1;
     }
@@ -6694,7 +6733,7 @@ fn tree_judge_begin(
                 .branch = back.branch,
                 .vtime_ns = back.vtime_ns,
             };
-            if ((resumed.children.get(key) orelse 0) >= state.children) {
+            if (resumed.return_recorded(key)) {
                 makings[making_count] = .{ .back = back, .parent = parent, .ready = true, .snapshot = state.setup };
                 making_count += 1;
                 continue;
@@ -6997,6 +7036,7 @@ test frontier_choose {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var state: TreeState = undefined;
+    state.resumed = null;
     state.change = null;
     state.prefer_sometimes = true;
     state.prefer_severe = true;
@@ -7056,13 +7096,14 @@ const Candidate = struct {
 fn recorded_returns(arena: std.mem.Allocator, resumed: *const Resumed, generation: u32) !?[]const TreeReturn {
     const Recorded_ = struct { first: u32, back: TreeReturn };
     var found: std.ArrayList(Recorded_) = .empty;
-    var keys = resumed.first_child.iterator();
+    var keys = resumed.planned.iterator();
     while (keys.next()) |entry| {
-        if (entry.key_ptr.generation != generation) continue;
-        try found.append(arena, .{ .first = entry.value_ptr.*, .back = .{
+        if (entry.key_ptr.generation != generation or entry.value_ptr.len == 0) continue;
+        try found.append(arena, .{ .first = entry.value_ptr.*[0], .back = .{
             .branch = entry.key_ptr.branch,
             .vtime_ns = entry.key_ptr.vtime_ns,
             .why = "Recorded: the return this resumed run made before its interruption.",
+            .branches = @intCast(entry.value_ptr.len),
         } });
     }
     if (found.items.len == 0) return null;
@@ -7082,16 +7123,53 @@ test recorded_returns {
     const allocator = arena.allocator();
     var resumed: Resumed = .{};
     // Generation 3's two returns (their children numbered from 70 and from 66), and one of 4's.
-    try resumed.first_child.put(allocator, .{ .generation = 3, .branch = 40, .vtime_ns = 9 }, 70);
-    try resumed.first_child.put(allocator, .{ .generation = 3, .branch = 12, .vtime_ns = 5 }, 66);
-    try resumed.first_child.put(allocator, .{ .generation = 4, .branch = 70, .vtime_ns = 2 }, 98);
+    try resumed.plan_note(allocator, .{ .generation = 3, .branch = 40, .vtime_ns = 9, .indices = &.{ 70, 71 } });
+    try resumed.plan_note(allocator, .{ .generation = 3, .branch = 12, .vtime_ns = 5, .indices = &.{ 66, 67, 68, 69 } });
+    try resumed.plan_note(allocator, .{ .generation = 4, .branch = 70, .vtime_ns = 2, .indices = &.{98} });
     const returns = (try recorded_returns(allocator, &resumed, 3)).?;
     try std.testing.expectEqual(@as(usize, 2), returns.len);
     // In the order they were numbered, not the map's.
     try std.testing.expectEqual(@as(u32, 12), returns[0].branch);
     try std.testing.expectEqual(@as(u64, 5), returns[0].vtime_ns);
     try std.testing.expectEqual(@as(u32, 40), returns[1].branch);
+    try std.testing.expectEqual(@as(?u32, 4), returns[0].branches);
+    try std.testing.expectEqual(@as(?u32, 2), returns[1].branches);
     try std.testing.expectEqual(@as(?[]const TreeReturn, null), try recorded_returns(allocator, &resumed, 7));
+}
+
+test "a resumed tree keeps every return's recorded numbers, whatever ran and whatever order its nodes come in" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var resumed: Resumed = .{};
+    // Generation 0 is timelines 0 to 4. Its returns: #0 at 10 ms (5 and 6), a filler (7) taken
+    // between the plans, #1 at 20 ms (8 and 9). Only 6, 8 and 9 finished before the stop.
+    try resumed.plan_note(arena, .{ .generation = 1, .branch = 0, .vtime_ns = 10, .indices = &.{ 5, 6 } });
+    try resumed.plan_note(arena, .{ .generation = 1, .branch = 1, .vtime_ns = 20, .indices = &.{ 8, 9 } });
+    for ([_]u32{ 0, 1, 2, 3, 4, 6, 8, 9 }) |index| try resumed.done.put(arena, index, {});
+    // #0 is back though only one of its children ran (CE32), #1 needs no node.
+    const returns = (try recorded_returns(arena, &resumed, 1)).?;
+    try std.testing.expectEqual(@as(usize, 2), returns.len);
+    try std.testing.expect(!resumed.return_recorded(.{ .generation = 1, .branch = 0, .vtime_ns = 10 }));
+    try std.testing.expect(resumed.return_recorded(.{ .generation = 1, .branch = 1, .vtime_ns = 20 }));
+    var state: TreeState = undefined;
+    state.resumed = &resumed;
+    state.tape_directory = null;
+    state.next_index = 5;
+    state.total = 64;
+    // The ready #1 planned first (CE33): its own numbers, the next number untouched.
+    const first = try child_indices(arena, &state, .{ .generation = 1, .branch = 1, .vtime_ns = 20 }, 4);
+    try std.testing.expectEqualSlices(u32, &.{ 8, 9 }, first);
+    try std.testing.expectEqual(@as(u32, 5), state.next_index);
+    // A filler between the plans takes 7 again (CE34): the recorded numbers passed over.
+    index_settle(&state);
+    try std.testing.expectEqual(@as(u32, 7), state.next_index);
+    state.next_index += 1;
+    const second = try child_indices(arena, &state, .{ .generation = 1, .branch = 0, .vtime_ns = 10 }, 4);
+    try std.testing.expectEqualSlices(u32, &.{ 5, 6 }, second);
+    // A return the record has not: fresh numbers past them.
+    const fresh = try child_indices(arena, &state, .{ .generation = 2, .branch = 6, .vtime_ns = 30 }, 2);
+    try std.testing.expectEqualSlices(u32, &.{ 10, 11 }, fresh);
 }
 
 const TreeReturn = struct {
@@ -9930,6 +10008,7 @@ test "a judged generation's plan starts before the filler, whenever it is judged
     const arena = std.testing.allocator;
     // Only what the queue uses: the rest of a tree's state is a run's.
     var state: TreeState = undefined;
+    state.resumed = null;
     state.queue = .empty;
     state.queue_head = 0;
     state.filler_start = 0;
@@ -9963,6 +10042,7 @@ test "a judged generation's plan starts before the filler, whenever it is judged
 test "while a judgment's nodes are made and nothing is planned, a CPU takes a fresh timeline" {
     const arena = std.testing.allocator;
     var state: TreeState = undefined;
+    state.resumed = null;
     state.queue = .empty;
     state.queue_head = 0;
     state.filler_start = 0;
@@ -10005,6 +10085,7 @@ test "a judgment's made nodes start their branches whatever their order: a slow 
     // made in seconds; planned as a prefix, none of their branches could start, and the judgment
     // waited 807 s with the CPUs on fillers.
     var state: TreeState = undefined;
+    state.resumed = null;
     state.queue = .empty;
     state.queue_head = 0;
     state.filler_start = 0;
@@ -10344,6 +10425,7 @@ test "the tree passes over a number a timeline extending another took, and plans
     // tapes there from before, the session's too).
     for (0..2) |_| {
         var state: TreeState = undefined;
+        state.resumed = null;
         state.queue = .empty;
         state.queue_head = 0;
         state.filler_start = 0;
