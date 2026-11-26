@@ -2366,9 +2366,12 @@ const SummaryHeader = extern struct {
     own_clock: u8 = 0,
     /// 1: `seed` is the seed it ran with (Summary.seed).
     own_seed: u8 = 0,
-    reserved: [4]u8 = @splat(0),
+    /// 1: `tape_full_ns` is when its tape was full (Summary.tape_full_ns).
+    tape_full: u8 = 0,
+    reserved: [3]u8 = @splat(0),
     jitter_seed: u64 = 0,
     seed: u64 = 0,
+    tape_full_ns: u64 = 0,
 };
 
 /// Bumped whenever Events.Behavior changes. 1: `sought`. 2: `score`. (SummaryHeader's own
@@ -2446,8 +2449,8 @@ fn persisted_hash(comptime T: type, hasher: *std.hash.Wyhash) void {
 test "what an explorer persists changes only with runs.state_format" {
     // A failure here: the layout changed. Bump runs.state_format and set both below to the new
     // values (a run made before then resumes on its own explorer, never on one that misreads it).
-    try std.testing.expectEqual(@as(u32, 6), runs.state_format);
-    try std.testing.expectEqual(@as(u64, 10656191066779764107), persisted_layout);
+    try std.testing.expectEqual(@as(u32, 7), runs.state_format);
+    try std.testing.expectEqual(@as(u64, 11856638849795496008), persisted_layout);
 }
 
 fn summary_write(fd: linux.fd_t, summary: *const Summary) void {
@@ -2463,6 +2466,8 @@ fn summary_write(fd: linux.fd_t, summary: *const Summary) void {
         .jitter_seed = summary.jitter_seed orelse 0,
         .own_seed = @intFromBool(summary.seed != null),
         .seed = summary.seed orelse 0,
+        .tape_full = @intFromBool(summary.tape_full_ns != null),
+        .tape_full_ns = summary.tape_full_ns orelse 0,
     };
     const behaviors = std.mem.sliceAsBytes(summary.behaviors[0..summary.behavior_count]);
     const vectors = [_]std.posix.iovec_const{
@@ -2498,6 +2503,7 @@ fn summary_load(summary: *Summary, bytes: []const u8) void {
     summary.cut = header.cut != 0;
     summary.jitter_seed = if (header.own_clock != 0) header.jitter_seed else null;
     summary.seed = if (header.own_seed != 0) header.seed else null;
+    summary.tape_full_ns = if (header.tape_full != 0) header.tape_full_ns else null;
     summary.ended_early = false;
     summary.again_ns = null;
     summary.holder_count = 0; // Gone with the run: its moments are made again by replay.
@@ -2546,6 +2552,9 @@ test "summaries round trip, a cut last one left" {
     summary.trace_hash = 0xabc;
     summary.last_pull_ns = 5;
     summary.cut = true;
+    summary.tape_full_ns = 4;
+    summary.jitter_seed = null;
+    summary.seed = null;
     summary.behavior_count = 2;
     summary.behaviors[0] = .{ .hash = 11, .vtime_ns = 3 };
     summary.behaviors[1] = .{ .hash = 12, .vtime_ns = 4 };
@@ -2568,6 +2577,7 @@ test "summaries round trip, a cut last one left" {
     try std.testing.expectEqual(2, loaded.behavior_count);
     try std.testing.expectEqual(12, loaded.behaviors[1].hash);
     try std.testing.expect(loaded.cut);
+    try std.testing.expectEqual(@as(?u64, 4), loaded.tape_full_ns);
     try std.testing.expectEqual(0, loaded.holder_count);
 }
 
@@ -4034,6 +4044,9 @@ const Summary = struct {
     again_ns: ?u64 = null,
     /// When its workload said its state looked hopeless (Events.doomed_ns: sdk.doomed), if it did.
     doomed_ns: ?u64 = null,
+    /// When its tape was full (VM.tape_full_ns), if it was: no return lands past it, whatever
+    /// else allows one (a cut timeline's moments to its end, a strategy's: CE58).
+    tape_full_ns: ?u64 = null,
     /// The properties it fails (their messages' hashes), up to `failing_max`: the explorer saves
     /// the first failing timeline of each to disk from its holders (Ladders).
     failing: [failing_max]u64 = undefined,
@@ -4077,6 +4090,7 @@ const Summaries = struct {
         summary.behavior_count = vm.events.behavior_count;
         summary.trace_hash = vm.events.hash.final();
         summary.last_pull_ns = returns_before_ns(vm.last_pull_ns, vm.events.checks_start_ns, vm.tape_full_ns);
+        summary.tape_full_ns = vm.tape_full_ns;
         summary.cut = place.horizon_ns != null and outcome == .moment_reached;
         summary.hung = outcome == .hung;
         summary.ended_early = outcome == .strategy_ended;
@@ -6553,6 +6567,19 @@ fn returns_before_ns(last_pull_ns: u64, checks_start_ns: ?u64, tape_full_ns: ?u6
     return @min(last_pull_ns, @min(checks_start_ns orelse std.math.maxInt(u64), tape_full_ns orelse std.math.maxInt(u64)));
 }
 
+/// A cut timeline's moments past its last pull are open to its end (its future never drawn),
+/// unless its tape was full: past the marker a child's chain never replays (CE58, the blind
+/// Lean replica of the platform: the archive's places and an extension at a horizon cut).
+fn open_to_end(summary: *const Summary) bool {
+    return summary.cut and summary.tape_full_ns == null;
+}
+
+/// Where any return to a timeline must land before: its end, or its tape's marker if full (a
+/// strategy's returns too, offered as its end: CE58).
+fn returns_end(summary: *const Summary) u64 {
+    return @min(summary.end_ns, summary.tape_full_ns orelse std.math.maxInt(u64));
+}
+
 test "a return lands before a full tape's marker" {
     // Its tape full at 3 s, its last pull at 9 s: returns before 3 s.
     try std.testing.expectEqual(@as(u64, 3), returns_before_ns(9, null, 3));
@@ -7002,7 +7029,7 @@ fn frontier_choose(
         // A moment past its last randomness pull returns to the same timeline (a cut
         // branch's future was never drawn: open to its end). A sought behavior's moment
         // first (the rarest of them), then the rarest of the rest.
-        const open = (summary.cut or behavior.vtime_ns + return_after_ns < summary.last_pull_ns) and
+        const open = (open_to_end(summary) or behavior.vtime_ns + return_after_ns < summary.last_pull_ns) and
             !(state.doom_frontier and doomed_at(summary, behavior.vtime_ns));
         const better = if ((sought != .no) != (moment_sought != .no))
             sought != .no
@@ -7309,6 +7336,52 @@ fn archive_add_judged(arena: std.mem.Allocator, state: *TreeState, plan: []const
     }
 }
 
+test "a cut timeline whose tape was full is no archive place past its marker (CE58)" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var state: TreeState = .{
+        .base = 1,
+        .total = 64,
+        .size = 16,
+        .children = 4,
+        .pipeline = 1,
+        .jobs = 1,
+        .holding = false,
+        .registry = undefined,
+        .change = null,
+        .hunks_reached = &.{},
+        .candidates = &.{},
+        .tape_buffer = undefined,
+        .io = undefined,
+        .archive = true,
+        .prefer_sometimes = true,
+        .setup = undefined,
+    };
+    // Cut at its horizon (100 ms), its tape full at 3 ms, its last pull bound there: behaviors at
+    // 2 ms and 5 ms.
+    const summary = try std.testing.allocator.create(Summary);
+    defer std.testing.allocator.destroy(summary);
+    summary.index = 0;
+    summary.start_ns = 0;
+    summary.end_ns = 100 * std.time.ns_per_ms;
+    summary.last_pull_ns = 3 * std.time.ns_per_ms;
+    summary.tape_full_ns = 3 * std.time.ns_per_ms;
+    summary.cut = true;
+    summary.doomed_ns = null;
+    summary.again_ns = null;
+    summary.trace_hash = 42;
+    summary.behavior_count = 2;
+    summary.behaviors[0] = .{ .hash = 7, .vtime_ns = 2 * std.time.ns_per_ms };
+    summary.behaviors[1] = .{ .hash = 8, .vtime_ns = 5 * std.time.ns_per_ms };
+    const plan = [_]Planned{.{ .index = 0, .seed = 1, .snapshot = undefined }};
+    try archive_add(arena, &state, &plan, summary, false);
+    try std.testing.expect(state.cells.contains(7));
+    try std.testing.expect(!state.cells.contains(8));
+    try std.testing.expect(!open_to_end(summary));
+    try std.testing.expectEqual(@as(u64, 3 * std.time.ns_per_ms), returns_end(summary));
+}
+
 test "a repeat is no archive cell's place" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
@@ -7367,7 +7440,7 @@ fn archive_add(arena: std.mem.Allocator, state: *TreeState, plan: []const Planne
         // An objective's state: no later than just before its composer's ask (objective_place).
         const reached = behavior.vtime_ns + return_after_ns;
         const at = if (behavior.score != null) objective_place(summary, reached) else reached;
-        const open = summary.cut or at < summary.last_pull_ns;
+        const open = open_to_end(summary) or at < summary.last_pull_ns;
         if (!open or at >= summary.end_ns) continue;
         const entry = try state.cells.getOrPut(arena, behavior.hash);
         if (entry.found_existing) if (behavior.score) |score| {
@@ -7602,7 +7675,7 @@ fn tree_returns(
         for (chosen, offered) |candidate, *offer| offer.* = .{
             .branch = candidate.summary.index,
             .start_ns = candidate.summary.start_ns,
-            .end_ns = candidate.summary.end_ns,
+            .end_ns = returns_end(candidate.summary),
             .novel = candidate.novel,
             .moment_ns = candidate.moment,
             .label = candidate.label,
@@ -7625,7 +7698,7 @@ fn tree_returns(
             } else null;
             if (candidate) |known| {
                 const summary = known.summary;
-                if (back.vtime_ns <= summary.start_ns or back.vtime_ns >= summary.end_ns) continue;
+                if (back.vtime_ns <= summary.start_ns or back.vtime_ns >= returns_end(summary)) continue;
             } else if (!planned.contains(back.branch)) continue;
             const reason = if (back.reason.len > 0) back.reason else "(it gave no reason)";
             // An archive cell's place: the cell credited as the explorer's own return would be.
@@ -7666,7 +7739,7 @@ fn tree_returns(
         const end_ns = @min(summary.end_ns, summary.last_pull_ns);
         const span = end_ns -| summary.start_ns;
         if (span < 2 * return_after_ns) continue;
-        const extend = summary.cut and candidate.novel > 0 and candidate.changed_moment == null;
+        const extend = open_to_end(summary) and candidate.novel > 0 and candidate.changed_moment == null;
         const after = if (candidate.changed_moment) |moment|
             moment + return_after_ns
         else if (extend)

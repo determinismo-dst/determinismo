@@ -15,8 +15,9 @@ const std = @import("std");
 /// each timeline's properties in its record line (report.Recorded), for a resume's verdict. 4:
 /// 2026-11-26, the seed a timeline ran with in its summary (SummaryHeader.seed: CE23). 5:
 /// 2026-11-26, the record's catalog line (RecordLine.catalog: CE45). 6: 2026-11-26, each return's
-/// children's numbers (RecordLine.planned: CE32-CE34).
-pub const state_format: u32 = 6;
+/// children's numbers (RecordLine.planned: CE32-CE34). 7: 2026-11-26, a summary's full tape's
+/// moment (SummaryHeader.tape_full_ns: CE58).
+pub const state_format: u32 = 7;
 const assert = std.debug.assert;
 const linux = std.os.linux;
 
