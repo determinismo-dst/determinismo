@@ -117,7 +117,6 @@ fn kind_of(reason: []const u8) Kind {
 
 /// A strategy's reason for an override, replayed with it (a `decision` event in the timeline).
 pub const Reason = struct { pull: u64, size: u8, text: [reason_size_max]u8 };
-pub const reason_count_max = 1024;
 
 /// Overrides of one branch, ordered by pull. A replay consumes them in order.
 /// The state of a branch at an event count: a replay that differs there has diverged.
@@ -144,7 +143,10 @@ pub const Overrides = struct {
     checkpoint_cursor: u32 = 0,
     /// Kept: one checkpoint in this many (a power of two), once a tape's outnumbered the array.
     checkpoint_every: u32 = 1,
-    reasons: [reason_count_max]Reason = undefined,
+    /// Sized at each load from the tape's own count of reasons, as `entries`: a fixed table of
+    /// 1,024 refused a tape whose system made 1,025 outside connections, each its egress channel's
+    /// decision and reason (CE48, the Lean replica of determinismo).
+    reasons: []Reason,
     reason_count: u32 = 0,
     reason_cursor: u32 = 0,
     /// The steps a person's session gave the timeline, each at the moment it ran (`{"step":
@@ -158,6 +160,7 @@ pub const Overrides = struct {
     pub fn create(allocator: std.mem.Allocator) !*Overrides {
         const overrides = try allocator.create(Overrides);
         overrides.entries = &.{};
+        overrides.reasons = &.{};
         overrides.allocator = allocator;
         overrides.count = 0;
         overrides.cursor = 0;
@@ -174,16 +177,24 @@ pub const Overrides = struct {
 
     pub fn destroy(overrides: *Overrides) void {
         overrides.allocator.free(overrides.entries);
+        overrides.allocator.free(overrides.reasons);
         overrides.allocator.destroy(overrides);
     }
 
-    /// The table made room for `count` overrides: allocated anew only past its size.
-    fn reserve(overrides: *Overrides, count: usize) !void {
+    /// The tables made room for `count` overrides and `reasons` of them with a reason: each
+    /// allocated anew only past its size.
+    fn reserve(overrides: *Overrides, count: usize, reasons: usize) !void {
         if (count > override_count_max) return error.TapeTooLong;
-        if (count <= overrides.entries.len) return;
-        overrides.allocator.free(overrides.entries);
-        overrides.entries = &.{};
-        overrides.entries = try overrides.allocator.alloc(Override, count);
+        if (count > overrides.entries.len) {
+            overrides.allocator.free(overrides.entries);
+            overrides.entries = &.{};
+            overrides.entries = try overrides.allocator.alloc(Override, count);
+        }
+        if (reasons > overrides.reasons.len) {
+            overrides.allocator.free(overrides.reasons);
+            overrides.reasons = &.{};
+            overrides.reasons = try overrides.allocator.alloc(Reason, reasons);
+        }
     }
 
     /// The taped steps, in the order they ran.
@@ -589,8 +600,9 @@ pub fn parse(source: []const u8, scratch: []u8, overrides: *Overrides) !Header {
     overrides.full_at = null;
     overrides.reason_count = 0;
     overrides.reason_cursor = 0;
-    // Its overrides counted first (each line the recorder writes starts so), the table sized.
-    try overrides.reserve(std.mem.count(u8, source, "\n{\"pull\":"));
+    // Its overrides and their reasons counted first (each line the recorder writes starts so,
+    // a reason is its line's "reason" field), the tables sized.
+    try overrides.reserve(std.mem.count(u8, source, "\n{\"pull\":"), std.mem.count(u8, source, ",\"reason\":\""));
     var lines = std.mem.tokenizeScalar(u8, source, '\n');
     const header_line = lines.next() orelse return error.EmptyTape;
     var fba = std.heap.FixedBufferAllocator.init(scratch);
@@ -636,7 +648,7 @@ fn override_parse(overrides: *Overrides, value: std.json.Value) !void {
         entry.kind = kind_of(reason.string);
     };
     if (value.object.get("reason")) |reason| if (reason == .string and entry.kind == .decision) {
-        if (overrides.reason_count == reason_count_max) return error.TapeTooLong;
+        if (overrides.reason_count == overrides.reasons.len) return error.TapeTooLong;
         const kept = &overrides.reasons[overrides.reason_count];
         kept.pull = entry.pull;
         kept.size = @intCast(@min(reason.string.len, reason_size_max));
