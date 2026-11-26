@@ -712,3 +712,17 @@ test "a run line ending in a comment still has every xargs run's report judged" 
     defer arena_state.deinit();
     try std.testing.expectEqual(@as(usize, 20_000), try shard_report_count(arena_state.allocator(), std.testing.io, runner_comment));
 }
+
+fn runner_exits_255(arena: std.mem.Allocator, report: []const u8) ![]const u8 {
+    // The first run's runner reports its tests, then exits 255 (mocha's status is its failure
+    // count capped at 255; System.exit(-1), os.Exit(-1) and `exit -1` exit 255 too).
+    return std.fmt.allocPrint(arena, "for t in {{tests}}; do printf '<testcase classname=\"c\" name=\"%s\"/>\\n' \"$t\"; done > {s}; if [ \"$1\" = suite.module.000000.a_test_name_long_enough_to_take_eighty_bytes_of_the_line ]; then exit 255; fi", .{report});
+}
+
+test "a runner exiting 255 in one xargs run still has every test of the shard judged" {
+    // CE55 (the Lean replica of determinismo): xargs stops at a command that exits 255, so the
+    // shard's later runs never ran and their tests got no verdict (5,000 of 20,000 judged).
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    try std.testing.expectEqual(@as(usize, 20_000), try shard_report_count(arena_state.allocator(), std.testing.io, runner_exits_255));
+}
