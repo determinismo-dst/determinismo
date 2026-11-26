@@ -1287,6 +1287,11 @@ fn run_register(arena: std.mem.Allocator, io: std.Io, arguments: *Arguments) !vo
     // A resume, said to serve once its explorer holds the run (runs.adopt_note): it showed the
     // run ended. Its own resumes say it too, and serve has them running already.
     if (arguments.resume_run) {
+        // Its last end's exit is not this resume's: gone before serve is told, so the one this
+        // explorer writes as it ends is the run's (serve deleted it as it adopted the resume, and
+        // a resume that had already ended read "passed" from its record: CE47).
+        const stale = try std.fs.path.joinZ(arena, &.{ directory, "exit" });
+        _ = linux.unlink(stale);
         const data = try runs.data_directory(arena, arguments.data_directory);
         if (runs.id_in(data, try runs.absolute(arena, directory))) |id| runs.adopt_note(arena, data, id) catch |err| {
             say("[determinismo] serve not told of this resume ({s}): it shows the run ended\n", .{@errorName(err)});

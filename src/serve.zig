@@ -5801,18 +5801,19 @@ fn runs_adopt(server: *Server) void {
         } else continue; // Not known yet: discovery finds it running.
         if (run.status == null) continue; // Running: this serve's own resume, or adopted.
         const directory = run_directory(server, id) catch continue;
-        // Not stopped any more, judged again as it ends (its notes too), and its last end's
-        // status not its own.
-        for ([_][]const u8{ "stopped", "unexplored", "jvm-cache", "exit" }) |name| {
+        // Not stopped any more, judged again as it ends (its notes too). Its last end's exit
+        // the explorer removed as it resumed (main.zig): the one here now is the resume's own
+        // (deleted here, a resume already ended read "passed" from its record: CE47).
+        for ([_][]const u8{ "stopped", "unexplored", "jvm-cache" }) |name| {
             const path = std.fs.path.join(server.arena, &.{ directory, name }) catch continue;
             std.Io.Dir.cwd().deleteFile(server.io, path) catch {};
         }
         shared.exploration_known[id] = false;
-        // Its explorer gone already, the resume's end is its record's: its timelines ingested
-        // once more (never a pid of 0, which a stop would send to serve's own process group).
+        // Its explorer gone already, the resume's end is its own (ended_status): its timelines
+        // ingested once more (never a pid of 0, which a stop would send to serve's own process
+        // group).
         const pid = host_runs.running_pid(server.arena, directory) orelse {
-            const record = run_file(server, id, "record.jsonl") catch "";
-            run.* = .{ .id = id, .pid = 0, .status = recorded_status(record) };
+            run.* = .{ .id = id, .pid = 0, .status = ended_status(server, id) };
             holders_drop(server, run);
             continue;
         };
@@ -5934,6 +5935,36 @@ test "a run's end is its explorer's exit, then its record's summary" {
     // An explorer that died before its exit: its record's.
     try cwd.deleteFile(io, try std.fs.path.join(arena, &.{ run, "exit" }));
     try std.testing.expectEqual(@as(u32, 0), ended_status(&server, 1));
+}
+
+test "a resume from the command line that ended before serve looked keeps its own end" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const cwd = std.Io.Dir.cwd();
+    const run = try std.fs.path.join(arena, &.{ data, "runs", "1" });
+    try cwd.createDirPath(io, run);
+    // Every timeline passed (the summary); the resume exited 3 (its run's catalog, judged).
+    const passed = "{\"summary\":{\"branches\":2,\"failing_branches\":0}}\n";
+    try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(arena, &.{ run, "record.jsonl" }), .data = passed });
+    try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(arena, &.{ run, "exit" }), .data = "3 exited with status 3\n" });
+    try host_runs.adopt_note(arena, data, 1);
+    var failure: duckdb.Failure = .{};
+    const shared = try std.testing.allocator.create(Shared);
+    defer std.testing.allocator.destroy(shared);
+    const options: Options = .{ .listen = "", .data_directory = data, .machine = &.{}, .self = "" };
+    shared.* = .{ .options = options, .io = io, .database = try duckdb.Database.open(":memory:", .{ .threads = 1 }, &failure) };
+    defer shared.database.close();
+    // Known to this serve as ended before the resume (its first end's status).
+    shared.runs[0] = .{ .id = 1, .pid = 0, .status = 0 };
+    shared.run_count = 1;
+    var server: Server = .{ .shared = shared, .options = options, .io = io, .arena = arena };
+    runs_adopt(&server);
+    try std.testing.expectEqual(@as(?u32, 3), shared.runs[0].status);
 }
 
 fn recorded_status(record: []const u8) u32 {
