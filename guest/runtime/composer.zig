@@ -913,10 +913,14 @@ fn driver_start_by(composer: *Composer, kinds: []const Kind, parallelism: u64, s
 /// now moves forward to a start drawn for it, as its commands begin: log-uniform from a second to
 /// det.clock_start_max_ms= (explore's --clock-start-max; 30 minutes unless asked, 0 none). Never
 /// back, and by default short of what a setup made to last an hour (a token's hour, the
-/// commonest lifetime): the jump and the longest default drive (20 minutes) stay within it, so a
-/// timeline failing on the jump, no workload's failure, takes a credential shorter than that. At
+/// commonest lifetime): the jump and the longest default drive (20 minutes) stay within it. At
 /// an hour's cap the last band reached the hour itself, and an hour token issued in the setup
-/// expired as the drivers began (CE15, the Lean replica of determinismo). The monotonic clock and
+/// expired as the drivers began (CE15, the Lean replica of determinismo). The rest of a timeline
+/// is not bounded so: a second phase (an objective's return), the length's grace and an ending
+/// that runs its window (20 minutes) take a timeline past 30 minutes, and with the jump at its
+/// cap a setup's hour token then expires in it, which without the jump it never does (CE44: 4,452
+/// of a million objective returns, 1,315 of a million single phases, by the replica's census).
+/// Such a failure follows its `clock_start` event by more than an hour less its `ms`. The monotonic clock and
 /// the timers' durations stay; the nodes' own skews (their time namespaces) add to it as before.
 const clock_start_max_default_ms: u64 = 30 * std.time.ms_per_min;
 
