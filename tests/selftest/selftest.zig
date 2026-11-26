@@ -1434,9 +1434,12 @@ fn durability_faults(context: *System.Context) !void {
 /// Lean replica of determinismo). A stall under a crash that seldom picks still holds every sync;
 /// a crash that picks every sync goes on after a stall over it ended.
 fn durability_both_kinds(echo: *const sdk.Node, stall_ms: u32) !void {
-    sdk.fault(.{ .kind = "sync_stall", .node = echo.name, .one_in = 1, .stall_ms_min = stall_ms, .stall_ms_max = stall_ms, .duration_ms = 4000 });
-    sdk.fault(.{ .kind = "durable_crash", .node = echo.name, .one_in = 1 << 30, .duration_ms = 4000 });
-    sdk.sleep_ms(100); // The injector applies both.
+    // The stall armed first, then a crash that seldom picks: the old module's crash arm replaced
+    // the stall's, so the sync went unstalled. Each request applied before the next is sent.
+    sdk.fault(.{ .kind = "sync_stall", .node = echo.name, .one_in = 1, .stall_ms_min = stall_ms, .stall_ms_max = stall_ms, .duration_ms = 6000 });
+    sdk.sleep_ms(500);
+    sdk.fault(.{ .kind = "durable_crash", .node = echo.name, .one_in = 1 << 30, .duration_ms = 6000 });
+    sdk.sleep_ms(500);
     const start_ns = monotonic_ns();
     const written = synced_write(echo, "/data/stalled-under-crash");
     const took_ns = monotonic_ns() - start_ns;
@@ -1444,13 +1447,16 @@ fn durability_both_kinds(echo: *const sdk.Node, stall_ms: u32) !void {
         .took_ns = took_ns,
         .written = written,
     });
-    sdk.sleep_ms(4000); // Both over.
-    sdk.fault(.{ .kind = "durable_crash", .node = echo.name, .one_in = 1, .duration_ms = 3000 });
+    sdk.sleep_ms(6000); // Both over.
+    // The crash armed first (every sync), then a short stall that seldom picks, over well before
+    // the write: the old module's stall arm replaced the crash's and its end disarmed the node.
+    sdk.fault(.{ .kind = "durable_crash", .node = echo.name, .one_in = 1, .duration_ms = 6000 });
+    sdk.sleep_ms(500);
     sdk.fault(.{ .kind = "sync_stall", .node = echo.name, .one_in = 1 << 30, .duration_ms = 300 });
-    sdk.sleep_ms(600); // The stall over; the crash still under way.
+    sdk.sleep_ms(2000); // The stall over; the crash still under way.
     const crashed_write = synced_write(echo, "/data/crashed-after-stall"); // Killed in its sync.
     sdk.always(!crashed_write, "a durable crash goes on after a sync stall over it ends", .{});
-    sdk.sleep_ms(3000);
+    sdk.sleep_ms(5000);
     try sdk.retry(100, 100, answers, .{echo.address});
 }
 
