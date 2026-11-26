@@ -51,7 +51,10 @@ fi
 echo "== Elle: rebuilding $image ($label ${built:-none} -> $tree)"
 podman build -q --label "$label=$tree" -t "$image" -f checkers/elle/Dockerfile . > /dev/null
 podman rm -f "$image" > /dev/null 2>&1 || true
-podman run -d --name "$image" --network host "$image" > /dev/null
+# On the host's reserved CPUs (isolate.sh's), never a run's: the user's manager keeps every CPU,
+# so a container without a cpuset could land on the runs' cores.
+reserved=$(sed -n 's/^AllowedCPUs=//p' /etc/systemd/system/service.d/50-determinismo-reserved-cpus.conf 2>/dev/null | tail -1)
+podman run -d --name "$image" --network host ${reserved:+--cpuset-cpus "$reserved"} "$image" > /dev/null
 answer=
 for _ in $(seq 1 120); do
   answer=$(curl -fsS -m 2 http://127.0.0.1:7700/version 2>/dev/null) && break

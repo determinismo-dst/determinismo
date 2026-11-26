@@ -15,14 +15,25 @@ set -euo pipefail
 own=${1:?usage: $0 <own cpus> <run cpus>}
 run=${2:?usage: $0 <own cpus> <run cpus>}
 [ "$own" = - ] && exit 0
-# Everything but serve, from now on: services (transient ones too: systemd-run units), the user
-# slice (ssh sessions, the user's manager and rootless podman's containers), machines. Serve's
-# own drop-in sorts after (drop-ins apply by file name, whatever their directory) and resets the
-# list first: assignments of AllowedCPUs merge (serve got 0-45 without the reset).
+# Everything but serve, from now on: services (transient ones too: systemd-run units), login
+# sessions (ssh), machines. Serve's own drop-in sorts after (drop-ins apply by file name, whatever
+# their directory) and resets the list first: assignments of AllowedCPUs merge (serve got 0-45
+# without the reset).
+#
+# The user's manager (user@<uid>.service, its slice) keeps the runs' CPUs too: rootless podman's
+# containers run under it, and a run's image builds take the run's own CPUs there (the explorer
+# passes its own to podman build: cpus.podman_cpuset). Confined with the whole user slice, every
+# image build of a run serve started ran on the reserved CPUs (2026-11-26); a container started
+# without a cpuset now lands anywhere, so the host's own (Elle: elle-image.sh) name theirs.
+# Its CPUs: the reserved ones and the runs', never the runs' idle siblings.
+user_cpus="$own,$run"
 mkdir -p /etc/systemd/system/service.d /etc/systemd/system/user.slice.d \
+  /etc/systemd/system/session-.scope.d /etc/systemd/system/user@.service.d \
   /etc/systemd/system/machine.slice.d /etc/systemd/system/determinismo-serve.service.d
 printf '[Service]\nAllowedCPUs=%s\n' "$own" > /etc/systemd/system/service.d/50-determinismo-reserved-cpus.conf
-printf '[Slice]\nAllowedCPUs=%s\n' "$own" > /etc/systemd/system/user.slice.d/50-determinismo-reserved-cpus.conf
+printf '[Scope]\nAllowedCPUs=%s\n' "$own" > /etc/systemd/system/session-.scope.d/50-determinismo-reserved-cpus.conf
+printf '[Slice]\nAllowedCPUs=%s\n' "$user_cpus" > /etc/systemd/system/user.slice.d/50-determinismo-reserved-cpus.conf
+printf '[Service]\nAllowedCPUs=\nAllowedCPUs=%s\n' "$user_cpus" > /etc/systemd/system/user@.service.d/zz-determinismo-all-cpus.conf
 printf '[Slice]\nAllowedCPUs=%s\n' "$own" > /etc/systemd/system/machine.slice.d/50-determinismo-reserved-cpus.conf
 printf '[Service]\nAllowedCPUs=\nAllowedCPUs=%s\n' "$run" > /etc/systemd/system/determinismo-serve.service.d/zz-determinismo-run-cpus.conf
 systemctl daemon-reload
@@ -30,6 +41,10 @@ systemctl daemon-reload
 for unit in $(systemctl list-units --type=service,scope,slice --state=active --no-legend --plain | awk '{print $1}'); do
   case $unit in
     determinismo-serve.service | -.slice | system.slice) continue ;;
+    user.slice | user-*.slice | user@*.service)
+      systemctl set-property --runtime "$unit" "AllowedCPUs=$user_cpus" 2>/dev/null || true
+      continue
+      ;;
   esac
   systemctl set-property --runtime "$unit" "AllowedCPUs=$own" 2>/dev/null || true
 done
