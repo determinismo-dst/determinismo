@@ -150,7 +150,7 @@ const image_prefix = "image:";
 /// logs not kept (its standard error goes to determinismo's, as a command's does).
 const image_command = [_][*:0]const u8{ "podman", "run", "--rm", "--interactive", "--network=host", "--log-driver=none" };
 comptime {
-    assert(image_command.len < argument_count_max);
+    assert(image_command.len + 2 < argument_count_max); // And its --cpuset-cpus.
 }
 
 /// `command` is the plugin's program followed by its arguments, separated by spaces; a program
@@ -189,6 +189,13 @@ pub fn start(
         for (image_command) |word| {
             argv[count] = word;
             count += 1;
+        }
+        // On the run's CPUs, as its image builds (cpus.podman_cpuset), not wherever the user's
+        // podman scope lands.
+        if (try @import("cpus.zig").podman_cpuset(arena)) |cpuset| {
+            argv[count] = "--cpuset-cpus";
+            argv[count + 1] = try arena.dupeSentinel(u8, cpuset, 0);
+            count += 2;
         }
     }
     var words = std.mem.tokenizeScalar(u8, if (image) command[image_prefix.len..] else command, ' ');

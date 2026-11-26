@@ -974,6 +974,89 @@ test "a check waiting for a CPU leaves the others to the rest" {
     try std.testing.expect(!other.priority_waiting(1));
 }
 
+/// The CPUs a rootless podman build or container of this process should use (podman's
+/// `--cpuset-cpus`): its own CPUs, as far as the user manager's cpuset reaches. Rootless podman
+/// moves its containers into a scope under user@<uid>.service, whose cpuset caps them: srv4's
+/// isolation confined the whole user slice to the sessions' CPUs, and every image build of a run
+/// serve started (serve on the hunt CPUs) ran on the sessions' instead (2026-11-26). Null when
+/// none of this process's CPUs is in reach (the build runs where the slice lets it).
+pub fn podman_cpuset(arena: std.mem.Allocator) !?[]const u8 {
+    const uid = linux.getuid();
+    var path_buffer: [160]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "/sys/fs/cgroup/user.slice/user-{d}.slice/user@{d}.service/cpuset.cpus.effective", .{ uid, uid }, 0);
+    var reach_buffer: [512]u8 = undefined;
+    const reach: ?[]const u8 = reach: {
+        const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(fd) != .SUCCESS) break :reach null; // No user manager's cpuset: no cap.
+        defer _ = linux.close(@intCast(fd));
+        const size = linux.read(@intCast(fd), &reach_buffer, reach_buffer.len);
+        if (linux.errno(size) != .SUCCESS) break :reach null;
+        break :reach std.mem.trim(u8, reach_buffer[0..size], " \n");
+    };
+    return cpuset_within(arena, given(), reach);
+}
+
+/// `mine`'s CPUs within the kernel CPU list `reach` (all of them without one), as a kernel CPU
+/// list; null when none is.
+fn cpuset_within(arena: std.mem.Allocator, mine: linux.cpu_set_t, reach: ?[]const u8) !?[]const u8 {
+    var mask = mine;
+    if (reach) |list| {
+        var allowed: linux.cpu_set_t = @splat(0);
+        var ranges = std.mem.splitScalar(u8, list, ',');
+        while (ranges.next()) |range| {
+            if (range.len == 0) continue;
+            const dash = std.mem.indexOfScalar(u8, range, '-');
+            const first = std.fmt.parseInt(usize, if (dash) |at| range[0..at] else range, 10) catch continue;
+            const last = if (dash) |at| std.fmt.parseInt(usize, range[at + 1 ..], 10) catch continue else first;
+            var cpu = first;
+            while (cpu <= last and cpu < cpus_max) : (cpu += 1) set_add(&allowed, cpu);
+        }
+        for (&mask, allowed) |*word, reachable| word.* &= reachable;
+    }
+    const bits = @bitSizeOf(@TypeOf(mask[0]));
+    var list: std.ArrayList(u8) = .empty;
+    var cpu: usize = 0;
+    while (cpu < mask.len * bits) {
+        if (!set_has(&mask, cpu)) {
+            cpu += 1;
+            continue;
+        }
+        var last = cpu;
+        while (last + 1 < mask.len * bits and set_has(&mask, last + 1)) last += 1;
+        if (list.items.len > 0) try list.append(arena, ',');
+        if (last == cpu) try list.print(arena, "{d}", .{cpu}) else try list.print(arena, "{d}-{d}", .{ cpu, last });
+        cpu = last + 1;
+    }
+    return if (list.items.len == 0) null else list.items;
+}
+
+fn set_add(set: *linux.cpu_set_t, cpu: usize) void {
+    const bits = @bitSizeOf(@TypeOf(set[0]));
+    set[cpu / bits] |= @as(@TypeOf(set[0]), 1) << @intCast(cpu % bits);
+}
+
+fn set_has(set: *const linux.cpu_set_t, cpu: usize) bool {
+    const bits = @bitSizeOf(@TypeOf(set[0]));
+    return set[cpu / bits] & (@as(@TypeOf(set[0]), 1) << @intCast(cpu % bits)) != 0;
+}
+
+test "a podman build's CPUs: the process's, as far as the user manager's cpuset reaches" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var hunt: linux.cpu_set_t = @splat(0);
+    for (9..44) |cpu| set_add(&hunt, cpu);
+    // Under today's srv4 isolation: the user slice on the sessions' CPUs, none of the hunt's.
+    try std.testing.expectEqual(@as(?[]const u8, null), try cpuset_within(arena, hunt, "0-8,44-52"));
+    // The user manager unconfined: the hunt's own.
+    try std.testing.expectEqualStrings("9-43", (try cpuset_within(arena, hunt, "0-52")).?);
+    // No cpuset to read: the process's own, ranges and single CPUs.
+    var some: linux.cpu_set_t = @splat(0);
+    for ([_]usize{ 0, 2, 3, 4, 7 }) |cpu| set_add(&some, cpu);
+    try std.testing.expectEqualStrings("0,2-4,7", (try cpuset_within(arena, some, null)).?);
+    try std.testing.expectEqualStrings("2-3", (try cpuset_within(arena, some, "1-3")).?);
+}
+
 test "a kernel CPU list's count" {
     try std.testing.expectEqual(@as(usize, 36), possible_count("0-35"));
     try std.testing.expectEqual(@as(usize, 6), possible_count("0,2-5"));

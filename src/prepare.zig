@@ -16,6 +16,7 @@ const compose = @import("compose.zig");
 const checks = @import("checks.zig");
 const kubernetes = @import("kubernetes.zig");
 const source_lines = @import("lines.zig");
+const cpus = @import("cpus.zig");
 
 pub const Options = struct {
     /// The test program (its `--describe`), or else a Compose file whose services become the
@@ -1341,6 +1342,8 @@ fn image_build(context: Context, build: schema.Build) ![]const u8 {
     std.debug.print("[determinismo] building {s}\n", .{dockerfile});
     var command: std.ArrayList([]const u8) = .empty;
     try command.appendSlice(context.arena, &.{ "podman", "build", "--quiet", "--file", dockerfile });
+    // On this process's CPUs (a run's: the hunt's), not wherever the user's podman scope lands.
+    if (try cpus.podman_cpuset(context.arena)) |cpuset| try command.appendSlice(context.arena, &.{ "--cpuset-cpus", cpuset });
     const sdk = try std.fmt.allocPrint(context.arena, "determinismo-sdk={s}", .{try sdk_context(context)});
     try command.appendSlice(context.arena, &.{ "--build-context", sdk });
     for (build.args) |argument| try command.appendSlice(context.arena, &.{ "--build-arg", argument });
