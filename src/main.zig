@@ -1165,9 +1165,12 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
     const every_scenario = scenarios.len == all_scenarios;
     // Setup mode judges no catalog: no assertion ran past the setup (setup_complete reached is
     // its verdict, explore_snapshot's exit status otherwise).
-    if (!arguments.setup_only) if (catalog.judge(every_scenario) > 0) {
-        failing_scenarios += 1;
-    };
+    const catalog_failing = if (arguments.setup_only) 0 else catalog.judge(every_scenario);
+    if (catalog_failing > 0) failing_scenarios += 1;
+    // In the record too: a complete run resumed again is judged from its record, and its
+    // catalog's verdict was nowhere in it (CE45, the blind Lean replica of the platform: one
+    // failing only an assertion no timeline reached read "passed").
+    if (!arguments.setup_only) report.record(.{ .catalog = .{ .failing = catalog_failing } });
     // How it ends, in its run's directory: serve learned it only from runs it reaped itself, and
     // read the others' (a trial's, every run adopted across a restart) from their timelines'
     // failing always properties alone. Datomic's runs 441, 445 and 447 showed "passed" while no
@@ -2102,6 +2105,8 @@ const Resumed = struct {
     /// Recorded timelines whose properties the record lacks (an older record's, or past its
     /// line's room): their verdicts are not counted, and the resume says how many.
     recorded_partial: u32 = 0,
+    /// The catalog's failing assertions as the run last judged them (RecordLine.catalog).
+    catalog_failing: u32 = 0,
 
     /// The recorded timelines' properties in the run's verdict: those still recorded (one whose
     /// summary the interruption cut runs again, and counts then).
@@ -2114,6 +2119,26 @@ const Resumed = struct {
 const RecordedOf = struct { index: u32, property: report.Recorded };
 const Fresh = struct { generation: u32, index: u32 };
 const ReturnKey = struct { generation: u32, branch: u32, vtime_ns: u64 };
+
+/// A complete run's verdict from its record: its timelines' properties merged, and its
+/// catalog's assertions no timeline reached (RecordLine.catalog).
+fn complete_verdict(arena: std.mem.Allocator, resumed: *const Resumed) !struct { properties: u32, status: u8 } {
+    const multiverse = try arena.create(report.Multiverse);
+    multiverse.* = .{};
+    try resumed.merge_into(multiverse);
+    const failing = multiverse.failing_properties();
+    return .{ .properties = failing, .status = if (failing > 0 or resumed.catalog_failing > 0) 3 else 0 };
+}
+
+test "a complete run resumed again fails for its catalog too" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    // Every recorded timeline passed; the run's catalog had an assertion no timeline reached.
+    var resumed: Resumed = .{ .catalog_failing = 1 };
+    const verdict = try complete_verdict(arena_state.allocator(), &resumed);
+    try std.testing.expectEqual(@as(u32, 0), verdict.properties);
+    try std.testing.expectEqual(@as(u8, 3), verdict.status);
+}
 
 /// What a run's record already has, for --resume: its run must be this one (the same inputs,
 /// seed, branching and, for a tree, how it plans), or there is nothing to continue.
@@ -2192,6 +2217,9 @@ const RecordLine = struct {
     } = null,
     generation: ?struct { number: u32, branches: []const u32 } = null,
     fresh: ?Fresh = null,
+    /// The run's catalog judged (main's catalog.judge: its assertions no timeline reached), the
+    /// last such line the run's verdict.
+    catalog: ?struct { failing: u32 = 0 } = null,
 };
 
 fn resume_read(context: Context, arguments: *const Arguments, inputs: u64) !*const Resumed {
@@ -2242,6 +2270,7 @@ fn resume_read(context: Context, arguments: *const Arguments, inputs: u64) !*con
             }
         }
         if (line.fresh) |fresh| try resumed.fresh.append(context.arena, fresh);
+        if (line.catalog) |judged| resumed.catalog_failing = judged.failing;
         if (line.branch) |branch| {
             // A timeline extending one of the run's (a session's): not the explorer's to resume.
             if (branch.extends != null) continue;
@@ -2290,12 +2319,10 @@ fn resume_read(context: Context, arguments: *const Arguments, inputs: u64) !*con
         // Judged from its record, as the run that recorded it would have been (a complete run
         // resumed once exited 0 here whatever its timelines failed: CE29). A catalog's
         // assertions no timeline reached are judged by the runs that ran timelines.
-        const multiverse = try context.arena.create(report.Multiverse);
-        multiverse.* = .{};
-        try resumed.merge_into(multiverse);
-        const failing = multiverse.failing_properties();
-        say("[determinismo] the run is complete: all {d} timelines recorded, {d} properties failing in them\n", .{ arguments.branches, failing });
-        const status: u8 = if (failing > 0) 3 else 0;
+        const verdict = try complete_verdict(context.arena, resumed);
+        say("[determinismo] the run is complete: all {d} timelines recorded, {d} properties failing in them, " ++
+            "{d} of its catalog's\n", .{ arguments.branches, verdict.properties, resumed.catalog_failing });
+        const status = verdict.status;
         if (exploration_is_run(arguments)) if (arguments.run_directory) |directory| {
             const text = try std.fmt.allocPrint(context.arena, "{d} exited with status {d}\n", .{ status, status });
             const exit_path = try std.fs.path.join(context.arena, &.{ directory, "exit" });
@@ -2406,8 +2433,8 @@ fn persisted_hash(comptime T: type, hasher: *std.hash.Wyhash) void {
 test "what an explorer persists changes only with runs.state_format" {
     // A failure here: the layout changed. Bump runs.state_format and set both below to the new
     // values (a run made before then resumes on its own explorer, never on one that misreads it).
-    try std.testing.expectEqual(@as(u32, 4), runs.state_format);
-    try std.testing.expectEqual(@as(u64, 1251832480649796883), persisted_layout);
+    try std.testing.expectEqual(@as(u32, 5), runs.state_format);
+    try std.testing.expectEqual(@as(u64, 11331929179682600902), persisted_layout);
 }
 
 fn summary_write(fd: linux.fd_t, summary: *const Summary) void {

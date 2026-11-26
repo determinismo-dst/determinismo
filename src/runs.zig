@@ -13,8 +13,9 @@ const std = @import("std");
 /// a run made with another keeps its own explorer (serve.zig's core_same). 1: 2026-11-15. 2:
 /// 2026-11-19, a timeline's own clock in its summary (SummaryHeader.jitter_seed). 3: 2026-11-25,
 /// each timeline's properties in its record line (report.Recorded), for a resume's verdict. 4:
-/// 2026-11-26, the seed a timeline ran with in its summary (SummaryHeader.seed: CE23).
-pub const state_format: u32 = 4;
+/// 2026-11-26, the seed a timeline ran with in its summary (SummaryHeader.seed: CE23). 5:
+/// 2026-11-26, the record's catalog line (RecordLine.catalog: CE45).
+pub const state_format: u32 = 5;
 const assert = std.debug.assert;
 const linux = std.os.linux;
 
