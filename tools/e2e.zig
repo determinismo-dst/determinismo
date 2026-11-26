@@ -9213,7 +9213,7 @@ fn check_own_sigkill(context: *Context) !void {
     });
     try events_plain(context, events);
     const script = try std.fmt.allocPrint(arena,
-        \\cd {s}; cat branch-*.jsonl | grep -c killed_self; cat branch-*.jsonl | grep -c '"command":"oom","status":137'
+        \\cd {s}; cat branch-*.jsonl | grep -c killed_self; cat branch-*.jsonl | grep -c '"event":"command_exit","details":{{"command":"oom","status":137}}'
     , .{events});
     const counted = try run_kept(context, &.{ "sh", "-c", script });
     var words = std.mem.tokenizeAny(u8, counted.stdout, " \n");
