@@ -238,3 +238,36 @@ test "captured output that prints its own closing tag never fails its test" {
     try std.testing.expect(!found[0].failed);
     try std.testing.expect(!found[1].failed);
 }
+
+test "captured output that prints test cases makes no test of its own and hides no failure" {
+    // CE49 (the Lean replica of determinismo): a case's body ended at the first `</testcase>`
+    // after its tag, through any CDATA, and the next case was looked for from there: a test that
+    // printed test cases had them judged as tests of their own (failing in every timeline), and
+    // a real failure after printed output was never seen.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const report =
+        \\<testsuite>
+        \\<testcase classname="report.WriterTest" name="writes_a_report" time="0.1"><system-out><![CDATA[<testsuite>
+        \\<testcase classname="printed" name="ok"></testcase>
+        \\<testcase classname="printed" name="bad"><failure message="x"/></testcase>
+        \\</testsuite>]]></system-out></testcase>
+        \\<testcase classname="report.WriterTest" name="closes_a_case" time="0.1"><system-out><![CDATA[</testcase>]]></system-out><failure message="expected two cases"/></testcase>
+        \\</testsuite>
+    ;
+    const found = try cases(arena_state.allocator(), report);
+    try std.testing.expectEqual(@as(usize, 2), found.len);
+    try std.testing.expectEqualStrings("report.WriterTest::writes_a_report", found[0].name);
+    try std.testing.expect(!found[0].failed);
+    try std.testing.expectEqualStrings("report.WriterTest::closes_a_case", found[1].name);
+    try std.testing.expect(found[1].failed);
+    // A suite's own output (go-junit-report writes a package's there) and a comment print none.
+    const suite_output =
+        \\<testsuite><testcase classname="pkg" name="TestA"/>
+        \\<!-- <testcase classname="commented" name="out"><failure/></testcase> -->
+        \\<system-out><![CDATA[<testcase classname="printed" name="bad"><failure message="x"/></testcase>]]></system-out></testsuite>
+    ;
+    const suite_found = try cases(arena_state.allocator(), suite_output);
+    try std.testing.expectEqual(@as(usize, 1), suite_found.len);
+    try std.testing.expectEqualStrings("pkg::TestA", suite_found[0].name);
+}
