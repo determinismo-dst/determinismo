@@ -529,13 +529,18 @@ fn shard_failing(output: []const u8) ?u32 {
 /// runner more than once, each run writing the JUnit report over the last, so with a report each
 /// run's is moved aside and all of them make the report (det-assert junit reads every
 /// `<testcase>` in its text): every test of the shard gets its verdict, not only the last run's
-/// (CE21, the Lean replica of determinismo: 1,617 of 2,000 80-byte names lost at 128 KiB).
+/// (CE21, the Lean replica of determinismo: 1,617 of 2,000 80-byte names lost at 128 KiB),
+/// whatever the run line does with its shell (CE40).
 fn shard_command(arena: std.mem.Allocator, run_line: []const u8, list: []const u8, shard_count: u32, shard_of: []const u8, junit: ?[]const u8) ![]const u8 {
     if (std.mem.indexOf(u8, run_line, "{tests}") != null) {
         var each: std.ArrayList(u8) = .empty;
+        // The run line in a subshell of its own, closed on a line of its own: one that leaves
+        // its shell (`exit`, `exec`, `set -e` and a failing runner) or ends in a comment still
+        // has its report moved aside after it (CE40, the Lean replica of determinismo).
+        if (junit != null) try each.appendSlice(arena, "(\n");
         try each.appendSlice(arena, try std.mem.replaceOwned(u8, arena, run_line, "{tests}", "\"$@\""));
         if (junit) |path| {
-            try each.appendSlice(arena, "; s=$?; if [ -f ");
+            try each.appendSlice(arena, "\n); s=$?; if [ -f ");
             try shell_quote(arena, &each, path);
             try each.appendSlice(arena, " ]; then mv ");
             try shell_quote(arena, &each, path);
