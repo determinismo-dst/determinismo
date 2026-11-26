@@ -172,6 +172,9 @@ const Composer = struct {
     /// Commands that did not run to completion (a signal ended them: a fault's, or the
     /// composer's): a timeline with any runs no finally command.
     interrupted: u32 = 0,
+    /// Starts the composer's own SIGKILL ended (kill_all's), reported killed rather than judged
+    /// by their status.
+    composer_kills: u32 = 0,
 
     /// The kept commands of `kind` (all of them but the drivers the swarm left out).
     fn kind_count(composer: *const Composer, kind: Kind) u32 {
@@ -334,6 +337,7 @@ const Composer = struct {
                 // judged as any (CE2, the blind Lean replica of the platform).
                 const by_kill = killed and bits & 0x7f == @backingInt(linux.SIG.KILL);
                 if (signaled or by_kill) composer.interrupted += 1;
+                if (by_kill) composer.composer_kills += 1;
                 report_exit(entry.command, bits, by_kill);
                 composer.running[index] = composer.running[composer.running_count - 1];
                 composer.running_count -= 1;
@@ -1180,6 +1184,28 @@ fn dev_in(cmdline: []const u8) bool {
 /// whose user decides when it is ready and where no drivers start.
 fn sdk_setup_waited(system: *const schema.System, cmdline: []const u8) bool {
     return system.sdk_setup and !dev_in(cmdline);
+}
+
+test "kill_all judges a start that died of its own SIGKILL before it by its status (CE2)" {
+    // A start dead of its own SIGKILL (the OOM killer's, a kill from outside) and not reaped yet
+    // when kill_all runs (with --min-drive 0 nothing reaps the starts first): its status is
+    // judged; only what kill_all's SIGKILL ends is the composer's kill.
+    const command: Command = .{ .name = "oom", .kind = .parallel_driver };
+    var composer: Composer = .{};
+    const pid = linux.fork();
+    if (pid == 0) {
+        _ = linux.kill(linux.getpid(), .KILL);
+        linux.exit_group(0);
+    }
+    // Dead, left unreaped (WNOWAIT): what kill_all finds.
+    var info: linux.siginfo_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.waitid(.PID, @intCast(pid), &info, linux.W.EXITED | linux.W.NOWAIT, null)));
+    composer.running[0] = .{ .pid = @intCast(pid), .command = &command };
+    composer.running_count = 1;
+    composer.kill_all();
+    try std.testing.expectEqual(@as(u32, 0), composer.running_count);
+    try std.testing.expectEqual(@as(u32, 1), composer.interrupted);
+    try std.testing.expectEqual(@as(u32, 0), composer.composer_kills);
 }
 
 test "the composer waits for an SDK's setup in a timeline, never in a fast VM's dev mode" {
