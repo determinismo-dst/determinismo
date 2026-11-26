@@ -3756,6 +3756,9 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
             for (taped.steps_taped()) |step| {
                 if (step.vtime_ns >= start_ns) break;
                 tape.write_step(vm.tape_fd.?, taped.step_of(step), step.vtime_ns);
+                // Counted as the timeline's own: its steps' cap is its tape's (CE52).
+                vm.tape_steps += 1;
+                vm.tape_step_bytes += step.size;
             }
         }
         const time_start_ns = monotonic_ns();

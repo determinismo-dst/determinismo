@@ -496,24 +496,122 @@ pub const Step = struct { vtime_ns: u64, start: u32, size: u32 };
 pub const steps_max = 1 << 16;
 pub const step_text_max = 16 << 20;
 
-/// A step a session gave the timeline, at the moment it ran.
+/// Whether a step of `size` bytes fits a tape holding `count` steps of `text_used` bytes: what a
+/// replay reads (the recorder refuses a step past it, instead of a tape no replay can read).
+pub fn step_fits(count: u32, text_used: u64, size: usize) bool {
+    return count < steps_max and text_used + size <= step_text_max;
+}
+
+/// The line a step starts with: `{"vtime":<ns>,"step":"<its JSON string>"}`.
+const step_line_head = "{\"vtime\":";
+
+/// A step a session gave the timeline, at the moment it ran: its line written whole, whatever
+/// the step's length, escaped as it goes. A fixed buffer for the step's JSON left a step past
+/// 128 KiB a line with no end, the tape unreadable from there (CE52, the Lean replica of
+/// determinismo: a 96 KiB REPL message).
 pub fn write_step(fd: linux.fd_t, step: []const u8, vtime_ns: u64) void {
     assert(fd >= 0);
-    var buffer: [256]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&buffer);
-    writer.print("{{\"vtime\":{d},\"step\":", .{vtime_ns}) catch unreachable;
-    write_all(fd, writer.buffered());
-    var text_buffer: [2 * 65536]u8 = undefined;
-    var text: std.Io.Writer = .fixed(&text_buffer);
-    std.json.Stringify.value(step, .{}, &text) catch return;
-    text.writeAll("}\n") catch return;
-    write_all(fd, text.buffered());
+    assert(step.len <= step_text_max);
+    var buffer: [4096]u8 = undefined;
+    var used = (std.fmt.bufPrint(&buffer, "{{\"vtime\":{d},\"step\":\"", .{vtime_ns}) catch unreachable).len;
+    for (step) |byte| {
+        var escaped: [6]u8 = undefined;
+        const piece: []const u8 = switch (byte) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            0x08 => "\\b",
+            0x0c => "\\f",
+            0x00...0x07, 0x0b, 0x0e...0x1f => std.fmt.bufPrint(&escaped, "\\u{x:0>4}", .{byte}) catch unreachable,
+            else => blk: {
+                escaped[0] = byte;
+                break :blk escaped[0..1];
+            },
+        };
+        if (used + piece.len > buffer.len) {
+            write_all(fd, buffer[0..used]);
+            used = 0;
+        }
+        @memcpy(buffer[used..][0..piece.len], piece);
+        used += piece.len;
+    }
+    if (used + 3 > buffer.len) {
+        write_all(fd, buffer[0..used]);
+        used = 0;
+    }
+    @memcpy(buffer[used..][0..3], "\"}\n");
+    write_all(fd, buffer[0 .. used + 3]);
+}
+
+/// A step's line as write_step writes it, its string unescaped straight into the step table: no
+/// scratch copy, so a step of any length the table holds reads back (std.json's value copied
+/// each string into the parse's 64 KiB scratch: 42,235 bytes was the longest step a tape read,
+/// CE52). Null for a line of another form (the generic parse reads it).
+fn step_line_parse(overrides: *Overrides, line: []const u8) !?void {
+    if (!std.mem.startsWith(u8, line, step_line_head)) return null;
+    const digits_end = std.mem.indexOfScalarPos(u8, line, step_line_head.len, ',') orelse return null;
+    const vtime_ns = std.fmt.parseInt(u64, line[step_line_head.len..digits_end], 10) catch return null;
+    const string_head = ",\"step\":\"";
+    if (!std.mem.startsWith(u8, line[digits_end..], string_head)) return null;
+    if (!std.mem.endsWith(u8, line, "\"}")) return null;
+    const escaped = line[digits_end + string_head.len .. line.len - 2];
+    if (overrides.step_count == steps_max) return error.TapeTooLong;
+    if (overrides.step_count > 0 and overrides.steps[overrides.step_count - 1].vtime_ns > vtime_ns) return error.BadTape;
+    const start = overrides.step_text_used;
+    var out: usize = start;
+    var at: usize = 0;
+    while (at < escaped.len) {
+        const byte = escaped[at];
+        if (byte == '"') return error.BadTape; // An unescaped quote: the string ended early.
+        var decoded: [4]u8 = undefined;
+        var size: usize = 1;
+        if (byte != '\\') {
+            decoded[0] = byte;
+            at += 1;
+        } else {
+            if (at + 1 >= escaped.len) return error.BadTape;
+            const kind = escaped[at + 1];
+            at += 2;
+            decoded[0] = switch (kind) {
+                '"', '\\', '/' => kind,
+                'b' => 0x08,
+                'f' => 0x0c,
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                'u' => 0,
+                else => return error.BadTape,
+            };
+            if (kind == 'u') {
+                if (at + 4 > escaped.len) return error.BadTape;
+                var code: u21 = std.fmt.parseInt(u16, escaped[at..][0..4], 16) catch return error.BadTape;
+                at += 4;
+                if (code >= 0xd800 and code <= 0xdbff) {
+                    // A surrogate pair: the low half must follow.
+                    if (at + 6 > escaped.len or !std.mem.startsWith(u8, escaped[at..], "\\u")) return error.BadTape;
+                    const low = std.fmt.parseInt(u16, escaped[at + 2 ..][0..4], 16) catch return error.BadTape;
+                    if (low < 0xdc00 or low > 0xdfff) return error.BadTape;
+                    at += 6;
+                    code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
+                } else if (code >= 0xdc00 and code <= 0xdfff) return error.BadTape;
+                size = std.unicode.utf8Encode(code, &decoded) catch return error.BadTape;
+            }
+        }
+        if (out + size > step_text_max) return error.TapeTooLong;
+        @memcpy(overrides.step_text[out..][0..size], decoded[0..size]);
+        out += size;
+    }
+    overrides.steps[overrides.step_count] = .{ .vtime_ns = vtime_ns, .start = start, .size = @intCast(out - start) };
+    overrides.step_count += 1;
+    overrides.step_text_used = @intCast(out);
 }
 
 fn step_parse(overrides: *Overrides, value: std.json.Value) !void {
     const text = (value.object.get("step") orelse return error.BadTape).string;
     const vtime_ns: u64 = @intCast((value.object.get("vtime") orelse return error.BadTape).integer);
-    if (overrides.step_count == steps_max or overrides.step_text_used + text.len > step_text_max) return error.TapeTooLong;
+    if (!step_fits(overrides.step_count, overrides.step_text_used, text.len)) return error.TapeTooLong;
     if (overrides.step_count > 0 and overrides.steps[overrides.step_count - 1].vtime_ns > vtime_ns) return error.BadTape;
     @memcpy(overrides.step_text[overrides.step_text_used..][0..text.len], text);
     overrides.steps[overrides.step_count] = .{ .vtime_ns = vtime_ns, .start = overrides.step_text_used, .size = @intCast(text.len) };
@@ -616,6 +714,7 @@ pub fn parse(source: []const u8, scratch: []u8, overrides: *Overrides) !Header {
     overrides.step_count = 0;
     overrides.step_text_used = 0;
     while (lines.next()) |line| {
+        if (try step_line_parse(overrides, line)) |_| continue;
         rest.reset();
         const value = try std.json.parseFromSliceLeaky(Value, rest.allocator(), line, .{});
         if (value.object.get("checkpoint")) |checkpoint| {
@@ -1240,6 +1339,34 @@ test "a session's REPL message of 33 KiB (a det:ask step of 45,000 bytes) is rea
     const source = try tape_with_step(allocator, step, &tmp);
     defer allocator.free(source);
     try std.testing.expect(std.mem.endsWith(u8, source, "\"det:over\"}\n")); // Every line whole.
+    const overrides = try Overrides.create(allocator);
+    defer overrides.destroy();
+    const scratch = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(scratch);
+    _ = try parse(source, scratch, overrides);
+    try std.testing.expectEqualStrings(step, overrides.step_of(overrides.steps_taped()[0]));
+}
+
+test "a step fits the tape a replay reads: 65,536 steps, 16 MiB of their text" {
+    try std.testing.expect(step_fits(0, 0, step_text_max));
+    try std.testing.expect(!step_fits(0, 1, step_text_max));
+    try std.testing.expect(step_fits(steps_max - 1, 0, 0));
+    try std.testing.expect(!step_fits(steps_max, 0, 0));
+}
+
+test "a step's control bytes, quotes, backslashes and non-ASCII text are read back as written" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const step = "det-nodes exec app sh -c 'printf \"%s\\n\" \"\\\\x\"' \x01\x1f\t\r\x08\x0c \u{e9}\u{1f600} /";
+    const source = try tape_with_step(allocator, step, &tmp);
+    defer allocator.free(source);
+    // The same JSON std.json writes: other readers of a tape read it too.
+    const line_start = std.mem.indexOf(u8, source, "{\"vtime\":15000019720").?;
+    const line = source[line_start..std.mem.indexOfScalarPos(u8, source, line_start, '\n').?];
+    const value = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer value.deinit();
+    try std.testing.expectEqualStrings(step, value.value.object.get("step").?.string);
     const overrides = try Overrides.create(allocator);
     defer overrides.destroy();
     const scratch = try allocator.alloc(u8, 64 * 1024);

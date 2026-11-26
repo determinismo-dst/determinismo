@@ -344,6 +344,9 @@ pull_note: ?PullNote = null,
 tape_fd: ?linux.fd_t,
 /// Overrides on this timeline's tape so far (tape_override), and whether it filled.
 tape_written: u32 = 0,
+/// The steps on the timeline's tape, and their bytes: a step past what a replay reads is refused.
+tape_steps: u32 = 0,
+tape_step_bytes: u64 = 0,
 tape_full: bool = false,
 overrides: ?*tape.Overrides,
 /// The driver phase's length bucket the explorer chose from the run's novelty curve: the answer
@@ -2202,9 +2205,16 @@ fn steps_poll(vm: *VM) !void {
 
 /// A step the moment runs, on the timeline's own tape at the moment it ran: a replay of the
 /// timeline runs it there again.
+/// A step past what a replay of the tape reads (65,536 steps, 16 MiB) is refused before it runs,
+/// room kept for the session's det:over, instead of a tape no replay can read (CE52, the Lean
+/// replica of determinismo: nothing capped the steps a session recorded).
 fn step_record(vm: *VM, step: []const u8) !void {
     const fd = vm.tape_fd orelse return;
-    if (step_taped(step)) tape.write_step(fd, step, (try vm.moment()).vtime_ns);
+    if (!step_taped(step)) return;
+    if (!tape.step_fits(vm.tape_steps + 1, vm.tape_step_bytes + step_over.len, step.len)) return error.TapeStepsFull;
+    tape.write_step(fd, step, (try vm.moment()).vtime_ns);
+    vm.tape_steps += 1;
+    vm.tape_step_bytes += step.len;
 }
 
 /// A session's checkpoint (det:checkpoint [name]), at the stop 1 ns after the step: its event
@@ -2242,7 +2252,12 @@ fn session_checkpoint(vm: *VM, name: []const u8) !bool {
 fn session_end(vm: *VM) !void {
     vm.steps_fd = null;
     vm.session_over = true;
-    if (vm.tape_fd) |fd| tape.write_step(fd, step_over, (try vm.moment()).vtime_ns);
+    if (vm.tape_fd) |fd| {
+        assert(tape.step_fits(vm.tape_steps, vm.tape_step_bytes, step_over.len)); // Kept by step_record.
+        tape.write_step(fd, step_over, (try vm.moment()).vtime_ns);
+        vm.tape_steps += 1;
+        vm.tape_step_bytes += step_over.len;
+    }
 }
 
 /// Whether a step goes on its timeline's tape: every step a session ran, its waits and looks
@@ -3679,6 +3694,8 @@ pub fn tape_attach(vm: *VM, fd: ?linux.fd_t) void {
     vm.tape_fd = fd;
     vm.tape_written = 0;
     vm.tape_full = false;
+    vm.tape_steps = 0;
+    vm.tape_step_bytes = 0;
 }
 
 /// An override onto the timeline's tape, override_count_max at most: there the tape says it
