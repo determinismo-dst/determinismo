@@ -9782,12 +9782,15 @@ fn check_changed(context: *Context) !void {
     const arena = context.arena;
     const record = try std.fmt.allocPrint(arena, "{s}/changed.jsonl", .{context.scratch});
     // One generation in flight: the tree returns from the second one on (with the default three,
-    // 48 timelines would all be roots).
+    // 48 timelines would all be roots). Four workers: with the host's 35, fresh timelines took the
+    // last of the 48 numbers while the changed-code returns' nodes replayed to their moments, and
+    // a quicker archive node at the timelines' start had what was left (the batch of 1555f2e,
+    // 2026-11-26: its judgment kept three changed-code returns, none of them planned).
     const report = try explore(context, &.{
         "--compose",  "tests/antithesis-compat/python/compose.yaml", "--scenario", "maze",
         "--seed",     "1",                                           "--branches", "48",
         "--changed",  "tests/changed/maze.diff",                     "--record",   record,
-        "--pipeline", "1",
+        "--pipeline", "1",                                           "--jobs",     "4",
     });
     const file = "tests/antithesis-compat/python/client/maze/singleton_driver_maze.py";
     const every = try std.fmt.allocPrint(arena, "ran in   48/48 timelines  {s}:24-24", .{file});
