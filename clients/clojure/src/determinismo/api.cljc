@@ -178,6 +178,23 @@
   (let [found (lines (request :post (str "/runs/" id "/query") request-map))]
     (tap/tell :query {:run id :request request-map :events found} found)))
 
+(defn event
+  "What the program said the first time it named `event-name` in a timeline of run `id` (timeline 0
+  unless {:branch n}): that event's details, a map; nil when it never did. Its moment and the
+  rest: `query`. (event 2294 \"page_split_update\") -> {:outcome \"no answer\" :waited_ms 10436 ...}"
+  ([id event-name] (event id event-name {}))
+  ([id event-name {:keys [branch] :or {branch 0}}]
+   (-> (query id {:condition (str "event=" event-name) :branch branch :limit 1}) first :event :details)))
+
+(defn samples
+  "A node's samples over a timeline of run `id` (timeline 0 unless {:branch n}): `field` of each
+  of its node_sample events (every 2 s of virtual time), in order, those it had: :cpu_ms (the
+  CPU it used since the last sample), :memory_mib. (samples 2294 \"turso\" :cpu_ms) -> (1998 1999 ...)"
+  ([id node field] (samples id node field {}))
+  ([id node field {:keys [branch] :or {branch 0}}]
+   (->> (query id {:condition (str "event=node_sample details.node=" node) :branch branch})
+        (keep (fn [found] (get-in found [:event :details (keyword field)]))))))
+
 (defn query-at
   "`query` at a run's whole URL (as causality planners are told it: http://host:port/runs/<id>)."
   [run-url request-map]

@@ -1375,7 +1375,10 @@ fn check_client(context: *Context) !void {
         \\                                   (connect t 1)
         \\                                   (mapv :value (d/watch-values t found {{:limit 1 :ms 3000}}))))
         \\                         {{:branches [0 1]}})
-        \\        fd (first (:args (first served)))]
+        \\        fd (first (:args (first served)))
+        \\        ;; An event's details by its name, and a node's samples as a series (the run's own).
+        \\        first-sample (api/event 1 "node_sample")
+        \\        memory (api/samples 1 "echo" :memory_mib)]
         \\    (said "regs" (some? (:rip regs)) (:rip regs))
         \\    (said "symbol-at" (and (some? (:address accepted)) (= (select-keys accepted [:pid :address :type]) (select-keys accepted-at [:pid :address :type])))
         \\          (select-keys accepted-at [:pid :address]))
@@ -1394,6 +1397,9 @@ fn check_client(context: *Context) !void {
         \\                        (some (fn [f] (str/includes? (:at f) "selftest")) framed))
         \\          (mapv (juxt :at :via) framed))
         \\    (said "moment-when" (and (= [false true] edge) (< 2000 (:ms reached) 3000) (some? (:rip (:regs reached)))) (dissoc reached :regs) edge (:rip (:regs reached)))
+        \\    (said "event" (and (map? first-sample) (string? (:node first-sample)) (nil? (api/event 1 "no_such_event")))
+        \\          first-sample)
+        \\    (said "samples" (and (seq memory) (every? number? memory)) memory)
         \\    (said "across-both" (and (= [0 1] (mapv :branch across))
         \\                             (every? (fn [r] (and (= 1 (count (:result r))) (pos? (first (:result r))))) across))
         \\          (mapv (juxt :branch :timeline :result) across))))
@@ -1410,7 +1416,7 @@ fn check_client(context: *Context) !void {
     for (runners.items) |runner| {
         const ran = try run_kept(context, runner.argv);
         const out = try std.mem.concat(arena, u8, &.{ ran.stdout, ran.stderr });
-        const names = [_][]const u8{ "regs", "symbol-at", "accepted-u64", "ratio-f64", "ratio-16-in", "ratios-half-a-connection", "call-descriptor", "call-params", "call-float", "frames", "moment-when", "across-both" };
+        const names = [_][]const u8{ "regs", "symbol-at", "accepted-u64", "ratio-f64", "ratio-16-in", "ratios-half-a-connection", "call-descriptor", "call-params", "call-float", "frames", "moment-when", "across-both", "event", "samples" };
         var good: [names.len]bool = undefined;
         for (names, 0..) |name, index| good[index] = std.mem.indexOf(u8, out, try std.fmt.allocPrint(arena, "ok {s} ", .{name})) != null;
         expect_all(context, &.{
@@ -1426,6 +1432,8 @@ fn check_client(context: *Context) !void {
             .{ "a stop's frames, named as a crash's stack is (det-nodes where), unwound by .eh_frame from the stop's own instruction, the node's own code among them", good[9] },
             .{ "moment-when: jiffies' +500 ticks from 2 s, not yet one branch before the moment found, held at it", good[10] },
             .{ "across: the same look in both timelines", good[11] },
+            .{ "api/event: an event's details by its name (nil for one never said)", good[12] },
+            .{ "api/samples: a node's sampled field as numbers, in order", good[13] },
         }, "client: the REPL's session, symbols, values, calls and across, from {s} ({s})", .{ runner.name, out[0..@min(out.len, 1200)] });
     }
 }
