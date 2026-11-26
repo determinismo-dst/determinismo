@@ -2690,6 +2690,7 @@ fn command_explore(
     if (arguments.record_path) |path| {
         if (report.record_fd == null) {
             report.record_fd = try open_for_appending(context.arena, path, if (arguments.resume_run) .resumed else .fresh);
+            report.declared_seen_open();
         }
     }
     if (arguments.record_path != null and !arguments.resume_run) {
@@ -2790,6 +2791,7 @@ fn command_explore(
             };
             exploration.replay.?.header.branch = own.branch;
             exploration.tape_directory = tapes;
+            report.declared_seen_open();
             report.record_fd = try open_for_appending(context.arena, try std.fs.path.join(context.arena, &.{ run_directory, "record.jsonl" }), .resumed);
             report.record_branches_only = true;
             // Its line among the run's timelines as it ends: what serve ingests from.

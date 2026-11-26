@@ -15,6 +15,78 @@ const print = std.debug.print;
 /// branch as it ends, and a `summary` line. Opened with O_APPEND before workers fork, so each
 /// line (one write) stays whole.
 pub var record_fd: ?std.os.linux.fd_t = null;
+
+/// The declarations the run's workers recorded already, by identity hash: an open-addressed table
+/// in memory shared with the workers it is mapped before they fork. A tree timeline's worker
+/// starts with an empty multiverse, so its own aggregates could not tell a declaration recorded
+/// by another, and every timeline recorded its unreached declarations again (CE65, the blind Lean
+/// replica of the platform: 100 declarations over 20,000 timelines, ~248 MiB of record).
+var declared_seen: ?[]std.atomic.Value(u64) = null;
+const declared_seen_size = 1 << 14;
+
+/// Maps the run's declaration table (before its workers fork). Without one (an error), every
+/// worker records its own: more lines, none lost.
+pub fn declared_seen_open() void {
+    if (declared_seen != null) return;
+    const bytes = declared_seen_size * @sizeOf(u64);
+    const address = std.os.linux.mmap(null, bytes, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED, .ANONYMOUS = true }, -1, 0);
+    if (std.os.linux.errno(address) != .SUCCESS) return;
+    const words: [*]std.atomic.Value(u64) = @ptrFromInt(address);
+    declared_seen = words[0..declared_seen_size];
+}
+
+/// Whether this declaration is the run's first of it (and now claimed): false when any worker
+/// claimed it before. A full table (or none) says true: recorded twice rather than lost.
+fn declared_claim(identity: u64) bool {
+    const table = declared_seen orelse return true;
+    const key = if (identity == 0) 1 else identity; // Never 0, an empty slot's.
+    var slot = key % table.len;
+    for (0..table.len) |_| {
+        const previous = table[slot].cmpxchgStrong(0, key, .acq_rel, .acquire) orelse return true;
+        if (previous == key) return false;
+        slot = (slot + 1) % table.len;
+    }
+    return true;
+}
+
+test "two tree workers' timelines record one declaration once (CE65)" {
+    declared_seen_open();
+    var pipe: [2]std.os.linux.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, std.os.linux.errno(std.os.linux.pipe2(&pipe, .{ .NONBLOCK = true })));
+    defer _ = std.os.linux.close(pipe[0]);
+    const saved = record_fd;
+    record_fd = pipe[1];
+    defer record_fd = saved;
+    var property: Events.Property = .{ .kind = .reachable, .message = undefined, .message_size = 9, .message_hash = 0x7e57ce65, .hits = 0, .trues = 0 };
+    @memcpy(property.message[0..9], "never hit");
+    // Each worker's multiverse empty, as a tree timeline's starts.
+    const first = try std.testing.allocator.create(Multiverse);
+    defer std.testing.allocator.destroy(first);
+    first.* = .{};
+    const second = try std.testing.allocator.create(Multiverse);
+    defer std.testing.allocator.destroy(second);
+    second.* = .{};
+    first.declared_record(&.{property});
+    second.declared_record(&.{property});
+    _ = std.os.linux.close(pipe[1]);
+    var buffer: [4096]u8 = undefined;
+    const size = std.os.linux.read(pipe[0], &buffer, buffer.len);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, buffer[0..size], "\"declared\""));
+}
+
+test "a declaration is claimed once across the run's processes" {
+    declared_seen_open();
+    try std.testing.expect(declared_seen != null);
+    try std.testing.expect(declared_claim(42));
+    try std.testing.expect(!declared_claim(42));
+    // A worker forked after the table's mapping: its claim of 42 is the same table's.
+    const pid = std.os.linux.fork();
+    if (pid == 0) std.os.linux.exit_group(if (declared_claim(42)) 1 else if (declared_claim(43)) 0 else 2);
+    var status: i32 = 0;
+    _ = std.os.linux.waitpid(@intCast(pid), &status, 0);
+    try std.testing.expectEqual(@as(u32, 0), std.os.linux.W.EXITSTATUS(@bitCast(status)));
+    try std.testing.expect(!declared_claim(43)); // The worker's claim, seen here.
+}
 /// The events directory's timelines.jsonl (`explore --events-dir`): a line per timeline as it
 /// ends, after its events, as its `branch` line has it; the events database ingests what it
 /// lists (store.zig). Opened as record_fd is.
@@ -550,22 +622,7 @@ pub const Multiverse = struct {
             " hazards: overshoots={d} throttles={d} late_steps={d}",
             .{ state.overshoots, state.throttles, state.late_steps },
         ) catch {};
-        // An assertion declared and not reached, new to this run: its declaration a record line
-        // of its own (once a run; a worker's), so a resume's catalog has it. Its timelines' lines
-        // keep reached ones only, and a resumed run lost the declarations of every timeline it
-        // skipped: a catalog assertion never reached then passed (CE45's remainder, the blind
-        // Lean replica of the platform).
-        for (vm.events.properties[0..vm.events.property_count]) |*property| {
-            if (property.hits != 0 or multiverse.aggregate_known(property)) continue;
-            record(.{ .declared = Recorded{
-                .message = property.name(),
-                .hash = property.message_hash,
-                .kind = property.kind,
-                .hits = 0,
-                .trues = 0,
-                .failure = null,
-            } });
-        }
+        declared_record(multiverse, vm.events.properties[0..vm.events.property_count]);
         var recorded_count: usize = 0;
         for (vm.events.properties[0..vm.events.property_count]) |*property| {
             if (property.hits == 0) continue;
@@ -653,6 +710,25 @@ pub const Multiverse = struct {
         };
         @memcpy(property.message[0..size], recorded.message[0..size]);
         try multiverse.merge(&property, branch);
+    }
+
+    /// An assertion declared and not reached, new to this run: its declaration a record line of
+    /// its own, once a run (declared_claim across its workers), so a resume's catalog has it. Its
+    /// timelines' lines keep reached ones only, and a resumed run lost the declarations of every
+    /// timeline it skipped: a catalog assertion never reached then passed (CE45's remainder).
+    fn declared_record(multiverse: *const Multiverse, timeline_properties: []const Events.Property) void {
+        for (timeline_properties) |*property| {
+            if (property.hits != 0 or multiverse.aggregate_known(property)) continue;
+            if (!declared_claim(property.message_hash ^ (@as(u64, @backingInt(property.kind)) *% 0x9e3779b97f4a7c15))) continue;
+            record(.{ .declared = Recorded{
+                .message = property.name(),
+                .hash = property.message_hash,
+                .kind = property.kind,
+                .hits = 0,
+                .trues = 0,
+                .failure = null,
+            } });
+        }
     }
 
     fn aggregate_known(multiverse: *const Multiverse, property: *const Events.Property) bool {
