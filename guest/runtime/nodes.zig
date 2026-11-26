@@ -2270,19 +2270,56 @@ fn disk_reads_read(fd: linux.fd_t, name: []const u8, file: []const u8, aimed: []
                 events += 1;
             }
             if (events > disk_reads_events_max) continue;
-            sdk.event("disk_corrupt_read", .{
-                .node = name,
-                .file = file,
-                .sector = read.sector,
-                .sectors = read.sectors,
-                .byte = read.sector * 512 + corrupt_byte - 1, // The device's byte the fault changed.
-            });
+            var parts_buffer: [fiemap_extents_max + 1]CorruptedPart = undefined;
+            for (read_corrupted_parts(extents, read.sector, read.sectors, corrupt_byte, &parts_buffer)) |part| {
+                sdk.event("disk_corrupt_read", .{
+                    .node = name,
+                    .file = file,
+                    .sector = part.sector,
+                    .sectors = part.sectors,
+                    .byte = part.byte, // The device's byte the fault changed.
+                });
+            }
             events += 1;
         }
         std.mem.copyForwards(u8, buffer[0 .. kept - from], buffer[from..kept]);
         kept -= from;
         if (kept == buffer.len) kept = 0; // A line longer than the buffer: dropped.
     }
+}
+
+/// A part of a read the fault corrupted: its sectors and the device's byte it changed.
+const CorruptedPart = struct { sector: u64, sectors: u64, byte: u64 };
+
+/// The parts of a read of `sectors` from `sector` the fault changed, and the byte of each.
+fn read_corrupted_parts(extents: []const Extent, sector: u64, sectors: u64, corrupt_byte: u64, out: []CorruptedPart) []const CorruptedPart {
+    _ = extents;
+    assert(out.len > 0);
+    out[0] = .{ .sector = sector, .sectors = sectors, .byte = sector * 512 + corrupt_byte - 1 };
+    return out[0..1];
+}
+
+test "a read over a linear part and two aimed extents names each byte the fault changed" {
+    // CE54 (the Lean replica of determinismo): device-mapper splits a read at its table's
+    // segments, and dm-flakey changes byte `corrupt_bio_byte` of each part it completes, counted
+    // from the part's start; the read's first sector's byte was named, a byte the fault never
+    // changed when the read began in a linear part (a hole before the extent, written during
+    // the fault, read with it), and one byte of two for a read over two extents.
+    // The file's extents at the fault's start: sectors 100-107 and 116-123; the holes before and
+    // between them were written during the fault at 92-99 and 108-115.
+    const aimed = [_]Extent{ .{ .start = 100, .count = 8 }, .{ .start = 116, .count = 8 } };
+    var parts: [fiemap_extents_max + 1]CorruptedPart = undefined;
+    // One read of 32 sectors from 92: linear 92-99, flakey 100-107, linear 108-115, flakey 116-123.
+    const changed = read_corrupted_parts(&aimed, 92, 32, 5, &parts);
+    try std.testing.expectEqual(@as(usize, 2), changed.len);
+    try std.testing.expectEqual(CorruptedPart{ .sector = 100, .sectors = 8, .byte = 100 * 512 + 4 }, changed[0]);
+    try std.testing.expectEqual(CorruptedPart{ .sector = 116, .sectors = 8, .byte = 116 * 512 + 4 }, changed[1]);
+    // A read inside one extent: its own first sector's byte.
+    try std.testing.expectEqualSlices(CorruptedPart, &.{.{ .sector = 104, .sectors = 4, .byte = 104 * 512 + 4 }}, read_corrupted_parts(&aimed, 104, 4, 5, &parts));
+    // A fault over the whole device (no extents): the read whole, its first sector's byte.
+    try std.testing.expectEqualSlices(CorruptedPart, &.{.{ .sector = 92, .sectors = 32, .byte = 92 * 512 + 4 }}, read_corrupted_parts(&.{}, 92, 32, 5, &parts));
+    // A part shorter than the byte's offset: nothing changed there.
+    try std.testing.expectEqual(@as(usize, 0), read_corrupted_parts(&aimed, 98, 3, 1100, &parts).len);
 }
 
 fn extents_overlap(extents: []const Extent, sector: u64, sectors: u64) bool {
