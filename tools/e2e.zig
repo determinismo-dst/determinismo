@@ -5037,7 +5037,18 @@ fn check_explain(context: *Context, branch: []const u8) !void {
         const result = try run_kept(context, argv.items);
         output.* = if (result.term.success()) std.mem.trim(u8, result.stdout, " \n") else "";
     }
-    const explained = std.json.parseFromSliceLeaky(Explained, arena, outputs[0], .{ .ignore_unknown_fields = true }) catch null;
+    // explain's --json line is `{"explain":{...}}` (explain.zig, `.explain = explained`); the
+    // first run of this check parsed it as the object itself and found nothing (60e3e87).
+    const explained: ?Explained = parsed: {
+        var lines = std.mem.tokenizeScalar(u8, outputs[0], '\n');
+        while (lines.next()) |line| {
+            if (!std.mem.startsWith(u8, line, "{\"explain\":")) continue;
+            const Line = struct { explain: Explained };
+            const line_parsed = std.json.parseFromSliceLeaky(Line, arena, line, .{ .ignore_unknown_fields = true }) catch break :parsed null;
+            break :parsed line_parsed.explain;
+        }
+        break :parsed null;
+    };
     var details: usize = 0;
     var bounded = true;
     var known = true;
