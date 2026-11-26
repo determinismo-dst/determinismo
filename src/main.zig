@@ -7235,17 +7235,43 @@ fn returns_earlier(
 ) ![]const TreeReturn {
     if (offsets_ns.len == 0) return returns;
     const moved = try arena.dupe(TreeReturn, returns);
-    for (moved) |*back| {
+    for (moved, 0..) |*back, at| {
         const earliest_ns = back.earliest_ns orelse continue;
         const offset_ns = offsets_ns[random.random().uintLessThan(usize, offsets_ns.len)];
         if (offset_ns == 0 or back.vtime_ns < earliest_ns + offset_ns) continue;
-        back.vtime_ns -= offset_ns;
+        // Never onto a moment another return of the generation has: two returns there made two
+        // nodes and their branches from one moment, and a resume's two planned lines under one
+        // key kept the last (CE59, CE26's remainder, the blind Lean replica of the platform).
+        const landing = back.vtime_ns - offset_ns;
+        const taken = for (moved, 0..) |other, other_at| {
+            if (other_at != at and other.branch == back.branch and other.vtime_ns == landing) break true;
+        } else false;
+        if (taken) continue;
+        back.vtime_ns = landing;
         back.why = try std.fmt.allocPrint(arena, "{s} Landed {d} ms before that moment instead " ++
             "(an earlier return): what was already in flight there can go another way.", .{
             back.why, offset_ns / std.time.ns_per_ms,
         });
     }
     return moved;
+}
+
+test "a generation's returns, moved earlier, never meet at one moment (CE59)" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const s = std.time.ns_per_s;
+    // A frontier return and an archive place on #0, 5 s apart: an offset of 5 s moves the later
+    // one onto the earlier one's moment, unless the landing is taken.
+    const returns = [_]TreeReturn{
+        .{ .branch = 0, .vtime_ns = 40 * s, .why = "frontier", .earliest_ns = s },
+        .{ .branch = 0, .vtime_ns = 35 * s, .why = "archive", .earliest_ns = s },
+    };
+    for (0..64) |seed| {
+        var random: std.Random.DefaultPrng = .init(seed);
+        const moved = try returns_earlier(arena, &return_offsets_default, &returns, &random);
+        try std.testing.expect(moved[0].vtime_ns != moved[1].vtime_ns);
+    }
 }
 
 test "earlier returns move only returns just after a behavior, never before their branch's start" {
