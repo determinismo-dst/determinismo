@@ -1339,6 +1339,9 @@ fn run_scenario(
     const data = try runs.data_directory(arena, arguments.data_directory);
     arguments.scenario = scenario;
     if (first) {
+        // The run's request as asked (serve's, or the explorer's own): every later scenario's run
+        // keeps it where its explorer's arguments say nothing (run_request_write).
+        request_base = try std.fs.path.join(arena, &.{ arguments.run_directory.?, "request.json" });
         try run_request_write(arena, io, data, arguments.run_directory.?, arguments);
         return;
     }
@@ -1408,6 +1411,51 @@ test "a run's request and machine keep every input its analyses boot with (CE51)
 /// A run started here: what was asked (serve's request: the program kept by its content, as
 /// serve keeps it) and the machine it boots (its kernel and initramfs kept the same way).
 /// The run's request and machine; its kernel and initramfs kept, and the run boots those.
+/// The request a run of several scenarios started from (its first run's request.json): a later
+/// scenario's run keeps what it asked (run_request_write); null outside such a run.
+var request_base: ?[]const u8 = null;
+
+/// `asked`'s fields at their defaults take `base`'s: the explorer's own where it has them,
+/// serve's elsewhere.
+fn request_merge(asked: *serve.RunRequest, base: *const serve.RunRequest) void {
+    const info = @typeInfo(serve.RunRequest).@"struct";
+    inline for (info.field_names, info.field_types, info.field_attrs) |name, T, attrs| {
+        const default = attrs.defaultValue(T).?;
+        const mine = @field(asked, name);
+        const theirs = @field(base, name);
+        if (field_default(T, mine, default) and !field_default(T, theirs, default)) {
+            @field(asked, name) = theirs;
+        }
+    }
+}
+
+fn field_default(comptime T: type, value: T, default: T) bool {
+    return switch (@typeInfo(T)) {
+        .optional => value == null,
+        .pointer => |pointer| if (pointer.size == .slice) value.len == 0 else value == default,
+        else => std.meta.eql(value, default),
+    };
+}
+
+test "a run's request keeps what serve asked where the explorer says nothing (CE63)" {
+    var asked: serve.RunRequest = .{ .scenario = "first", .branching = "tree" };
+    const base: serve.RunRequest = .{
+        .scenario = "all",
+        .return_branches = 2,
+        .holders_on_disk = true,
+        .checkpoint = "/data/machines/3/checkpoints/c1",
+        .egress = &.{"10.0.0.0/8"},
+    };
+    request_merge(&asked, &base);
+    // The explorer's own stay; serve's fill what it left at its defaults.
+    try std.testing.expectEqualStrings("first", asked.scenario.?);
+    try std.testing.expectEqualStrings("tree", asked.branching.?);
+    try std.testing.expectEqual(@as(?u32, 2), asked.return_branches);
+    try std.testing.expect(asked.holders_on_disk);
+    try std.testing.expectEqualStrings("/data/machines/3/checkpoints/c1", asked.checkpoint.?);
+    try std.testing.expectEqual(@as(usize, 1), asked.egress.len);
+}
+
 fn run_request_write(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -1415,7 +1463,7 @@ fn run_request_write(
     directory: []const u8,
     arguments: *Arguments,
 ) !void {
-    const asked: serve.RunRequest = .{
+    var asked: serve.RunRequest = .{
         .program = if (arguments.program_path) |path| try runs.artifact_keep(arena, io, data, path) else null,
         .program_asked = if (arguments.program_path) |path| try runs.absolute(arena, path) else null,
         .compose = if (arguments.compose_path) |path| try runs.absolute(arena, path) else null,
@@ -1523,8 +1571,19 @@ fn run_request_write(
         try machine.appendSlice(arena, &.{ "--disk", try runs.absolute(arena, path) });
     }
     const cwd = std.Io.Dir.cwd();
+    const request_path = try std.fs.path.join(arena, &.{ directory, "request.json" });
+    // What serve asked for this run (its own request.json, or for a later scenario's run the
+    // first's): kept where the explorer's arguments say nothing. Written over, a run of several
+    // scenarios lost every field serve alone records (a CI job's, return branches, a checkpoint:
+    // CE63, the blind Lean replica of the platform).
+    const base_path = request_base orelse request_path;
+    if (cwd.readFileAlloc(io, base_path, arena, .limited(1 << 20))) |text| {
+        if (std.json.parseFromSliceLeaky(serve.RunRequest, arena, text, .{ .ignore_unknown_fields = true })) |base| {
+            request_merge(&asked, &base);
+        } else |_| {}
+    } else |_| {}
     try cwd.writeFile(io, .{
-        .sub_path = try std.fs.path.join(arena, &.{ directory, "request.json" }),
+        .sub_path = request_path,
         .data = try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(asked, .{})}),
     });
     try cwd.writeFile(io, .{
