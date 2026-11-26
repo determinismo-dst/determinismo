@@ -4036,7 +4036,7 @@ const Summaries = struct {
         summary.end_ns = if (vm.moment()) |moment| moment.vtime_ns else |_| summary.start_ns;
         summary.behavior_count = vm.events.behavior_count;
         summary.trace_hash = vm.events.hash.final();
-        summary.last_pull_ns = @min(vm.last_pull_ns, vm.events.checks_start_ns orelse std.math.maxInt(u64));
+        summary.last_pull_ns = returns_before_ns(vm.last_pull_ns, vm.events.checks_start_ns, vm.tape_full_ns);
         summary.cut = place.horizon_ns != null and outcome == .moment_reached;
         summary.hung = outcome == .hung;
         summary.ended_early = outcome == .strategy_ended;
@@ -6481,6 +6481,21 @@ fn judge_plan_one(arena: std.mem.Allocator, branches: Branches, state: *TreeStat
 /// A generation judged up to its nodes, started (tree_judge_poll collects them, tree_judge_end
 /// plans their branches); its summaries and plan the Judging's, the batch's spare ones the next
 /// generation's.
+/// Where a timeline's returns must land before: its last randomness pull, when its checks'
+/// inputs began streaming out, and when its tape was full (VM.tape_full_ns), the earliest. Past
+/// a full tape's marker a child's chain stops there and never replays, nor its failures (CE53,
+/// the blind Lean replica of the platform).
+fn returns_before_ns(last_pull_ns: u64, checks_start_ns: ?u64, tape_full_ns: ?u64) u64 {
+    return @min(last_pull_ns, @min(checks_start_ns orelse std.math.maxInt(u64), tape_full_ns orelse std.math.maxInt(u64)));
+}
+
+test "a return lands before a full tape's marker" {
+    // Its tape full at 3 s, its last pull at 9 s: returns before 3 s.
+    try std.testing.expectEqual(@as(u64, 3), returns_before_ns(9, null, 3));
+    try std.testing.expectEqual(@as(u64, 2), returns_before_ns(9, 2, 3));
+    try std.testing.expectEqual(@as(u64, 9), returns_before_ns(9, null, null));
+}
+
 /// Each judged timeline's clock and seed as its worker ran them (its strategy may have chosen
 /// them there): the plan's, which the timelines planned from it inherit, so a child's chain
 /// replays its parent as it ran. The seed stayed the plan's: a strategy's seed's children

@@ -348,6 +348,9 @@ tape_written: u32 = 0,
 tape_steps: u32 = 0,
 tape_step_bytes: u64 = 0,
 tape_full: bool = false,
+/// The moment its tape was full (tape_override): a return past it makes a timeline no replay
+/// reaches (its chain stops at the marker), so the tree returns only before it (CE53).
+tape_full_ns: ?u64 = null,
 overrides: ?*tape.Overrides,
 /// The driver phase's length bucket the explorer chose from the run's novelty curve: the answer
 /// to det-composer's `composer.drive_ms` decision, unless a replay or a strategy answered it.
@@ -3694,6 +3697,7 @@ pub fn tape_attach(vm: *VM, fd: ?linux.fd_t) void {
     vm.tape_fd = fd;
     vm.tape_written = 0;
     vm.tape_full = false;
+    vm.tape_full_ns = null;
     vm.tape_steps = 0;
     vm.tape_step_bytes = 0;
 }
@@ -3705,6 +3709,7 @@ fn tape_override(vm: *VM, fd: linux.fd_t, pull: u64, value: []const u8, reason: 
     if (vm.tape_written >= tape.override_count_max) {
         if (vm.tape_full) return;
         vm.tape_full = true;
+        vm.tape_full_ns = (try vm.moment()).vtime_ns;
         tape.write_full(fd, pull);
         var buffer: [96]u8 = undefined;
         const event = std.fmt.bufPrint(&buffer, "{{\"event\":\"tape_full\",\"pull\":{d},\"overrides\":{d}}}", .{ pull, vm.tape_written }) catch unreachable;
