@@ -2169,6 +2169,13 @@ fn disk_reads_instance(buffer: *[path_size_max]u8, mapper: []const u8) ![:0]cons
     return print_z(buffer, "/sys/kernel/tracing/instances/det-reads-{s}", .{mapper});
 }
 
+/// What the heal writes into the tracer's instance (its trace_marker) once no read is traced
+/// any more: the reader names every read before it, then exits.
+const disk_reads_end_marker = "det-corrupt-reads-end";
+
+/// How long the heal waits for the reader to drain to the end marker before killing it.
+const disk_reads_drain_ms = 2000;
+
 /// The tracer started (a process of its own, its pid beside the node's state), or said failed.
 fn disk_reads_trace_start(name: []const u8, paths: *const Paths, mapper: []const u8, file: []const u8, aimed: []const Extent, corrupt_byte: u32) void {
     // The device by its minor (/dev/dm-N, as mount and fsck use it): the guest has no udev, so no
@@ -2189,8 +2196,13 @@ fn disk_reads_trace_start(name: []const u8, paths: *const Paths, mapper: []const
     _ = linux.mount("none", "/sys/kernel/tracing", "tracefs", 0, 0); // Mounted already, or now.
     var instance_buffer: [path_size_max]u8 = undefined;
     const instance = disk_reads_instance(&instance_buffer, mapper) catch return;
-    _ = linux.mkdir(instance, 0o700);
     var path_buffer: [path_size_max]u8 = undefined;
+    if (linux.errno(linux.mkdir(instance, 0o700)) == .EXIST) {
+        // A tracer left behind (its removal failed): what its buffer holds is an earlier
+        // fault's, cleared so this one names only its own reads (CE43, the Lean replica of
+        // determinismo).
+        file_write(print_z(&path_buffer, "{s}/trace", .{instance}) catch return, "") catch {};
+    }
     var filter_buffer: [64]u8 = undefined;
     // The kernel's dev_t (MKDEV: major << 20 | minor), this device's bios alone.
     const filter = std.fmt.bufPrint(&filter_buffer, "dev == {d}\n", .{(@as(u64, major) << 20) | minor}) catch return;
@@ -2248,6 +2260,8 @@ fn disk_reads_read(fd: linux.fd_t, name: []const u8, file: []const u8, aimed: []
         kept += size;
         var from: usize = 0;
         while (std.mem.indexOfScalarPos(u8, buffer[0..kept], from, '\n')) |end| : (from = end + 1) {
+            // The heal's marker: every read queued before it named, nothing after it traced.
+            if (std.mem.indexOf(u8, buffer[from..end], "tracing_mark_write: " ++ disk_reads_end_marker) != null) return;
             const read = bio_read_line(buffer[from..end]) orelse continue;
             if (read.major != major or read.minor != minor) continue;
             if (extents.len > 0 and !extents_overlap(extents, read.sector, read.sectors)) continue;
@@ -2319,14 +2333,40 @@ fn disk_reads_trace_stop(paths: *const Paths) void {
     const text = read_small(tracer, &text_buffer) orelse return;
     defer _ = linux.unlink(tracer);
     const pid = std.fmt.parseInt(linux.pid_t, std.mem.trim(u8, text, " \n"), 10) catch return;
-    _ = linux.kill(pid, .KILL);
+    const node = std.fs.path.basename(paths.directory);
     var name_buffer: [mapper_name_size]u8 = undefined;
-    const mapper = mapper_name(&name_buffer, std.fs.path.basename(paths.directory)) catch return;
+    const mapper = mapper_name(&name_buffer, node) catch return;
     var instance_buffer: [path_size_max]u8 = undefined;
     const instance = disk_reads_instance(&instance_buffer, mapper) catch return;
     var path_buffer: [path_size_max]u8 = undefined;
+    // Drained, not killed: reads queued just before the heal are still in the instance's
+    // buffer, the reader not yet run. Killed, they were never named, and the instance, removed
+    // while the dying reader held its pipe, stayed with them for the node's next fault to name
+    // as its own (CE43, the Lean replica of determinismo). No read traced from here on, then
+    // the end marker after the last one; the reader names them all and exits at it.
     file_write(print_z(&path_buffer, "{s}/events/block/block_bio_queue/enable", .{instance}) catch return, "0\n") catch {};
-    _ = linux.rmdir(instance);
+    const pidfd = linux.pidfd_open(pid, 0);
+    const watched = linux.errno(pidfd) == .SUCCESS;
+    defer if (watched) {
+        _ = linux.close(@intCast(pidfd));
+    };
+    file_write(print_z(&path_buffer, "{s}/trace_marker", .{instance}) catch return, disk_reads_end_marker ++ "\n") catch {};
+    if (watched and !pid_exited(@intCast(pidfd), disk_reads_drain_ms)) {
+        sdk.event("disk_reads_trace_failed", .{ .node = node, .why = "drain" });
+        _ = linux.kill(pid, .KILL);
+        _ = pid_exited(@intCast(pidfd), disk_reads_drain_ms);
+    }
+    file_write(print_z(&path_buffer, "{s}/tracing_on", .{instance}) catch return, "0\n") catch {};
+    if (linux.errno(linux.rmdir(instance)) != .SUCCESS) {
+        sdk.event("disk_reads_trace_failed", .{ .node = node, .why = "rmdir" });
+    }
+}
+
+/// Whether the process a pidfd refers to exited within `timeout_ms`.
+fn pid_exited(pidfd: linux.fd_t, timeout_ms: i32) bool {
+    var fds = [_]linux.pollfd{.{ .fd = pidfd, .events = linux.POLL.IN, .revents = 0 }};
+    const ready = linux.poll(&fds, fds.len, timeout_ms);
+    return linux.errno(ready) == .SUCCESS and ready == 1;
 }
 
 /// The extents of `file` (a path from the node's root) in its writable layer, as the disk holds
