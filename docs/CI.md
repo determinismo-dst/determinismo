@@ -87,7 +87,9 @@ the timelines that reach new code and serve can tell a job that ran from one tha
   node's `DETERMINISMO_COVERAGE` narrows it). A `sitecustomize` of your own still runs.
 - Other languages: built with their instrumentation (docs/SDKS.md).
 
-An older Python or JVM runs uncovered and says so on standard error.
+An older Python or JVM, or a runtime with no automatic coverage (Node.js, Ruby, PHP, a shell
+script), runs uncovered: the job runs to its end, never stopped by serve's coverage gate, and
+says so on standard error.
 
 ## Running it
 
