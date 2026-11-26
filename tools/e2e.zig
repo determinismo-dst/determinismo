@@ -33,6 +33,8 @@ const Context = struct {
     /// bank's first timeline of seed 3 that loses money (bank_violating_branch), once found.
     bank_violating: ?[]const u8 = null,
     bank_cold_violating: ?[]const []const u8 = null,
+    /// The bank_cold run those timelines are of (its directory: explain reads its tapes).
+    bank_cold_run: ?[]const u8 = null,
 };
 
 /// The first of bank's seed 3 timelines that violates "total balance is conserved", found once
@@ -87,6 +89,10 @@ fn bank_cold_violating_branches(context: *Context) ![]const []const u8 {
     var indexes: std.ArrayList(u32) = .empty;
     var lines = std.mem.tokenizeScalar(u8, report, '\n');
     while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "[determinismo] run ")) {
+            if (std.mem.indexOf(u8, line, ": ")) |colon| context.bank_cold_run = try context.arena.dupe(u8, std.mem.trim(u8, line[colon + 2 ..], " "));
+            continue;
+        }
         if (!std.mem.startsWith(u8, line, "[branch ")) continue;
         if (std.mem.indexOf(u8, line, "FAIL \"total balance is conserved\"") == null) continue;
         const end = std.mem.indexOfScalar(u8, line, ']') orelse continue;
@@ -5001,6 +5007,62 @@ fn sleep_ms(duration_ms: u64) void {
     _ = std.os.linux.nanosleep(&request, null);
 }
 
+/// `determinismo explain` on a violating timeline (causality's): each of its last faults' details
+/// varied against the timeline's control, every verdict over the variants' distinct histories
+/// (each replay's events hash: CE62, the Lean replica of determinismo, round 8), and the same
+/// explanation twice (its variants drawn from the request's seed). No other check runs explain
+/// itself (causality's --explain-exec is another command).
+fn check_explain(context: *Context, branch: []const u8) !void {
+    const arena = context.arena;
+    const run = context.bank_cold_run orelse {
+        expect(context, false, "explain: the bank_cold run's directory (its report's run line)", .{});
+        return error.NoRunDirectory;
+    };
+    const Explained = struct {
+        faults: []const struct {
+            control: ?struct { failing: u32, of: u32 } = null,
+            removed: ?struct { failing: u32, of: u32 } = null,
+            details: []const struct { failing: u32, of: u32, verdict: []const u8 },
+        },
+    };
+    var outputs: [2][]const u8 = undefined;
+    for (&outputs) |*output| {
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(arena, &.{ context.determinismo, "explain" });
+        try argv.appendSlice(arena, context.machine);
+        try argv.appendSlice(arena, &.{
+            "--run",      run, "--branch", branch, "--property", "total balance is conserved", "--faults", "2",
+            "--variants", "4", "--jobs",   "4",    "--json",
+        });
+        const result = try run_kept(context, argv.items);
+        output.* = if (result.term.success()) std.mem.trim(u8, result.stdout, " \n") else "";
+    }
+    const explained = std.json.parseFromSliceLeaky(Explained, arena, outputs[0], .{ .ignore_unknown_fields = true }) catch null;
+    var details: usize = 0;
+    var bounded = true;
+    var known = true;
+    var controlled = true;
+    if (explained) |e| for (e.faults) |fault| {
+        if (fault.control) |control| controlled = controlled and control.of >= 1 and control.of <= 4;
+        if (fault.removed) |removed| bounded = bounded and removed.of >= 1 and removed.of <= 4;
+        for (fault.details) |detail| {
+            details += 1;
+            bounded = bounded and detail.of >= 1 and detail.of <= 4 and detail.failing <= detail.of;
+            var one = false;
+            for ([_][]const u8{ "needed", "partly", "free", "unclear" }) |name| one = one or std.mem.eql(u8, detail.verdict, name);
+            known = known and one;
+        }
+    };
+    expect_all(context, &.{
+        .{ "an explanation (its --json line)", explained != null },
+        .{ "a fault's details varied", details > 0 },
+        .{ "each count its distinct histories, 1 to the 4 variants", bounded },
+        .{ "each control its own histories", controlled },
+        .{ "each verdict one of needed, partly, free, unclear", known },
+        .{ "the same explanation twice", outputs[0].len > 0 and std.mem.eql(u8, outputs[0], outputs[1]) },
+    }, "explain: timeline {s}'s last 2 faults, {d} details, each against its control over distinct histories", .{ branch, details });
+}
+
 /// `--until` (Antithesis's wait_until) stops a branch at its first violation and runs a command
 /// there, the same on every replay; causality analysis measures the failure's probability at
 /// moments before it (certain at the failure itself).
@@ -5076,6 +5138,7 @@ fn check_until_and_causality(context: *Context) !void {
         .{ "certain at the failure", verdict.latest.probability == 1 },
     }, "causality with a verdict (an event condition, no property): {d} moments, certain at the " ++
         "failure ({d:.2})", .{ verdict.moments, verdict.latest.probability });
+    try check_explain(context, cold_branch);
     try check_files(context, &system, violation);
     try check_rewind(context, &system, violation);
 }
