@@ -479,6 +479,9 @@ const Arguments = struct {
     /// log-uniform from a second) as its commands begin, so a system seeding from the time draws
     /// apart in each (det-composer's clock_start). Null: the composer's 30 minutes; 0: none.
     clock_start_max_ms: ?u64 = null,
+    /// `--clock-start-max` as given, for the run's request (serve's analyses boot its timelines
+    /// with it: their guest's command line has it).
+    clock_start_max_text: ?[]const u8 = null,
     /// The longest a scenario's driver phase is drawn in this exploration (its own drive_ms_max,
     /// else --drive-max), null with --timeline or none: the length the explorer steers (Novelty).
     drive_steered_max_ms: ?u64 = null,
@@ -1348,6 +1351,23 @@ fn run_scenario(
     arguments.tape_directory = try std.fs.path.join(arena, &.{ run.directory, "tapes" });
 }
 
+test "a run's request keeps what its guest's command line needs: the wall clock's start" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const kernel = try std.fs.path.joinZ(arena, &.{ directory, "vmlinuz" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = kernel, .data = "a kernel" });
+    var arguments = try parse_arguments(arena, &.{ "determinismo", "explore", "--kernel", kernel, "--clock-start-max", "0" });
+    try run_request_write(arena, io, directory, directory, &arguments);
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(arena, &.{ directory, "request.json" }), arena, .limited(1 << 20));
+    const asked = try std.json.parseFromSliceLeaky(serve.RunRequest, arena, text, .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings("0", asked.clock_start_max.?);
+}
+
 /// A run started here: what was asked (serve's request: the program kept by its content, as
 /// serve keeps it) and the machine it boots (its kernel and initramfs kept the same way).
 /// The run's request and machine; its kernel and initramfs kept, and the run boots those.
@@ -1380,6 +1400,10 @@ fn run_request_write(
         .min_drive = arguments.min_drive_text,
         .drivers_cpu_weight = arguments.drivers_cpu_weight_text,
         .drive_max = arguments.drive_max_text, // In the guest's command line: replays need it.
+        // In the guest's command line too: left out, serve's analyses of a run started with
+        // --clock-start-max 0 booted another guest line, and its tapes were refused
+        // (TapeInputsDiffer, run 2219's causality, 2026-11-26).
+        .clock_start_max = arguments.clock_start_max_text,
         .trace_errno = arguments.trace_errno, // In the guest's command line: replays need it.
         .generation = arguments.generation_size,
         .horizon = arguments.horizon_text,
@@ -1801,6 +1825,7 @@ test "fault exclusions: a pattern det-faults would not take is a usage error; on
     try std.testing.expectEqual(@as(?u64, null), plain.clock_start_max_ms);
     const clock_off = try parse_arguments(arena, &.{ "determinismo", "explore", "--kernel", "vmlinuz", "--clock-start-max", "0" });
     try std.testing.expectEqual(@as(?u64, 0), clock_off.clock_start_max_ms);
+    try std.testing.expectEqualStrings("0", clock_off.clock_start_max_text.?);
     const clock_ten = try parse_arguments(arena, &.{ "determinismo", "explore", "--kernel", "vmlinuz", "--clock-start-max", "10m" });
     try std.testing.expectEqual(@as(?u64, 600_000), clock_ten.clock_start_max_ms);
     try std.testing.expect(std.mem.indexOf(u8, try cmdline_build(arena, "console=ttyS0", &clock_ten, null), "det.clock_start_max_ms=600000") != null);
@@ -9178,6 +9203,7 @@ fn parse_option(
         arguments.egress_allow = entries.items;
     } else if (eql(u8, flag, "--clock-start-max")) {
         arguments.clock_start_max_ms = if (eql(u8, value, "0")) 0 else try duration_parse(value) / std.time.ns_per_ms;
+        arguments.clock_start_max_text = value;
     } else if (eql(u8, flag, "--drive-max")) {
         arguments.drive_max_ms = if (eql(u8, value, "none")) null else try duration_parse(value) / std.time.ns_per_ms;
         arguments.drive_max_text = value;
