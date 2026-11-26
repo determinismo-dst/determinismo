@@ -6942,20 +6942,23 @@ fn check_tree(context: *Context) !void {
     // steering trusts a run's first minute once 5 minutes of it are explored, every judgment
     // halving what came before: with bank's timelines of about 6 s, a generation of 16 explores
     // about 96 s, and the sum never gets there (64 and 128 timelines, none steered, 2026-11-02).
-    // Generations of 48 do after their second judgment.
+    // Generations of 48 did after their second judgment, until a tree's shape varied with the
+    // host's timing: 128 timelines steered 25 once and none the next time, the same binary and
+    // seed (their timelines 7.7 s and 5.4 s on average, 2026-11-26); 192 steered 58, 62 and 63 in
+    // three runs (a third judgment).
     var steered_common = common;
-    steered_common[7] = "128";
+    steered_common[7] = "192";
     const drive_options = [_][]const u8{ "--no-cpu-modulation", "--drive-max", "20s" };
     const driven = try explore(context, &(steered_common ++ drive_options ++ [_][]const u8{
         "--generation", "48", "--jobs", "4", "--tape-dir", drive_tapes, "--record", drive_record,
     }));
-    var driven_branches: [2 * branches_max]Branch = undefined;
+    var driven_branches: [3 * branches_max]Branch = undefined;
     const driven_count = parse_branches(driven, &driven_branches);
     const driven_deep = try deepest_replays(context, program, drive_record, drive_tapes, driven_branches[0..driven_count], &drive_options);
     const steered_tapes = try run_kept(context, &.{ "grep", "-rlF", "the run's novelty curve", drive_tapes });
     const steered_tape_count = std.mem.count(u8, steered_tapes.stdout, "\n");
     expect_all(context, &.{
-        .{ "128 timelines, their driver phases drawn", driven_count == 128 },
+        .{ "192 timelines, their driver phases drawn", driven_count == 192 },
         .{ "the explorer steered some (its overrides in their tapes)", steered_tape_count > 0 },
         .{ "the tree deepens", driven_deep.depth >= 1 },
         .{ "the deepest replays alone from its tape", driven_deep.replays },
