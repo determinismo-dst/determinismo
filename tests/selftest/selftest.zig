@@ -1524,7 +1524,14 @@ fn aimed_corruption(echo: *const sdk.Node) !void {
     var beside_buffer: [32]u8 = undefined;
     const aimed = page_check(echo, "/data/aimed", &aimed_buffer);
     const beside = page_check(echo, "/data/beside", &beside_buffer);
+    const traced = reads_tracer_exists(echo);
     sdk.sleep_ms(fault_ms); // Over: the disk healthy again.
+    // Its read tracer drained and removed: one left behind (its reader killed and the instance
+    // removed while the dying reader held its pipe) kept reads queued before the heal, and the
+    // node's next corrupt_reads named them as its own, with its byte (CE43, the Lean replica of
+    // determinismo).
+    const left = reads_tracer_exists(echo);
+    sdk.always(traced and !left, "a corrupt_reads fault's read tracer is gone once it heals", .{ .traced = traced, .left = left });
     var after_buffer: [32]u8 = undefined;
     const after = page_check(echo, "/data/aimed", &after_buffer);
     sdk.always(written and std.mem.startsWith(u8, aimed, "corrupt") and std.mem.eql(u8, beside, "intact") and
@@ -1563,6 +1570,14 @@ fn rmw_corruption(echo: *const sdk.Node) void {
     const text = std.mem.trim(u8, result.output, " \n");
     const foreign = if (std.mem.startsWith(u8, text, "foreign ")) std.fmt.parseInt(i64, text["foreign ".len..], 10) catch -1 else -1;
     sdk.event("rmw_checked", .{ .written = written, .merged = merged, .foreign = foreign });
+}
+
+/// Whether the node's corrupt_reads tracer (its tracefs instance, guest/runtime/nodes.zig's
+/// disk_reads_instance) exists.
+fn reads_tracer_exists(node: *const sdk.Node) bool {
+    var buffer: [128]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&buffer, "/sys/kernel/tracing/instances/det-reads-det-{s}", .{node.name}, 0) catch return false;
+    return linux.errno(linux.faccessat(linux.AT.FDCWD, path, linux.F_OK, 0)) == .SUCCESS;
 }
 
 fn page_write(node: *const sdk.Node, path: []const u8) bool {

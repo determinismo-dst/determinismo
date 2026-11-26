@@ -7458,6 +7458,8 @@ fn check_disk(context: *Context) !void {
     const aimed_passes = has_lines(report, &.{
         "PASS always                hit in    3/3 branches, failing in    0  a disk fault aimed at one " ++
             "file corrupts its reads alone, until it heals",
+        "PASS always                hit in    3/3 branches, failing in    0  a corrupt_reads fault's " ++
+            "read tracer is gone once it heals",
     });
     // A byte written into an uncached page during corrupt_reads (CE31, the Lean replica of
     // determinismo): the merge's read corrupted, the write-back stores a byte the node never
