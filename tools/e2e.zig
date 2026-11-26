@@ -275,7 +275,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "sites", check_sites },                           .{ "client", check_client },                       .{ "session-exact", check_session_exact },
         .{ "java-watch", check_java_watch },                 .{ "raft-558", check_raft_558 },                   .{ "jvm-caches", check_jvm_caches },
         .{ "guest-panic", check_guest_panic },               .{ "resume-seen", check_resume_seen },             .{ "reserved-run", check_reserved_run },
-        .{ "home", check_home },                             .{ "clock-start", check_clock_start },
+        .{ "home", check_home },                             .{ "clock-start", check_clock_start },             .{ "half-limit-again", check_half_limit_again },
     };
     // A check's whole name runs it alone (check.sh's `ui` ran guidance and quiet too).
     var exact = std.mem.eql(u8, only, "tla");
@@ -9202,6 +9202,35 @@ fn check_slot_wait(context: *Context) !void {
         .{ "drivers stopped starting in some", stopped > 0 },
         .{ "no driver started past the stop", late == 0 },
     }, "slot-wait: {d} starts of the holder, {d} timelines stopped starting, {d} starts past the stop", .{ held, stopped, late });
+}
+
+/// A second driver phase stops its starts at half the timeline limit since the drivers began, as
+/// the first does (CE42, the Lean replica of determinismo): half_limit_again's two 6 s starts a
+/// phase, one slot, a 30 s limit; the second phase (composer.again fixed to yes) begins at 6 s and
+/// its second start waits for the slot to 15 s, then stops. Drawn from the phase's own start, its
+/// stop was 21 s and that start began at 18 s.
+fn check_half_limit_again(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
+    const events = try std.fs.path.join(context.arena, &.{ context.scratch, "half-limit-again-events" });
+    const report = try explore(context, &.{
+        "--program",        program, "--scenario",  "half_limit_again", "--seed",       "1",    "--branches", "4",
+        "--timeline-limit", "30s",   "--branching", "flat",             "--events-dir", events, "--decide",   "composer.again=1,composer.starts_log2=0,composer.starts=0,composer.load=steady",
+    });
+    var branches: [4]Branch = undefined;
+    const count = parse_branches(report, &branches);
+    const starts = try query_count(context, &.{ events, "event=command_start and details.name=six_seconds" });
+    const stopped = try query_count(context, &.{ events, "event=drivers_stopped" });
+    const late = try query_count(context, &.{
+        events,              "event=command_start",
+        "--not-preceded-by", "event=faults_phase and details.state=start",
+        "--within",          "15",
+    });
+    expect_all(context, &.{
+        .{ "4 timelines", count == 4 },
+        .{ "a second phase started a driver", starts > 2 },
+        .{ "the second phase stopped starting at the stop", stopped > 0 },
+        .{ "no driver started past half the limit", late == 0 },
+    }, "half-limit-again: {d} starts, {d} timelines stopped starting, {d} starts past half the limit", .{ starts, stopped, late });
 }
 
 /// A start that died of its own SIGKILL is judged by its status (137), never reported as the

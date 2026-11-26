@@ -169,6 +169,7 @@ pub fn main(init: std.process.Init) !void {
             .aim = aim_scenario,
             .slow = slow_scenario,
             .slot_wait = slot_wait_scenario,
+            .half_limit_again = half_limit_again_scenario,
             .sought = sought_scenario,
             .streak = streak_scenario,
             .streak_blind = streak_blind_scenario,
@@ -2129,6 +2130,21 @@ fn holding_driver(_: *System.Context) !void {
 
 fn next_driver(_: *System.Context) !void {
     sdk.sleep_ms(100);
+}
+
+/// One slot and a 6 s driver: with two starts a phase, the first phase ends at 6 s, under a
+/// quarter of a 30 s limit, and a second phase is asked for (an objective's return: e2e fixes
+/// composer.again). Its starts stop at half the limit since the drivers began, as the first
+/// phase's do: the second phase's stop drawn from its own start let a start in at 18 s of a 15 s
+/// stop (CE42, the Lean replica of determinismo).
+fn half_limit_again_scenario(s: *System.Scenario) void {
+    s.faults = false;
+    s.parallel_max = 1;
+    s.parallel_driver("six_seconds", six_seconds_driver);
+}
+
+fn six_seconds_driver(_: *System.Context) !void {
+    sdk.sleep_ms(6 * std.time.ms_per_s);
 }
 
 /// Half the timelines reach a marked state (a `sometimes` made true), among the selftest's other
