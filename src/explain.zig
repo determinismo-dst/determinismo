@@ -6,6 +6,13 @@
 //!   determinismo explain <machine and system options> (--tape <tape> | --run <dir> --branch <n>)
 //!       --property '<message>' [--faults <k>] [--variants <m>] [--jobs <j>] [--json]
 //!       [--seed-variants <s>]   (the variants' values: 1 by default, the same explanation again)
+//!       [--draw <name>[=<v>,<v>...]]...   (a named draw of the scenario's own, varied too)
+//!
+//! A scenario's own requests are drawn by its workload (a clock step's size, whether a driver
+//! acts): `--draw <name>` varies that named draw's last pull before the failure as a fault's
+//! details are (m fresh values, against the control), and `--draw <name>=0,1000` sets it to each
+//! value given instead, m times each: "the step removed, or under twice the interval" (Datomic's
+//! #3, whose step explain could not vary). The guest takes each value modulo the draw's range.
 //!
 //! A fault is a decision of named pulls (guest/runtime/faults.zig): its kind (`fault.kind`, by the
 //! timeline's weights), which one (`fault`), its length, and the wait to the next (`fault.wait_ns`).
@@ -51,6 +58,24 @@ const Request = struct {
     seed: u64 = 1,
     /// The explore options every replay is given (machine, system, `--run`).
     rest: []const []const u8,
+    /// Named draws of the scenario's own to vary (`--draw`), beside the faults.
+    draws: []const DrawAsked = &.{},
+};
+
+pub const DrawAsked = struct {
+    name: []const u8,
+    /// The values to set it to, each m times; none: m fresh values.
+    values: []const u64 = &.{},
+
+    pub fn parse(arena: std.mem.Allocator, text: []const u8) !DrawAsked {
+        const equals = std.mem.indexOfScalar(u8, text, '=') orelse return .{ .name = text };
+        if (equals == 0) return error.Usage;
+        var values: std.ArrayList(u64) = .empty;
+        var parts = std.mem.tokenizeScalar(u8, text[equals + 1 ..], ',');
+        while (parts.next()) |part| try values.append(arena, try std.fmt.parseInt(u64, part, 0));
+        if (values.items.len == 0) return error.Usage;
+        return .{ .name = text[0..equals], .values = values.items };
+    }
 };
 
 pub const Draw = struct {
@@ -63,6 +88,8 @@ pub const Draw = struct {
     option: ?[]const u8 = null,
     /// Every option's name, for a decision among options.
     options: ?[]const []const u8 = null,
+    /// A value its variants set it to (`--draw <name>=<values>`), instead of fresh ones.
+    set: ?u64 = null,
 
     fn fault(draw: Draw) bool {
         return std.mem.startsWith(u8, draw.name, "fault");
@@ -124,6 +151,34 @@ pub fn decisions_of(arena: std.mem.Allocator, draws: []const Draw, complete_from
         } else if (current.items.len > 0) try current.append(arena, draw);
     }
     if (current.items.len > 0 and current.items[0].pull >= complete_from) try decisions.append(arena, current.items);
+    return decisions.items;
+}
+
+/// Each named draw asked for (`--draw`): its last pull before the failure as a decision of its
+/// own, one detail per value to set (or one of fresh values). error.DrawNotFound when the
+/// timeline drew none by that name before it fails.
+pub fn named_decisions(arena: std.mem.Allocator, draws: []const Draw, asked: []const DrawAsked) ![]const []const Draw {
+    var decisions: std.ArrayList([]const Draw) = .empty;
+    for (asked) |wanted| {
+        var last: ?Draw = null;
+        for (draws) |draw| if (std.mem.eql(u8, draw.name, wanted.name)) {
+            last = draw;
+        };
+        const found = last orelse {
+            std.debug.print("[determinismo] explain: no draw named '{s}' before the failure\n", .{wanted.name});
+            return error.DrawNotFound;
+        };
+        if (wanted.values.len == 0) {
+            try decisions.append(arena, try arena.dupe(Draw, &.{found}));
+            continue;
+        }
+        const details = try arena.alloc(Draw, wanted.values.len);
+        for (details, wanted.values) |*detail, value| {
+            detail.* = found;
+            detail.set = value;
+        }
+        try decisions.append(arena, details);
+    }
     return decisions.items;
 }
 
@@ -373,6 +428,7 @@ pub fn run(
         index -= 1;
         if (is_fault(decisions[index])) try chosen.append(arena, decisions[index]);
     }
+    try chosen.appendSlice(arena, try named_decisions(arena, read.draws, request.draws));
     if (chosen.items.len == 0) {
         // No fault decided before it fails, or only restores: it needs none (an answer).
         var buffer: [4096]u8 = undefined;
@@ -454,7 +510,7 @@ pub fn run(
                 .fault = @intCast(at),
                 .what = .detail,
                 .draw = @intCast(draw_index),
-                .overrides = .{ .{ .pull = draw.pull, .value = random.int(u64) }, none },
+                .overrides = .{ .{ .pull = draw.pull, .value = draw.set orelse random.int(u64) }, none },
             });
         };
     }
@@ -538,6 +594,8 @@ fn regime_at(regimes: []const Regime, vtime_ns: u64) ?Regime {
 
 /// What a decision picked (its `fault` draw's option: "restart etcd-3", "partition_groups").
 fn pick_of(decision: []const Draw) []const u8 {
+    // A named draw of the scenario's own (`--draw`): its name.
+    if (!decision[0].fault()) return decision[0].name;
     for (decision) |draw| if (std.mem.eql(u8, draw.name, "fault")) return draw.option orelse "?";
     return "?";
 }
@@ -599,6 +657,8 @@ const Explained = struct {
             draw: []const u8,
             pull: u64,
             drew: u64,
+            /// The value its variants set it to (`--draw <name>=<values>`).
+            set: ?u64 = null,
             option: ?[]const u8,
             failing: u32,
             of: u32,
@@ -621,6 +681,7 @@ fn explained_of(arena: std.mem.Allocator, request: *const Request, r: Report) !E
                 .draw = draw.name,
                 .pull = draw.pull,
                 .drew = draw.value,
+                .set = draw.set,
                 .option = draw.option,
                 .failing = tally.failing,
                 .of = tally.of,
@@ -690,9 +751,10 @@ fn report(arena: std.mem.Allocator, out: *std.Io.Writer, request: *const Request
         }
         for (fault.details) |detail| {
             var number: [24]u8 = undefined;
-            try out.print("  {s:<20} drew {s:>16}: {d} of {d} fail: {s}\n", .{
+            try out.print("  {s:<20} {s} {s:>16}: {d} of {d} fail: {s}\n", .{
                 detail.draw,
-                if (detail.option) |option| option else try std.fmt.bufPrint(&number, "{d}", .{detail.drew}),
+                if (detail.set != null) "set " else "drew",
+                if (detail.set) |set| try std.fmt.bufPrint(&number, "{d}", .{set}) else if (detail.option) |option| option else try std.fmt.bufPrint(&number, "{d}", .{detail.drew}),
                 detail.failing,
                 detail.of,
                 @tagName(detail.verdict),
@@ -717,6 +779,7 @@ fn arguments_parse(arena: std.mem.Allocator, arguments: []const [:0]const u8) !R
     var run_directory: ?[]const u8 = null;
     var branch: ?[]const u8 = null;
     var tape: ?[]const u8 = null;
+    var draws: std.ArrayList(DrawAsked) = .empty;
     var index: usize = 0;
     while (index < arguments.len) : (index += 1) {
         const flag = arguments[index];
@@ -727,7 +790,7 @@ fn arguments_parse(arena: std.mem.Allocator, arguments: []const [:0]const u8) !R
         }
         const ours = eql(u8, flag, "--property") or eql(u8, flag, "--faults") or
             eql(u8, flag, "--variants") or eql(u8, flag, "--jobs") or eql(u8, flag, "--tape") or
-            eql(u8, flag, "--branch") or eql(u8, flag, "--seed-variants");
+            eql(u8, flag, "--branch") or eql(u8, flag, "--seed-variants") or eql(u8, flag, "--draw");
         if (!ours) {
             try rest.append(arena, flag);
             // The run's own options (explore --run): its tapes are beside them.
@@ -753,6 +816,8 @@ fn arguments_parse(arena: std.mem.Allocator, arguments: []const [:0]const u8) !R
             tape = value;
         } else if (eql(u8, flag, "--branch")) {
             branch = value;
+        } else if (eql(u8, flag, "--draw")) {
+            try draws.append(arena, try DrawAsked.parse(arena, value));
         } else {
             request.seed = try std.fmt.parseInt(u64, value, 10);
         }
@@ -765,6 +830,7 @@ fn arguments_parse(arena: std.mem.Allocator, arguments: []const [:0]const u8) !R
     if (request.faults == 0 or request.faults > faults_max) return error.Usage;
     if (request.variants == 0 or request.variants > variants_max) return error.Usage;
     request.rest = rest.items;
+    request.draws = draws.items;
     return request;
 }
 
@@ -825,6 +891,33 @@ test "decisions without kind weights start at their pick; removal picks restore"
     const removed = removal(decisions[0], &.{}).?;
     try std.testing.expectEqual(@as(u64, 50), removed.pull);
     try std.testing.expectEqual(@as(u64, 1), removed.value);
+}
+
+test "a scenario's own named draw is varied as a decision: fresh values, or each value set" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const draws = [_]Draw{
+        .{ .pull = 10, .after_ns = 1, .name = "clock_step.ms", .count = 8000, .value = 4100 },
+        .{ .pull = 20, .after_ns = 2, .name = "fault.kind", .count = 10, .value = 3 },
+        .{ .pull = 30, .after_ns = 3, .name = "clock_step.ms", .count = 8000, .value = 5200 },
+        .{ .pull = 40, .after_ns = 4, .name = "retry.jitter-ms", .count = 100, .value = 7 },
+    };
+    // Its last pull before the failure, fresh values.
+    const fresh = try named_decisions(arena, &draws, &.{.{ .name = "clock_step.ms" }});
+    try std.testing.expectEqual(@as(usize, 1), fresh.len);
+    try std.testing.expectEqual(@as(u64, 30), fresh[0][0].pull);
+    try std.testing.expectEqual(@as(?u64, null), fresh[0][0].set);
+    try std.testing.expectEqualStrings("clock_step.ms", pick_of(fresh[0]));
+    // Each value set: one detail each, at that pull.
+    const asked = try DrawAsked.parse(arena, "clock_step.ms=0,1000");
+    const set = try named_decisions(arena, &draws, &.{asked});
+    try std.testing.expectEqual(@as(usize, 2), set[0].len);
+    try std.testing.expectEqual(@as(?u64, 0), set[0][0].set);
+    try std.testing.expectEqual(@as(?u64, 1000), set[0][1].set);
+    try std.testing.expectEqual(@as(u64, 30), set[0][1].pull);
+    try std.testing.expectError(error.DrawNotFound, named_decisions(arena, &draws, &.{.{ .name = "absent" }}));
+    try std.testing.expectError(error.Usage, DrawAsked.parse(arena, "clock_step.ms="));
 }
 
 test variant_tape {

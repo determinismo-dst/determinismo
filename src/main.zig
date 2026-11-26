@@ -317,6 +317,8 @@ const usage =
     \\                            [--jobs <j>] [--json]   (which details of the failure's last k
     \\                            faults it needed: each drawn again m times against a
     \\                            control; see explain.zig)
+    \\                            [--draw <name>[=<v>,<v>...]]   (a named draw of the scenario's
+    \\                            own varied too, or set to each value: a clock step's size)
     \\       determinismo extract <options> --branch <n> (--at-vtime-ms <ms> | --until '<cond>')
     \\                            --file <node>:<path> --to <local file>
     \\       determinismo inject  <options> --branch <n> (--at-vtime-ms <ms> | --until '<cond>')
