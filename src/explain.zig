@@ -11,7 +11,8 @@
 //! A scenario's own requests are drawn by its workload (a clock step's size, whether a driver
 //! acts): `--draw <name>` varies that named draw's last pull before the failure as a fault's
 //! details are (m fresh values, against the control), and `--draw <name>=0,1000` sets it to each
-//! value given instead, m times each: "the step removed, or under twice the interval" (Datomic's
+//! value given instead, m times each with the control's draw varied beside it (one tape replays
+//! one history), once with no control: "the step removed, or under twice the interval" (Datomic's
 //! #3, whose step explain could not vary). The guest takes each value modulo the draw's range.
 //!
 //! A fault is a decision of named pulls (guest/runtime/faults.zig): its kind (`fault.kind`, by the
@@ -480,41 +481,9 @@ pub fn run(
 
     // 4. The variants: per fault a control, the fault removed, each pull m times.
     var prng: std.Random.DefaultPrng = .init(request.seed);
-    const random = prng.random();
-    var items: std.ArrayList(Item) = .empty;
-    const controls = try arena.alloc(?Draw, chosen.items.len);
-    for (chosen.items, 0..) |decision, at| {
-        const last = decision[decision.len - 1].pull;
-        controls[at] = for (read.draws) |draw| {
-            if (draw.pull > last and !draw.fault() and draw.count > 1) break draw;
-        } else null;
-        const none: Override = .{ .pull = 0, .value = 0 };
-        if (controls[at]) |control| for (0..request.variants) |_| {
-            try items.append(arena, .{ .fault = @intCast(at), .what = .control, .overrides = .{ .{ .pull = control.pull, .value = random.int(u64) }, none } });
-        };
-        // The fault removed, as often as each detail: with the control's draw varied too (the same
-        // nudge as the control's), so its failures compare with the control's; once without one.
-        if (removal(decision, regimes)) |removed| {
-            const fault_removed: Override = .{ .pull = removed.pull, .value = removed.value };
-            if (controls[at]) |control| {
-                // (A for's else runs when the loop ends: braces keep this one the if's.)
-                for (0..request.variants) |_| {
-                    try items.append(arena, .{ .fault = @intCast(at), .what = .removed, .count = 2, .overrides = .{
-                        fault_removed, .{ .pull = control.pull, .value = random.int(u64) },
-                    } });
-                }
-            } else try items.append(arena, .{ .fault = @intCast(at), .what = .removed, .overrides = .{ fault_removed, none } });
-        }
-        for (decision, 0..) |draw, draw_index| for (0..request.variants) |_| {
-            try items.append(arena, .{
-                .fault = @intCast(at),
-                .what = .detail,
-                .draw = @intCast(draw_index),
-                .overrides = .{ .{ .pull = draw.pull, .value = draw.set orelse random.int(u64) }, none },
-            });
-        };
-    }
-    const results = try arena.alloc(Result, items.items.len);
+    const varied = try variant_items(arena, chosen.items, read.draws, regimes, request.variants, prng.random());
+    const controls = varied.controls;
+    const results = try arena.alloc(Result, varied.items.len);
     @memset(results, .{});
     var explanation: Explanation = .{
         .arena = arena,
@@ -525,7 +494,7 @@ pub fn run(
         .snapshot = snapshot,
         .until = until,
         .directory = directory,
-        .items = items.items,
+        .items = varied.items,
         .results = results,
     };
     // The unchanged tape first: from the snapshot it must fail as it did from the start.
@@ -566,6 +535,65 @@ pub fn run(
     });
     try out.flush();
     return 0;
+}
+/// Step 4's variants: per fault decision a control (its first other draw after it, varied m times:
+/// the timeline's own chance of failing again once its history parts there), the fault removed
+/// (with the control's draw varied too, so its failures compare with the control's; once without
+/// one), and each of its pulls m times (fresh values, or a value set by `--draw <name>=<v>`).
+pub fn variant_items(arena: std.mem.Allocator, chosen: []const []const Draw, draws: []const Draw, regimes: []const Regime, variants: u32, random: std.Random) !struct { items: []const Item, controls: []const ?Draw } {
+    var items: std.ArrayList(Item) = .empty;
+    const controls = try arena.alloc(?Draw, chosen.len);
+    for (chosen, 0..) |decision, at| {
+        const last = decision[decision.len - 1].pull;
+        controls[at] = for (draws) |draw| {
+            if (draw.pull > last and !draw.fault() and draw.count > 1) break draw;
+        } else null;
+        const none: Override = .{ .pull = 0, .value = 0 };
+        if (controls[at]) |control| for (0..variants) |_| {
+            try items.append(arena, .{ .fault = @intCast(at), .what = .control, .overrides = .{ .{ .pull = control.pull, .value = random.int(u64) }, none } });
+        };
+        // The fault removed, as often as each detail: with the control's draw varied too (the same
+        // nudge as the control's), so its failures compare with the control's; once without one.
+        if (removal(decision, regimes)) |removed| {
+            const fault_removed: Override = .{ .pull = removed.pull, .value = removed.value };
+            if (controls[at]) |control| {
+                // (A for's else runs when the loop ends: braces keep this one the if's.)
+                for (0..variants) |_| {
+                    try items.append(arena, .{ .fault = @intCast(at), .what = .removed, .count = 2, .overrides = .{
+                        fault_removed, .{ .pull = control.pull, .value = random.int(u64) },
+                    } });
+                }
+            } else try items.append(arena, .{ .fault = @intCast(at), .what = .removed, .overrides = .{ fault_removed, none } });
+        }
+        for (decision, 0..) |draw, draw_index| {
+            const set = draw.set orelse {
+                for (0..variants) |_| try items.append(arena, .{
+                    .fault = @intCast(at),
+                    .what = .detail,
+                    .draw = @intCast(draw_index),
+                    .overrides = .{ .{ .pull = draw.pull, .value = random.int(u64) }, none },
+                });
+                continue;
+            };
+            // A value set (`--draw <name>=<v>`) is one tape: replayed m times from the snapshot it
+            // is one history, which step 5 would count as m samples (a value whose one history did
+            // not fail read "needed" against a control failing 5 of 6: CE57, the Lean replica of
+            // determinismo). Its m variants vary the control's draw beside it, as the removal's
+            // do, so each is a history of its own that compares with the control's; with no
+            // control, it is run once.
+            const fixed: Override = .{ .pull = draw.pull, .value = set };
+            if (controls[at]) |control| {
+                for (0..variants) |_| try items.append(arena, .{
+                    .fault = @intCast(at),
+                    .what = .detail,
+                    .draw = @intCast(draw_index),
+                    .count = 2,
+                    .overrides = .{ fixed, .{ .pull = control.pull, .value = random.int(u64) } },
+                });
+            } else try items.append(arena, .{ .fault = @intCast(at), .what = .detail, .draw = @intCast(draw_index), .overrides = .{ fixed, none } });
+        }
+    }
+    return .{ .items = items.items, .controls = controls };
 }
 
 /// The pull and value that make a decision a restore: its kind drawn into the regime's restore
@@ -918,6 +946,43 @@ test "a scenario's own named draw is varied as a decision: fresh values, or each
     try std.testing.expectEqual(@as(u64, 30), set[0][1].pull);
     try std.testing.expectError(error.DrawNotFound, named_decisions(arena, &draws, &.{.{ .name = "absent" }}));
     try std.testing.expectError(error.Usage, DrawAsked.parse(arena, "clock_step.ms="));
+}
+
+test "a set value's m variants are m histories, each with the control's draw varied beside it" {
+    // `--draw <name>=<v>` once made m identical tapes of one value: one deterministic replay
+    // judged as m samples, so a value whose one history did not fail read "needed" (0 of m)
+    // against a control failing 5 of 6 (CE57, the Lean replica of determinismo, round 7).
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const draws = [_]Draw{
+        .{ .pull = 10, .after_ns = 1, .name = "clock_step.ms", .count = 8001, .value = 4100 },
+        .{ .pull = 20, .after_ns = 2, .name = "retry.jitter-ms", .count = 100, .value = 7 },
+    };
+    const asked = try DrawAsked.parse(arena, "clock_step.ms=0,1000");
+    const decisions = try named_decisions(arena, &draws, &.{asked});
+    var prng: std.Random.DefaultPrng = .init(1);
+    const varied = try variant_items(arena, decisions, &draws, &.{}, 6, prng.random());
+    try std.testing.expectEqual(@as(u64, 20), varied.controls[0].?.pull);
+    for (0..2) |value_index| {
+        var tapes: std.ArrayList([2]Override) = .empty;
+        for (varied.items) |item| {
+            if (item.what != .detail or item.draw != value_index) continue;
+            try std.testing.expectEqual(@as(u64, if (value_index == 0) 0 else 1000), item.overrides[0].value);
+            try std.testing.expectEqual(@as(u8, 2), item.count);
+            try std.testing.expectEqual(@as(u64, 20), item.overrides[1].pull);
+            for (tapes.items) |seen| try std.testing.expect(seen[1].value != item.overrides[1].value);
+            try tapes.append(arena, item.overrides);
+        }
+        try std.testing.expectEqual(@as(usize, 6), tapes.items.len);
+    }
+    // Without a control there is one history a value: it is run once.
+    const alone = [_]Draw{.{ .pull = 10, .after_ns = 1, .name = "clock_step.ms", .count = 8001, .value = 4100 }};
+    const alone_decisions = try named_decisions(arena, &alone, &.{asked});
+    const once = try variant_items(arena, alone_decisions, &alone, &.{}, 6, prng.random());
+    var details: usize = 0;
+    for (once.items) |item| details += @intFromBool(item.what == .detail);
+    try std.testing.expectEqual(@as(usize, 2), details);
 }
 
 test variant_tape {
