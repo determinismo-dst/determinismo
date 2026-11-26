@@ -2253,8 +2253,11 @@ const SummaryHeader = extern struct {
     format: u8 = summary_format,
     /// 1: `jitter_seed` is its own clock (Summary.jitter_seed); 0: the run's.
     own_clock: u8 = 0,
-    reserved: [5]u8 = @splat(0),
+    /// 1: `seed` is the seed it ran with (Summary.seed).
+    own_seed: u8 = 0,
+    reserved: [4]u8 = @splat(0),
     jitter_seed: u64 = 0,
+    seed: u64 = 0,
 };
 
 /// Bumped whenever Events.Behavior changes. 1: `sought`. 2: `score`. (SummaryHeader's own
@@ -2332,8 +2335,8 @@ fn persisted_hash(comptime T: type, hasher: *std.hash.Wyhash) void {
 test "what an explorer persists changes only with runs.state_format" {
     // A failure here: the layout changed. Bump runs.state_format and set both below to the new
     // values (a run made before then resumes on its own explorer, never on one that misreads it).
-    try std.testing.expectEqual(@as(u32, 3), runs.state_format);
-    try std.testing.expectEqual(@as(u64, 5359976621188398076), persisted_layout);
+    try std.testing.expectEqual(@as(u32, 4), runs.state_format);
+    try std.testing.expectEqual(@as(u64, 1251832480649796883), persisted_layout);
 }
 
 fn summary_write(fd: linux.fd_t, summary: *const Summary) void {
@@ -2347,6 +2350,8 @@ fn summary_write(fd: linux.fd_t, summary: *const Summary) void {
         .cut = @intFromBool(summary.cut),
         .own_clock = @intFromBool(summary.jitter_seed != null),
         .jitter_seed = summary.jitter_seed orelse 0,
+        .own_seed = @intFromBool(summary.seed != null),
+        .seed = summary.seed orelse 0,
     };
     const behaviors = std.mem.sliceAsBytes(summary.behaviors[0..summary.behavior_count]);
     const vectors = [_]std.posix.iovec_const{
@@ -2381,6 +2386,7 @@ fn summary_load(summary: *Summary, bytes: []const u8) void {
     summary.last_pull_ns = header.last_pull_ns;
     summary.cut = header.cut != 0;
     summary.jitter_seed = if (header.own_clock != 0) header.jitter_seed else null;
+    summary.seed = if (header.own_seed != 0) header.seed else null;
     summary.ended_early = false;
     summary.again_ns = null;
     summary.holder_count = 0; // Gone with the run: its moments are made again by replay.
@@ -3925,6 +3931,9 @@ const Summary = struct {
     /// Its own clock (Planned.jitter_seed), which its strategy may have chosen in the worker:
     /// the tree gives it to the timelines it plans from this one.
     jitter_seed: ?u64 = null,
+    /// The seed it ran with (Planned.seed, its strategy's choice at its branch if any): the
+    /// plan's once judged, so its children's chains replay it as it ran (plan_adopt_ran).
+    seed: ?u64 = null,
 
     const failing_max = 16;
 };
@@ -3948,6 +3957,7 @@ const Summaries = struct {
         summaries.count += 1;
         summary.index = place.index;
         summary.jitter_seed = place.jitter_seed;
+        summary.seed = place.seed;
         summary.start_ns = place.snapshot.tsc / (cpuid_tsc_hz / std.time.ns_per_s);
         summary.end_ns = if (vm.moment()) |moment| moment.vtime_ns else |_| summary.start_ns;
         summary.behavior_count = vm.events.behavior_count;
@@ -6359,6 +6369,31 @@ fn judge_plan_one(arena: std.mem.Allocator, branches: Branches, state: *TreeStat
 /// A generation judged up to its nodes, started (tree_judge_poll collects them, tree_judge_end
 /// plans their branches); its summaries and plan the Judging's, the batch's spare ones the next
 /// generation's.
+/// Each judged timeline's clock and seed as its worker ran them (its strategy may have chosen
+/// them there): the plan's, which the timelines planned from it inherit, so a child's chain
+/// replays its parent as it ran. The seed stayed the plan's: a strategy's seed's children
+/// replayed another parent, and a node made by replay was a state the parent never had (CE23,
+/// the blind Lean replica of the platform).
+fn plan_adopt_ran(plan: []Planned, done: []const *const Summary) void {
+    for (done) |summary| for (plan) |*entry| {
+        if (entry.index != summary.index) continue;
+        if (summary.jitter_seed) |jitter| entry.jitter_seed = jitter;
+        if (summary.seed) |seed| entry.seed = seed;
+    };
+}
+
+test "a judged timeline's plan has the seed it ran with: its children's chain replays it" {
+    const summary = try std.testing.allocator.create(Summary);
+    defer std.testing.allocator.destroy(summary);
+    summary.index = 3;
+    summary.jitter_seed = null;
+    summary.seed = 0x42; // Its strategy's, at its branch.
+    var plan = [_]Planned{.{ .index = 3, .seed = 7, .snapshot = undefined }};
+    const done = [_]*const Summary{summary};
+    plan_adopt_ran(&plan, &done);
+    try std.testing.expectEqual(@as(u64, 0x42), plan[0].seed);
+}
+
 fn tree_judge_begin(
     context: Context,
     vm: *VM,
@@ -6402,11 +6437,7 @@ fn tree_judge_begin(
         entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
     };
     state.novelty.judge(done, &state.seen);
-    // Each timeline's clock as its worker ran it (its strategy may have chosen it there): the
-    // plan's, which the timelines planned from it inherit.
-    for (done) |summary| if (summary.jitter_seed) |jitter| for (plan.items) |*entry| {
-        if (entry.index == summary.index) entry.jitter_seed = jitter;
-    };
+    plan_adopt_ran(plan.items, done);
     for (done) |summary| try archive_add(arena, state, plan.items, summary);
     var candidate_count: u32 = 0;
     const generation_seed = state.base ^ (@as(u64, generation) *% 0x9e3779b97f4a7c15);
