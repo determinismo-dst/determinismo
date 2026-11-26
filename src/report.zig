@@ -39,9 +39,8 @@ pub const Recorded = struct {
     failure: ?Events.Moment = null,
 };
 
-/// The record line's room for a timeline's properties: a line past record_line_size_max is
-/// dropped whole, so the ones past this are left out and the line says so (properties_all).
-const recorded_bytes_max = 40 * 1024;
+/// Every property a timeline evaluated, for its record line (line_write writes a line of any
+/// size whole: properties_all is true but in an older record's lines).
 var recorded_buffer: [Events.property_count_max]Recorded = undefined;
 
 pub fn record(value: anytype) void {
@@ -52,9 +51,50 @@ pub fn record(value: anytype) void {
 fn line_write(fd: std.os.linux.fd_t, value: anytype) void {
     var buffer: [record_line_size_max]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
-    std.json.Stringify.value(value, .{}, &writer) catch return; // Too large: dropped.
-    writer.writeAll("\n") catch return;
-    _ = std.os.linux.write(fd, writer.buffered().ptr, writer.buffered().len);
+    std.json.Stringify.value(value, .{}, &writer) catch return line_write_large(fd, value);
+    writer.writeAll("\n") catch return line_write_large(fd, value);
+    line_bytes_write(fd, writer.buffered());
+}
+
+/// A line past record_line_size_max (a timeline's every property: a CI shard's thousands of
+/// tests), written whole from the heap. Dropped, a resume lost what it said (CE46, the blind
+/// Lean replica of the platform: the properties past the line's room were left out).
+fn line_write_large(fd: std.os.linux.fd_t, value: anytype) void {
+    var out: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer out.deinit();
+    std.json.Stringify.value(value, .{}, &out.writer) catch return;
+    out.writer.writeAll("\n") catch return;
+    line_bytes_write(fd, out.written());
+}
+
+/// One write of the whole line (the record's fd is O_APPEND: lines of several workers never
+/// interleave), retried only when interrupted.
+fn line_bytes_write(fd: std.os.linux.fd_t, bytes: []const u8) void {
+    while (true) {
+        const result = std.os.linux.write(fd, bytes.ptr, bytes.len);
+        if (std.os.linux.errno(result) == .INTR) continue;
+        return;
+    }
+}
+
+test "a record line past the line's room is written whole" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, ".zig-cache/tmp/{s}/record.jsonl", .{&tmp.sub_path}, 0);
+    defer std.testing.allocator.free(path_z);
+    const path: []const u8 = path_z;
+    const opened = std.os.linux.open(path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, 0o644);
+    try std.testing.expect(std.os.linux.errno(opened) == .SUCCESS);
+    const fd: std.os.linux.fd_t = @intCast(opened);
+    const long = try std.testing.allocator.alloc(u8, 3 * record_line_size_max);
+    defer std.testing.allocator.free(long);
+    @memset(long, 'm');
+    line_write(fd, .{ .branch = .{ .message = long } });
+    _ = std.os.linux.close(fd);
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, std.testing.allocator, .limited(1 << 24));
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(text.len > long.len and text[text.len - 1] == '\n');
 }
 
 fn hex(value: u64) [16]u8 {
@@ -511,16 +551,8 @@ pub const Multiverse = struct {
             .{ state.overshoots, state.throttles, state.late_steps },
         ) catch {};
         var recorded_count: usize = 0;
-        var recorded_bytes: usize = 0;
-        var recorded_all = true;
         for (vm.events.properties[0..vm.events.property_count]) |*property| {
             if (property.hits == 0) continue;
-            const size = property.name().len + 128;
-            if (recorded_bytes + size > recorded_bytes_max) {
-                recorded_all = false;
-                continue;
-            }
-            recorded_bytes += size;
             recorded_buffer[recorded_count] = .{
                 .message = property.name(),
                 .hash = property.message_hash,
@@ -553,7 +585,7 @@ pub const Multiverse = struct {
             .guest_hash = &hex(guest_hash),
             .failing = failing_names[0..failing_count],
             .properties = recorded_buffer[0..recorded_count],
-            .properties_all = recorded_all,
+            .properties_all = true,
             .path = branch.path,
             .extends = branch.extends,
             .generation = branch.generation,
