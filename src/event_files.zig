@@ -92,12 +92,65 @@ pub fn compress(directory: []const u8, index: u32) !void {
     _ = linux.unlink(plain);
 }
 
-fn compress_fd(input: linux.fd_t, output: linux.fd_t) !void {
+/// `bytes` compressed into `target` (one frame, as an ended timeline's events are), written beside
+/// it first and renamed into place, so a reader never sees half of it.
+pub fn compress_bytes(target: []const u8, bytes: []const u8) !void {
+    var temporary_buffer: [4096]u8 = undefined;
+    const temporary = try std.fmt.bufPrintSentinel(&temporary_buffer, "{s}{s}", .{ target, temporary_suffix }, 0);
+    var target_buffer: [4096]u8 = undefined;
+    const target_z = try std.fmt.bufPrintSentinel(&target_buffer, "{s}", .{target}, 0);
+    const output = linux.open(temporary, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);
+    if (linux.errno(output) != .SUCCESS) return error.EventsUnwritable;
+    errdefer _ = linux.unlink(temporary);
+    {
+        defer _ = linux.close(@intCast(output));
+        const context = try compression_context();
+        defer _ = ZSTD_freeCCtx(context);
+        const out_bytes = try std.heap.page_allocator.alloc(u8, @max(ZSTD_CStreamOutSize(), chunk_size));
+        defer std.heap.page_allocator.free(out_bytes);
+        var in: InBuffer = .{ .src = bytes.ptr, .size = bytes.len, .pos = 0 };
+        while (true) {
+            var out: OutBuffer = .{ .dst = out_bytes.ptr, .size = out_bytes.len, .pos = 0 };
+            const left = ZSTD_compressStream2(context, &out, &in, e_end);
+            if (ZSTD_isError(left) != 0) return error.Compression;
+            try write_all(@intCast(output), out_bytes[0..out.pos]);
+            if (left == 0) break;
+        }
+    }
+    if (linux.errno(linux.rename(temporary, target_z)) != .SUCCESS) return error.EventsUnwritable;
+}
+
+fn compression_context() !*CCtx {
     const context = ZSTD_createCCtx() orelse return error.OutOfMemory;
-    defer _ = ZSTD_freeCCtx(context);
+    errdefer _ = ZSTD_freeCCtx(context);
     if (ZSTD_isError(ZSTD_CCtx_setParameter(context, c_compression_level, level)) != 0) return error.Compression;
     // A checksum in each frame, for `zstd -t` (Zig's reader leaves it unverified: decompress).
     if (ZSTD_isError(ZSTD_CCtx_setParameter(context, c_checksum_flag, 1)) != 0) return error.Compression;
+    return context;
+}
+
+test compress_bytes {
+    var path_buffer: [64]u8 = undefined;
+    const target = try std.fmt.bufPrint(&path_buffer, ".det-compress-test-{d}.zst", .{linux.getpid()});
+    var bytes: [3 * 1024]u8 = undefined;
+    for (&bytes, 0..) |*byte, index| byte.* = @intCast(index % 7 + 'a');
+    try compress_bytes(target, &bytes);
+    var target_buffer: [96:0]u8 = undefined;
+    const target_z = try std.fmt.bufPrintSentinel(&target_buffer, "{s}", .{target}, 0);
+    defer _ = linux.unlink(target_z);
+    const file = try std.Io.Dir.cwd().openFile(std.testing.io, target, .{});
+    defer file.close(std.testing.io);
+    var file_buffer: [4096]u8 = undefined;
+    var reader = file.reader(std.testing.io, &file_buffer);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try decompress(&reader.interface, &out.writer, .limited(1 << 20));
+    try std.testing.expectEqualSlices(u8, &bytes, out.written());
+}
+
+fn compress_fd(input: linux.fd_t, output: linux.fd_t) !void {
+    const context = try compression_context();
+    defer _ = ZSTD_freeCCtx(context);
     const in_bytes = try std.heap.page_allocator.alloc(u8, chunk_size);
     defer std.heap.page_allocator.free(in_bytes);
     const out_bytes = try std.heap.page_allocator.alloc(u8, @max(ZSTD_CStreamOutSize(), chunk_size));

@@ -12,6 +12,7 @@ const linux = std.os.linux;
 const schema = @import("determinismo").schema;
 const Events = @import("core").events;
 const VM = @import("core").vm;
+const event_files = @import("event_files.zig");
 
 /// Room for the inputs of a timeline's checks (Events.check_buffer): a history of a long
 /// timeline is megabytes, of a long fault-free one past 64 MiB (Valkey's, Turso's and
@@ -37,6 +38,13 @@ pub const Options = struct {
     /// there, `<keep>.check-<name>.jsonl` (an Elle history: Oxia's, Datahike's and Comdb2's
     /// failures each took a replay to the timeline's end to read theirs, 2026-11-06).
     keep: ?[]const u8 = null,
+    /// A passing check's input kept too, in one timeline of this many (by its number, so the
+    /// same timelines in every replay), compressed: `<keep>.check-<name>.passed.jsonl.zst`.
+    /// Before, passing timelines kept nothing, and a checker fixed later (Elle's D-series,
+    /// 2026-11-26: violations passed) could not judge them again; one is judged again as
+    /// `<program> check <name> <scenario>` with its decompressed history on standard input.
+    /// 0: none (`--keep-passing-checks`).
+    passing_one_in: u32 = 0,
 };
 
 /// `DETERMINISMO_LIBRARY=<path>` for a test program run on the host (its --describe, its
@@ -67,6 +75,8 @@ pub const Hook = struct {
     scenario: []const u8,
     /// `Options.lines`.
     lines: ?[]const u8 = null,
+    /// `Options.passing_one_in`.
+    passing_one_in: u32 = 0,
 
     pub fn end_checks(hook: *const Hook) VM.EndChecks {
         return .{ .context = hook, .run = run_hook };
@@ -81,7 +91,13 @@ pub const Hook = struct {
 
     fn run_hook(context: *const anyopaque, events: *Events, end: Events.Moment, keep: ?[]const u8) anyerror!void {
         const hook: *const Hook = @ptrCast(@alignCast(context));
-        try run(events, end, hook.checks, .{ .program = hook.program, .scenario = hook.scenario, .lines = hook.lines, .keep = keep });
+        try run(events, end, hook.checks, .{
+            .program = hook.program,
+            .scenario = hook.scenario,
+            .lines = hook.lines,
+            .keep = keep,
+            .passing_one_in = hook.passing_one_in,
+        });
     }
 };
 
@@ -118,10 +134,42 @@ pub fn run(events: *Events, moment: Events.Moment, checks: []const schema.Check,
         }
         var buffer: [512]u8 = undefined;
         try events.emit(moment, try ran_event(&buffer, check.name, result.status, asserted));
-        if (options.keep) |prefix| if (std.mem.indexOf(u8, result.output, "\"condition\":false") != null) {
-            input_keep(prefix, check.name, input);
-        };
+        if (options.keep) |prefix| {
+            if (std.mem.indexOf(u8, result.output, "\"condition\":false") != null) {
+                input_keep(prefix, check.name, input);
+            } else if (sampled(prefix, options.passing_one_in)) {
+                passing_keep(prefix, check.name, input);
+            }
+        }
     }
+}
+
+/// Whether the timeline `<events directory>/branch-<n>` keeps its passing checks' inputs.
+fn sampled(prefix: []const u8, one_in: u32) bool {
+    if (one_in == 0) return false;
+    const name = std.fs.path.basename(prefix);
+    if (!std.mem.startsWith(u8, name, "branch-")) return false;
+    const index = std.fmt.parseInt(u32, name["branch-".len..], 10) catch return false;
+    return index % one_in == 0;
+}
+
+test sampled {
+    try std.testing.expect(sampled("/runs/7/events/branch-32", 16));
+    try std.testing.expect(sampled("/runs/7/events/branch-0", 16));
+    try std.testing.expect(!sampled("/runs/7/events/branch-33", 16));
+    try std.testing.expect(!sampled("/runs/7/events/branch-32", 0));
+    try std.testing.expect(sampled("/runs/7/events/branch-33", 1));
+    try std.testing.expect(!sampled("/runs/7/events/setup", 1));
+}
+
+/// A passing check's input, compressed beside the timeline's events (best effort, as a failing
+/// one's is).
+fn passing_keep(prefix: []const u8, name: []const u8, input: []const u8) void {
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "{s}.check-{s}.passed.jsonl.zst", .{ prefix, name }) catch return;
+    event_files.compress_bytes(path, input) catch |err| {
+        std.debug.print("[determinismo] check {s}: its passing input not kept: {s}\n", .{ name, @errorName(err) });
+    };
 }
 
 /// A failing check's input, beside the timeline's events (best effort: the verdict stands).

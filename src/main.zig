@@ -260,6 +260,9 @@ const usage =
     \\                            generation's judgment, until room is needed: an arm to measure)
     \\                            [--no-holders-writeback]   (a snapshot written to disk left to the
     \\                            kernel's dirty thresholds, not started at once: an arm to measure)
+    \\                            [--keep-passing-checks <N>]   (a passing host check's input
+    \\                            kept, compressed, in one timeline of N, for a fixed checker to
+    \\                            judge again; default 16, 0 for none)
     \\                            [--holders-budget <GB>]   (the kept snapshots' room on disk;
     \\                            default: half the disk's free space above its reserve)
     \\                            [--data <dir>]   (the host's runs, where this one goes:
@@ -641,6 +644,10 @@ const Arguments = struct {
     /// space above its reserve at the first judgment (holders.Registry.kept_trim). A small one
     /// makes a short run trim as a long one does: what trials of the trims use.
     holders_budget_gb: ?u64 = null,
+    /// A passing host check's input kept in one timeline of this many (checks.Options
+    /// .passing_one_in; `--keep-passing-checks`, 0 for none): a checker fixed later judges them
+    /// again.
+    keep_passing_checks: u32 = 16,
     /// The host's runs (runs.zig): an exploration is one of them, in its own directory there.
     data_directory: ?[]const u8 = null,
     /// The run's directory, claimed already (serve's runs); else the exploration claims one.
@@ -1135,6 +1142,7 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
                 .program = program,
                 .scenario = scenario orelse "",
                 .lines = if (prepared) |system| system.program_lines else null,
+                .passing_one_in = arguments.keep_passing_checks,
             };
             options.end_checks = host_checks.end_checks();
         }
@@ -9543,6 +9551,8 @@ fn parse_option(
         arguments.kernel_path = value;
     } else if (eql(u8, flag, "--initrd")) {
         arguments.initrd_path = value;
+    } else if (eql(u8, flag, "--keep-passing-checks")) {
+        arguments.keep_passing_checks = try std.fmt.parseInt(u32, value, 10);
     } else if (eql(u8, flag, "--holders-budget")) {
         arguments.holders_budget_gb = try std.fmt.parseInt(u64, value, 10);
     } else if (eql(u8, flag, "--memory-mib")) {
