@@ -85,7 +85,9 @@ memory order, with its moment (`"watch"`, `"size"`, `"hex"` beside `vtime_ns`, `
 and `cr3`): `det:continue` again goes to the next one, so a variable's values over a stretch of a
 timeline are the stops' lines, each a moment a session can be opened at. A node's variable by
 its name: `det-nodes symbol <node> <name> [--field <path>] [--pid <pid>]`, a guest command, says where it is in the first
-of the node's processes that defines it (its program's symbols, then its libraries'): its
+of the node's processes that defines it (its program's symbols, then its libraries'; a Rust
+function by its path as well, `<turso_core::io::unix::UnixIO as turso_core::io::IO>::step`, its
+v0 or legacy mangled name read back and matched whole): its
 `address` there, `size`, `kind`, the `physical` address of its page now (null until the
 process first touched it), its `type` from the module's DWARF (`kind`: signed, unsigned,
 float, boolean, pointer, aggregate; `size`, `name`; null without DWARF), with `--field` a field
@@ -98,7 +100,7 @@ registers at its entry, by their parameters' names and types when the module has
 float's from its vector register) take it from there, keeping to the process's address space from its
 first stop there. `det-nodes where <node> <address>... [--return]` names each address as a crash's
 stack names its frames (its source line, its Go function and line, its ELF function with Rust's
-and C++'s paths demangled, else its module and offset), with the ELF function beside a line;
+paths demangled, v0 and legacy, and C++'s, else its module and offset), with the ELF function beside a line;
 the REPL's `frames` reads a process's
 stack at a stop inside it (a breakpoint's, a watch's) and unwinds it there: the stop's own
 instruction, then each caller by its frame's rule (`det-nodes cfi`: the module's .eh_frame, as
