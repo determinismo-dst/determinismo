@@ -737,7 +737,12 @@ fn coverage_gate(server: *Server, id: u32, connection: *duckdb.Connection) void 
             return;
         }
     }
-    const Asked = struct { coverage: ?[]const u8 = null, ci: ?std.json.Value = null };
+    const Asked = struct {
+        coverage: ?[]const u8 = null,
+        ci: ?std.json.Value = null,
+        checkpoint: ?[]const u8 = null,
+        from_snapshot: ?[]const u8 = null,
+    };
     const request = run_file(server, id, "request.json") catch return;
     const asked = std.json.parseFromSliceLeaky(Asked, server.arena, request, .{ .ignore_unknown_fields = true }) catch Asked{};
     if (asked.coverage) |set| if (std.mem.eql(u8, set, "off")) {
@@ -771,6 +776,11 @@ fn coverage_gate(server: *Server, id: u32, connection: *duckdb.Connection) void 
     // `uncovered` above). Stopped, its passing shards read "error" (CE38, the blind Lean replica
     // of the platform).
     if (asked.ci != null) return;
+    // A run started from a machine's checkpoint or a session fork's snapshot: its setup ran
+    // there, so its own events/setup.jsonl is empty and the gate has no setup to read; its
+    // timelines repeating what the machine ran report none. Judged at its end, never stopped
+    // as uninstrumented (CE50, the blind Lean replica of the platform: CE30's remainder).
+    if (asked.checkpoint != null or asked.from_snapshot != null) return;
     shared.coverage_known[id] = true;
     var buffer: [256]u8 = undefined;
     var reply: std.Io.Writer = .fixed(&buffer);
@@ -6004,6 +6014,39 @@ test "an instrumented run whose first timelines repeat its setup's code is not s
     coverage_gate(&server, 1, &connection);
     try std.testing.expect(!shared.runs[0].stopped);
     try std.testing.expect(shared.coverage_known[1]);
+}
+
+test "a run started from a machine's checkpoint is not stopped as uncovered: its setup ran there" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const cwd = std.Io.Dir.cwd();
+    const run = try std.fs.path.join(arena, &.{ data, "runs", "1" });
+    try cwd.createDirPath(io, try std.fs.path.join(arena, &.{ run, "events" }));
+    try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(arena, &.{ run, "events", "setup.jsonl" }), .data = "" });
+    try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(arena, &.{ run, "request.json" }), .data = "{\"checkpoint\":\"/data/machines/3/checkpoints/c1\"}" });
+    var failure: duckdb.Failure = .{};
+    const shared = try std.testing.allocator.create(Shared);
+    defer std.testing.allocator.destroy(shared);
+    const options: Options = .{ .listen = "", .data_directory = data, .machine = &.{}, .self = "" };
+    shared.* = .{ .options = options, .io = io, .database = try duckdb.Database.open(":memory:", .{ .threads = 1 }, &failure) };
+    defer shared.database.close();
+    var connection = try shared.database.connect(&failure);
+    defer connection.close();
+    try connection.exec("CREATE TABLE events (name VARCHAR); CREATE TABLE timelines (branch INTEGER, extends INTEGER); " ++
+        "CREATE VIEW explored AS SELECT * FROM timelines WHERE extends IS NULL; " ++
+        "INSERT INTO timelines VALUES (0, NULL), (1, NULL), (2, NULL), (3, NULL)");
+    var explorer = try std.process.spawn(io, .{ .argv = &.{ "sleep", "60" }, .stdout = .ignore, .stderr = .ignore });
+    defer explorer.kill(io);
+    shared.runs[0] = .{ .id = 1, .pid = explorer.id.? };
+    shared.run_count = 1;
+    var server: Server = .{ .shared = shared, .options = options, .io = io, .arena = arena };
+    coverage_gate(&server, 1, &connection);
+    try std.testing.expect(!shared.runs[0].stopped);
 }
 
 test "a CI job whose runtime reports no coverage runs to its end, said uncovered then" {
