@@ -74,7 +74,7 @@ fn element_index(body: []const u8, opening: []const u8) ?usize {
                 if (body[tag_end - 1] == '/') {
                     at = tag_end + 1;
                 } else {
-                    const end = std.mem.indexOfPos(u8, body, tag_end, "</" ++ captured ++ ">") orelse return null;
+                    const end = captured_end(body, tag_end, "</" ++ captured ++ ">") orelse return null;
                     at = end + "</".len + captured.len + ">".len;
                 }
                 continue :scan;
@@ -84,6 +84,22 @@ fn element_index(body: []const u8, opening: []const u8) ?usize {
         at = next + 1;
     }
     return null;
+}
+
+/// Where a captured element's closing tag is, past `from`: a CDATA section before it is the
+/// output's, whatever it holds (its own closing tag, printed by a test of something that writes
+/// JUnit XML: CE41, the Lean replica of determinismo).
+fn captured_end(body: []const u8, from: usize, closing: []const u8) ?usize {
+    var at = from;
+    while (true) {
+        const close = std.mem.indexOfPos(u8, body, at, closing) orelse return null;
+        if (std.mem.indexOfPos(u8, body, at, "<![CDATA[")) |cdata| if (cdata < close) {
+            const end = std.mem.indexOfPos(u8, body, cdata, "]]>") orelse return null;
+            at = end + "]]>".len;
+            continue;
+        };
+        return close;
+    }
 }
 
 fn attribute(tag: []const u8, comptime key: []const u8) ?[]const u8 {
