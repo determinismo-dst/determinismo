@@ -482,6 +482,8 @@ const Arguments = struct {
     /// `--clock-start-max` as given, for the run's request (serve's analyses boot its timelines
     /// with it: their guest's command line has it).
     clock_start_max_text: ?[]const u8 = null,
+    /// `--timeline-limit` as given, for the run's request (in the guest's command line).
+    timeline_limit_text: ?[]const u8 = null,
     /// The longest a scenario's driver phase is drawn in this exploration (its own drive_ms_max,
     /// else --drive-max), null with --timeline or none: the length the explorer steers (Novelty).
     drive_steered_max_ms: ?u64 = null,
@@ -1368,6 +1370,36 @@ test "a run's request keeps what its guest's command line needs: the wall clock'
     try std.testing.expectEqualStrings("0", asked.clock_start_max.?);
 }
 
+test "a run's request and machine keep every input its analyses boot with (CE51)" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const kernel = try std.fs.path.joinZ(arena, &.{ directory, "vmlinuz" });
+    const injector = try std.fs.path.joinZ(arena, &.{ directory, "injector" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = kernel, .data = "a kernel" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = injector, .data = "an injector" });
+    var arguments = try parse_arguments(arena, &.{
+        "determinismo", "explore",    "--kernel",         kernel, "--timeline-limit",         "30s", "--no-swarm",
+        "--epoch",      "2026-01-01", "--timer-slack-us", "250",  "--timer-landing-permille", "50",  "--injector",
+        injector,
+    });
+    try run_request_write(arena, io, directory, directory, &arguments);
+    const cwd = std.Io.Dir.cwd();
+    const text = try cwd.readFileAlloc(io, try std.fs.path.join(arena, &.{ directory, "request.json" }), arena, .limited(1 << 20));
+    const asked = try std.json.parseFromSliceLeaky(serve.RunRequest, arena, text, .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings("30s", asked.timeline_limit.?);
+    try std.testing.expect(!asked.swarm);
+    try std.testing.expectEqual(@as(usize, 1), asked.injectors.?.len);
+    const machine = try cwd.readFileAlloc(io, try std.fs.path.join(arena, &.{ directory, "machine.json" }), arena, .limited(1 << 20));
+    for ([_][]const u8{ "\"--epoch\"", "\"--timer-slack-us\",\"250\"", "\"--timer-landing-permille\",\"50\"" }) |word| {
+        try std.testing.expect(std.mem.indexOf(u8, machine, word) != null);
+    }
+}
+
 /// A run started here: what was asked (serve's request: the program kept by its content, as
 /// serve keeps it) and the machine it boots (its kernel and initramfs kept the same way).
 /// The run's request and machine; its kernel and initramfs kept, and the run boots those.
@@ -1404,6 +1436,16 @@ fn run_request_write(
         // --clock-start-max 0 booted another guest line, and its tapes were refused
         // (TapeInputsDiffer, run 2219's causality, 2026-11-26).
         .clock_start_max = arguments.clock_start_max_text,
+        // The same for these: in the guest's command line or its initramfs, so an analysis of a
+        // run started with one booted other inputs and was refused (CE51, the blind Lean replica
+        // of the platform). Its injectors kept by content, as its kernel is.
+        .timeline_limit = arguments.timeline_limit_text,
+        .swarm = arguments.swarm,
+        .injectors = if (arguments.injectors.len == 0) null else injectors: {
+            const kept = try arena.alloc([]const u8, arguments.injectors.len);
+            for (kept, arguments.injectors) |*path, given| path.* = try runs.artifact_keep(arena, io, data, given);
+            break :injectors kept;
+        },
         .trace_errno = arguments.trace_errno, // In the guest's command line: replays need it.
         .generation = arguments.generation_size,
         .horizon = arguments.horizon_text,
@@ -1469,6 +1511,10 @@ fn run_request_write(
         try machine.appendSlice(arena, &.{ "--tsc-jitter-seed", try std.fmt.allocPrint(arena, "0x{x}", .{seed}) });
     }
     if (arguments.tsc_jitter_exact) try machine.append(arena, "--tsc-jitter-exact");
+    // The guest's wall clock at boot and its timers, when asked: they make its inputs too (CE51).
+    if (arguments.epoch_seconds) |seconds| try machine.appendSlice(arena, &.{ "--epoch", try std.fmt.allocPrint(arena, "{d}", .{seconds}) });
+    if (arguments.timer_slack_us != 1000) try machine.appendSlice(arena, &.{ "--timer-slack-us", try std.fmt.allocPrint(arena, "{d}", .{arguments.timer_slack_us}) });
+    if (arguments.timer_delay_permille != 0) try machine.appendSlice(arena, &.{ "--timer-landing-permille", try std.fmt.allocPrint(arena, "{d}", .{arguments.timer_delay_permille}) });
     // A guest CPU of another host's: its resumes and replays boot the same.
     if (arguments.cpuid_path) |path| try machine.appendSlice(arena, &.{ "--cpuid", try runs.absolute(arena, path) });
     if (arguments.guest_cpu != .host) try machine.appendSlice(arena, &.{ "--guest-cpu", @tagName(arguments.guest_cpu) });
@@ -9245,6 +9291,7 @@ fn parse_option(
         arguments.time_budget_text = value;
     } else if (eql(u8, flag, "--timeline-limit")) {
         arguments.timeline_limit_ns = try duration_parse(value);
+        arguments.timeline_limit_text = value;
     } else if (eql(u8, flag, "--timeline-limit-learned")) {
         arguments.timeline_limit_learned = try std.fmt.parseInt(u32, value, 10);
     } else if (eql(u8, flag, "--retroactive")) {
