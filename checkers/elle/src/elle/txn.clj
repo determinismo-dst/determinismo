@@ -706,17 +706,18 @@
         ; Round 2's D3 fix: edges into :info operations only for models
         ; prohibiting G1a.
         g1a? (contains? (prohibited-anomaly-types opts) :G1a)]
-    (-> ; If we need realtime, use realtime-graph. No need to bother
-        ; with process, cuz we'll find those too.
-        (cond (seq (set/intersection realtime-anomaly-types ats))
-              #{(if g1a? elle/realtime-graph elle/realtime-graph-without-info)}
+    (-> ; Realtime anomalies need realtime-graph, process anomalies process-graph: each
+        ; graph for its own kind. The D2 fix (the Lean replica of Elle): realtime-graph
+        ; alone, once any realtime anomaly was reportable, named a process-order cycle
+        ; G-single-item-realtime, and a model asked for beside one prohibiting only process
+        ; anomalies (strong session SI with strong read uncommitted) passed it.
+        (cond-> nil
+          (seq (set/intersection realtime-anomaly-types ats))
+          (conj (if g1a? elle/realtime-graph elle/realtime-graph-without-info))
 
-              ; If we're looking for any process anomalies...
-              (seq (set/intersection process-anomaly-types ats))
-              #{(if g1a? elle/process-graph-with-info elle/process-graph)}
-
-              ; Otherwise, the usual graph is fine.
-              true nil)
+          (seq (set/intersection process-anomaly-types ats))
+          (conj (if g1a? elle/process-graph-with-info elle/process-graph)))
+        (some-> set)
         ; Tack on any other requested graphs.
         (into (:additional-graphs opts)))))
 
