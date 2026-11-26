@@ -6488,7 +6488,7 @@ fn tree_judge_begin(
     };
     state.novelty.judge(done, &state.seen);
     plan_adopt_ran(plan.items, done);
-    for (done) |summary| try archive_add(arena, state, plan.items, summary);
+    try archive_add_judged(arena, state, plan.items, done);
     var candidate_count: u32 = 0;
     const generation_seed = state.base ^ (@as(u64, generation) *% 0x9e3779b97f4a7c15);
     var random: std.Random.DefaultPrng = .init(generation_seed);
@@ -7093,12 +7093,72 @@ fn doomed_at(summary: *const Summary, vtime_ns: u64) bool {
 /// with `--archive`, every behavior it reached that the archive lacks becomes a cell just after
 /// it (a moment that leads elsewhere: before its last randomness pull, or anywhere in a cut
 /// branch).
-fn archive_add(arena: std.mem.Allocator, state: *TreeState, plan: []const Planned, summary: *const Summary) !void {
+/// A judgment's timelines in the archive, in index order: each one planned (its children's
+/// parent), and its places in the cells unless it repeats an earlier timeline's whole trace
+/// (state.traces, or one before it in this judgment). A repeat added there was returned to as a
+/// cell's next place, a node and its branches spent on a state the tree had (CE25, the blind
+/// Lean replica of the platform).
+fn archive_add_judged(arena: std.mem.Allocator, state: *TreeState, plan: []const Planned, done: []const *const Summary) !void {
+    var traced: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    for (done) |summary| {
+        const repeat = state.traces.contains(summary.trace_hash) or (try traced.getOrPut(arena, summary.trace_hash)).found_existing;
+        try archive_add(arena, state, plan, summary, repeat);
+    }
+}
+
+test "a repeat is no archive cell's place" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var state: TreeState = .{
+        .base = 1,
+        .total = 64,
+        .size = 16,
+        .children = 4,
+        .pipeline = 1,
+        .jobs = 1,
+        .holding = false,
+        .registry = undefined,
+        .change = null,
+        .hunks_reached = &.{},
+        .candidates = &.{},
+        .tape_buffer = undefined,
+        .io = undefined,
+        .archive = true,
+        .prefer_sometimes = true,
+        .setup = undefined,
+    };
+    // Timelines 0 and 1, one trace: 1 repeats 0, and both reached the behavior at 5 ms.
+    const summaries = try std.testing.allocator.alloc(Summary, 2);
+    defer std.testing.allocator.free(summaries);
+    for (summaries, 0..) |*summary, index| {
+        summary.index = @intCast(index);
+        summary.start_ns = 0;
+        summary.end_ns = 100 * std.time.ns_per_ms;
+        summary.last_pull_ns = 90 * std.time.ns_per_ms;
+        summary.cut = false;
+        summary.doomed_ns = null;
+        summary.again_ns = null;
+        summary.trace_hash = 42;
+        summary.behavior_count = 1;
+        summary.behaviors[0] = .{ .hash = 7, .vtime_ns = 5 * std.time.ns_per_ms };
+    }
+    const plan = [_]Planned{ .{ .index = 0, .seed = 1, .snapshot = undefined }, .{ .index = 1, .seed = 2, .snapshot = undefined } };
+    const done = [_]*const Summary{ &summaries[0], &summaries[1] };
+    try archive_add_judged(arena, &state, &plan, &done);
+    const cell = state.cells.get(7).?;
+    try std.testing.expectEqual(@as(u32, 1), cell.place_count);
+    try std.testing.expectEqual(@as(u32, 0), cell.places[0].branch);
+    // Both planned: the repeat's children still have their parent.
+    try std.testing.expect(state.planned.contains(0) and state.planned.contains(1));
+}
+
+fn archive_add(arena: std.mem.Allocator, state: *TreeState, plan: []const Planned, summary: *const Summary, repeat: bool) !void {
     const planned = for (plan) |entry| {
         if (entry.index == summary.index) break entry;
     } else return;
     try state.planned.put(arena, summary.index, planned);
-    if (!state.archive) return;
+    if (!state.archive or repeat) return;
     for (summary.behaviors[0..summary.behavior_count]) |behavior| {
         if (behavior.vtime_ns <= summary.start_ns) continue; // Its ancestors' (reached before).
         // An objective's state: no later than just before its composer's ask (objective_place).
