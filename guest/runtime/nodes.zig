@@ -2171,8 +2171,14 @@ fn disk_reads_instance(buffer: *[path_size_max]u8, mapper: []const u8) ![:0]cons
 
 /// The tracer started (a process of its own, its pid beside the node's state), or said failed.
 fn disk_reads_trace_start(name: []const u8, paths: *const Paths, mapper: []const u8, file: []const u8, aimed: []const Extent, corrupt_byte: u32) void {
+    // The device by its minor (/dev/dm-N, as mount and fsck use it): the guest has no udev, so no
+    // /dev/mapper/<name> links (every trace failed at statx, e2e disk 2026-11-26).
+    const dev = mapper_call(dm_dev_status, mapper, 0, null) catch {
+        sdk.event("disk_reads_trace_failed", .{ .node = name, .why = "dm_status" });
+        return;
+    };
     var device_buffer: [path_size_max]u8 = undefined;
-    const device = print_z(&device_buffer, "/dev/mapper/{s}", .{mapper}) catch return;
+    const device = print_z(&device_buffer, "/dev/dm-{d}", .{(dev & 0xff) | ((dev >> 12) & 0xfff00)}) catch return;
     var stat: linux.Statx = undefined;
     if (linux.errno(linux.statx(linux.AT.FDCWD, device, 0, .{ .TYPE = true }, &stat)) != .SUCCESS) {
         sdk.event("disk_reads_trace_failed", .{ .node = name, .why = "statx" });
