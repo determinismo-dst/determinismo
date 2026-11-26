@@ -523,9 +523,9 @@ pub fn main(init: std.process.Init) !void {
     } else if (singleton_timeline) {
         length_end_ns = run_singleton(&composer);
     } else {
-        length_end_ns = run_drivers(&composer, scenario.drive_ms_max orelse drive_max_default_ms(), scenario.parallel_max);
+        length_end_ns = run_drivers(&composer, drive_start_ns, scenario.drive_ms_max orelse drive_max_default_ms(), scenario.parallel_max);
         while (drive_again(drive_start_ns)) {
-            length_end_ns = run_drivers(&composer, scenario.drive_ms_max orelse drive_max_default_ms(), scenario.parallel_max);
+            length_end_ns = run_drivers(&composer, drive_start_ns, scenario.drive_ms_max orelse drive_max_default_ms(), scenario.parallel_max);
         }
     }
     // The ending, as Antithesis's: an eventually command kills every command still running
@@ -764,7 +764,7 @@ fn starts_draw() u64 {
 }
 
 /// Returns when the timeline's length ends, when it has one (--timeline, drive_ms_max).
-fn run_drivers(composer: *Composer, drive_ms_max: ?u32, parallel_max: ?u32) ?u64 {
+fn run_drivers(composer: *Composer, drive_start_ns: u64, drive_ms_max: ?u32, parallel_max: ?u32) ?u64 {
     const timeline_ns = timeline_length_ns() orelse drive_drawn_ns(drive_ms_max);
     const starts = if (timeline_ns == null) starts_draw() else 0;
     const log2_max = if (parallel_max) |most| @min(parallelism_log2_max, std.math.log2_int(u32, @max(most, 1))) else parallelism_log2_max;
@@ -798,7 +798,10 @@ fn run_drivers(composer: *Composer, drive_ms_max: ?u32, parallel_max: ?u32) ?u64
         // ending and the checks run. Many starts one at a time of a slow system's drivers ran
         // past the limit and failed as hangs while every command progressed (Redpanda run 177:
         // its median timeline 20 minutes, a tenth at the hour; Group Replication's timeline 222).
-        const stop_ns = if (timeline_limit_ns()) |limit_ns| now_ns() + limit_ns / 2 else null;
+        // Half the limit since the drivers began, whichever phase this is: a second phase's stop
+        // drawn from its own start let its drivers start up to three quarters of the limit in
+        // (CE42, the Lean replica of determinismo).
+        const stop_ns = if (timeline_limit_ns()) |limit_ns| drive_start_ns + limit_ns / 2 else null;
         for (0..starts) |started| {
             // The stop checked after a quiet stretch too: checked before only, a driver started
             // past it once the stretch was slept through, and stretches all quiet slept past the
