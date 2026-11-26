@@ -3837,6 +3837,10 @@ fn check_jank_repl(context: *Context) !void {
         .scenario = "jank",
         .seed = 1,
         .branches = 1,
+        // A driver phase that outlasts the session's evaluations: drawn, it ended 1.5 s into the
+        // session (5df3392's draws), killing the scenario's commands and the timeline with them
+        // before the third evaluation's reply.
+        .timeline = "60s",
     }, .{})});
     _ = try curl(context, &.{ "-X", "POST", "-d", asked, url ++ "/runs" });
     // Its one timeline done (jank's image built the first time: minutes).
