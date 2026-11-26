@@ -30,7 +30,8 @@
 //!    failing again once its history parts there), the fault removed (its kind drawn into the
 //!    regime's restore weights), and each of its pulls m times.
 //! 5. A verdict per detail against its fault's control, by their 90% intervals (Wilson's, as
-//!    causality's): needed (none fails, its interval wholly below the control's), partly (some
+//!    causality's), each over its distinct histories (variants replaying one history, one events
+//!    hash, are one sample): needed (none fails, its interval wholly below the control's), partly (some
 //!    fail, wholly below), free (it fails as often as the control), unclear (fewer fail, but
 //!    the intervals overlap: more variants would tell; or the control never fails). Six variants
 //!    once called a wait needed (0 of 6) that another six found half the time (3 of 6).
@@ -299,7 +300,9 @@ const Item = struct {
     count: u8 = 1,
 };
 
-const Result = struct { failing: bool = false, vtime_ns: ?u64 = null };
+/// A variant's replay: whether it failed, when, and its history (the replay's events hash: one
+/// history, replayed again, is the same hash).
+const Result = struct { failing: bool = false, vtime_ns: ?u64 = null, history: ?u64 = null };
 
 const Explanation = struct {
     arena: std.mem.Allocator,
@@ -351,8 +354,9 @@ const Explanation = struct {
 /// Whether a replay stopped at the property's failure (its `until:` line an assertion of it that
 /// failed, not the horizon's event), and when.
 pub fn outcome(arena: std.mem.Allocator, stderr: []const u8, property: []const u8) !Result {
+    const history = history_of(stderr);
     const key = "[determinismo] until: ";
-    const at = std.mem.lastIndexOf(u8, stderr, key) orelse return .{};
+    const at = std.mem.lastIndexOf(u8, stderr, key) orelse return .{ .history = history };
     const start = at + key.len;
     const end = std.mem.indexOfScalarPos(u8, stderr, start, '\n') orelse stderr.len;
     const Assertion = struct {
@@ -363,7 +367,7 @@ pub fn outcome(arena: std.mem.Allocator, stderr: []const u8, property: []const u
         hit: ?bool = null,
     };
     const Line = struct { assert: ?Assertion = null, antithesis_assert: ?Assertion = null };
-    const line = std.json.parseFromSliceLeaky(Line, arena, stderr[start..end], .{ .ignore_unknown_fields = true }) catch return .{};
+    const line = std.json.parseFromSliceLeaky(Line, arena, stderr[start..end], .{ .ignore_unknown_fields = true }) catch return .{ .history = history };
     const failing = if (line.assert) |a|
         std.mem.eql(u8, a.message, property) and
             (a.condition == false or (std.mem.eql(u8, a.type, "unreachable") and a.condition == true))
@@ -372,14 +376,24 @@ pub fn outcome(arena: std.mem.Allocator, stderr: []const u8, property: []const u
             (a.condition == false or std.mem.eql(u8, a.display_type, "Unreachable"))
     else
         false;
-    if (!failing) return .{};
+    if (!failing) return .{ .history = history };
     const moment = "at moment vtime=";
     const vtime_ns: ?u64 = if (std.mem.lastIndexOf(u8, stderr, moment)) |m| digits: {
         var e = m + moment.len;
         while (e < stderr.len and std.ascii.isDigit(stderr[e])) e += 1;
         break :digits std.fmt.parseInt(u64, stderr[m + moment.len .. e], 10) catch null;
     } else null;
-    return .{ .failing = true, .vtime_ns = vtime_ns };
+    return .{ .failing = true, .vtime_ns = vtime_ns, .history = history };
+}
+
+/// A replay's events hash, from its timeline's line (`... events_hash=<hex> ...`), or null.
+fn history_of(stderr: []const u8) ?u64 {
+    const key = "events_hash=";
+    const at = std.mem.lastIndexOf(u8, stderr, key) orelse return null;
+    const start = at + key.len;
+    var end = start;
+    while (end < stderr.len and std.ascii.isHex(stderr[end])) end += 1;
+    return std.fmt.parseInt(u64, stderr[start..end], 16) catch null;
 }
 
 pub fn run(
@@ -652,12 +666,21 @@ const Report = struct {
     results: []const Result,
 };
 
-fn count(r: Report, fault: usize, what: What, draw: u32) struct { failing: u32, of: u32 } {
+/// A detail's (or the control's, or the removal's) variants: how many histories of its own, and
+/// how many of those failed. Variants that replayed one history (one events hash) are one sample:
+/// a set value can leave the control's pull to a draw that decides nothing, and its m variants
+/// were one history counted m times, "needed" from one sample (CE62, the Lean replica of
+/// determinismo, round 8). A variant whose replay said no hash counts on its own.
+fn count(arena: std.mem.Allocator, r: Report, fault: usize, what: What, draw: u32) !struct { failing: u32, of: u32 } {
     var failing: u32 = 0;
     var of: u32 = 0;
+    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
     for (r.items, r.results) |item, result| {
         if (item.fault != fault or item.what != what) continue;
         if (what == .detail and item.draw != draw) continue;
+        if (result.history) |history| {
+            if ((try seen.getOrPut(arena, history)).found_existing) continue;
+        }
         of += 1;
         failing += @intFromBool(result.failing);
     }
@@ -700,11 +723,11 @@ fn explained_of(arena: std.mem.Allocator, request: *const Request, r: Report) !E
     const Details = @typeInfo(@FieldType(Faults, "details")).pointer.child;
     const faults = try arena.alloc(Faults, r.chosen.len);
     for (r.chosen, faults, 0..) |decision, *fault, at| {
-        const control = count(r, at, .control, 0);
-        const removed = count(r, at, .removed, 0);
+        const control = try count(arena, r, at, .control, 0);
+        const removed = try count(arena, r, at, .removed, 0);
         const details = try arena.alloc(Details, decision.len);
         for (decision, details, 0..) |draw, *detail, draw_index| {
-            const tally = count(r, at, .detail, @intCast(draw_index));
+            const tally = try count(arena, r, at, .detail, @intCast(draw_index));
             detail.* = .{
                 .draw = draw.name,
                 .pull = draw.pull,
@@ -946,6 +969,101 @@ test "a scenario's own named draw is varied as a decision: fresh values, or each
     try std.testing.expectEqual(@as(u64, 30), set[0][1].pull);
     try std.testing.expectError(error.DrawNotFound, named_decisions(arena, &draws, &.{.{ .name = "absent" }}));
     try std.testing.expectError(error.Usage, DrawAsked.parse(arena, "clock_step.ms="));
+}
+
+/// explain on a stand-in explorer (`explain_stand_in`) with `--draw <draw>`: its `--json` line.
+fn explain_with_stand_in(arena: std.mem.Allocator, draw: [:0]const u8) ![]const u8 {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = std.Io.Dir.cwd();
+    const root = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const explorer = try std.fs.path.join(arena, &.{ root, "explore.sh" });
+    try cwd.writeFile(io, .{ .sub_path = explorer, .data = explain_stand_in });
+    const explorer_z = try arena.dupeSentinel(u8, explorer, 0);
+    if (std.os.linux.errno(std.os.linux.fchmodat(std.os.linux.AT.FDCWD, explorer_z, 0o755)) != .SUCCESS) return error.ChmodFailed;
+    const tape = try std.fs.path.join(arena, &.{ root, "branch-3.jsonl" });
+    try cwd.writeFile(io, .{ .sub_path = tape, .data = "{\"tape\":2,\"inputs\":\"00000000000000aa\",\"branch\":3,\"branch_seed\":\"0000000000000006\"}\n" });
+    const report_path = try std.fs.path.join(arena, &.{ root, "report.json" });
+    const report_z = try arena.dupeSentinel(u8, report_path, 0);
+    const linux = std.os.linux;
+    const saved: i32 = @intCast(linux.dup(1));
+    const opened = linux.open(report_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    _ = linux.dup2(@intCast(opened), 1);
+    const tape_z = try arena.dupeSentinel(u8, tape, 0);
+    const status = run(arena, io, explorer, &.{ "--tape", tape_z, "--property", "balances add up", "--variants", "6", "--jobs", "1", "--draw", draw, "--json" });
+    _ = linux.dup2(saved, 1);
+    _ = linux.close(@intCast(opened));
+    _ = linux.close(saved);
+    try std.testing.expectEqual(@as(u8, 0), try status);
+    return try cwd.readFileAlloc(io, report_path, arena, .limited(1 << 20));
+}
+
+const explain_stand_in =
+    \\#!/bin/sh
+    \\# A stand-in for `determinismo explore` as explain runs it. The timeline fails at 20 s. Its named
+    \\# draws: clock_step.ms (pulls 10 and 30, of 8,000 values), retry.jitter-ms (pull 40, the control).
+    \\# A clock step makes a retry, which draws its jitter at pull 40; with the step removed there is no
+    \\# retry, and pull 40 decides nothing. A history fails unless its text hashes to 0 modulo 6. Each
+    \\# replay prints its branch line with its history's hash, as the explorer prints its events' hash.
+    \\while [ $# -gt 0 ]; do
+    \\  case $1 in
+    \\    --tape) tape=$2; shift ;;
+    \\    --events) events=$2; shift ;;
+    \\    --draws-out) draws=$2; shift ;;
+    \\    --save-snapshots) snaps=$2; shift ;;
+    \\  esac
+    \\  shift
+    \\done
+    \\fail() {
+    \\  echo '[determinismo] until: {"assert":{"message":"balances add up","condition":false,"hit":true,"type":"always","display_type":"Always"}}' >&2
+    \\  echo '[determinismo] the first failure at moment vtime=20000000000' >&2
+    \\}
+    \\if [ -n "$draws" ]; then
+    \\  : > "$events"
+    \\  printf '%s\n' '{"name":"clock_step.ms","kind":"range","count":8000,"drawn":2,"kept":[{"pull":10,"after_ns":15000000000,"value":4100},{"pull":30,"after_ns":17000000000,"value":5200}]}' \
+    \\    '{"name":"retry.jitter-ms","kind":"range","count":100,"drawn":1,"kept":[{"pull":40,"after_ns":18000000000,"value":7}]}' > "$draws"
+    \\  fail
+    \\  exit 0
+    \\fi
+    \\if [ -n "$snaps" ]; then
+    \\  echo "[determinismo] saved snapshot $snaps/at-16999 at 16999 ms" >&2
+    \\  fail
+    \\  exit 0
+    \\fi
+    \\seed=$(head -1 "$tape" | sed 's/.*"branch_seed":"\([0-9a-f]*\)".*/\1/')
+    \\le() { printf '%s' "$1" | sed 's/\(..\)/\1 /g' | awk '{for(i=NF;i>0;i--) printf "%s",$i}'; }
+    \\step_hex=$(grep '"pull":30,' "$tape" | sed 's/.*"hex":"\([0-9a-f]*\)".*/\1/')
+    \\jitter_hex=$(grep '"pull":40,' "$tape" | sed 's/.*"hex":"\([0-9a-f]*\)".*/\1/')
+    \\if [ -n "$step_hex" ]; then step=$(( $(printf '%d' "0x$(le "$step_hex")") % 8000 )); else step=5200; fi
+    \\history="seed=$seed step=$step"
+    \\if [ "$step" -ne 0 ]; then history="$history jitter=${jitter_hex:-recorded}"; fi
+    \\hash=$(printf '%s' "$history" | cksum | cut -d' ' -f1)
+    \\echo "[branch    3] seed=$seed ended events=1 events_hash=$(printf '%016x' "$hash") guest_hash=0 failing=0" >&2
+    \\if [ $((hash % 6)) -eq 0 ]; then
+    \\  echo '[determinismo] until: {"event":"horizon"}' >&2
+    \\  exit 0
+    \\fi
+    \\fail
+;
+
+test "a set value whose variants are one history is never called needed from that one sample" {
+    // The control is found by its pull in the recorded timeline, and a variant's tape answers that
+    // pull whatever draw takes it in the variant's history: the clock step removed, there is no
+    // retry and the jitter's pull decides nothing, so the m variants are one history, which read
+    // "needed" (0 of 6) against the control's 5 of 6 (CE62, the Lean replica of determinismo,
+    // round 8). The verdict now counts distinct histories (the replays' events hashes).
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const removed = try explain_with_stand_in(arena, "clock_step.ms=0");
+    const details = std.mem.indexOf(u8, removed, "\"details\":") orelse return error.NoDetails;
+    try std.testing.expect(std.mem.indexOf(u8, removed[details..], "\"verdict\":\"needed\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, removed[details..], "\"of\":1,") != null);
+    // A value that keeps the retry: its variants are six histories, counted as six.
+    const kept = try explain_with_stand_in(arena, "clock_step.ms=8");
+    const kept_details = std.mem.indexOf(u8, kept, "\"details\":") orelse return error.NoDetails;
+    try std.testing.expect(std.mem.indexOf(u8, kept[kept_details..], "\"of\":6,") != null);
 }
 
 test "a set value's m variants are m histories, each with the control's draw varied beside it" {
