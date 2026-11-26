@@ -2265,13 +2265,14 @@ fn disk_reads_read(fd: linux.fd_t, name: []const u8, file: []const u8, aimed: []
             const read = bio_read_line(buffer[from..end]) orelse continue;
             if (read.major != major or read.minor != minor) continue;
             if (extents.len > 0 and !extents_overlap(extents, read.sector, read.sectors)) continue;
-            if (events == disk_reads_events_max) {
-                sdk.event("disk_corrupt_reads_capped", .{ .node = name, .file = file, .events = events });
-                events += 1;
-            }
             if (events > disk_reads_events_max) continue;
             var parts_buffer: [fiemap_extents_max + 1]CorruptedPart = undefined;
             for (read_corrupted_parts(extents, read.sector, read.sectors, corrupt_byte, &parts_buffer)) |part| {
+                if (events == disk_reads_events_max) {
+                    sdk.event("disk_corrupt_reads_capped", .{ .node = name, .file = file, .events = events });
+                    events += 1;
+                    break;
+                }
                 sdk.event("disk_corrupt_read", .{
                     .node = name,
                     .file = file,
@@ -2279,8 +2280,8 @@ fn disk_reads_read(fd: linux.fd_t, name: []const u8, file: []const u8, aimed: []
                     .sectors = part.sectors,
                     .byte = part.byte, // The device's byte the fault changed.
                 });
+                events += 1;
             }
-            events += 1;
         }
         std.mem.copyForwards(u8, buffer[0 .. kept - from], buffer[from..kept]);
         kept -= from;
@@ -2291,12 +2292,29 @@ fn disk_reads_read(fd: linux.fd_t, name: []const u8, file: []const u8, aimed: []
 /// A part of a read the fault corrupted: its sectors and the device's byte it changed.
 const CorruptedPart = struct { sector: u64, sectors: u64, byte: u64 };
 
-/// The parts of a read of `sectors` from `sector` the fault changed, and the byte of each.
+/// The parts of a read of `sectors` from `sector` the fault changed, and the byte of each. A
+/// fault over the whole device (no extents): the read whole. An aimed one: device-mapper splits
+/// the read at its table's segments (aimed_record's), and dm-flakey changes byte `corrupt_byte`
+/// of each part over an extent, counted from the part's start, nothing in the linear parts, and
+/// nothing in a part shorter than that (CE54, the Lean replica of determinismo: the read's first
+/// sector's byte was named, one the fault never changed when the read began in a linear part).
 fn read_corrupted_parts(extents: []const Extent, sector: u64, sectors: u64, corrupt_byte: u64, out: []CorruptedPart) []const CorruptedPart {
-    _ = extents;
-    assert(out.len > 0);
-    out[0] = .{ .sector = sector, .sectors = sectors, .byte = sector * 512 + corrupt_byte - 1 };
-    return out[0..1];
+    assert(corrupt_byte >= 1);
+    assert(out.len > extents.len);
+    if (extents.len == 0) {
+        if (corrupt_byte > sectors * 512) return out[0..0];
+        out[0] = .{ .sector = sector, .sectors = sectors, .byte = sector * 512 + corrupt_byte - 1 };
+        return out[0..1];
+    }
+    var count: usize = 0;
+    for (extents) |extent| {
+        const part_start = @max(sector, extent.start);
+        const part_end = @min(sector + sectors, extent.start + extent.count);
+        if (part_start >= part_end or corrupt_byte > (part_end - part_start) * 512) continue;
+        out[count] = .{ .sector = part_start, .sectors = part_end - part_start, .byte = part_start * 512 + corrupt_byte - 1 };
+        count += 1;
+    }
+    return out[0..count];
 }
 
 test "a read over a linear part and two aimed extents names each byte the fault changed" {
