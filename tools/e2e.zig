@@ -227,62 +227,62 @@ fn scratches_sweep(io: std.Io, arena: std.mem.Allocator, scratches: []const u8) 
 /// and counts them.
 fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
     const checks = .{
-        .{ "bank", check_bank },                         .{ "hold", check_hold },                             .{ "shop", check_shop },
-        .{ "tapes", check_tapes },                       .{ "debugging", check_debugging },                   .{ "python", check_python_strategy },
-        .{ "setup-decisions", check_setup_decisions },   .{ "machine-decisions", check_machine_decisions },   .{ "branch-seeds", check_branch_seeds },
-        .{ "plugin-faults", check_plugin_faults },       .{ "plugin-checks", check_plugin_checks },           .{ "device-models", check_device_models },
-        .{ "plugin-histories", check_plugin_histories }, .{ "wasm-plugin", check_wasm_plugin },               .{ "wasm-misbehaving", check_wasm_misbehaving },
-        .{ "wasm-reach", check_wasm_reach },             .{ "plugins-many", check_plugins_many },             .{ "strategy-follow", check_strategy_follow },
-        .{ "steppers", check_steppers },                 .{ "reactive-faults", check_reactive_faults },       .{ "injectors", check_injectors },
-        .{ "labels", check_labels },                     .{ "wasm-upload", check_wasm_upload },               .{ "timeline-clocks", check_timeline_clocks },
-        .{ "egress", check_egress },                     .{ "fork-replay", check_fork_replay },               .{ "workload-singleton", check_workload_singleton },
-        .{ "length-bounds", check_length_bounds },       .{ "quiet-stop", check_quiet_stop },                 .{ "ingress", check_ingress },
-        .{ "ingress-session", check_ingress_session },   .{ "moments", check_moments },                       .{ "properties", check_builtin_properties },
-        .{ "entropy", check_kernel_entropy },            .{ "quiet", check_quiet_period },                    .{ "clock_jitter", check_clock_jitter },
-        .{ "query", check_query },                       .{ "progress", check_progress_while_quiet },         .{ "network", check_network_faults },
-        .{ "fault-exclusions", check_fault_exclusions }, .{ "serve", check_serve },                           .{ "until", check_until_and_causality },
-        .{ "coverage-gate", check_coverage_gate },       .{ "coverage", check_coverage },                     .{ "parallel", check_parallel },
-        .{ "fork", check_fork },                         .{ "tree", check_tree },                             .{ "startup-coverage", check_startup_coverage },
-        .{ "memory-climb", check_memory_climb },         .{ "disk", check_disk },                             .{ "shape", check_shape },
-        .{ "repl-strategy", check_repl_strategy },       .{ "end", check_end },                               .{ "plans", check_plans },
-        .{ "durability", check_durability },             .{ "mutate", check_mutate },                         .{ "interleave", check_interleave },
-        .{ "checks", check_host_checks },                .{ "pausing", check_pausing },                       .{ "shrink", check_shrink },
-        .{ "shrink-plugin", check_shrink_plugin },       .{ "holds", check_holds },                           .{ "coverage-set", check_coverage_set },
-        .{ "horizons", check_horizon_replays },          .{ "inject", check_inject },                         .{ "learned-limit", check_learned_limit },
-        .{ "sysctls", check_sysctls },                   .{ "hostname", check_hostname },                     .{ "self-driven", check_self_driven },
-        .{ "aim", check_aim },                           .{ "aftershock", check_aftershock },                 .{ "record-power-loss", check_record_power_loss },
-        .{ "errno-storm", check_errno_storm },           .{ "compose", check_compose },                       .{ "shards", check_shards },
-        .{ "stress", check_stress },                     .{ "controller", check_controller },                 .{ "clojure", check_clojure },
-        .{ "k3s", check_k3s },                           .{ "script", check_script },                         .{ "modulation", check_cpu_modulation },
-        .{ "profile", check_profile },                   .{ "catalog", check_catalog },                       .{ "guidance", check_guidance },
-        .{ "voidstar", check_voidstar },                 .{ "changed", check_changed },                       .{ "readdress", check_readdress },
-        .{ "unlist", check_unlist },                     .{ "signal", check_signal },                         .{ "syscall_error", check_syscall_error },
-        .{ "swarm", check_swarm },                       .{ "metastable", check_metastable },                 .{ "file_error", check_file_error },
-        .{ "retroactive", check_retroactive },           .{ "epoch", check_epoch },                           .{ "drive", check_drive },
-        .{ "hang", check_hang },                         .{ "pinned", check_pinned },                         .{ "slow", check_slow },
-        .{ "slot-wait", check_slot_wait },               .{ "ending-window", check_ending_window },           .{ "ending-killed", check_ending_killed },
-        .{ "own-sigkill", check_own_sigkill },           .{ "sought", check_sought },                         .{ "optimize", check_optimize },
-        .{ "states", check_states },                     .{ "crash-points", check_crash_points },             .{ "nodes-down", check_nodes_down },
-        .{ "stale-pid", check_stale_pid },               .{ "memory-growth", check_memory_growth },           .{ "upgrade", check_upgrade },
-        .{ "knobs", check_knobs },                       .{ "quorum", check_quorum },                         .{ "spare", check_spare },
-        .{ "saved", check_saved },                       .{ "concurrent", check_concurrent },                 .{ "resume", check_resume },
-        .{ "ui", check_ui },                             .{ "runs", check_runs },                             .{ "kubernetes", check_kubernetes },
-        .{ "steps", check_steps },                       .{ "before-nodes", check_before_nodes },             .{ "session", check_session },
-        .{ "fast", check_fast },                         .{ "sandbox", check_sandbox },                       .{ "devproxy", check_devproxy },
-        .{ "sandbox-egress", check_sandbox_egress },     .{ "ci", check_ci },                                 .{ "repl", check_repl },
-        .{ "mechanics", check_mechanics },               .{ "budget", check_budget },                         .{ "sinks", check_sinks },
-        .{ "dotnet", check_dotnet },                     .{ "lines", check_lines },                           .{ "voidstar-static", check_voidstar_static },
-        .{ "coverage-shared", check_coverage_shared },   .{ "frozen-start", check_frozen_start },             .{ "hangup", check_hangup },
-        .{ "frozen-step", check_frozen_step },           .{ "templates", check_templates },                   .{ "scenarios-sometimes", check_scenarios_sometimes },
-        .{ "scenarios-resume", check_scenarios_resume }, .{ "volumes", check_volumes },                       .{ "setup-mode", check_setup_mode },
-        .{ "jank", check_jank_repl },                    .{ "jank-aot", check_jank_aot },                     .{ "bank-steps", check_bank_steps },
-        .{ "checkpoint", check_session_checkpoint },     .{ "ingress-checkpoint", check_ingress_checkpoint }, .{ "ingress-crash", check_ingress_crash },
-        .{ "draws", check_draws },                       .{ "exit-stack", check_exit_stack },                 .{ "plan-calls", check_plan_calls },
-        .{ "services", check_services },                 .{ "sites", check_sites },                           .{ "client", check_client },
-        .{ "session-exact", check_session_exact },       .{ "java-watch", check_java_watch },                 .{ "raft-558", check_raft_558 },
-        .{ "jvm-caches", check_jvm_caches },             .{ "guest-panic", check_guest_panic },               .{ "resume-seen", check_resume_seen },
-        .{ "reserved-run", check_reserved_run },         .{ "home", check_home },                             .{ "clock-start", check_clock_start },
-        .{ "half-limit-again", check_half_limit_again },
+        .{ "bank", check_bank },                               .{ "hold", check_hold },                           .{ "shop", check_shop },
+        .{ "tapes", check_tapes },                             .{ "debugging", check_debugging },                 .{ "python", check_python_strategy },
+        .{ "setup-decisions", check_setup_decisions },         .{ "machine-decisions", check_machine_decisions }, .{ "branch-seeds", check_branch_seeds },
+        .{ "plugin-faults", check_plugin_faults },             .{ "plugin-checks", check_plugin_checks },         .{ "device-models", check_device_models },
+        .{ "plugin-histories", check_plugin_histories },       .{ "wasm-plugin", check_wasm_plugin },             .{ "wasm-misbehaving", check_wasm_misbehaving },
+        .{ "wasm-reach", check_wasm_reach },                   .{ "plugins-many", check_plugins_many },           .{ "strategy-follow", check_strategy_follow },
+        .{ "steppers", check_steppers },                       .{ "reactive-faults", check_reactive_faults },     .{ "injectors", check_injectors },
+        .{ "labels", check_labels },                           .{ "wasm-upload", check_wasm_upload },             .{ "timeline-clocks", check_timeline_clocks },
+        .{ "egress", check_egress },                           .{ "fork-replay", check_fork_replay },             .{ "workload-singleton", check_workload_singleton },
+        .{ "length-bounds", check_length_bounds },             .{ "quiet-stop", check_quiet_stop },               .{ "ingress", check_ingress },
+        .{ "ingress-session", check_ingress_session },         .{ "moments", check_moments },                     .{ "properties", check_builtin_properties },
+        .{ "explain-draw", check_explain_draw },               .{ "entropy", check_kernel_entropy },              .{ "quiet", check_quiet_period },
+        .{ "clock_jitter", check_clock_jitter },               .{ "query", check_query },                         .{ "progress", check_progress_while_quiet },
+        .{ "network", check_network_faults },                  .{ "fault-exclusions", check_fault_exclusions },   .{ "serve", check_serve },
+        .{ "until", check_until_and_causality },               .{ "coverage-gate", check_coverage_gate },         .{ "coverage", check_coverage },
+        .{ "parallel", check_parallel },                       .{ "fork", check_fork },                           .{ "tree", check_tree },
+        .{ "startup-coverage", check_startup_coverage },       .{ "memory-climb", check_memory_climb },           .{ "disk", check_disk },
+        .{ "shape", check_shape },                             .{ "repl-strategy", check_repl_strategy },         .{ "end", check_end },
+        .{ "plans", check_plans },                             .{ "durability", check_durability },               .{ "mutate", check_mutate },
+        .{ "interleave", check_interleave },                   .{ "checks", check_host_checks },                  .{ "pausing", check_pausing },
+        .{ "shrink", check_shrink },                           .{ "shrink-plugin", check_shrink_plugin },         .{ "holds", check_holds },
+        .{ "coverage-set", check_coverage_set },               .{ "horizons", check_horizon_replays },            .{ "inject", check_inject },
+        .{ "learned-limit", check_learned_limit },             .{ "sysctls", check_sysctls },                     .{ "hostname", check_hostname },
+        .{ "self-driven", check_self_driven },                 .{ "aim", check_aim },                             .{ "aftershock", check_aftershock },
+        .{ "record-power-loss", check_record_power_loss },     .{ "errno-storm", check_errno_storm },             .{ "compose", check_compose },
+        .{ "shards", check_shards },                           .{ "stress", check_stress },                       .{ "controller", check_controller },
+        .{ "clojure", check_clojure },                         .{ "k3s", check_k3s },                             .{ "script", check_script },
+        .{ "modulation", check_cpu_modulation },               .{ "profile", check_profile },                     .{ "catalog", check_catalog },
+        .{ "guidance", check_guidance },                       .{ "voidstar", check_voidstar },                   .{ "changed", check_changed },
+        .{ "readdress", check_readdress },                     .{ "unlist", check_unlist },                       .{ "signal", check_signal },
+        .{ "syscall_error", check_syscall_error },             .{ "swarm", check_swarm },                         .{ "metastable", check_metastable },
+        .{ "file_error", check_file_error },                   .{ "retroactive", check_retroactive },             .{ "epoch", check_epoch },
+        .{ "drive", check_drive },                             .{ "hang", check_hang },                           .{ "pinned", check_pinned },
+        .{ "slow", check_slow },                               .{ "slot-wait", check_slot_wait },                 .{ "ending-window", check_ending_window },
+        .{ "ending-killed", check_ending_killed },             .{ "own-sigkill", check_own_sigkill },             .{ "sought", check_sought },
+        .{ "optimize", check_optimize },                       .{ "states", check_states },                       .{ "crash-points", check_crash_points },
+        .{ "nodes-down", check_nodes_down },                   .{ "stale-pid", check_stale_pid },                 .{ "memory-growth", check_memory_growth },
+        .{ "upgrade", check_upgrade },                         .{ "knobs", check_knobs },                         .{ "quorum", check_quorum },
+        .{ "spare", check_spare },                             .{ "saved", check_saved },                         .{ "concurrent", check_concurrent },
+        .{ "resume", check_resume },                           .{ "ui", check_ui },                               .{ "runs", check_runs },
+        .{ "kubernetes", check_kubernetes },                   .{ "steps", check_steps },                         .{ "before-nodes", check_before_nodes },
+        .{ "session", check_session },                         .{ "fast", check_fast },                           .{ "sandbox", check_sandbox },
+        .{ "devproxy", check_devproxy },                       .{ "sandbox-egress", check_sandbox_egress },       .{ "ci", check_ci },
+        .{ "repl", check_repl },                               .{ "mechanics", check_mechanics },                 .{ "budget", check_budget },
+        .{ "sinks", check_sinks },                             .{ "dotnet", check_dotnet },                       .{ "lines", check_lines },
+        .{ "voidstar-static", check_voidstar_static },         .{ "coverage-shared", check_coverage_shared },     .{ "frozen-start", check_frozen_start },
+        .{ "hangup", check_hangup },                           .{ "frozen-step", check_frozen_step },             .{ "templates", check_templates },
+        .{ "scenarios-sometimes", check_scenarios_sometimes }, .{ "scenarios-resume", check_scenarios_resume },   .{ "volumes", check_volumes },
+        .{ "setup-mode", check_setup_mode },                   .{ "jank", check_jank_repl },                      .{ "jank-aot", check_jank_aot },
+        .{ "bank-steps", check_bank_steps },                   .{ "checkpoint", check_session_checkpoint },       .{ "ingress-checkpoint", check_ingress_checkpoint },
+        .{ "ingress-crash", check_ingress_crash },             .{ "draws", check_draws },                         .{ "exit-stack", check_exit_stack },
+        .{ "plan-calls", check_plan_calls },                   .{ "services", check_services },                   .{ "sites", check_sites },
+        .{ "client", check_client },                           .{ "session-exact", check_session_exact },         .{ "java-watch", check_java_watch },
+        .{ "raft-558", check_raft_558 },                       .{ "jvm-caches", check_jvm_caches },               .{ "guest-panic", check_guest_panic },
+        .{ "resume-seen", check_resume_seen },                 .{ "reserved-run", check_reserved_run },           .{ "home", check_home },
+        .{ "clock-start", check_clock_start },                 .{ "half-limit-again", check_half_limit_again },
     };
     // A check's whole name runs it alone (check.sh's `ui` ran guidance and quiet too).
     var exact = std.mem.eql(u8, only, "tla");
@@ -5081,6 +5081,68 @@ fn check_explain(context: *Context, branch: []const u8) !void {
         .{ "each verdict one of needed, partly, free, unclear", known },
         .{ "the same explanation twice", outputs[0].len > 0 and std.mem.eql(u8, outputs[0], outputs[1]) },
     }, "explain: timeline {s}'s last 2 faults, {d} details, each against its control over distinct histories", .{ branch, details });
+}
+
+/// `explain --draw`: a named draw of the scenario's own varied as a fault's details are. The
+/// selftest's cache (sdk.swarm_choice's "swarm.cache.operation", its eviction reached in seed 1's
+/// timeline 1 at 24.8 s) stopped at that violation (--until), its tape explained twice: the
+/// draw's last pull before the failure varied with fresh values (one detail, no value set), then
+/// set to 0 and 1 (`--draw <name>=0,1`: a detail each, its `set` the value asked). Each the same
+/// pull and draw, a count of distinct histories within the variants, a known verdict.
+fn check_explain_draw(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "det-selftest" });
+    const tapes = try std.fs.path.join(arena, &.{ context.scratch, "explain-draw-tapes" });
+    std.Io.Dir.cwd().deleteTree(context.io, tapes) catch {};
+    const property = "the cache's eviction is never reached (its bug)";
+    const violation = "assert.message=\"" ++ property ++ "\" assert.condition=true";
+    const report = try explore(context, &.{
+        "--program", program, "--scenario", "cache", "--seed", "1", "--branch", "1", "--tape-dir", tapes, "--until", violation,
+    });
+    const stopped = std.mem.indexOf(u8, report, "moment_reached") != null;
+    const tape = try std.fs.path.join(arena, &.{ tapes, "branch-1.jsonl" });
+    const Detail = struct { draw: []const u8, pull: u64, drew: u64, set: ?u64 = null, failing: u32, of: u32, verdict: []const u8 };
+    const Explained = struct { faults: []const struct { picked: []const u8, details: []const Detail } };
+    var found: [2]?[]const Detail = .{ null, null };
+    for ([_][]const u8{ "swarm.cache.operation", "swarm.cache.operation=0,1" }, &found) |asked, *details| {
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(arena, &.{ context.determinismo, "explain" });
+        try argv.appendSlice(arena, context.machine);
+        try argv.appendSlice(arena, &.{
+            "--tape", tape,  "--property", property, "--faults",   "1",     "--variants", "2", "--jobs", "4", "--json",
+            "--draw", asked, "--program",  program,  "--scenario", "cache",
+        });
+        const result = try run_kept(context, argv.items);
+        var lines = std.mem.tokenizeScalar(u8, result.stdout, '\n');
+        while (lines.next()) |line| {
+            if (!std.mem.startsWith(u8, line, "{\"explain\":")) continue;
+            const Line = struct { explain: Explained };
+            const parsed = std.json.parseFromSliceLeaky(Line, arena, line, .{ .ignore_unknown_fields = true }) catch break;
+            for (parsed.explain.faults) |fault| {
+                if (std.mem.eql(u8, fault.picked, "swarm.cache.operation")) details.* = fault.details;
+            }
+        }
+    }
+    const known = struct {
+        fn verdict(detail: Detail) bool {
+            for ([_][]const u8{ "needed", "partly", "free", "unclear" }) |name| if (std.mem.eql(u8, detail.verdict, name)) return true;
+            return false;
+        }
+        fn counted(detail: Detail) bool {
+            return detail.of >= 1 and detail.of <= 2 and detail.failing <= detail.of and std.mem.eql(u8, detail.draw, "swarm.cache.operation");
+        }
+    };
+    const fresh = found[0] orelse &.{};
+    const set = found[1] orelse &.{};
+    const same_pull = fresh.len == 1 and set.len == 2 and set[0].pull == fresh[0].pull and set[1].pull == fresh[0].pull and
+        set[0].drew == fresh[0].drew;
+    expect_all(context, &.{
+        .{ "the timeline stopped at the violation (--until)", stopped },
+        .{ "--draw <name>: the draw explained, one detail, no value set", fresh.len == 1 and fresh[0].set == null and known.counted(fresh[0]) and known.verdict(fresh[0]) },
+        .{ "--draw <name>=0,1: a detail each value, its set the value asked", set.len == 2 and set[0].set == 0 and set[1].set == 1 and
+            known.counted(set[0]) and known.counted(set[1]) and known.verdict(set[0]) and known.verdict(set[1]) },
+        .{ "both the same pull, the draw's last before the failure", same_pull },
+    }, "explain --draw: the cache's swarm draw before its eviction ({d} and {d} details)", .{ fresh.len, set.len });
 }
 
 /// `--until` (Antithesis's wait_until) stops a branch at its first violation and runs a command
