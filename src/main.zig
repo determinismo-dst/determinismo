@@ -735,6 +735,10 @@ const Arguments = struct {
     injectors: []const []const u8 = &.{},
     profile: ?[]const u8 = null,
     scenario: ?[]const u8 = null,
+    /// The scenarios explored after this one in a run of several (its request's, CE63).
+    scenarios_next: ?[]const []const u8 = null,
+    /// Explored with other scenarios: a complete run resumed goes on to the next (resume_read).
+    scenario_chain: bool = false,
     cache_directory: []const u8 = ".determinismo-cache",
 };
 
@@ -1120,12 +1124,16 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
     // The `sometimes` each scenario without other failures reached and never made true: it
     // fails only when no scenario explored made them true, judged once all ran.
     var unmet: std.ArrayList([]const []const u8) = .empty;
-    const scenarios = try scenarios_selected(arena, &arguments, prepared);
+    const scenarios = try scenarios_selected(arena, init.io, &arguments, prepared);
+    arguments.scenario_chain = scenarios.len > 1;
     for (scenarios, 0..) |scenario, index| {
         // Several scenarios explored: each its own run (its record, events and tapes, branch
         // numbers of its own); in one run, each scenario's timelines took the same files, and the
         // last scenario's were all that stayed (Quint, srv3 run 25).
         if (scenarios.len > 1 and exploration_is_run(&arguments)) {
+            const next = try arena.alloc([]const u8, scenarios.len - index - 1);
+            for (next, scenarios[index + 1 ..]) |*name, after| name.* = after.?;
+            arguments.scenarios_next = next;
             try run_scenario(arena, init.io, &arguments, scenario.?, index == 0);
         }
         options.cmdline = try cmdline_build(arena, base_cmdline, &arguments, scenario);
@@ -1353,20 +1361,92 @@ fn run_scenario(
         try run_request_write(arena, io, data, arguments.run_directory.?, arguments);
         return;
     }
-    const run = try runs.claim(arena, io, data);
-    try runs.output_tee(arena, try std.fs.path.join(arena, &.{ run.directory, "output.log" }));
-    say("[determinismo] run {d}: {s} (scenario {s})\n", .{ run.id, run.directory, scenario });
-    try run_request_write(arena, io, data, run.directory, arguments);
-    try runs.running_mark(arena, run.directory);
+    // A resume follows the chain: the scenario's run the interrupted explorer had started (its
+    // id in the record before), resumed; none, the rest are new runs (a resume of the first
+    // scenario's run explored the first alone, the others never: CE63, the blind Lean replica of
+    // the platform).
+    const followed: ?[]const u8 = if (arguments.resume_run) followed: {
+        const id = try next_run_read(arena, io, arguments.record_path orelse break :followed null) orelse {
+            arguments.resume_run = false;
+            break :followed null;
+        };
+        break :followed try chain_follow(arena, io, data, id, scenario);
+    } else null;
+    const directory = followed orelse claimed: {
+        const run = try runs.claim(arena, io, data);
+        // In the record of the scenario's run before: a resume of it goes on here.
+        report.record(.{ .next_run = run.id });
+        try runs.output_tee(arena, try std.fs.path.join(arena, &.{ run.directory, "output.log" }));
+        say("[determinismo] run {d}: {s} (scenario {s})\n", .{ run.id, run.directory, scenario });
+        try run_request_write(arena, io, data, run.directory, arguments);
+        break :claimed run.directory;
+    };
+    try runs.running_mark(arena, directory);
     // The record is opened once per run (command_explore): this one's anew.
     if (report.record_fd) |fd| {
         close(fd);
         report.record_fd = null;
     }
-    arguments.run_directory = run.directory;
-    arguments.events_directory = try std.fs.path.join(arena, &.{ run.directory, "events" });
-    arguments.record_path = try std.fs.path.join(arena, &.{ run.directory, "record.jsonl" });
-    arguments.tape_directory = try std.fs.path.join(arena, &.{ run.directory, "tapes" });
+    arguments.run_directory = directory;
+    arguments.events_directory = try std.fs.path.join(arena, &.{ directory, "events" });
+    arguments.record_path = try std.fs.path.join(arena, &.{ directory, "record.jsonl" });
+    arguments.tape_directory = try std.fs.path.join(arena, &.{ directory, "tapes" });
+}
+
+/// The run a scenario's record names as the next scenario's (`{"next_run":id}`), or null.
+fn next_run_read(arena: std.mem.Allocator, io: std.Io, record_path: []const u8) !?u32 {
+    const source = std.Io.Dir.cwd().readFileAlloc(io, record_path, arena, .unlimited) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    return next_run_in(arena, source);
+}
+
+fn next_run_in(arena: std.mem.Allocator, source: []const u8) ?u32 {
+    var found: ?u32 = null;
+    var lines = std.mem.tokenizeScalar(u8, source, '\n');
+    while (lines.next()) |text| {
+        if (std.mem.indexOf(u8, text, "\"next_run\"") == null) continue;
+        const line = std.json.parseFromSliceLeaky(struct { next_run: ?u32 = null }, arena, text, .{
+            .ignore_unknown_fields = true,
+        }) catch continue;
+        if (line.next_run) |id| found = id;
+    }
+    return found;
+}
+
+/// The next scenario's run of a chain, resumed: its directory, once no explorer holds it and
+/// its request is that scenario's.
+fn chain_follow(arena: std.mem.Allocator, io: std.Io, data: []const u8, id: u32, scenario: []const u8) ![]const u8 {
+    const directory = try runs.directory_of(arena, data, id);
+    if (runs.running_pid(arena, directory)) |pid| {
+        say("[determinismo] run {d}, scenario {s}'s, is running (pid {d}): resume it once it ends\n", .{ id, scenario, pid });
+        return error.RunRunning;
+    }
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(arena, &.{ directory, "request.json" }), arena, .limited(1 << 20));
+    const asked = try std.json.parseFromSliceLeaky(serve.RunRequest, arena, text, .{ .ignore_unknown_fields = true });
+    if (!std.mem.eql(u8, asked.scenario orelse "", scenario)) {
+        say("[determinismo] run {d} is scenario {s}'s, not {s}'s: the chain does not go on\n", .{ id, asked.scenario orelse "?", scenario });
+        return error.Usage;
+    }
+    try runs.output_tee(arena, try std.fs.path.join(arena, &.{ directory, "output.log" }));
+    say("[determinismo] run {d} resumed: {s} (scenario {s})\n", .{ id, directory, scenario });
+    // Its last end's exit is not this resume's, and serve is told it runs (run_register's).
+    _ = linux.unlink(try std.fs.path.joinZ(arena, &.{ directory, "exit" }));
+    runs.adopt_note(arena, data, id) catch |err| {
+        say("[determinismo] serve not told of this resume ({s}): it shows the run ended\n", .{@errorName(err)});
+    };
+    return directory;
+}
+
+test "a scenario's record names the next scenario's run, its last such line" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqual(@as(?u32, null), next_run_in(arena, "{\"run\":{}}\n{\"branch\":{\"index\":0}}\n"));
+    try std.testing.expectEqual(@as(?u32, 12), next_run_in(arena, "{\"run\":{}}\n{\"next_run\":12}\n"));
+    // A line cut short by an interruption is none.
+    try std.testing.expectEqual(@as(?u32, 12), next_run_in(arena, "{\"next_run\":12}\n{\"next_run\":1"));
 }
 
 test "a run's request keeps what its guest's command line needs: the wall clock's start" {
@@ -1478,6 +1558,7 @@ fn run_request_write(
         .kubernetes = if (arguments.kubernetes_path) |path| try runs.absolute(arena, path) else null,
         .images = arguments.kubernetes_images,
         .scenario = arguments.scenario,
+        .scenarios_next = arguments.scenarios_next,
         .profile = arguments.profile,
         .seed = arguments.seed,
         .branches = if (arguments.branches_given) arguments.branches else null,
@@ -1845,10 +1926,36 @@ fn system_nodes(system: ?std.json.Value) u32 {
 /// The scenarios to run, one at a time (null: the guest decides, as without --program).
 fn scenarios_selected(
     arena: std.mem.Allocator,
+    io: std.Io,
     arguments: *const Arguments,
     prepared: ?prepare.Prepared,
 ) ![]const ?[]const u8 {
     const system = (prepared orelse return &.{null}).system;
+    // A resume of a scenario's run of several: that scenario, then those its request names after
+    // it (the chain run_scenario follows).
+    if (arguments.resume_run) if (arguments.run_directory) |directory| {
+        const path = try std.fs.path.join(arena, &.{ directory, "request.json" });
+        if (std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20))) |text| {
+            const asked = try std.json.parseFromSliceLeaky(serve.RunRequest, arena, text, .{ .ignore_unknown_fields = true });
+            if (asked.scenarios_next) |next| if (next.len > 0) if (asked.scenario) |own| {
+                const chain = try arena.alloc(?[]const u8, next.len + 1);
+                chain[0] = own;
+                for (chain[1..], next) |*slot, name| {
+                    const scenario = system.scenario(name) orelse {
+                        say("[determinismo] the run's next scenario {s} is no scenario of the system\n", .{name});
+                        return error.Usage;
+                    };
+                    try quorum_known(system, scenario);
+                    slot.* = name;
+                }
+                if (arguments.scenario) |wanted| if (!std.mem.eql(u8, wanted, own)) {
+                    say("[determinismo] --scenario {s}: the resumed run is scenario {s}'s\n", .{ wanted, own });
+                    return error.Usage;
+                };
+                return chain;
+            };
+        } else |_| {}
+    };
     const wanted = arguments.scenario orelse if (system.scenarios.len == 1)
         system.scenarios[0].name
     else {
@@ -2461,8 +2568,9 @@ fn resume_read(context: Context, arguments: *const Arguments, inputs: u64) !*con
     } else false;
     // Complete, its catalog judged in its record: judged from the record. Without that verdict (a
     // run stopped after its last timeline, before its end) it ends as a run does, its catalog
-    // judged with its scenarios (CE45's remainder).
-    if (!left and resumed.catalog_seen) {
+    // judged with its scenarios (CE45's remainder). In a chain of scenarios, it ends as a run
+    // does too: the next scenario's run follows, and the catalog spans them all.
+    if (!left and resumed.catalog_seen and !arguments.scenario_chain) {
         // Judged from its record, as the run that recorded it would have been (a complete run
         // resumed once exited 0 here whatever its timelines failed: CE29). A catalog's
         // assertions no timeline reached are judged by the runs that ran timelines.

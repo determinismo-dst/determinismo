@@ -1726,6 +1726,9 @@ pub const RunRequest = struct {
     /// With kubernetes: images loaded beside those its manifests name (explore's --images).
     images: ?[]const u8 = null,
     scenario: ?[]const u8 = null,
+    /// A run of several scenarios (`all`): each scenario's run names the scenarios explored after
+    /// it, and a resume of it continues them (main's scenario chain, CE63); empty in the last's.
+    scenarios_next: ?[]const []const u8 = null,
     profile: ?[]const u8 = null,
     /// Absent: a fresh one, drawn by the server and kept in the run's request.json (as
     /// Antithesis's runs: each explores anew, and every moment of it replays).
