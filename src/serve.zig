@@ -448,6 +448,8 @@ pub fn serve(arena: std.mem.Allocator, io: std.Io, options: Options) !void {
     }
     const watcher = try std.Thread.spawn(.{}, watch, .{shared});
     watcher.detach();
+    const reaper = try std.Thread.spawn(.{}, reap, .{shared});
+    reaper.detach();
     std.debug.print("[determinismo] serving on http://{s} (data in {s})\n", .{
         first, options.data_directory,
     });
@@ -519,31 +521,16 @@ fn answer(shared: *Shared, client: linux.fd_t, public: bool) void {
     handle(&server, client);
 }
 
-/// The watcher: reaps runs, and ingests the timelines that finished (a running run's as they
-/// do; a finished run's last ones once).
-fn watch(shared: *Shared) void {
-    var ids: [runs_max]u32 = undefined;
-    var finals: [runs_max]bool = undefined;
-    var watches: u64 = 0;
-    // A test's slow store (e2e reap-beside-ingest): every ingest that much longer.
-    const ingest_delay_ms: u64 = if (std.c.getenv("DETERMINISMO_INGEST_DELAY_MS")) |text|
-        std.fmt.parseInt(u64, std.mem.span(text), 10) catch 0
-    else
-        0;
-    while (true) : (watches += 1) {
-        if (watches % snapshots_sweep_interval == 0) snapshots_sweep(shared);
-        if (watches % sessions_idle_interval == 0) sessions_idle_end(shared);
-        if (watches % detach_watch_interval == 0) {
-            var detach_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
-            defer detach_arena.deinit();
-            var server: Server = .{
-                .shared = shared,
-                .options = shared.options,
-                .io = shared.io,
-                .arena = detach_arena.allocator(),
-            };
-            detach_idle(&server);
-        }
+/// The reaper: runs found and reaped (their ends, repeats and automations), orphans swept, idle
+/// sessions ended, old snapshots swept, each watch interval, whatever an ingest takes. On the
+/// watcher's thread, a run's end waited for every ingest in flight: a calibration's composer
+/// run ended at 13:36 and was reaped after its own events' ingest (srv4, 2026-11-27), the next
+/// line started that much later, and a session idle meanwhile ran on.
+fn reap(shared: *Shared) void {
+    var reaps: u64 = 0;
+    while (true) : (reaps += 1) {
+        if (reaps % snapshots_sweep_interval == 0) snapshots_sweep(shared);
+        if (reaps % sessions_idle_interval == 0) sessions_idle_end(shared);
         const interval: linux.timespec = .{
             .sec = @divFloor(watch_interval_ns, std.time.ns_per_s),
             .nsec = @mod(watch_interval_ns, std.time.ns_per_s),
@@ -555,15 +542,6 @@ fn watch(shared: *Shared) void {
         const ended_count = runs_reap(shared, &ended);
         orphan_sweep_ticks += 1;
         if (orphan_sweep_ticks % orphan_sweep_every == 0) orphan_checks_kill();
-        var count: usize = 0;
-        for (shared.runs[0..shared.run_count]) |*run| {
-            if (run.complete) continue;
-            ids[count] = run.id;
-            finals[count] = run.status != null;
-            count += 1;
-            // Finished: one last ingest brings in every timeline.
-            if (run.status != null) run.complete = true;
-        }
         shared.unlock();
         for (ended[0..ended_count]) |id| {
             var request_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
@@ -581,6 +559,48 @@ fn watch(shared: *Shared) void {
             };
             automations_start(&server, id);
         }
+    }
+}
+
+/// The watcher: ingests the timelines that finished (a running run's as they do; a finished
+/// run's last ones once, after the reaper saw it end).
+fn watch(shared: *Shared) void {
+    var ids: [runs_max]u32 = undefined;
+    var finals: [runs_max]bool = undefined;
+    var watches: u64 = 0;
+    // A test's slow store (e2e reap-beside-ingest): every ingest that much longer.
+    const ingest_delay_ms: u64 = if (std.c.getenv("DETERMINISMO_INGEST_DELAY_MS")) |text|
+        std.fmt.parseInt(u64, std.mem.span(text), 10) catch 0
+    else
+        0;
+    while (true) : (watches += 1) {
+        if (watches % detach_watch_interval == 0) {
+            var detach_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+            defer detach_arena.deinit();
+            var server: Server = .{
+                .shared = shared,
+                .options = shared.options,
+                .io = shared.io,
+                .arena = detach_arena.allocator(),
+            };
+            detach_idle(&server);
+        }
+        const interval: linux.timespec = .{
+            .sec = @divFloor(watch_interval_ns, std.time.ns_per_s),
+            .nsec = @mod(watch_interval_ns, std.time.ns_per_s),
+        };
+        assert(linux.errno(linux.nanosleep(&interval, null)) != .INVAL);
+        shared.lock();
+        var count: usize = 0;
+        for (shared.runs[0..shared.run_count]) |*run| {
+            if (run.complete) continue;
+            ids[count] = run.id;
+            finals[count] = run.status != null;
+            count += 1;
+            // Finished: one last ingest brings in every timeline.
+            if (run.status != null) run.complete = true;
+        }
+        shared.unlock();
         for (ids[0..count], finals[0..count]) |id, final| {
             var request_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
             defer request_arena.deinit();
