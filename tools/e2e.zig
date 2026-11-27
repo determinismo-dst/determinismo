@@ -5016,12 +5016,15 @@ fn sleep_ms(duration_ms: u64) void {
     _ = std.os.linux.nanosleep(&request, null);
 }
 
-/// `determinismo explain` on a violating timeline (causality's): each of its last faults' details
-/// varied against the timeline's control, every verdict over the variants' distinct histories
-/// (each replay's events hash: CE62, the Lean replica of determinismo, round 8), and the same
-/// explanation twice (its variants drawn from the request's seed). No other check runs explain
-/// itself (causality's --explain-exec is another command).
-fn check_explain(context: *Context, branch: []const u8) !void {
+/// `determinismo explain` on a violating timeline: each of its last faults' details varied against
+/// the timeline's control, every verdict over the variants' distinct histories (each replay's
+/// events hash: CE62, the Lean replica of determinismo, round 8), and the same explanation twice
+/// (its variants drawn from the request's seed). No other check runs explain itself
+/// (causality's --explain-exec is another command). The timeline: causality's, else the first
+/// violating one with faults before its failure. Which timelines fail before any fault moves with
+/// anything that moves their moments: causality's timeline 1 lost its money at 0.8 s, no fault
+/// before it, once the guest's tools changed (1bbacd9's Rust names), and explain had nothing to vary.
+fn check_explain(context: *Context, causality_branch: []const u8) !void {
     const arena = context.arena;
     const run = context.bank_cold_run orelse {
         expect(context, false, "explain: the bank_cold run's directory (its report's run line)", .{});
@@ -5034,30 +5037,51 @@ fn check_explain(context: *Context, branch: []const u8) !void {
             details: []const struct { failing: u32, of: u32, verdict: []const u8 },
         },
     };
-    var outputs: [2][]const u8 = undefined;
-    for (&outputs) |*output| {
-        var argv: std.ArrayList([]const u8) = .empty;
-        try argv.appendSlice(arena, &.{ context.determinismo, "explain" });
-        try argv.appendSlice(arena, context.machine);
-        try argv.appendSlice(arena, &.{
-            "--run",      run, "--branch", branch, "--property", "total balance is conserved", "--faults", "2",
-            "--variants", "4", "--jobs",   "4",    "--json",
-        });
-        const result = try run_kept(context, argv.items);
-        output.* = if (result.term.success()) std.mem.trim(u8, result.stdout, " \n") else "";
-    }
+    const explain_once = struct {
+        fn once(c: *Context, run_directory: []const u8, branch: []const u8) ![]const u8 {
+            var argv: std.ArrayList([]const u8) = .empty;
+            try argv.appendSlice(c.arena, &.{ c.determinismo, "explain" });
+            try argv.appendSlice(c.arena, c.machine);
+            try argv.appendSlice(c.arena, &.{
+                "--run",      run_directory, "--branch", branch, "--property", "total balance is conserved", "--faults", "2",
+                "--variants", "4",           "--jobs",   "4",    "--json",
+            });
+            const result = try run_kept(c, argv.items);
+            return if (result.term.success()) std.mem.trim(u8, result.stdout, " \n") else "";
+        }
+    }.once;
     // explain's --json line is `{"explain":{...}}` (explain.zig, `.explain = explained`); the
     // first run of this check parsed it as the object itself and found nothing (60e3e87).
-    const explained: ?Explained = parsed: {
-        var lines = std.mem.tokenizeScalar(u8, outputs[0], '\n');
-        while (lines.next()) |line| {
-            if (!std.mem.startsWith(u8, line, "{\"explain\":")) continue;
-            const Line = struct { explain: Explained };
-            const line_parsed = std.json.parseFromSliceLeaky(Line, arena, line, .{ .ignore_unknown_fields = true }) catch break :parsed null;
-            break :parsed line_parsed.explain;
+    const parse = struct {
+        fn parse(a: std.mem.Allocator, output: []const u8) ?Explained {
+            var lines = std.mem.tokenizeScalar(u8, output, '\n');
+            while (lines.next()) |line| {
+                if (!std.mem.startsWith(u8, line, "{\"explain\":")) continue;
+                const Line = struct { explain: Explained };
+                const line_parsed = std.json.parseFromSliceLeaky(Line, a, line, .{ .ignore_unknown_fields = true }) catch return null;
+                return line_parsed.explain;
+            }
+            return null;
         }
-        break :parsed null;
-    };
+    }.parse;
+    var candidates: std.ArrayList([]const u8) = .empty;
+    try candidates.append(arena, causality_branch);
+    for (try bank_cold_violating_branches(context)) |other| {
+        if (!std.mem.eql(u8, other, causality_branch)) try candidates.append(arena, other);
+    }
+    var outputs: [2][]const u8 = .{ "", "" };
+    var explained: ?Explained = null;
+    var branch: []const u8 = causality_branch;
+    var tried: usize = 0;
+    for (candidates.items[0..@min(candidates.items.len, 6)]) |candidate| {
+        tried += 1;
+        branch = candidate;
+        outputs[0] = try explain_once(context, run, candidate);
+        explained = parse(arena, outputs[0]);
+        if (explained) |e| if (e.faults.len > 0) break;
+    }
+    outputs[1] = try explain_once(context, run, branch);
+    const with_faults = if (explained) |e| e.faults.len > 0 else false;
     var details: usize = 0;
     var bounded = true;
     var known = true;
@@ -5075,6 +5099,7 @@ fn check_explain(context: *Context, branch: []const u8) !void {
     };
     expect_all(context, &.{
         .{ "an explanation (its --json line)", explained != null },
+        .{ "a violating timeline with faults before its failure (the check's premise)", with_faults },
         .{ "a fault's details varied", details > 0 },
         .{ "each count its distinct histories, 1 to the 4 variants", bounded },
         .{ "each control its own histories", controlled },
