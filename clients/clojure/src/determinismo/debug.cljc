@@ -309,6 +309,11 @@ std::string determinismo_debug_hex(std::string const &decimal) {
   [x]
   (if (or (keyword? x) (symbol? x)) (clojure.core/name x) (str x)))
 
+(defn- shell-quoted
+  "`text` as one word of a POSIX shell's command line: single quotes, its own escaped."
+  [text]
+  (str "'" (str/replace (str text) "'" "'\\''") "'"))
+
 (defn symbol
   "Where a variable (or function) of a node's processes is, by its name, at the session's
   moment (`det-nodes symbol`): {:pid :module :address :size :kind :physical :type :probe},
@@ -325,8 +330,9 @@ std::string determinismo_debug_hex(std::string const &decimal) {
   ([session node wanted options]
    (let [node (named node)
          wanted (named wanted)
-         said (sh session (str "det-nodes symbol " node " " wanted
-                               (when (:field options) (str " --field " (:field options)))
+         ;; Quoted for the guest's shell: a Rust path's `<`, `>` and spaces, a field's brackets.
+         said (sh session (str "det-nodes symbol " node " " (shell-quoted wanted)
+                               (when (:field options) (str " --field " (shell-quoted (:field options))))
                                (when (:pid options) (str " --pid " (:pid options)))))
          line (some (fn [l] (when (str/starts-with? l "{") l)) (str/split-lines (or said "")))]
      (when-not line
