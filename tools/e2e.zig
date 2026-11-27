@@ -274,15 +274,15 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "sinks", check_sinks },                             .{ "dotnet", check_dotnet },                       .{ "lines", check_lines },
         .{ "voidstar-static", check_voidstar_static },         .{ "coverage-shared", check_coverage_shared },     .{ "frozen-start", check_frozen_start },
         .{ "hangup", check_hangup },                           .{ "frozen-step", check_frozen_step },             .{ "templates", check_templates },
-        .{ "scenarios-sometimes", check_scenarios_sometimes }, .{ "scenarios-resume", check_scenarios_resume },   .{ "volumes", check_volumes },
-        .{ "setup-mode", check_setup_mode },                   .{ "jank", check_jank_repl },                      .{ "jank-aot", check_jank_aot },
-        .{ "bank-steps", check_bank_steps },                   .{ "checkpoint", check_session_checkpoint },       .{ "ingress-checkpoint", check_ingress_checkpoint },
-        .{ "ingress-crash", check_ingress_crash },             .{ "draws", check_draws },                         .{ "exit-stack", check_exit_stack },
-        .{ "plan-calls", check_plan_calls },                   .{ "services", check_services },                   .{ "sites", check_sites },
-        .{ "client", check_client },                           .{ "session-exact", check_session_exact },         .{ "java-watch", check_java_watch },
-        .{ "raft-558", check_raft_558 },                       .{ "jvm-caches", check_jvm_caches },               .{ "guest-panic", check_guest_panic },
-        .{ "resume-seen", check_resume_seen },                 .{ "reserved-run", check_reserved_run },           .{ "home", check_home },
-        .{ "clock-start", check_clock_start },                 .{ "half-limit-again", check_half_limit_again },
+        .{ "scenarios-sometimes", check_scenarios_sometimes }, .{ "scenarios-resume", check_scenarios_resume },   .{ "reap-beside-ingest", check_reap_beside_ingest },
+        .{ "volumes", check_volumes },                         .{ "setup-mode", check_setup_mode },               .{ "jank", check_jank_repl },
+        .{ "jank-aot", check_jank_aot },                       .{ "bank-steps", check_bank_steps },               .{ "checkpoint", check_session_checkpoint },
+        .{ "ingress-checkpoint", check_ingress_checkpoint },   .{ "ingress-crash", check_ingress_crash },         .{ "draws", check_draws },
+        .{ "exit-stack", check_exit_stack },                   .{ "plan-calls", check_plan_calls },               .{ "services", check_services },
+        .{ "sites", check_sites },                             .{ "client", check_client },                       .{ "session-exact", check_session_exact },
+        .{ "java-watch", check_java_watch },                   .{ "raft-558", check_raft_558 },                   .{ "jvm-caches", check_jvm_caches },
+        .{ "guest-panic", check_guest_panic },                 .{ "resume-seen", check_resume_seen },             .{ "reserved-run", check_reserved_run },
+        .{ "home", check_home },                               .{ "clock-start", check_clock_start },             .{ "half-limit-again", check_half_limit_again },
     };
     // A check's whole name runs it alone (check.sh's `ui` ran guidance and quiet too).
     var exact = std.mem.eql(u8, only, "tla");
@@ -10850,6 +10850,54 @@ fn check_scenarios_sometimes(context: *Context) !void {
         .{ "the property reported", std.mem.indexOf(u8, report, message) != null },
         .{ "true in one template, the run passes", status == 0 },
     }, "scenarios-sometimes: a sometimes false in one template and true in the other passes the run (exit {d})", .{status});
+}
+
+/// A run's end is seen at once, whatever an ingest takes: serve reaps on a thread of its own. On
+/// the watcher's thread a run that ended while an ingest ran waited for it (a calibration's
+/// composer run behind its own events' ingest, 2026-11-27: the next line started that much
+/// later). Here every ingest takes two minutes (DETERMINISMO_INGEST_DELAY_MS, a test's slow store).
+fn check_reap_beside_ingest(context: *Context) !void {
+    const arena = context.arena;
+    const address = "127.0.0.1:7923";
+    const url = "http://" ++ address;
+    const data = try std.fs.path.join(arena, &.{ context.scratch, "serve-reap-beside-ingest" });
+    std.Io.Dir.cwd().deleteTree(context.io, data) catch {};
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{ "env", "DETERMINISMO_INGEST_DELAY_MS=120000", context.determinismo, "serve", "--listen", address, "--data", data });
+    try argv.appendSlice(arena, context.machine);
+    var server = try std.process.spawn(context.io, .{ .argv = argv.items, .stdout = .ignore, .stderr = .ignore });
+    defer server.kill(context.io);
+    for (0..50) |_| {
+        const runs: []const u8 = curl(context, &.{url ++ "/runs"}) catch "";
+        if (runs.len > 0) break;
+        sleep_ms(100);
+    }
+    const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
+    const asked = try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(.{
+        .program = program,
+        .scenario = "bank",
+        .seed = 1,
+        .branches = 2,
+        .branching = "flat",
+    }, .{})});
+    _ = try curl(context, &.{ "-X", "POST", "-d", asked, url ++ "/runs" });
+    // The explorer's end: its exit, written as it ends.
+    const exit_path = try std.fmt.allocPrint(arena, "{s}/runs/1/exit", .{data});
+    const ended = for (0..6000) |_| {
+        if (std.Io.Dir.cwd().access(context.io, exit_path, .{})) |_| break true else |_| {}
+        sleep_ms(100);
+    } else false;
+    const exited_ns = monotonic_ns();
+    const seen = for (0..600) |_| {
+        const run = curl(context, &.{url ++ "/runs/1"}) catch "";
+        if (run.len > 0 and std.mem.indexOf(u8, run, "\"state\":\"running\"") == null) break true;
+        sleep_ms(100);
+    } else false;
+    const seen_ms = (monotonic_ns() - exited_ns) / std.time.ns_per_ms;
+    expect_all(context, &.{
+        .{ "the run ended (its explorer's exit)", ended },
+        .{ "serve said so within 15 s, every ingest taking 2 minutes", seen and seen_ms <= 15_000 },
+    }, "reap-beside-ingest: a run's end seen {d} ms after its exit, ingests slowed to 2 minutes", .{seen_ms});
 }
 
 /// A run of several scenarios resumed goes on through them: the next scenario's run the

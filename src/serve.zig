@@ -525,6 +525,11 @@ fn watch(shared: *Shared) void {
     var ids: [runs_max]u32 = undefined;
     var finals: [runs_max]bool = undefined;
     var watches: u64 = 0;
+    // A test's slow store (e2e reap-beside-ingest): every ingest that much longer.
+    const ingest_delay_ms: u64 = if (std.c.getenv("DETERMINISMO_INGEST_DELAY_MS")) |text|
+        std.fmt.parseInt(u64, std.mem.span(text), 10) catch 0
+    else
+        0;
     while (true) : (watches += 1) {
         if (watches % snapshots_sweep_interval == 0) snapshots_sweep(shared);
         if (watches % sessions_idle_interval == 0) sessions_idle_end(shared);
@@ -590,6 +595,13 @@ fn watch(shared: *Shared) void {
             defer if (final) {
                 _ = detach_one(&server, id, 0);
             };
+            if (ingest_delay_ms > 0) {
+                const delay: linux.timespec = .{
+                    .sec = @intCast(ingest_delay_ms / std.time.ms_per_s),
+                    .nsec = @intCast((ingest_delay_ms % std.time.ms_per_s) * std.time.ns_per_ms),
+                };
+                _ = linux.nanosleep(&delay, null);
+            }
             run_update(&server, id) catch |err| {
                 std.debug.print("[determinismo] run {d}'s events: {s} {s}\n", .{
                     id, @errorName(err), server.detail orelse "",
