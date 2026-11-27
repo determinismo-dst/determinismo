@@ -6916,8 +6916,50 @@ test run_reserved {
 fn reserved(server: *Server, argv: []const []const u8) ![]const []const u8 {
     const on = std.c.getenv("DETERMINISMO_RESERVED_SCOPE") orelse return argv;
     if (std.mem.span(on).len == 0) return argv; // No reserved cores: serve.sh leaves it empty.
-    const prefix = [_][]const u8{ "/usr/bin/systemd-run", "--user", "--scope", "--quiet", "--collect", "--" };
-    return std.mem.concat(server.arena, []const u8, &.{ &prefix, argv });
+    const prefix = [_][]const u8{ "/usr/bin/systemd-run", "--user", "--scope", "--quiet", "--collect" };
+    // The reserved CPUs named, isolate.sh's: the user's manager keeps the runs' CPUs too (so a
+    // run's image builds take its own), and a scope of it without them ran on serve's (e2e
+    // reserved-run: "a run asked reserved on 9-43", 2026-11-27).
+    var drop_in_buffer: [512]u8 = undefined;
+    const reserved_list = reserved_cpus(file_read_small(reserved_cpus_drop_in, &drop_in_buffer) orelse "");
+    const pinned: []const []const u8 = if (reserved_list) |list|
+        &.{ "-p", try std.fmt.allocPrint(server.arena, "AllowedCPUs={s}", .{list}) }
+    else
+        &.{};
+    return std.mem.concat(server.arena, []const u8, &.{ &prefix, pinned, &.{"--"}, argv });
+}
+
+/// isolate.sh's drop-in for every service: its AllowedCPUs are the host's reserved CPUs.
+const reserved_cpus_drop_in = "/etc/systemd/system/service.d/50-determinismo-reserved-cpus.conf";
+
+/// The CPU list a drop-in's last non-empty AllowedCPUs= names, or null.
+fn reserved_cpus(text: []const u8) ?[]const u8 {
+    var found: ?[]const u8 = null;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (!std.mem.startsWith(u8, trimmed, "AllowedCPUs=")) continue;
+        const value = std.mem.trim(u8, trimmed["AllowedCPUs=".len..], " \t");
+        if (value.len > 0) found = value;
+    }
+    return found;
+}
+
+fn file_read_small(path: [:0]const u8, buffer: []u8) ?[]const u8 {
+    const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return null;
+    defer _ = linux.close(@intCast(fd));
+    const size = linux.read(@intCast(fd), buffer.ptr, buffer.len);
+    if (linux.errno(size) != .SUCCESS) return null;
+    return buffer[0..size];
+}
+
+test "a reserved run's scope names the reserved CPUs isolate.sh gave every service" {
+    try std.testing.expectEqualStrings("0-8,44-52", reserved_cpus("[Service]\nAllowedCPUs=0-8,44-52\n").?);
+    // A reset then a list (serve's own drop-in's shape): the list.
+    try std.testing.expectEqualStrings("9-43", reserved_cpus("[Service]\nAllowedCPUs=\nAllowedCPUs=9-43\n").?);
+    try std.testing.expectEqual(@as(?[]const u8, null), reserved_cpus("[Service]\nOOMPolicy=continue\n"));
+    try std.testing.expectEqual(@as(?[]const u8, null), reserved_cpus(""));
 }
 
 /// The user manager's runtime directory, for systemd-run --user (reserved).
