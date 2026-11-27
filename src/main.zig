@@ -3296,6 +3296,14 @@ fn command_explore(
         learned_cuts,
         learned_stopped,
     });
+    // A resume with nothing left (every timeline recorded, the run stopped before its end, or a
+    // scenario's run complete in a chain) is judged from its record: it ended with
+    // NoTimelineFinished, and a chain resumed from a complete first scenario never went on.
+    const recorded = if (exploration.done) |resumed| resumed.done.count() else 0;
+    if (multiverse.branches == 0 and recorded > 0) {
+        say("[determinismo] nothing left to explore: its {d} recorded timelines judged from the record\n", .{recorded});
+        return multiverse;
+    }
     multiverse.summarize(monotonic_ns() - time_start_ns);
     // Not a pass: nothing was judged.
     if (multiverse.branches == 0) return error.NoTimelineFinished;
