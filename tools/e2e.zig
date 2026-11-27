@@ -5121,8 +5121,14 @@ fn check_explain_draw(context: *Context) !void {
     std.Io.Dir.cwd().deleteTree(context.io, tapes) catch {};
     const property = "the cache's eviction is never reached (its bug)";
     const violation = "assert.message=\"" ++ property ++ "\" assert.condition=true";
+    // Explore's own drive length, over the machine's counted starts (--drive-max none): with none
+    // the cache's parallel driver never starts and timeline 1 ends at 0.76 s, before its eviction
+    // (the batch of dbe1cce). The explains pass it too: the tape's inputs include the guest's
+    // command line.
+    const drive = "20m";
     const report = try explore(context, &.{
-        "--program", program, "--scenario", "cache", "--seed", "1", "--branch", "1", "--tape-dir", tapes, "--until", violation,
+        "--program",   program, "--scenario", "cache", "--seed", "1", "--branch", "1", "--tape-dir", tapes, "--until", violation,
+        "--drive-max", drive,
     });
     const stopped = std.mem.indexOf(u8, report, "moment_reached") != null;
     const tape = try std.fs.path.join(arena, &.{ tapes, "branch-1.jsonl" });
@@ -5134,8 +5140,8 @@ fn check_explain_draw(context: *Context) !void {
         try argv.appendSlice(arena, &.{ context.determinismo, "explain" });
         try argv.appendSlice(arena, context.machine);
         try argv.appendSlice(arena, &.{
-            "--tape", tape,  "--property", property, "--faults",   "1",     "--variants", "2", "--jobs", "4", "--json",
-            "--draw", asked, "--program",  program,  "--scenario", "cache",
+            "--tape", tape,  "--property", property, "--faults",   "1",     "--variants",  "2",   "--jobs", "4", "--json",
+            "--draw", asked, "--program",  program,  "--scenario", "cache", "--drive-max", drive,
         });
         const result = try run_kept(context, argv.items);
         var lines = std.mem.tokenizeScalar(u8, result.stdout, '\n');
