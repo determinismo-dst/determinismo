@@ -103,11 +103,16 @@ const register_names = [_]struct { name: []const u8, index: u8 }{
 /// test and the act it guards (Turso's Completion::set_waker, its waker stored after `finished()`
 /// returned false: `...::set_waker@389`; its lost wakeup, fixed by tursodatabase/turso#11848),
 /// where an entry would hold it before the test.
+/// `#<n>` after the line names its n-th start in the function (1, the first, by default): an
+/// optimized function's code for one source line comes in several runs, an inlined helper's line
+/// among them (Turso's set_waker at v0.6.1 has its store's line inlined away: the point after its
+/// test is the second start of `ptr/non_null.rs:428`, get_inner's, before the mutex is taken).
 pub const Spec = struct {
     function: []const u8,
     offset: ?u64 = null,
     file: ?[]const u8 = null,
     line: ?u32 = null,
+    start: u32 = 1,
 
     fn at_entry(spec: Spec) bool {
         return spec.offset == null and spec.line == null;
@@ -118,13 +123,19 @@ pub fn spec_parse(text: []const u8) error{Usage}!Spec {
     if (text.len == 0) return error.Usage;
     if (std.mem.lastIndexOfScalar(u8, text, '@')) |at| {
         if (at == 0) return error.Usage;
-        const place = text[at + 1 ..];
+        var place = text[at + 1 ..];
+        var start: u32 = 1;
+        if (std.mem.lastIndexOfScalar(u8, place, '#')) |hash| {
+            start = std.fmt.parseInt(u32, place[hash + 1 ..], 10) catch return error.Usage;
+            if (start == 0) return error.Usage;
+            place = place[0..hash];
+        }
         const colon = std.mem.lastIndexOfScalar(u8, place, ':');
         const line = std.fmt.parseInt(u32, if (colon) |c| place[c + 1 ..] else place, 10) catch return error.Usage;
         if (line == 0) return error.Usage;
         const file: ?[]const u8 = if (colon) |c| place[0..c] else null;
         if (file != null and file.?.len == 0) return error.Usage;
-        return .{ .function = text[0..at], .file = file, .line = line };
+        return .{ .function = text[0..at], .file = file, .line = line, .start = start };
     }
     // An offset is a number after the last plus (`operator+` and `operator+=` are names).
     if (std.mem.lastIndexOfScalar(u8, text, '+')) |plus| if (plus > 0) {
@@ -812,11 +823,12 @@ pub fn run(arena: std.mem.Allocator, options: Options) !u8 {
             if (process == null) process = where.Process.read(arena, hold.pid);
             const starts = process.?.line_starts(arena, found.module, spec.file, line, found.address, found.address + found.size) orelse return error.NoLineTable;
             if (starts.len == 0) return error.NoSuchLine;
-            // The line's first start; the others are in the event (a line split in two by the
-            // compiler: `+<offset>` names another).
-            sdk.event("hold", .{ .node = options.node, .what = "resolved", .point = hold.count, .address = starts[0], .offset = starts[0] - found.address, .starts = starts.len });
-            resolved[hold.count] = .{ .offset = starts[0] - found.address, .starts = starts.len };
-            break :address starts[0];
+            // The start asked for (`#<n>`, the first by default); their count is in the event.
+            if (spec.start > starts.len) return error.NoSuchStart;
+            const chosen = starts[spec.start - 1];
+            sdk.event("hold", .{ .node = options.node, .what = "resolved", .point = hold.count, .address = chosen, .offset = chosen - found.address, .starts = starts.len });
+            resolved[hold.count] = .{ .offset = chosen - found.address, .starts = starts.len };
+            break :address chosen;
         } else found.address;
         var caller: ?[2]u64 = null;
         if (asked.caller) |name| {
@@ -1026,6 +1038,13 @@ test spec_parse {
     try std.testing.expectError(error.Usage, spec_parse("f@:3"));
     try std.testing.expectError(error.Usage, spec_parse("f@0"));
     try std.testing.expectError(error.Usage, spec_parse("@3"));
+    const second = try spec_parse("turso_core::io::completions::Completion::set_waker@ptr/non_null.rs:428#2");
+    try std.testing.expectEqualStrings("ptr/non_null.rs", second.file.?);
+    try std.testing.expectEqual(@as(?u32, 428), second.line);
+    try std.testing.expectEqual(@as(u32, 2), second.start);
+    try std.testing.expectEqual(@as(u32, 1), (try spec_parse("f@3")).start);
+    try std.testing.expectError(error.Usage, spec_parse("f@3#0"));
+    try std.testing.expectError(error.Usage, spec_parse("f@3#x"));
     // `--direct` only at an entry; a line point takes `--caller` by its frame pointers.
     try std.testing.expectError(error.Usage, parse("n", "f@3", &.{ "--caller", "g", "--direct" }));
     const inside = try parse("n", "f@3", &.{ "--caller", "g", "--and", "h+8" });
