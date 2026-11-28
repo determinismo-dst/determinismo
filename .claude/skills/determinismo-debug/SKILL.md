@@ -61,6 +61,16 @@ Every timeline replays exactly, so a failure is evidence, not flakiness. Follow
    `dbg/watch` on the word with its `:cr3` and `dbg/continue` to stop at the write, and
    `dbg/frames` for the stack at it (unwound by the module's `.eh_frame`, exact for Rust and
    C++ release code: `OnceLock::initialize <- Completion::error <- Statement::run_once ...`).
+   A race inside a process you now understand (two threads, a window between a test and an
+   act) is made to happen in every timeline with a hold, not waited for: a walk
+   (`node.hold`, the determinismo-workload skill's "Races inside a process") or, in a session at
+   the moment, `/opt/determinismo/bin/det-nodes hold <node> '<function>@<file>:<line>' >
+   /tmp/hold.out 2>&1 & echo $! > /tmp/hold.pid` (`armed`, `held` and `point` lines in
+   /tmp/hold.out), then step on and `kill -TERM $(cat /tmp/hold.pid)` to let the held threads go
+   (the hold's own `timeout-ms` ends it too). Points are entries, offsets or source
+   lines (`#<n>` for a line's n-th start); in optimized code read the function's lines first.
+   A blind miss of a race that reproduces plainly is a gap in where the guest switches threads,
+   not a limit of one vCPU.
 5. **Shrink its faults**: `determinismo script <events>` then `determinismo shrink <explore
    options> --script <script.json> --property '<message>'`: the fewest faults that still make it
    fail (or that it needs none), judged over 16 seeds, and the shrunk script for `--script`.

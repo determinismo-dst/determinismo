@@ -223,6 +223,39 @@ fn transfers(s: *System.Scenario) void {
   (something busy-waits or polls: a runtime's spin setting), clock reads per virtual second,
   and the busy node (CPU by node).
 
+## Races inside a process: make them happen
+
+On one vCPU a race between two threads of a process (a check then an act, a test then a store,
+a lost wakeup) shows only when a thread switch lands in its window, a few instructions wide:
+timer-driven switches nearly never do. A miss is the platform's gap until shown otherwise; use
+the controls, from blind to certain:
+
+- **Faults that move switches**: the node's `interleave` (the scheduler's choices drawn at its
+  decision points), `thread_pause` and `process_pause`; an instrumented build (coverage) pauses
+  threads at its edges (examples/race, profile `instrumented`).
+- **Yield points in the system's code** (FoundationDB's BUGGIFY): the SDK's `buggify_pause(name)`
+  (Rust; the others' buggify) placed between the test and the act, a patch of the system's (a
+  profile's build argument, never the default build): the explorer draws and steers them, and a
+  window of instructions becomes milliseconds.
+- **A walk that holds threads** (a race you understand, in every timeline): `node.hold(&.{
+  point, flags... }, timeout_ms)`, then `armed()`, `held(n)`, `release_point(n)`, `release()`
+  (det-nodes hold: ptrace and int3 in the node's process). A point: `<function>` (its entry),
+  `<function>+<offset>`, or `<function>@[<file>:]<line>[#<n>]`, the first instruction of that
+  source line's code inside the function (`#<n>`: its n-th start), from the module's table of
+  lines (a binary node with debug information, or an image's ELF files under /symbols). Flags:
+  `--and <point>` (up to 4), `--caller <f>` (frame pointers), `--direct` (entries only),
+  `--arg`, `--arg-field`, `--arg-string`, `--every`, `--repeat`, `--later` (then `arm`). Each
+  hold, release and step past is a `hold` event; a line point's place is its `resolved` event.
+  Examples: examples/race/race_test.zig, scenarios `held`, `held_line`, `held_release`,
+  `held_later`, `held_crowd`.
+- **Optimized code**: a line's own instructions may be inlined away or split. Read the function's
+  lines first (`objdump -d -l` on the binary, `det-nodes where <node> <address>`), take the first
+  instruction after the test, and check it comes before any lock the other side takes: a thread
+  held holding the lock makes the other side wait instead of racing.
+- **Check the other side moves**: a hold only races if the other thread runs into the window
+  meanwhile. Note the process's threads while held (`/proc/<pid>/task/*/stat`, `wchan`) and give
+  the walk a control: the same hold on the fixed code, which must pass.
+
 ## Assertions in the service
 
 Use the SDK of the service's language (`sdk/c`, `sdk/python`, `sdk/java` with the catalog agent,
