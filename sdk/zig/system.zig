@@ -184,6 +184,8 @@ pub fn NodeSpec(comptime Name: type) type {
         /// Settings drawn as it starts (schema.Knob: FoundationDB's knobs), e.g.
         /// `.{ .name = "snapshot", .choices = &.{ &.{"ETCD_SNAPSHOT_COUNT=10"}, &.{"ETCD_SNAPSHOT_COUNT=1000"} } }`.
         knobs: []const schema.Knob = &.{},
+        /// The CPUs its programs size their thread pools by (schema.Node.cpus).
+        cpus: []const u32 = &.{ 1, 2, 4 },
         /// Processes (by command name) whose crashes the system is known to have: counted, not
         /// failed (schema.Node.crashes_known).
         crashes_known: []const []const u8 = &.{},
@@ -641,6 +643,7 @@ pub fn node_convert(arena: std.mem.Allocator, name: []const u8, spec: NodeSpec([
         .log_failures = spec.log_failures,
         .spare = spec.spare,
         .knobs = spec.knobs,
+        .cpus = spec.cpus,
         .antithesis_library = spec.antithesis_library,
         .once = spec.once,
         .volumes = spec.volumes,

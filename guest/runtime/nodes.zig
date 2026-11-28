@@ -4050,7 +4050,7 @@ const Launch = struct {
         if (node.knobs.len > schema.knobs_max) return error.TooManyKnobs;
         // A start's knobs (schema.Knob): their chosen entries first, the node's own of the same
         // names left out (one value each, whichever entry a program reads).
-        var knob_entries: [schema.knobs_max * schema.knob_entries_max][]const u8 = undefined;
+        var knob_entries: [schema.knobs_max * schema.knob_entries_max + cpus_entries_max][]const u8 = undefined;
         var knob_count: usize = 0;
         if (kind == .start) {
             for (node.knobs) |knob| {
@@ -4059,6 +4059,15 @@ const Launch = struct {
                     knob_entries[knob_count] = entry;
                     knob_count += 1;
                 }
+            }
+            // The CPUs its programs size their thread pools by (schema.Node.cpus), drawn as a
+            // knob of its own (`knob.cpus`): each runtime's setting where the node sets none.
+            if (node.cpus.len > 0) {
+                const count = node.cpus[@intCast(sdk.random_below_named("knob.cpus", node.cpus.len))];
+                var own_buffer: [256]u8 = undefined;
+                var own: std.ArrayList(u8) = .initBuffer(&own_buffer);
+                try cpus_add(arena, count, &knob_entries, &knob_count, node.env, &own);
+                sdk.event("node_cpus", .{ .node = node.name, .cpus = count, .own = own.items });
             }
         }
         var env_kept: usize = 0;
@@ -4524,6 +4533,108 @@ fn knob_read(path: [:0]const u8, count: usize) ?usize {
 }
 
 /// Whether one of a start's knob entries sets the variable `entry` (NAME=value) sets.
+/// Each runtime's own setting of the CPUs it sizes its thread pools by (schema.Node.cpus): the
+/// count alone, or Erlang's schedulers (`+S n:n`). The JVM's is a flag in JAVA_TOOL_OPTIONS
+/// (cpus_add). Node.js sizes its pool by none (libuv's 4), CPython has no pool to size.
+const cpus_variables = [_]struct { name: []const u8, form: enum { count, erlang } }{
+    .{ .name = "TOKIO_WORKER_THREADS", .form = .count },
+    .{ .name = "GOMAXPROCS", .form = .count },
+    .{ .name = "RAYON_NUM_THREADS", .form = .count },
+    .{ .name = "OMP_NUM_THREADS", .form = .count },
+    .{ .name = "DOTNET_PROCESSOR_COUNT", .form = .count },
+    .{ .name = "ERL_FLAGS", .form = .erlang },
+};
+const java_cpus_flag = "-XX:ActiveProcessorCount=";
+/// The entries cpus_add may add: each variable's, and JAVA_TOOL_OPTIONS.
+const cpus_entries_max = cpus_variables.len + 1;
+
+/// The entries giving a start's programs `count` CPUs to size their pools by, appended to
+/// `entries` (a start's knob entries, which come before the node's own): each runtime's
+/// variable the node's environment and its knobs leave unset, and the JVM's flag after their
+/// JAVA_TOOL_OPTIONS (replacing a knob's entry of it, so one value is taken). What the node
+/// sets itself is left alone, its names in `own` (space-separated): a count of its own.
+fn cpus_add(arena: std.mem.Allocator, count: u32, entries: [][]const u8, entries_count: *usize, env: []const []const u8, own: *std.ArrayList(u8)) !void {
+    assert(entries.len >= entries_count.* + cpus_entries_max);
+    const knobs = entries[0..entries_count.*];
+    for (cpus_variables) |variable| {
+        if (env_sets(knobs, variable.name) or env_sets(env, variable.name)) {
+            if (own.items.len > 0) own.appendBounded(' ') catch {};
+            own.appendSliceBounded(variable.name) catch {};
+            continue;
+        }
+        entries[entries_count.*] = switch (variable.form) {
+            .count => try std.fmt.allocPrint(arena, "{s}={d}", .{ variable.name, count }),
+            .erlang => try std.fmt.allocPrint(arena, "{s}=+S {d}:{d}", .{ variable.name, count, count }),
+        };
+        entries_count.* += 1;
+    }
+    const java = "JAVA_TOOL_OPTIONS";
+    var knob_index: ?usize = null;
+    for (entries[0..entries_count.*], 0..) |entry, index| {
+        if (entry.len > java.len and entry[java.len] == '=' and std.mem.startsWith(u8, entry, java)) knob_index = index;
+    }
+    const value: ?[]const u8 = if (knob_index) |index| entries[index][java.len + 1 ..] else env_value(env, java);
+    if (value != null and std.mem.indexOf(u8, value.?, "ActiveProcessorCount") != null) {
+        if (own.items.len > 0) own.appendBounded(' ') catch {};
+        own.appendSliceBounded(java) catch {};
+        return;
+    }
+    const joined = if (value) |options|
+        try std.fmt.allocPrint(arena, "{s}={s} " ++ java_cpus_flag ++ "{d}", .{ java, std.mem.trim(u8, options, " "), count })
+    else
+        try std.fmt.allocPrint(arena, "{s}=" ++ java_cpus_flag ++ "{d}", .{ java, count });
+    if (knob_index) |index| {
+        entries[index] = joined;
+    } else {
+        entries[entries_count.*] = joined;
+        entries_count.* += 1;
+    }
+}
+
+/// The value of `name` in environment entries, or null.
+fn env_value(entries: []const []const u8, name: []const u8) ?[]const u8 {
+    for (entries) |entry| {
+        if (entry.len > name.len and entry[name.len] == '=' and std.mem.eql(u8, entry[0..name.len], name)) return entry[name.len + 1 ..];
+    }
+    return null;
+}
+
+test "a start's CPUs: each runtime's setting where the node sets none, the JVM's after its own" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var entries: [4 + cpus_entries_max][]const u8 = undefined;
+    entries[0] = "SNAPSHOT_COUNT=100"; // A knob's.
+    var count: usize = 1;
+    var own_buffer: [256]u8 = undefined;
+    var own: std.ArrayList(u8) = .initBuffer(&own_buffer);
+    const env = [_][]const u8{ "GOMAXPROCS=8", "JAVA_TOOL_OPTIONS=-Xmx1g", "PATH=/bin" };
+    try cpus_add(arena, 4, &entries, &count, &env, &own);
+    try std.testing.expectEqualStrings("GOMAXPROCS", own.items);
+    try std.testing.expectEqualStrings("4", env_value(entries[0..count], "TOKIO_WORKER_THREADS").?);
+    try std.testing.expect(env_value(entries[0..count], "GOMAXPROCS") == null); // The node's own stays.
+    try std.testing.expectEqualStrings("+S 4:4", env_value(entries[0..count], "ERL_FLAGS").?);
+    try std.testing.expectEqualStrings("-Xmx1g -XX:ActiveProcessorCount=4", env_value(entries[0..count], "JAVA_TOOL_OPTIONS").?);
+    // A knob's JAVA_TOOL_OPTIONS: the flag after it, in its place (one value each).
+    var knobbed: [4 + cpus_entries_max][]const u8 = undefined;
+    knobbed[0] = "JAVA_TOOL_OPTIONS=-Xss512k";
+    var knobbed_count: usize = 1;
+    own.clearRetainingCapacity();
+    try cpus_add(arena, 2, &knobbed, &knobbed_count, &.{}, &own);
+    try std.testing.expectEqualStrings("", own.items);
+    try std.testing.expectEqualStrings("-Xss512k -XX:ActiveProcessorCount=2", knobbed[0]["JAVA_TOOL_OPTIONS=".len..]);
+    var java_count: usize = 0;
+    for (knobbed[0..knobbed_count]) |entry| java_count += @intFromBool(std.mem.startsWith(u8, entry, "JAVA_TOOL_OPTIONS="));
+    try std.testing.expectEqual(@as(usize, 1), java_count);
+    // A count of the node's own in its JVM options: left alone.
+    var counted: [4 + cpus_entries_max][]const u8 = undefined;
+    var counted_count: usize = 0;
+    own.clearRetainingCapacity();
+    try cpus_add(arena, 2, &counted, &counted_count, &.{"JAVA_TOOL_OPTIONS=-XX:ActiveProcessorCount=8"}, &own);
+    try std.testing.expectEqualStrings("JAVA_TOOL_OPTIONS", own.items);
+    try std.testing.expect(env_value(counted[0..counted_count], "JAVA_TOOL_OPTIONS") == null);
+}
+
 fn knob_sets(knob_entries: []const []const u8, entry: []const u8) bool {
     const name_end = std.mem.indexOfScalar(u8, entry, '=') orelse return false;
     for (knob_entries) |knob_entry| {

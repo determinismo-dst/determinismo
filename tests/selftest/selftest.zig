@@ -440,8 +440,9 @@ fn describe_faulted(d: *System.Describe) !void {
     inline for (.{ .echo, .witness }) |name| {
         knobbed.node(name, .{
             .binary = "zig-out/bin/det-selftest-node",
-            // Replaced by the knob's entry: one value of a name, the knob's.
-            .env = &.{"DET_KNOB=unset"},
+            // Replaced by the knob's entry: one value of a name, the knob's. The witness sets
+            // GOMAXPROCS itself: left alone by the drawn CPU count (schema.Node.cpus).
+            .env = if (name == .witness) &.{ "DET_KNOB=unset", "GOMAXPROCS=8" } else &.{"DET_KNOB=unset"},
             .knobs = &knobs,
             .ready = .{ .tcp = port },
             .faults = quiet,
@@ -3083,8 +3084,19 @@ fn knobs_driver(context: *System.Context) !void {
         .witness = shared_witness,
         .other = other,
     });
+    // The witness's own GOMAXPROCS kept beside a drawn count for the rest (schema.Node.cpus).
+    const witness_go = try node_environment(arena, "witness", "GOMAXPROCS");
+    const witness_tokio = try node_environment(arena, "witness", "TOKIO_WORKER_THREADS");
+    sdk.always(std.mem.eql(u8, witness_go, "8") and witness_tokio.len > 0, "a node's own CPU setting is kept beside the drawn ones", .{
+        .gomaxprocs = witness_go,
+        .tokio = witness_tokio,
+    });
     var seen: [3]bool = @splat(false);
+    var cpus_seen: [3]bool = @splat(false);
     for (0..6) |_| {
+        const cpus = try cpus_of(arena, "echo");
+        sdk.always(cpus != null, "a start's CPU count is one of its choices, the same in every runtime's setting", .{ .cpus = cpus orelse 0 });
+        if (cpus) |count| cpus_seen[if (count == 1) 0 else if (count == 2) 1 else 2] = true;
         const mode = try node_environment(arena, "echo", "DET_KNOB");
         const index: ?usize = if (mode.len == 1 and mode[0] >= 'a' and mode[0] <= 'c') mode[0] - 'a' else null;
         sdk.always(index != null, "a start's knob is one of its choices", .{ .value = mode });
@@ -3097,6 +3109,28 @@ fn knobs_driver(context: *System.Context) !void {
     }
     const distinct = @as(u32, @intFromBool(seen[0])) + @intFromBool(seen[1]) + @intFromBool(seen[2]);
     sdk.sometimes(distinct > 1, "restarts drew a start's knob anew", .{ .distinct = distinct });
+    const cpus_distinct = @as(u32, @intFromBool(cpus_seen[0])) + @intFromBool(cpus_seen[1]) + @intFromBool(cpus_seen[2]);
+    sdk.sometimes(cpus_distinct > 1, "restarts drew a start's CPU count anew", .{ .distinct = cpus_distinct });
+}
+
+/// The CPU count a node's start was given (schema.Node.cpus), when every runtime's setting says
+/// the same one of 1, 2 and 4: tokio's, Go's, Rayon's, OpenMP's, .NET's, Erlang's schedulers and
+/// the JVM's flag; null otherwise.
+fn cpus_of(arena: std.mem.Allocator, node: []const u8) !?u32 {
+    const tokio = try node_environment(arena, node, "TOKIO_WORKER_THREADS");
+    const count = std.fmt.parseInt(u32, tokio, 10) catch return null;
+    if (count != 1 and count != 2 and count != 4) return null;
+    for ([_][]const u8{ "GOMAXPROCS", "RAYON_NUM_THREADS", "OMP_NUM_THREADS", "DOTNET_PROCESSOR_COUNT" }) |name| {
+        const value = try node_environment(arena, node, name);
+        if ((std.fmt.parseInt(u32, value, 10) catch return null) != count) return null;
+    }
+    var expected_buffer: [48]u8 = undefined;
+    const erlang = try std.fmt.bufPrint(&expected_buffer, "+S {d}:{d}", .{ count, count });
+    if (!std.mem.eql(u8, try node_environment(arena, node, "ERL_FLAGS"), erlang)) return null;
+    const java = try node_environment(arena, node, "JAVA_TOOL_OPTIONS");
+    const flag = try std.fmt.bufPrint(&expected_buffer, "-XX:ActiveProcessorCount={d}", .{count});
+    if (std.mem.indexOf(u8, java, flag) == null) return null;
+    return count;
 }
 
 fn upgrade_scenario(s: *System.Scenario) void {

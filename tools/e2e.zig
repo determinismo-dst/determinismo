@@ -8761,23 +8761,34 @@ fn check_knobs(context: *Context) !void {
         "--program", program, "--profile",  "knobs", "--scenario",   "knobs",
         "--seed",    "1",     "--branches", "4",     "--events-dir", events,
     });
-    var broken: [3]u64 = undefined;
+    var broken: [5]u64 = undefined;
     for ([_][]const u8{
         "a run's knob is the same choice in every node",
         "a start's knob is one of its choices",
         "a run's knob is kept across restarts",
+        "a start's CPU count is one of its choices, the same in every runtime's setting",
+        "a node's own CPU setting is kept beside the drawn ones",
     }, &broken) |message, *count| {
         count.* = try query_count(context, &.{ events, try std.fmt.allocPrint(context.arena, "assert.message=\"{s}\" assert.condition=false", .{message}) });
     }
     const anew = try query_count(context, &.{ events, "assert.message=\"restarts drew a start's knob anew\" assert.condition=true" });
     const said = try query_count(context, &.{ events, "event=node_knob details.knob=mode" });
+    // The drawn CPU count (schema.Node.cpus): each start's said, anew at restarts, the witness's
+    // GOMAXPROCS its own. Red before: no TOKIO_WORKER_THREADS in any node.
+    const cpus_anew = try query_count(context, &.{ events, "assert.message=\"restarts drew a start's CPU count anew\" assert.condition=true" });
+    const cpus_said = try query_count(context, &.{ events, "event=node_cpus" });
+    const cpus_own = try query_count(context, &.{ events, "event=node_cpus details.own=GOMAXPROCS" });
     expect_all(context, &.{
+        .{ "a start's CPU count was one of its choices in every runtime's setting", broken[3] == 0 },
+        .{ "a node's own CPU setting was kept", broken[4] == 0 and cpus_own > 0 },
+        .{ "restarts drew a start's CPU count anew", cpus_anew > 0 },
+        .{ "each CPU count was said", cpus_said > 0 },
         .{ "a run's knob agreed in every node", broken[0] == 0 },
         .{ "a start's knob was one of its choices, the node's own entry replaced", broken[1] == 0 },
         .{ "a run's knob was kept across restarts", broken[2] == 0 },
         .{ "restarts drew a start's knob anew", anew > 0 },
         .{ "each draw was said", said > 0 },
-    }, "knobs: broken {d}/{d}/{d}, drawn anew {d}, said {d}", .{ broken[0], broken[1], broken[2], anew, said });
+    }, "knobs: broken {d}/{d}/{d}, drawn anew {d}, said {d}; CPUs: broken {d}/{d}, anew {d}, said {d}, own {d}", .{ broken[0], broken[1], broken[2], anew, said, broken[3], broken[4], cpus_anew, cpus_said, cpus_own });
 }
 
 /// A run's named draws (src/draws.zig) through serve, as determinismo.api reads them: the knobs

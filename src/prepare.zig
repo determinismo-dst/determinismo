@@ -417,6 +417,7 @@ fn node_resolve(
         .log_failures = node.log_failures,
         .spare = node.spare,
         .knobs = node.knobs,
+        .cpus = node.cpus,
         .once = node.once,
         .hostname = node.hostname,
         .aliases = node.aliases,

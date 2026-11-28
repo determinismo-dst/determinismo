@@ -230,6 +230,12 @@ a lost wakeup) shows only when a thread switch lands in its window, a few instru
 timer-driven switches nearly never do. A miss is the platform's gap until shown otherwise; use
 the controls, from blind to certain:
 
+- **Worker threads to race**: a runtime that sizes its pool by the CPUs it sees runs one worker
+  on the guest's one vCPU (tokio's tasks then never run inside each other's synchronous code; Go
+  with GOMAXPROCS 1). Each node's start draws the CPU count its programs see (`.cpus`, 1, 2 or 4
+  by default, the named draw `knob.cpus`, a `node_cpus` event): tokio's, Go's, the JVM's, .NET's,
+  Rayon's, OpenMP's and Erlang's settings given it, where the node sets none itself. One choice
+  pins it (`.cpus = &.{4}` for a walk that needs workers); `&.{}` leaves the runtimes alone.
 - **Faults that move switches**: the node's `interleave` (the scheduler's choices drawn at its
   decision points), `thread_pause` and `process_pause`; an instrumented build (coverage) pauses
   threads at its edges (examples/race, profile `instrumented`).

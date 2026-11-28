@@ -260,6 +260,15 @@ pub const Node = struct {
     spare: bool = false,
     /// Settings drawn as it starts (Knob: FoundationDB's randomized knobs).
     knobs: []const Knob = &.{},
+    /// The CPUs its programs size their thread pools by, drawn as it starts from these
+    /// (`knob.cpus`, a `node_cpus` event): each runtime's own setting given that count
+    /// (cpus_variables in guest/runtime/nodes.zig: tokio's workers, GOMAXPROCS, the JVM's
+    /// ActiveProcessorCount, ...), where the node sets none itself. The guest has one vCPU, and a
+    /// runtime that sizes itself by it runs one worker: two tasks of tokio's then never run inside
+    /// each other's synchronous code, and races between them cannot happen (Turso's set_waker,
+    /// examples/turso/stress_test.zig). Still one vCPU and deterministic: only the number of
+    /// worker threads changes. One choice pins it; none leaves the runtimes as they are.
+    cpus: []const u32 = &.{ 1, 2, 4 },
     /// A one-shot (Compose's `service_completed_successfully`: a setup step, etcd_demo's `init`
     /// making its members' directories): the nodes after it start once its processes ended, and
     /// it is never started again, no faults (none of Faults), no supervisor. Its exit is judged
@@ -789,6 +798,7 @@ pub const Resolved = struct {
     log_failures: []const LogFailure = &.{},
     spare: bool = false,
     knobs: []const Knob = &.{},
+    cpus: []const u32 = &.{},
     /// Its next release, resolved (Node.upgrade): on a disk of its own.
     upgrade: ?Variant = null,
     once: bool = false,
