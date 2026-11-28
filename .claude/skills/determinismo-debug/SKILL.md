@@ -65,9 +65,14 @@ Every timeline replays exactly, so a failure is evidence, not flakiness. Follow
    act) is made to happen in every timeline with a hold, not waited for: a walk
    (`node.hold`, the determinismo-workload skill's "Races inside a process") or, in a session at
    the moment, `/opt/determinismo/bin/det-nodes hold <node> '<function>@<file>:<line>' >
-   /tmp/hold.out 2>&1 & echo $! > /tmp/hold.pid` (`armed`, `held` and `point` lines in
-   /tmp/hold.out), then step on and `kill -TERM $(cat /tmp/hold.pid)` to let the held threads go
-   (the hold's own `timeout-ms` ends it too). Points are entries, offsets or source
+   /tmp/hold.out 2>&1 < /dev/null & echo $! > /tmp/hold.pid` (`--pid <pid>` for a process other
+   than the node's main one: a compose driver's exec). Its `armed` line in /tmp/hold.out comes
+   once every thread is seized and the breakpoints are in, seconds for a process of many threads
+   (13 threads of Turso's stress tester: 3 to 8 s): wait for it before stepping on; then a `held`
+   line. Step on and `kill -TERM $(cat /tmp/hold.pid)` to let the held threads go: a held thread
+   stays held until then (`--timeout-ms` ends only a hold that has held none), and a session
+   left without the kill hangs there (a replay's tokio worker held to the timeline's end).
+   Points are entries, offsets or source
    lines (`#<n>` for a line's n-th start); in optimized code read the function's lines first.
    A blind miss of a race that reproduces plainly is a gap in where the guest switches threads,
    not a limit of one vCPU.

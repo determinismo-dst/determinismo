@@ -1873,7 +1873,10 @@ fn moment_arrive(vm: *VM) !?Outcome {
     vm.moment_commands_rest = if (vm.steps_fd != null)
         // Released when the steps' input ends (steps_read).
         commands
-    else if (stepped)
+    else if (stepped or vm.moment_continue)
+        // A timeline continued after its commands runs on to its own end: held, the scenario's
+        // end waited on the hold to the timeline's limit (a plain `--exec <cmd> --continue`,
+        // every such timeline read as hung: e2e continue).
         try std.mem.concat(vm.step_arena.allocator(), u8, &.{ commands, "\x00det:release" })
     else
         commands;

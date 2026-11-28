@@ -617,6 +617,7 @@ const platform_events = std.StaticStringMap(void).initComptime(.{
     .{"node_address"},
     .{"node_completed"},
     .{"node_cpu"},
+    .{"node_cpus"},
     .{"node_crash"},
     .{"node_crash_files"},
     .{"node_crash_nul_files"},
