@@ -3096,6 +3096,14 @@ fn knobs_driver(context: *System.Context) !void {
     for (0..6) |_| {
         const cpus = try cpus_of(arena, "echo");
         sdk.always(cpus != null, "a start's CPU count is one of its choices, the same in every runtime's setting", .{ .cpus = cpus orelse 0 });
+        // A command run in the node gets its start's count, not a draw of its own.
+        var exec_buffer: [32]u8 = undefined;
+        const exec_tokio = try echo.exec_output(&.{ "/bin/det-selftest-node", "env", "TOKIO_WORKER_THREADS" }, &exec_buffer);
+        const exec_count = std.fmt.parseInt(u32, std.mem.trim(u8, exec_tokio.output, " \n"), 10) catch 0;
+        sdk.always(cpus != null and exec_count == cpus.?, "a command run in a node gets its start's CPU count", .{
+            .start = cpus orelse 0,
+            .exec = exec_count,
+        });
         if (cpus) |count| cpus_seen[if (count == 1) 0 else if (count == 2) 1 else 2] = true;
         const mode = try node_environment(arena, "echo", "DET_KNOB");
         const index: ?usize = if (mode.len == 1 and mode[0] >= 'a' and mode[0] <= 'c') mode[0] - 'a' else null;

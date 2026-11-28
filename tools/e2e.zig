@@ -8761,13 +8761,14 @@ fn check_knobs(context: *Context) !void {
         "--program", program, "--profile",  "knobs", "--scenario",   "knobs",
         "--seed",    "1",     "--branches", "4",     "--events-dir", events,
     });
-    var broken: [5]u64 = undefined;
+    var broken: [6]u64 = undefined;
     for ([_][]const u8{
         "a run's knob is the same choice in every node",
         "a start's knob is one of its choices",
         "a run's knob is kept across restarts",
         "a start's CPU count is one of its choices, the same in every runtime's setting",
         "a node's own CPU setting is kept beside the drawn ones",
+        "a command run in a node gets its start's CPU count",
     }, &broken) |message, *count| {
         count.* = try query_count(context, &.{ events, try std.fmt.allocPrint(context.arena, "assert.message=\"{s}\" assert.condition=false", .{message}) });
     }
@@ -8783,12 +8784,13 @@ fn check_knobs(context: *Context) !void {
         .{ "a node's own CPU setting was kept", broken[4] == 0 and cpus_own > 0 },
         .{ "restarts drew a start's CPU count anew", cpus_anew > 0 },
         .{ "each CPU count was said", cpus_said > 0 },
+        .{ "a command run in a node got its start's CPU count", broken[5] == 0 },
         .{ "a run's knob agreed in every node", broken[0] == 0 },
         .{ "a start's knob was one of its choices, the node's own entry replaced", broken[1] == 0 },
         .{ "a run's knob was kept across restarts", broken[2] == 0 },
         .{ "restarts drew a start's knob anew", anew > 0 },
         .{ "each draw was said", said > 0 },
-    }, "knobs: broken {d}/{d}/{d}, drawn anew {d}, said {d}; CPUs: broken {d}/{d}, anew {d}, said {d}, own {d}", .{ broken[0], broken[1], broken[2], anew, said, broken[3], broken[4], cpus_anew, cpus_said, cpus_own });
+    }, "knobs: broken {d}/{d}/{d}, drawn anew {d}, said {d}; CPUs: broken {d}/{d}/{d}, anew {d}, said {d}, own {d}", .{ broken[0], broken[1], broken[2], anew, said, broken[3], broken[4], broken[5], cpus_anew, cpus_said, cpus_own });
 }
 
 /// A run's named draws (src/draws.zig) through serve, as determinismo.api reads them: the knobs

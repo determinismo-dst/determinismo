@@ -3567,7 +3567,7 @@ fn file_size(path: [:0]const u8) u64 {
 }
 
 const Paths = struct {
-    buffers: [18][path_size_max]u8 = undefined,
+    buffers: [19][path_size_max]u8 = undefined,
     directory: [:0]const u8 = "",
     lower: [:0]const u8 = "",
     /// The writable layer's mount (upper and work are in it), its disk image and loop device
@@ -3594,6 +3594,9 @@ const Paths = struct {
     variant: [:0]const u8 = "",
     /// How many times the node was wiped (a decimal number; absent: never), for its starts.
     wipes: [:0]const u8 = "",
+    /// The CPU count its running start drew (schema.Node.cpus; absent: none drawn), for the
+    /// commands run in it: a machine's CPUs, the same for every process in the node.
+    cpus: [:0]const u8 = "",
     cgroup: [:0]const u8 = "",
     cgroup_procs: [:0]const u8 = "",
     cgroup_kill: [:0]const u8 = "",
@@ -3623,6 +3626,7 @@ const Paths = struct {
         paths.variant = try print_z(&b[15], state_root ++ "/{s}/variant-next", .{name});
         paths.stopping = try print_z(&b[16], state_root ++ "/{s}/pid-stopping", .{name});
         paths.wipes = try print_z(&b[17], state_root ++ "/{s}/wipes", .{name});
+        paths.cpus = try print_z(&b[18], state_root ++ "/{s}/cpus", .{name});
         paths.cgroup = try print_z(&b[7], cgroup_root ++ "/{s}", .{name});
         const c = &paths.cgroup_buffers;
         paths.cgroup_procs = try print_z(&c[0], "{s}/cgroup.procs", .{paths.cgroup});
@@ -4061,14 +4065,23 @@ const Launch = struct {
                 }
             }
             // The CPUs its programs size their thread pools by (schema.Node.cpus), drawn as a
-            // knob of its own (`knob.cpus`): each runtime's setting where the node sets none.
+            // knob of its own (`knob.cpus`): each runtime's setting where the node sets none,
+            // kept for the commands run in the node meanwhile (paths.cpus).
             if (node.cpus.len > 0) {
                 const count = node.cpus[@intCast(sdk.random_below_named("knob.cpus", node.cpus.len))];
                 var own_buffer: [256]u8 = undefined;
                 var own: std.ArrayList(u8) = .initBuffer(&own_buffer);
                 try cpus_add(arena, count, &knob_entries, &knob_count, node.env, &own);
+                var digits: [16]u8 = undefined;
+                try file_write(paths.cpus, try std.fmt.bufPrint(&digits, "{d}", .{count}));
                 sdk.event("node_cpus", .{ .node = node.name, .cpus = count, .own = own.items });
-            }
+            } else _ = linux.unlink(paths.cpus);
+        } else if (cpus_kept(paths.cpus)) |count| {
+            // A command run in the node: the CPUs its start drew (a machine's, every process's),
+            // not drawn again; its knobs are the start's alone.
+            var own_buffer: [256]u8 = undefined;
+            var own: std.ArrayList(u8) = .initBuffer(&own_buffer);
+            try cpus_add(arena, count, &knob_entries, &knob_count, node.env, &own);
         }
         var env_kept: usize = 0;
         for (node.env) |entry| env_kept += @intFromBool(!knob_sets(knob_entries[0..knob_count], entry));
@@ -4589,6 +4602,17 @@ fn cpus_add(arena: std.mem.Allocator, count: u32, entries: [][]const u8, entries
         entries[entries_count.*] = joined;
         entries_count.* += 1;
     }
+}
+
+/// The CPU count a node's running start drew (paths.cpus), or null: none drawn, or unreadable.
+fn cpus_kept(path: [:0]const u8) ?u32 {
+    const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return null;
+    defer _ = linux.close(@intCast(fd));
+    var digits: [16]u8 = undefined;
+    const size = linux.read(@intCast(fd), &digits, digits.len);
+    if (linux.errno(size) != .SUCCESS) return null;
+    return std.fmt.parseInt(u32, std.mem.trim(u8, digits[0..size], " \n"), 10) catch null;
 }
 
 /// The value of `name` in environment entries, or null.

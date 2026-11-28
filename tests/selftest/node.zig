@@ -47,6 +47,13 @@ pub fn main(init: std.process.Init) !void {
     const arguments = try init.minimal.args.toSlice(init.arena.allocator());
     if (arguments.len == 2 and std.mem.eql(u8, arguments[1], "hog")) return hog();
     if (arguments.len == 2 and std.mem.eql(u8, arguments[1], "leak")) return leak();
+    // `env <name>`: prints the variable's value as this command got it (an exec's environment:
+    // the node has no shell to ask), nothing when unset.
+    if (arguments.len == 3 and std.mem.eql(u8, arguments[1], "env")) {
+        const value = init.environ_map.get(arguments[2]) orelse "";
+        _ = linux.write(1, value.ptr, value.len);
+        linux.exit_group(0);
+    }
     // `exists <path>`: exits 0 if the file is there (the node has no shell to ask).
     if (arguments.len == 3 and std.mem.eql(u8, arguments[1], "exists")) {
         const found = linux.errno(linux.access(arguments[2], linux.F_OK)) == .SUCCESS;
