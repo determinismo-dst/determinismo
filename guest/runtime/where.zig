@@ -102,6 +102,18 @@ pub const Process = struct {
         }
     }
 
+    /// The addresses in memory, in [start, end), where source `line` begins: of a file whose path
+    /// ends with `file` (any file when null), from the table of lines of the module at `path`
+    /// (lines.zig). Each run of rows on that line counts once, at its first row: the first
+    /// instruction of the line's code there (det-nodes hold's `<function>@<line>`). Null when the
+    /// module has no table; empty when the line has no code in the range.
+    pub fn line_starts(process: *const Process, arena: std.mem.Allocator, path: []const u8, file: ?[]const u8, line: u32, start: u64, end: u64) ?[]const u64 {
+        const module = process.module_of(path) orelse return null;
+        const table = module.table orelse return null;
+        if (start < module.bias or end < start) return &.{};
+        return line_starts_in(arena, table, module.rows, file, line, start - module.bias, end - module.bias, module.bias);
+    }
+
     fn module_of(process: *const Process, path: []const u8) ?*const Module {
         for (process.modules) |*module| {
             if (std.mem.eql(u8, module.path, path)) return module;
@@ -381,6 +393,63 @@ fn line_of(arena: std.mem.Allocator, table: linux.fd_t, rows: u64, address: u64)
     const room = name_size_max - 12;
     const shown = if (file.len > room) file[file.len - room ..] else file;
     return std.fmt.allocPrint(arena, "{s}:{d}", .{ shown, line }) catch null;
+}
+
+/// The file addresses in [low, high) where `line` of a file ending with `file` begins, in a table
+/// of lines (as line_of reads it), each plus `bias`: the rows from the first at or above `low`, a
+/// run of rows on the line counted at its first. Null when the table cannot be read.
+fn line_starts_in(arena: std.mem.Allocator, table: linux.fd_t, rows: u64, file: ?[]const u8, line: u32, low: u64, high: u64, bias: u64) ?[]const u64 {
+    // The first row at or above `low`.
+    var first: u64 = 0;
+    var last: u64 = rows;
+    var row: [16]u8 = undefined;
+    while (first < last) {
+        const middle = first + (last - first) / 2;
+        if (!pread_all(table, &row, 16 + middle * 16)) return null;
+        if (std.mem.readInt(u64, row[0..8], .little) < low) first = middle + 1 else last = middle;
+    }
+    // A file's name is read once: the files of a function's rows are few.
+    const Known = struct { at: u32, matches: bool };
+    var known: [16]Known = undefined;
+    var known_count: usize = 0;
+    var starts: std.ArrayList(u64) = .empty;
+    var on_line = false;
+    var index = first;
+    while (index < rows) : (index += 1) {
+        if (!pread_all(table, &row, 16 + index * 16)) return null;
+        const address = std.mem.readInt(u64, row[0..8], .little);
+        if (address >= high) break;
+        const row_line = std.mem.readInt(u32, row[8..12], .little);
+        const file_at = std.mem.readInt(u32, row[12..16], .little);
+        var matches = row_line == line;
+        if (matches) if (file) |suffix| {
+            const seen = for (known[0..known_count]) |entry| {
+                if (entry.at == file_at) break entry.matches;
+            } else seen: {
+                var name_buffer: [512]u8 = undefined;
+                const read = linux.pread(table, &name_buffer, name_buffer.len, @intCast(16 + rows * 16 + file_at));
+                if (linux.errno(read) != .SUCCESS) return null;
+                const name = std.mem.sliceTo(name_buffer[0..read], 0);
+                const result = path_ends_with(name, suffix);
+                if (known_count < known.len) {
+                    known[known_count] = .{ .at = file_at, .matches = result };
+                    known_count += 1;
+                }
+                break :seen result;
+            };
+            matches = seen;
+        };
+        if (matches and !on_line) starts.append(arena, address + bias) catch return null;
+        on_line = matches;
+    }
+    return starts.items;
+}
+
+/// Whether `path` is `suffix` or ends with it after a slash: `core/io/completions.rs` names
+/// `/app/core/io/completions.rs`, not `/app/core/io/xcompletions.rs`.
+fn path_ends_with(path: []const u8, suffix: []const u8) bool {
+    if (!std.mem.endsWith(u8, path, suffix)) return false;
+    return path.len == suffix.len or path[path.len - suffix.len - 1] == '/' or suffix[0] == '/';
 }
 
 /// Where the process whose core is at `core_path` crashed; null when the core does not say
@@ -732,4 +801,52 @@ test "unwinding: a function's entry by its .eh_frame (the CFA rsp+8, the return 
     try std.testing.expectEqual(@as(i64, 8), rule.cfa_offset);
     try std.testing.expectEqual(@as(i64, -8), rule.return_at);
     try std.testing.expect(found[0].named.at != null);
+}
+
+test "a line's starts in a table of lines: each run once, its file by its path's end, in the range" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // "DETLINES", the rows' count, the rows by address {address, line, file}, then the names.
+    const names = "/app/core/io/completions.rs\x00/app/core/io/other.rs\x00";
+    const other: u32 = 28; // The second name's offset.
+    const Row = struct { address: u64, line: u32, file: u32 };
+    const rows = [_]Row{
+        .{ .address = 0x1000, .line = 385, .file = 0 },
+        .{ .address = 0x1004, .line = 386, .file = 0 },
+        .{ .address = 0x1010, .line = 389, .file = 0 }, // A run of two rows: one start.
+        .{ .address = 0x1014, .line = 389, .file = 0 },
+        .{ .address = 0x1020, .line = 387, .file = 0 },
+        .{ .address = 0x1030, .line = 389, .file = 0 }, // The line again: a second start.
+        .{ .address = 0x1040, .line = 389, .file = other }, // Another file's line 389.
+        .{ .address = 0x2000, .line = 389, .file = 0 }, // Beyond the range.
+    };
+    var bytes: std.ArrayList(u8) = .empty;
+    try bytes.appendSlice(arena, "DETLINES");
+    try bytes.appendSlice(arena, std.mem.asBytes(&@as(u64, rows.len)));
+    for (rows) |row| {
+        try bytes.appendSlice(arena, std.mem.asBytes(&row.address));
+        try bytes.appendSlice(arena, std.mem.asBytes(&row.line));
+        try bytes.appendSlice(arena, std.mem.asBytes(&row.file));
+    }
+    try bytes.appendSlice(arena, names);
+    const table: linux.fd_t = @intCast(linux.memfd_create("lines", 0));
+    defer _ = linux.close(table);
+    try std.testing.expectEqual(bytes.items.len, linux.write(table, bytes.items.ptr, bytes.items.len));
+    const bias = 0x5000;
+    const starts = line_starts_in(arena, table, rows.len, "core/io/completions.rs", 389, 0x1000, 0x1100, bias).?;
+    try std.testing.expectEqualSlices(u64, &.{ 0x6010, 0x6030 }, starts);
+    // Any file: the other file's row goes on the second run.
+    const any = line_starts_in(arena, table, rows.len, null, 389, 0x1000, 0x1100, bias).?;
+    try std.testing.expectEqualSlices(u64, &.{ 0x6010, 0x6030 }, any);
+    const other_file = line_starts_in(arena, table, rows.len, "io/other.rs", 389, 0x1000, 0x1100, bias).?;
+    try std.testing.expectEqualSlices(u64, &.{0x6040}, other_file);
+    // A range from the middle of the first run: the range's first row on the line is a start.
+    const middle = line_starts_in(arena, table, rows.len, "core/io/completions.rs", 389, 0x1014, 0x1100, bias).?;
+    try std.testing.expectEqualSlices(u64, &.{ 0x6014, 0x6030 }, middle);
+    try std.testing.expectEqual(@as(usize, 0), line_starts_in(arena, table, rows.len, null, 999, 0x1000, 0x1100, bias).?.len);
+    try std.testing.expect(path_ends_with("/app/core/io/completions.rs", "core/io/completions.rs"));
+    try std.testing.expect(path_ends_with("/app/core/io/completions.rs", "completions.rs"));
+    try std.testing.expect(!path_ends_with("/app/core/io/xcompletions.rs", "completions.rs"));
+    try std.testing.expect(path_ends_with("completions.rs", "completions.rs"));
 }

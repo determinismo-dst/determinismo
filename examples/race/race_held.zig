@@ -28,7 +28,13 @@ noinline fn act() void {
 fn update(slot: usize) void {
     worker_tids[slot].store(linux.gettid(), .release);
     defer worker_tids[slot].store(0, .release);
-    if (check()) act();
+    const zero = check();
+    if (zero) {
+        // A thread here saw a zero and has not incremented yet: race_test.zig's `held_line`
+        // holds both here, `race_held.update@race_held.zig:36` (this call's line: keep it
+        // there), a point inside a function between its test and its act.
+        act();
+    }
 }
 
 fn on_urgent(_: linux.SIG) callconv(.c) void {}

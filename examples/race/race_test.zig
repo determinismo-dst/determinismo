@@ -29,7 +29,7 @@ const Nodes = struct { race: sdk.Node };
 const System = sdk.System(Nodes);
 
 pub fn main(init: std.process.Init) !void {
-    return System.main(init, .{ .describe = describe, .scenarios = .{ .race = race, .held = held, .held_release = held_release, .held_later = held_later, .held_crowd = held_crowd } });
+    return System.main(init, .{ .describe = describe, .scenarios = .{ .race = race, .held = held, .held_line = held_line, .held_release = held_release, .held_later = held_later, .held_crowd = held_crowd } });
 }
 
 fn describe(d: *System.Describe) !void {
@@ -104,8 +104,27 @@ fn held(s: *System.Scenario) void {
 }
 
 fn hold_both(context: *System.Context) !void {
+    return hold_both_at(context, "race_held.act");
+}
+
+/// Scenario `held_line` (profile `held`): as `held`, its point inside `update` at the line of its
+/// `act()` call (det-nodes hold's `<function>@<file>:<line>`: the binary's table of lines names
+/// the line's first instruction): each thread held once its check saw a zero, then both let go,
+/// the race in every timeline. A point between a test and its act, where a function's entry
+/// would hold the thread before its test (Turso's Completion::set_waker and its lost wakeup,
+/// fixed by tursodatabase/turso#11848).
+fn held_line(s: *System.Scenario) void {
+    s.faults = false;
+    s.singleton_driver("hold", hold_both_line);
+}
+
+fn hold_both_line(context: *System.Context) !void {
+    return hold_both_at(context, "race_held.update@race_held.zig:36");
+}
+
+fn hold_both_at(context: *System.Context, point: []const u8) !void {
     sdk.sleep_ms(200 + sdk.random_below(800));
-    const hold = try context.nodes.race.hold(&.{ "race_held.act", "--every" }, 10_000);
+    const hold = try context.nodes.race.hold(&.{ point, "--every" }, 10_000);
     if (!hold.armed()) {
         hold.release();
         return error.NotArmed;

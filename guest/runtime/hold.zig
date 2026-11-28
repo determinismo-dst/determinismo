@@ -2,7 +2,11 @@
 //! det-nodes hold <node> <point> [--and <point>]... [--pid <pid>] [--timeout-ms <ms>], a point
 //! being `<function> [--caller <function>] [--arg <register>=<value>]`: holds, for each point,
 //! the first thread of a node's process that enters its function, at its first instruction,
-//! while the process's other threads run on; each held thread goes on when this command is told
+//! while the process's other threads run on. `<function>+<offset>` and `<function>@<line>` (or
+//! `<function>@<file>:<line>`) hold a thread inside the function instead, at that byte or at the
+//! first instruction of that source line's code (Spec below: the module's table of lines names
+//! it, and a `{"point":<n>,"offset":<bytes in>,"starts":<n>}` line after `armed` says where it
+//! landed). Each held thread goes on when this command is told
 //! (`release <point>` on its standard input, then SIGUSR1), all of them on SIGTERM or SIGINT, as
 //! it ends. A race inside a process made to happen: a scenario holds the thread that would write
 //! first and lets it go once the other has written; several points order several threads (one
@@ -50,6 +54,7 @@ const nodes = @import("nodes.zig");
 const sdk = @import("determinismo");
 const symbol = @import("symbol.zig");
 const dwarf_types = @import("dwarf_types.zig");
+const where = @import("where.zig");
 
 const ptrace_cont = 7;
 const ptrace_singlestep = 9;
@@ -89,6 +94,46 @@ const register_names = [_]struct { name: []const u8, index: u8 }{
     .{ .name = "r8", .index = 9 },   .{ .name = "rax", .index = 10 }, .{ .name = "rcx", .index = 11 },
     .{ .name = "rdx", .index = 12 }, .{ .name = "rsi", .index = 13 }, .{ .name = "rdi", .index = 14 },
 };
+
+/// A point as written: `<function>` (its entry), `<function>+<offset>` (that many bytes in, the
+/// first byte of an instruction: det-nodes where names one), `<function>@<line>` or
+/// `<function>@<file>:<line>` (the first instruction of the source line's code inside the
+/// function, from its module's table of lines: where.zig's line_starts; `<file>` the end of the
+/// file's path, any file without it). A point inside a function holds a thread there: between a
+/// test and the act it guards (Turso's Completion::set_waker, its waker stored after `finished()`
+/// returned false: `...::set_waker@389`; its lost wakeup, fixed by tursodatabase/turso#11848),
+/// where an entry would hold it before the test.
+pub const Spec = struct {
+    function: []const u8,
+    offset: ?u64 = null,
+    file: ?[]const u8 = null,
+    line: ?u32 = null,
+
+    fn at_entry(spec: Spec) bool {
+        return spec.offset == null and spec.line == null;
+    }
+};
+
+pub fn spec_parse(text: []const u8) error{Usage}!Spec {
+    if (text.len == 0) return error.Usage;
+    if (std.mem.lastIndexOfScalar(u8, text, '@')) |at| {
+        if (at == 0) return error.Usage;
+        const place = text[at + 1 ..];
+        const colon = std.mem.lastIndexOfScalar(u8, place, ':');
+        const line = std.fmt.parseInt(u32, if (colon) |c| place[c + 1 ..] else place, 10) catch return error.Usage;
+        if (line == 0) return error.Usage;
+        const file: ?[]const u8 = if (colon) |c| place[0..c] else null;
+        if (file != null and file.?.len == 0) return error.Usage;
+        return .{ .function = text[0..at], .file = file, .line = line };
+    }
+    // An offset is a number after the last plus (`operator+` and `operator+=` are names).
+    if (std.mem.lastIndexOfScalar(u8, text, '+')) |plus| if (plus > 0) {
+        if (std.fmt.parseInt(u64, text[plus + 1 ..], 0)) |offset| {
+            return .{ .function = text[0..plus], .offset = offset };
+        } else |_| {}
+    };
+    return .{ .function = text };
+}
 
 pub const Arg = struct { index: u8, value: u64 };
 
@@ -179,6 +224,11 @@ pub fn parse(node: []const u8, function: []const u8, rest: []const []const u8) !
             options.timeout_ms = try std.fmt.parseInt(u64, value, 10);
         } else return error.Usage;
         option = option[2..];
+    }
+    for (options.points[0..options.count]) |point| {
+        const spec = try spec_parse(point.function);
+        // `--direct` names the entry's own caller: no return address is at rsp inside a function.
+        if (point.direct and !spec.at_entry()) return error.Usage;
     }
     return options;
 }
@@ -301,7 +351,11 @@ fn on_child(_: linux.SIG) callconv(.c) void {}
 const instruction_size_max = 15;
 
 const Point = struct {
+    /// Its breakpoint's address: the function's entry, or an instruction inside it (Spec).
     entry: u64,
+    /// At the function's entry: its return address is at rsp (inside it, only the frame
+    /// pointers' chain names callers).
+    at_entry: bool = true,
     original: u8,
     caller: ?[2]u64,
     arg: ?Arg,
@@ -438,9 +492,11 @@ const Hold = struct {
             if (!hold.text_at(regs[string.pointer], regs[string.length], string.value)) return false;
         }
         const range = point.caller orelse return true;
-        const first = hold.word_read(regs[rsp_index]) orelse return false;
-        if (returns_into(first, range[0], range[1])) return true;
-        if (point.direct) return false;
+        if (point.at_entry) {
+            const first = hold.word_read(regs[rsp_index]) orelse return false;
+            if (returns_into(first, range[0], range[1])) return true;
+            if (point.direct) return false;
+        }
         var frame = regs[rbp_index];
         for (0..frames_max) |_| {
             if (frame == 0) return false;
@@ -729,7 +785,8 @@ pub fn run(arena: std.mem.Allocator, options: Options) !u8 {
         pids_buffer[0] = pid;
         break :blk pids_buffer[0..1];
     } else pids_buffer[0..try nodes.processes(options.node, &pids_buffer)];
-    const first = symbol_in(arena, pids, options.points[0].function) orelse return error.UnknownFunction;
+    const first_spec = try spec_parse(options.points[0].function);
+    const first = symbol_in(arena, pids, first_spec.function) orelse return error.UnknownFunction;
     var path_buffer: [48]u8 = undefined;
     const path = std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}/mem", .{first.pid}, 0) catch unreachable;
     const fd = linux.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
@@ -739,8 +796,28 @@ pub fn run(arena: std.mem.Allocator, options: Options) !u8 {
     // runtime.main, a Go function every Go program has (runtime.goexit is assembly: its symbol
     // runtime.goexit.abi0, not found by that name, and no goroutine was ever matched).
     hold.go = ((symbol.find(arena, hold.pid, "runtime.main", null) catch null) orelse null) != null;
+    // The process's modules and their tables of lines, read for the first `@<line>` point; each
+    // line point's place, printed after the `armed` line (Node.hold reads that one first).
+    var process: ?where.Process = null;
+    var resolved: [points_max]?struct { offset: u64, starts: usize } = @splat(null);
+    defer if (process) |*read| read.release();
     for (options.points[0..options.count]) |asked| {
-        const found = (symbol.find(arena, hold.pid, asked.function, null) catch null) orelse return error.UnknownFunction;
+        const spec = try spec_parse(asked.function);
+        const found = (symbol.find(arena, hold.pid, spec.function, null) catch null) orelse return error.UnknownFunction;
+        const address: u64 = if (spec.offset) |offset| address: {
+            if (found.size > 0 and offset >= found.size) return error.OffsetOutsideFunction;
+            break :address found.address + offset;
+        } else if (spec.line) |line| address: {
+            if (found.size == 0) return error.UnknownFunctionSize;
+            if (process == null) process = where.Process.read(arena, hold.pid);
+            const starts = process.?.line_starts(arena, found.module, spec.file, line, found.address, found.address + found.size) orelse return error.NoLineTable;
+            if (starts.len == 0) return error.NoSuchLine;
+            // The line's first start; the others are in the event (a line split in two by the
+            // compiler: `+<offset>` names another).
+            sdk.event("hold", .{ .node = options.node, .what = "resolved", .point = hold.count, .address = starts[0], .offset = starts[0] - found.address, .starts = starts.len });
+            resolved[hold.count] = .{ .offset = starts[0] - found.address, .starts = starts.len };
+            break :address starts[0];
+        } else found.address;
         var caller: ?[2]u64 = null;
         if (asked.caller) |name| {
             const site = (symbol.find(arena, hold.pid, name, null) catch null) orelse return error.UnknownCaller;
@@ -762,9 +839,9 @@ pub fn run(arena: std.mem.Allocator, options: Options) !u8 {
             };
         }
         var original: [1]u8 = undefined;
-        if (linux.pread(hold.memory, &original, 1, @bitCast(found.address)) != 1) return error.Memory;
+        if (linux.pread(hold.memory, &original, 1, @bitCast(address)) != 1) return error.Memory;
         assert(original[0] != int3);
-        hold.points[hold.count] = .{ .entry = found.address, .original = original[0], .caller = caller, .arg = asked.arg, .field = field, .string = asked.string, .repeat = asked.repeat, .every = asked.every, .direct = asked.direct, .later = asked.later };
+        hold.points[hold.count] = .{ .entry = address, .at_entry = spec.at_entry(), .original = original[0], .caller = caller, .arg = asked.arg, .field = field, .string = asked.string, .repeat = asked.repeat, .every = asked.every, .direct = asked.direct, .later = asked.later };
         hold.count += 1;
     }
 
@@ -811,6 +888,9 @@ pub fn run(arena: std.mem.Allocator, options: Options) !u8 {
     }
     for (hold.tids[0..hold.threads]) |tid| _ = linux.ptrace(ptrace_cont, tid, 0, 0, 0);
     out("{{\"armed\":{d},\"threads\":{d},\"breakpoints\":{d}}}\n", .{ hold.pid, hold.threads, inserted });
+    for (resolved[0..hold.count], 0..) |place, index| if (place) |line_point| {
+        out("{{\"point\":{d},\"offset\":{d},\"starts\":{d}}}\n", .{ index, line_point.offset, line_point.starts });
+    };
     hold.note(if (hold.go) "start_go" else "start", 0, hold.pid, 0);
 
     // Queued hits and new stops take turns (below).
@@ -921,6 +1001,36 @@ test parse {
     try std.testing.expectEqual(@as(u64, 2500), options.timeout_ms);
     try std.testing.expectError(error.UnknownRegister, parse("n", "f", &.{ "--arg", "xmm0=1" }));
     try std.testing.expectError(error.Usage, parse("n", "f", &.{"--caller"}));
+}
+
+test spec_parse {
+    const entry = try spec_parse("turso_core::io::completions::Completion::set_waker");
+    try std.testing.expectEqualStrings("turso_core::io::completions::Completion::set_waker", entry.function);
+    try std.testing.expect(entry.at_entry());
+    const line = try spec_parse("turso_core::io::completions::Completion::set_waker@389");
+    try std.testing.expectEqualStrings("turso_core::io::completions::Completion::set_waker", line.function);
+    try std.testing.expectEqual(@as(?u32, 389), line.line);
+    try std.testing.expect(line.file == null and !line.at_entry());
+    const file_line = try spec_parse("set_waker@core/io/completions.rs:389");
+    try std.testing.expectEqualStrings("set_waker", file_line.function);
+    try std.testing.expectEqualStrings("core/io/completions.rs", file_line.file.?);
+    try std.testing.expectEqual(@as(?u32, 389), file_line.line);
+    const offset = try spec_parse("race_held.act+0x1a");
+    try std.testing.expectEqualStrings("race_held.act", offset.function);
+    try std.testing.expectEqual(@as(?u64, 0x1a), offset.offset);
+    // Names with a plus are names (no number after it).
+    try std.testing.expectEqualStrings("Vec::operator+", (try spec_parse("Vec::operator+")).function);
+    try std.testing.expectEqualStrings("Vec::operator+=", (try spec_parse("Vec::operator+=")).function);
+    try std.testing.expectError(error.Usage, spec_parse("f@"));
+    try std.testing.expectError(error.Usage, spec_parse("f@x"));
+    try std.testing.expectError(error.Usage, spec_parse("f@:3"));
+    try std.testing.expectError(error.Usage, spec_parse("f@0"));
+    try std.testing.expectError(error.Usage, spec_parse("@3"));
+    // `--direct` only at an entry; a line point takes `--caller` by its frame pointers.
+    try std.testing.expectError(error.Usage, parse("n", "f@3", &.{ "--caller", "g", "--direct" }));
+    const inside = try parse("n", "f@3", &.{ "--caller", "g", "--and", "h+8" });
+    try std.testing.expectEqualStrings("f@3", inside.points[0].function);
+    try std.testing.expectEqualStrings("h+8", inside.points[1].function);
 }
 
 test arg_field_parse {

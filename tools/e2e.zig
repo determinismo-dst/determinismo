@@ -7999,6 +7999,17 @@ fn check_hold(context: *Context) !void {
     var branches: [timelines]Branch = undefined;
     const count = parse_branches(report, &branches);
     const crashed = failing_in(report, "no process crashes: race-held") orelse 0;
+    // The same race held at a line inside `update`, between its check and its act
+    // (`race_held.update@race_held.zig:36`): the binary's table of lines names the instruction,
+    // and both threads held there race in every timeline. Red before det-nodes hold took a line
+    // (an unknown function: the hold never armed, the program never failed).
+    const line_report = try explore(context, &.{
+        "--program", program, "--profile",  "held", "--scenario", "held_line",
+        "--seed",    "1",     "--branches", "4",
+    });
+    var line_branches: [timelines]Branch = undefined;
+    const line_count = parse_branches(line_report, &line_branches);
+    const line_crashed = failing_in(line_report, "no process crashes: race-held") orelse 0;
     // One point let go alone (release_point on a --repeat hold), the others' way: its thread
     // goes on and the next is held.
     const released_report = try explore(context, &.{
@@ -8038,13 +8049,15 @@ fn check_hold(context: *Context) !void {
     expect_all(context, &.{
         .{ "every timeline explored", count == timelines },
         .{ "every timeline has the race", count > 0 and crashed == count },
+        .{ "held at a line inside a function: every timeline explored", line_count == timelines },
+        .{ "held at a line between the check and the act: the race in every timeline", line_count > 0 and line_crashed == line_count },
         .{ "threads stepping past a point beside held ones: every timeline explored", crowd_count == timelines },
         .{ "each thread with the held argument held, in every timeline", crowd_hit == timelines and crowd_failing != null and crowd_failing.? == 0 },
         .{ "a point armed later: every timeline explored", later_count == timelines },
         .{ "none held before it was armed, the next after, in every timeline", later_hit == timelines and later_failing != null and later_failing.? == 0 },
         .{ "a point let go alone: every timeline explored", released_count == timelines },
         .{ "its thread went on and the next was held, in every timeline", released_hit == timelines and released_failing != null and released_failing.? == 0 },
-    }, "hold: {d} of {d} timelines failing \"no process crashes: race-held\"; a point let go alone: {d} timelines, the next held in {d}; beside threads stepping past it: {d} of {d} failing", .{ crashed, count, released_count, released_hit - (released_failing orelse released_hit), crowd_failing orelse crowd_hit, crowd_count });
+    }, "hold: {d} of {d} timelines failing \"no process crashes: race-held\"; held at a line: {d} of {d}; a point let go alone: {d} timelines, the next held in {d}; beside threads stepping past it: {d} of {d} failing", .{ crashed, count, line_crashed, line_count, released_count, released_hit - (released_failing orelse released_hit), crowd_failing orelse crowd_hit, crowd_count });
 }
 
 /// Thread pausing at the instrumentation's callbacks, in every language instrumented by

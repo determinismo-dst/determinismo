@@ -14,7 +14,8 @@
 //!                                     their disks synced each window; off, none (init runs it)
 //!   det-nodes samples                 each node's CPU and memory every 2 s, as events, for good
 //!                                     (init runs it)
-//!   det-nodes hold <node> <function> [--caller <f>] [--arg <reg>=<v>] [--and <function> ...]
+//!   det-nodes hold <node> <point> [--caller <f>] [--arg <reg>=<v>] [--and <point> ...]
+//!                                     a point: <function>, <function>+<offset>, <function>@[<file>:]<line>
 //!                                     the first thread entering each function held there until
 //!                                     released (hold.zig): a race inside a process caused
 const std = @import("std");
@@ -34,7 +35,8 @@ const usage =
     \\       det-nodes exec [--coverage] <node> <command>...
     \\       det-nodes list
     \\       det-nodes symbol <node> <name> [--field <path>] [--pid <pid>]
-    \\       det-nodes hold <node> <function> [--caller <function>] [--arg <register>=<value>]
+    \\       det-nodes hold <node> <point> [--caller <function>] [--arg <register>=<value>]
+    \\                 (<point>: <function>, <function>+<offset> or <function>@[<file>:]<line>)
     \\                      [--arg-field <register>:<type>:<path>=<value>]
     \\                      [--arg-string <register>:<register>=<text>] [--repeat] [--every] [--direct]
     \\                      [--and <function> [--caller ...] [--arg ...]]... [--pid <pid>] [--timeout-ms <ms>]
