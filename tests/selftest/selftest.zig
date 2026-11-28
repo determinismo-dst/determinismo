@@ -3091,16 +3091,35 @@ fn knobs_driver(context: *System.Context) !void {
         .gomaxprocs = witness_go,
         .tokio = witness_tokio,
     });
+    // Echo's start the setup's (before the timelines parted, every timeline's) at this
+    // timeline's first run of the driver, before its first restart (a marker file: the
+    // runner's filesystem is the timeline's).
+    const setup_start = setup_start: {
+        const marker = linux.open(knobs_started_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(marker) == .SUCCESS) {
+            _ = linux.close(@intCast(marker));
+            break :setup_start false;
+        }
+        const created = linux.open(knobs_started_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true }, 0o644);
+        if (linux.errno(created) != .SUCCESS) return error.MarkerNotWritten;
+        _ = linux.close(@intCast(created));
+        break :setup_start true;
+    };
     var seen: [3]bool = @splat(false);
     var cpus_seen: [3]bool = @splat(false);
-    for (0..6) |_| {
+    for (0..6) |iteration| {
         const cpus = try cpus_of(arena, "echo");
         sdk.always(cpus != null, "a start's CPU count is one of its choices, the same in every runtime's setting", .{ .cpus = cpus orelse 0 });
-        // A command run in the node gets its start's count, not a draw of its own.
-        var exec_buffer: [32]u8 = undefined;
-        const exec_tokio = try echo.exec_output(&.{ "/bin/det-selftest-node", "env", "TOKIO_WORKER_THREADS" }, &exec_buffer);
-        const exec_count = std.fmt.parseInt(u32, std.mem.trim(u8, exec_tokio.output, " \n"), 10) catch 0;
-        sdk.always(cpus != null and exec_count == cpus.?, "a command run in a node gets its start's CPU count", .{
+        const exec_count = try exec_cpus(echo);
+        sdk.always(exec_count == try exec_cpus(echo), "a timeline's commands in a node get one CPU count", .{ .exec = exec_count });
+        if (iteration == 0 and setup_start) {
+            // The setup's start, every timeline's: this timeline's commands draw their own.
+            sdk.always(exec_count == 1 or exec_count == 2 or exec_count == 4, "a timeline's commands in a node started in the setup get a count of its choices", .{ .exec = exec_count });
+            sdk.sometimes(cpus != null and exec_count != cpus.?, "a timeline's commands draw a CPU count of their own", .{
+                .start = cpus orelse 0,
+                .exec = exec_count,
+            });
+        } else sdk.always(cpus != null and exec_count == cpus.?, "a command run in a node gets its start's CPU count", .{
             .start = cpus orelse 0,
             .exec = exec_count,
         });
@@ -3119,6 +3138,15 @@ fn knobs_driver(context: *System.Context) !void {
     sdk.sometimes(distinct > 1, "restarts drew a start's knob anew", .{ .distinct = distinct });
     const cpus_distinct = @as(u32, @intFromBool(cpus_seen[0])) + @intFromBool(cpus_seen[1]) + @intFromBool(cpus_seen[2]);
     sdk.sometimes(cpus_distinct > 1, "restarts drew a start's CPU count anew", .{ .distinct = cpus_distinct });
+}
+
+const knobs_started_path = "/tmp/det-selftest-knobs-started";
+
+/// The tokio worker count a command run in the node gets (0: none or unreadable).
+fn exec_cpus(node: sdk.Node) !u32 {
+    var buffer: [32]u8 = undefined;
+    const output = try node.exec_output(&.{ "/bin/det-selftest-node", "env", "TOKIO_WORKER_THREADS" }, &buffer);
+    return std.fmt.parseInt(u32, std.mem.trim(u8, output.output, " \n"), 10) catch 0;
 }
 
 /// The CPU count a node's start was given (schema.Node.cpus), when every runtime's setting says

@@ -8761,7 +8761,7 @@ fn check_knobs(context: *Context) !void {
         "--program", program, "--profile",  "knobs", "--scenario",   "knobs",
         "--seed",    "1",     "--branches", "4",     "--events-dir", events,
     });
-    var broken: [6]u64 = undefined;
+    var broken: [8]u64 = undefined;
     for ([_][]const u8{
         "a run's knob is the same choice in every node",
         "a start's knob is one of its choices",
@@ -8769,6 +8769,8 @@ fn check_knobs(context: *Context) !void {
         "a start's CPU count is one of its choices, the same in every runtime's setting",
         "a node's own CPU setting is kept beside the drawn ones",
         "a command run in a node gets its start's CPU count",
+        "a timeline's commands in a node get one CPU count",
+        "a timeline's commands in a node started in the setup get a count of its choices",
     }, &broken) |message, *count| {
         count.* = try query_count(context, &.{ events, try std.fmt.allocPrint(context.arena, "assert.message=\"{s}\" assert.condition=false", .{message}) });
     }
@@ -8779,18 +8781,23 @@ fn check_knobs(context: *Context) !void {
     const cpus_anew = try query_count(context, &.{ events, "assert.message=\"restarts drew a start's CPU count anew\" assert.condition=true" });
     const cpus_said = try query_count(context, &.{ events, "event=node_cpus" });
     const cpus_own = try query_count(context, &.{ events, "event=node_cpus details.own=GOMAXPROCS" });
+    const commands_own = try query_count(context, &.{ events, "assert.message=\"a timeline's commands draw a CPU count of their own\" assert.condition=true" });
+    const commands_said = try query_count(context, &.{ events, "event=node_cpus details.commands=true" });
     expect_all(context, &.{
         .{ "a start's CPU count was one of its choices in every runtime's setting", broken[3] == 0 },
         .{ "a node's own CPU setting was kept", broken[4] == 0 and cpus_own > 0 },
         .{ "restarts drew a start's CPU count anew", cpus_anew > 0 },
         .{ "each CPU count was said", cpus_said > 0 },
         .{ "a command run in a node got its start's CPU count", broken[5] == 0 },
+        // Red before: every timeline's commands had the setup's count.
+        .{ "a timeline's commands got one CPU count, of the choices", broken[6] == 0 and broken[7] == 0 },
+        .{ "a timeline's commands drew a CPU count of their own", commands_own > 0 and commands_said > 0 },
         .{ "a run's knob agreed in every node", broken[0] == 0 },
         .{ "a start's knob was one of its choices, the node's own entry replaced", broken[1] == 0 },
         .{ "a run's knob was kept across restarts", broken[2] == 0 },
         .{ "restarts drew a start's knob anew", anew > 0 },
         .{ "each draw was said", said > 0 },
-    }, "knobs: broken {d}/{d}/{d}, drawn anew {d}, said {d}; CPUs: broken {d}/{d}/{d}, anew {d}, said {d}, own {d}", .{ broken[0], broken[1], broken[2], anew, said, broken[3], broken[4], broken[5], cpus_anew, cpus_said, cpus_own });
+    }, "knobs: broken {d}/{d}/{d}, drawn anew {d}, said {d}; CPUs: broken {d}/{d}/{d}/{d}/{d}, anew {d}, said {d}, own {d}, commands' own {d} (said {d})", .{ broken[0], broken[1], broken[2], anew, said, broken[3], broken[4], broken[5], broken[6], broken[7], cpus_anew, cpus_said, cpus_own, commands_own, commands_said });
 }
 
 /// A run's named draws (src/draws.zig) through serve, as determinismo.api reads them: the knobs

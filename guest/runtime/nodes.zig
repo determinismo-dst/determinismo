@@ -441,6 +441,7 @@ pub fn exec(
         .user = running.user,
         .ulimits = node.ulimits, // As docker exec: the container's limits.
         .hostname = node.hostname, // Its HOSTNAME as the start's (docker exec: the container's).
+        .cpus = node.cpus, // Its choices: a timeline's commands draw from them (cpus_for_exec).
     };
     paths.root = root; // The node's root as this namespace sees it.
     const launch = try Launch.init(arena, &exec_node, &paths, if (options.coverage) .exec_covered else .exec);
@@ -3567,7 +3568,7 @@ fn file_size(path: [:0]const u8) u64 {
 }
 
 const Paths = struct {
-    buffers: [19][path_size_max]u8 = undefined,
+    buffers: [20][path_size_max]u8 = undefined,
     directory: [:0]const u8 = "",
     lower: [:0]const u8 = "",
     /// The writable layer's mount (upper and work are in it), its disk image and loop device
@@ -3597,6 +3598,9 @@ const Paths = struct {
     /// The CPU count its running start drew (schema.Node.cpus; absent: none drawn), for the
     /// commands run in it: a machine's CPUs, the same for every process in the node.
     cpus: [:0]const u8 = "",
+    /// The count of this timeline's commands in it, when its start came before the timelines
+    /// parted (cpus_for_exec): drawn at the first command after, each timeline its own.
+    cpus_timeline: [:0]const u8 = "",
     cgroup: [:0]const u8 = "",
     cgroup_procs: [:0]const u8 = "",
     cgroup_kill: [:0]const u8 = "",
@@ -3627,6 +3631,7 @@ const Paths = struct {
         paths.stopping = try print_z(&b[16], state_root ++ "/{s}/pid-stopping", .{name});
         paths.wipes = try print_z(&b[17], state_root ++ "/{s}/wipes", .{name});
         paths.cpus = try print_z(&b[18], state_root ++ "/{s}/cpus", .{name});
+        paths.cpus_timeline = try print_z(&b[19], state_root ++ "/{s}/cpus-timeline", .{name});
         paths.cgroup = try print_z(&b[7], cgroup_root ++ "/{s}", .{name});
         const c = &paths.cgroup_buffers;
         paths.cgroup_procs = try print_z(&c[0], "{s}/cgroup.procs", .{paths.cgroup});
@@ -4073,12 +4078,17 @@ const Launch = struct {
                 var own: std.ArrayList(u8) = .initBuffer(&own_buffer);
                 try cpus_add(arena, count, &knob_entries, &knob_count, node.env, &own);
                 var digits: [16]u8 = undefined;
-                try file_write(paths.cpus, try std.fmt.bufPrint(&digits, "{d}", .{count}));
+                const text = try std.fmt.bufPrint(&digits, "{d}", .{count});
+                try file_write(paths.cpus, text);
+                // A start in a timeline: its commands get its count too.
+                if (exists(parted_path)) try file_write(paths.cpus_timeline, text) else _ = linux.unlink(paths.cpus_timeline);
                 sdk.event("node_cpus", .{ .node = node.name, .cpus = count, .own = own.items });
-            } else _ = linux.unlink(paths.cpus);
-        } else if (cpus_kept(paths.cpus)) |count| {
-            // A command run in the node: the CPUs its start drew (a machine's, every process's),
-            // not drawn again; its knobs are the start's alone.
+            } else {
+                _ = linux.unlink(paths.cpus);
+                _ = linux.unlink(paths.cpus_timeline);
+            }
+        } else if (try cpus_for_exec(node, paths)) |count| {
+            // A command run in the node (cpus_for_exec): its knobs are the start's alone.
             var own_buffer: [256]u8 = undefined;
             var own: std.ArrayList(u8) = .initBuffer(&own_buffer);
             try cpus_add(arena, count, &knob_entries, &knob_count, node.env, &own);
@@ -4602,6 +4612,25 @@ fn cpus_add(arena: std.mem.Allocator, count: u32, entries: [][]const u8, entries
         entries[entries_count.*] = joined;
         entries_count.* += 1;
     }
+}
+
+/// The CPU count of a command run in a node, or null (none drawn). Its start's, a machine's CPUs
+/// for every process in it, when that start came in this timeline or the timelines have not
+/// parted. A start before they parted (the setup's, every timeline's) gave its process one count
+/// for all: the timeline's commands draw their own instead, once, at the first (`knob.cpus`
+/// again, kept in paths.cpus_timeline, a `node_cpus` event), as the writeback flusher is drawn
+/// again as they part. Antithesis-style drivers run their tests by exec in a node started in the
+/// setup: one count a run otherwise.
+fn cpus_for_exec(node: *const schema.Resolved, paths: *const Paths) !?u32 {
+    if (node.cpus.len == 0) return null;
+    const started = cpus_kept(paths.cpus) orelse return null;
+    if (!exists(parted_path)) return started;
+    if (cpus_kept(paths.cpus_timeline)) |count| return count;
+    const count = node.cpus[@intCast(sdk.random_below_named("knob.cpus", node.cpus.len))];
+    var digits: [16]u8 = undefined;
+    try file_write(paths.cpus_timeline, try std.fmt.bufPrint(&digits, "{d}", .{count}));
+    sdk.event("node_cpus", .{ .node = node.name, .cpus = count, .start = started, .commands = true });
+    return count;
 }
 
 /// The CPU count a node's running start drew (paths.cpus), or null: none drawn, or unreadable.

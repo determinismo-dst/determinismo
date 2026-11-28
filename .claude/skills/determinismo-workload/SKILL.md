@@ -234,8 +234,11 @@ the controls, from blind to certain:
   on the guest's one vCPU (tokio's tasks then never run inside each other's synchronous code; Go
   with GOMAXPROCS 1). Each node's start draws the CPU count its programs see (`.cpus`, 1, 2 or 4
   by default, the named draw `knob.cpus`, a `node_cpus` event): tokio's, Go's, the JVM's, .NET's,
-  Rayon's, OpenMP's and Erlang's settings given it, where the node sets none itself. One choice
-  pins it (`.cpus = &.{4}` for a walk that needs workers); `&.{}` leaves the runtimes alone.
+  Rayon's, OpenMP's and Erlang's settings given it, where the node sets none itself. Commands
+  run in the node get its start's count; in a node started in the setup (every timeline's
+  start), a timeline's commands draw their own once, so a compose driver's tests vary by
+  timeline. One choice pins it (`.cpus = &.{4}` for a walk that needs workers); `&.{}` leaves
+  the runtimes alone.
 - **Faults that move switches**: the node's `interleave` (the scheduler's choices drawn at its
   decision points), `thread_pause` and `process_pause`; an instrumented build (coverage) pauses
   threads at its edges (examples/race, profile `instrumented`).
